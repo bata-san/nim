@@ -57,6 +57,9 @@ public:
     uint64_t signal();               // signals the queue fence, returns the value
     void wait(uint64_t fence_value); // blocks until the fence reaches it
     void wait_idle() { wait(signal()); }
+    // Throws when the device was removed (a GPU fault); with NIM_D3D_DEBUG=1 logs DRED first.
+    void check_device();
+    bool removed() const { return removed_; }
 
     void begin_frame(uint32_t frame_index);  // recycles that frame's dynamic region
     DynamicAlloc dynamic(size_t size);       // 256-byte aligned, valid for the current frame
@@ -82,6 +85,7 @@ private:
     ComPtr<ID3D12GraphicsCommandList> list_;
     ComPtr<ID3D12Fence> fence_;
     uint64_t fence_value_ = 0;
+    bool removed_ = false;
     HANDLE event_ = nullptr;
     std::vector<ComPtr<ID3D12Resource>> keep_;  // staging kept alive until the next flush
     DescriptorAllocator srv_;

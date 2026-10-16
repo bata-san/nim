@@ -141,7 +141,9 @@ float snorm16(const uint8_t* p) {
 // skinning streams t2-t4 as typed buffers (a table).
 ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool dynamic = false) {
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 20, 0, 0, 0};
-    D3D12_DESCRIPTOR_RANGE skin_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 2, 0, 0};
+    // Dynamic models: t0 vertex colour (goriath binds it for every dynamic model), t1 unused,
+    // t2-t4 the skinning streams.
+    D3D12_DESCRIPTOR_RANGE skin_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0};
     D3D12_ROOT_PARAMETER params[6]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor = {0, 0};
@@ -201,9 +203,17 @@ TfxEnvironment default_environment() {
 } // namespace
 
 void StaticMeshScene::release(Gpu& gpu) {
+    // A failed upload leaves texture copies recorded on the immediate list; run them while their
+    // resources are still alive, or the next flush page-faults the GPU (device removed).
+    if (!items_.empty() || !sets_.empty()) {
+        try {
+            gpu.flush();
+        } catch (...) {
+        }
+    }
     for (auto& it : items_) gpu.srv().free(it.srv_first, 20);
     for (auto& st : sets_)
-        if (st.srv_first != UINT32_MAX) gpu.srv().free(st.srv_first, 3);
+        if (st.srv_first != UINT32_MAX) gpu.srv().free(st.srv_first, 5);
     items_.clear();
     info_.clear();
     sets_.clear();
@@ -360,6 +370,12 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
             bufs.ib = load_index_buffer(pm, mesh.index);
             bufs.vb0 = load_vertex_buffer(pm, mesh.vertex0);
             if (!mesh.vertex1.is_none()) bufs.vb1 = load_vertex_buffer(pm, mesh.vertex1);
+            if (!mesh.color.is_none()) {
+                try {
+                    bufs.color = load_vertex_buffer(pm, mesh.color).data;
+                } catch (...) {
+                }
+            }
         } catch (const std::exception& ex) {
             out.notes.push_back(std::format("mesh {}: buffers: {}", mi, ex.what()));
             continue;
@@ -534,14 +550,18 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
             };
             set.skin_pos = up(b.skin_pos);
             set.skin_normal = up(b.skin_normal);
-            set.srv_first = gpu.srv().alloc(3);
-            ID3D12Resource* res[3] = {set.skin_pos.Get(), set.skin_normal.Get(), set.skin_pos.Get()};
-            for (UINT k = 0; k < 3; ++k) {
+            const uint8_t white[4] = {255, 255, 255, 255};
+            set.color = b.color.size() >= 4 ? gpu.upload(b.color.data(), b.color.size() & ~size_t(3)) : gpu.upload(white, 4);
+            set.srv_first = gpu.srv().alloc(5);
+            ID3D12Resource* res[5] = {set.color.Get(), set.color.Get(), set.skin_pos.Get(), set.skin_normal.Get(),
+                                      set.skin_pos.Get()};
+            const UINT elements[5] = {UINT(std::max<size_t>(1, b.color.size() / 4)), 1, 0, 0, 0};
+            for (UINT k = 0; k < 5; ++k) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-                sd.Format = DXGI_FORMAT_R32_UINT;
+                sd.Format = k < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_UINT;
                 sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
                 sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                sd.Buffer.NumElements = UINT(res[k]->GetDesc().Width / 4);
+                sd.Buffer.NumElements = k < 2 ? elements[k] : UINT(res[k]->GetDesc().Width / 4);
                 dev->CreateShaderResourceView(res[k], &sd, gpu.srv().cpu(set.srv_first + k));
             }
         }
@@ -627,7 +647,21 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
         for (int r = 0; r < 4; ++r) pd.RTVFormats[r] = GBuffer::kFormat;
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.SampleDesc.Count = 1;
-        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&item.pso)), "CreateGraphicsPipelineState (game DXIL)");
+        if (const HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&item.pso)); FAILED(hr)) {
+            gpu.srv().free(item.srv_first, 20);
+            std::string vs_in, layout;
+            for (const auto& in : shader_inputs(g.vs)) vs_in += std::format(" {}{}", in.semantic, in.index);
+            for (const auto& d : ied) layout += std::format(" {}{}@{}", d.SemanticName, d.SemanticIndex, d.InputSlot);
+            auto binds = [](std::span<const uint8_t> code) {
+                std::string o;
+                for (const auto& b : shader_bindings(code))
+                    o += std::format(" {}{}-{}/s{}k{}", "?scbu"[int(b.type)], b.lower, b.upper, b.space, int(b.kind));
+                return o;
+            };
+            layout += "; VS binds" + binds(g.vs) + "; PS binds" + binds(g.ps);
+            throw std::runtime_error(std::format("CreateGraphicsPipelineState (game DXIL) failed (hr=0x{:08X}); VS in:{}; layout {}:{}",
+                                                 uint32_t(hr), vs_in, g.input_layout, layout));
+        }
 
         items_.push_back(std::move(item));
         info_.push_back(std::move(g.info));

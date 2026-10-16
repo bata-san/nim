@@ -78,6 +78,7 @@ struct PreparedMesh {
         // Skinned meshes: the packed streams the game's compute skinning writes for the vertex
         // shader (t2/t4 positions, 21/21/22-bit snorm pairs; t3 octahedral normal + tangent).
         std::vector<uint32_t> skin_pos, skin_normal;
+        std::vector<uint8_t> color;  // dynamic models: per-vertex RGBA8 the VS reads as t0
     };
     struct Group {
         StaticMeshPart part;
@@ -147,8 +148,8 @@ private:
     std::vector<SceneGroupInfo> info_;
     ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
     struct BufferSet {
-        ComPtr<ID3D12Resource> ib, vb0, vb1, skin_pos, skin_normal;
-        uint32_t srv_first = UINT32_MAX;  // t2, t3, t4 (dynamic models)
+        ComPtr<ID3D12Resource> ib, vb0, vb1, skin_pos, skin_normal, color;
+        uint32_t srv_first = UINT32_MAX;  // VS t0-t4 (dynamic models): color, -, skin streams
         D3D12_INDEX_BUFFER_VIEW ibv{};
         D3D12_VERTEX_BUFFER_VIEW vbv[4]{};
     };

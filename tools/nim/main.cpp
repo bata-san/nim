@@ -46,7 +46,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr const char* kVersion = "0.3.0";
+constexpr const char* kVersion = "0.3.1";
 constexpr ImU32 kGreen = IM_COL32(201, 254, 0, 255);  // Marathon green
 constexpr uint32_t kThumbSize = 256;
 
@@ -1901,7 +1901,22 @@ int run(const std::wstring& cmdline) {
         check_hr(cl->Close(), "Close");
         ID3D12CommandList* lists[] = {cl};
         app->gpu.queue()->ExecuteCommandLists(1, lists);
-        g_win.swapchain->Present(1, 0);
+        const HRESULT present = g_win.swapchain->Present(1, 0);
+        if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) {
+            // The GPU faulted: every later frame would only wait out timeouts, so say so and quit.
+            std::string why = "GPU error";
+            try {
+                app->gpu.check_device();
+            } catch (const std::exception& ex) {
+                why = ex.what();
+            }
+            MessageBoxW(g_win.hwnd,
+                        to_wide("GPU がエラーで停止したため終了します (device removed)。\n"
+                                "NIM_D3D_DEBUG=1 を設定して起動すると nim_d3d.log に詳細が出ます。\n\n" + why)
+                            .c_str(),
+                        L"nim", MB_ICONERROR);
+            break;
+        }
         g_win.fence[fi] = app->gpu.signal();
         ++frame;
         app->after_frame();

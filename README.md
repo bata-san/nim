@@ -77,4 +77,8 @@ lighting). `--game` adds `composite_game.png`: the game's own deferred shading a
 `--fog 12` adds `composite_game_fog.png` with the game shader's height fog at 12 per km.
 Requires a D3D12 GPU with Shader Model 6.6, or pass `--warp`.
 
+GPU faults: set `NIM_D3D_DEBUG=1` before starting any of the tools to enable the D3D12 debug layer
+(if installed) and DRED; messages and the faulting operation go to `nim_d3d.log` in the current
+directory.
+
 nim only reads installed files. It never touches the running game, and it ships no game data or Oodle binaries.

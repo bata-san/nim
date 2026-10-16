@@ -1,6 +1,7 @@
 #include "nim/render/gpu.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <stdexcept>
@@ -51,7 +52,34 @@ void DescriptorAllocator::free(uint32_t first, uint32_t n) {
 
 // ---- Gpu -----------------------------------------------------------------------------------------
 
+namespace {
+FILE* g_debug_log = nullptr;
+void CALLBACK on_d3d_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
+    if (!g_debug_log || sev > D3D12_MESSAGE_SEVERITY_WARNING) return;
+    std::fprintf(g_debug_log, "[%d] #%d %s\n", int(sev), int(id), text);
+    std::fflush(g_debug_log);
+}
+void debug_name(ID3D12Resource* r, const char* kind, uint64_t a, uint64_t b) {
+    if (!g_debug_log || !r) return;
+    static uint64_t n = 0;
+    r->SetName(std::format(L"{} #{} {}x{}", std::wstring(kind, kind + std::strlen(kind)), ++n, a, b).c_str());
+}
+}  // namespace
+
 void Gpu::init(bool warp) {
+    // NIM_D3D_DEBUG=1: D3D12 debug layer + DRED, messages to nim_d3d.log in the current directory.
+    char flag[8] = {};
+    const bool debug = GetEnvironmentVariableA("NIM_D3D_DEBUG", flag, sizeof(flag)) > 0 && flag[0] == '1';
+    if (debug) {
+        ComPtr<ID3D12Debug> dbg;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        }
+        fopen_s(&g_debug_log, "nim_d3d.log", "w");
+    }
     check_hr(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "CreateDXGIFactory2");
     ComPtr<IDXGIAdapter1> ad;
     if (warp) check_hr(factory_->EnumWarpAdapter(IID_PPV_ARGS(&ad)), "EnumWarpAdapter");
@@ -63,6 +91,12 @@ void Gpu::init(bool warp) {
     for (wchar_t* p = desc.Description; *p; ++p) adapter_ += char(*p < 128 ? *p : '?');
     ad.As(&adapter3_);
     check_hr(D3D12CreateDevice(ad.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)), "D3D12CreateDevice");
+    if (debug) {
+        ComPtr<ID3D12InfoQueue1> iq;
+        DWORD cookie = 0;
+        if (SUCCEEDED(device_.As(&iq)))
+            iq->RegisterMessageCallback(on_d3d_message, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+    }
 
     D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
     if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
@@ -100,10 +134,40 @@ void Gpu::flush() {
     ID3D12CommandList* lists[] = {list_.Get()};
     queue_->ExecuteCommandLists(1, lists);
     wait(signal());
-    check_hr(device_->GetDeviceRemovedReason(), "GPU execution (device removed)");
+    check_device();
     keep_.clear();
     check_hr(alloc_->Reset(), "allocator Reset");
     check_hr(list_->Reset(alloc_.Get(), nullptr), "list Reset");
+}
+
+void Gpu::check_device() {
+    const HRESULT hr = device_->GetDeviceRemovedReason();
+    if (SUCCEEDED(hr)) return;
+    if (g_debug_log) {
+        ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+        if (SUCCEEDED(device_.As(&dred)) && SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+            for (auto* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+                const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+                std::fprintf(g_debug_log, "DRED list %s: %u of %u ops done\n", n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?",
+                             done, n->BreadcrumbCount);
+                if (done < n->BreadcrumbCount)
+                    for (UINT i = done > 4 ? done - 4 : 0; i < std::min(n->BreadcrumbCount, done + 4); ++i)
+                        std::fprintf(g_debug_log, "   %s op %u = %d\n", i == done ? ">>" : "  ", i, int(n->pCommandHistory[i]));
+            }
+        }
+        D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+        if (dred && SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
+            std::fprintf(g_debug_log, "DRED page fault VA 0x%llx\n", (unsigned long long)pf.PageFaultVA);
+            for (auto* a = pf.pHeadExistingAllocationNode; a; a = a->pNext)
+                std::fprintf(g_debug_log, "  existing: %s type %d\n", a->ObjectNameA ? a->ObjectNameA : "?", int(a->AllocationType));
+            for (auto* a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext)
+                std::fprintf(g_debug_log, "  freed: %s type %d\n", a->ObjectNameA ? a->ObjectNameA : "?", int(a->AllocationType));
+        }
+        std::fflush(g_debug_log);
+    }
+    removed_ = true;
+    check_hr(hr, "GPU execution (device removed)");
 }
 
 uint64_t Gpu::vram_usage() const {
@@ -143,6 +207,7 @@ ComPtr<ID3D12Resource> Gpu::buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESO
     ComPtr<ID3D12Resource> r;
     check_hr(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&r)),
              "CreateCommittedResource(buffer)");
+    debug_name(r.Get(), heap == D3D12_HEAP_TYPE_UPLOAD ? "upload" : heap == D3D12_HEAP_TYPE_READBACK ? "readback" : "buffer", size, 0);
     return r;
 }
 
@@ -182,6 +247,7 @@ ComPtr<ID3D12Resource> Gpu::texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format
     ComPtr<ID3D12Resource> r;
     check_hr(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r)),
              "CreateCommittedResource(texture2d)");
+    debug_name(r.Get(), "tex2d", w, h);
     return r;
 }
 
@@ -200,6 +266,7 @@ ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
     check_hr(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&r)),
              "CreateCommittedResource(texture)");
+    debug_name(r.Get(), "texture", t.width, t.height);
 
     const UINT subs = UINT(t.mip_count) * (is3d ? 1u : std::max<UINT>(1, t.array_size));
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subs);
@@ -228,7 +295,10 @@ ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
         list_->CopyTextureRegion(&dst, 0, 0, 0, &s, nullptr);
     }
     barrier(list_.Get(), r.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // Keep both ends of the copy alive until it has run: a caller that throws before flushing
+    // would otherwise free a texture the GPU still copies into.
     keep_.push_back(up);
+    keep_.push_back(r);
     return r;
 }
 
