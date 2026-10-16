@@ -98,8 +98,11 @@ const PackageInfo* PackageManager::info(uint16_t pkg_id) const {
 }
 
 Package& PackageManager::open(const PackageInfo& info) {
-    if (auto it = open_.find(&info); it != open_.end()) return *it->second;
-    return *open_.emplace(&info, std::make_unique<Package>(info.newest_path)).first->second;
+    const size_t index = size_t(&info - infos_.data());
+    std::lock_guard lk(open_->mutex);
+    auto& slot = open_->by_index[index];
+    if (!slot) slot = std::make_unique<Package>(info.newest_path);
+    return *slot;
 }
 
 Package& PackageManager::open(uint16_t pkg_id) {
@@ -131,6 +134,7 @@ std::unique_ptr<PackageManager> PackageManager::fork() const {
     m->by_id_ = by_id_;
     m->language_ = language_;
     m->h64_ = h64_;
+    m->open_ = open_;
     return m;
 }
 

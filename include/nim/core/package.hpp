@@ -103,7 +103,7 @@ private:
     std::vector<Hash64Entry> hash64s_;
     std::unique_ptr<PackageCipher> cipher_;
 
-    static constexpr size_t kCacheSlots = 8;
+    static constexpr size_t kCacheSlots = 32;
     mutable std::mutex cache_mutex_;
     mutable std::vector<std::pair<uint32_t, std::shared_ptr<const std::vector<uint8_t>>>> cache_;
 

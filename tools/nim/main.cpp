@@ -2012,6 +2012,8 @@ public:
             ImGui::Dummy(size);
         const ImVec2 end = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(origin);
+        // The toolbar drawn on top must win hover and clicks over this catch-all.
+        ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton("view", size,
                                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
                                    ImGuiButtonFlags_MouseButtonMiddle);

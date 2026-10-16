@@ -164,7 +164,9 @@ int run(int argc, char** argv) {
                 }
             };
             std::vector<std::unique_ptr<PackageManager>> helpers;
-            for (unsigned i = 1; i < std::max(std::thread::hardware_concurrency(), 1u); ++i) helpers.push_back(pm.fork());
+            unsigned threads_n = std::max(std::thread::hardware_concurrency(), 1u);
+            if (const char* e = std::getenv("NIM_THREADS")) threads_n = std::max(1, std::atoi(e));
+            for (unsigned i = 1; i < threads_n; ++i) helpers.push_back(pm.fork());
             std::vector<std::thread> threads;
             for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
             work(pm);

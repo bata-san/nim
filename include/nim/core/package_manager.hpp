@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -44,7 +45,8 @@ public:
     void build_hash64_index();
 
     // Another manager over the same install for a worker thread: the package list and hash64
-    // index are copied (no directory scan, no reopening every package); open packages are its own.
+    // index are copied (no directory scan); open packages and their block caches are shared
+    // (Package reads are thread-safe), so threads do not decompress the same blocks again.
     std::unique_ptr<PackageManager> fork() const;
 
 private:
@@ -52,7 +54,11 @@ private:
     std::filesystem::path pkg_dir_;
     std::vector<PackageInfo> infos_;
     std::unordered_map<uint16_t, std::vector<size_t>> by_id_;
-    std::unordered_map<const PackageInfo*, std::unique_ptr<Package>> open_;
+    struct OpenPackages {
+        std::mutex mutex;
+        std::unordered_map<size_t, std::unique_ptr<Package>> by_index;  // index into infos_
+    };
+    std::shared_ptr<OpenPackages> open_ = std::make_shared<OpenPackages>();
     uint16_t language_ = 1;
     std::unordered_map<uint64_t, TagHash> h64_;
 };
