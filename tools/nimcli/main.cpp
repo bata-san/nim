@@ -17,8 +17,17 @@
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
+//   nimcli [--install DIR] components [CLASS]           component tags by resource class (or those holding CLASS)
+//   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
+//   nimcli [--install DIR] skeletons                    skinned models -> their entity's skeleton and rig, clip counts
+//   nimcli [--install DIR] rig COMPONENT                animation rig (8080AD7E): rig -> skeleton bones, spaces
+//   nimcli [--install DIR] clip TAG [FRAME]             decode an animation clip (8080AE01), print one frame
+//   nimcli [--install DIR] clips [BONES]                decode every clip (or those with BONES bones)
+//   nimcli [--install DIR] clipfit MODEL                pose the model's skeleton with every clip of its rig
+//   nimcli [--install DIR] skin MODEL                   skin weight summary of a dynamic model
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
 //                                                       (also reports how many of those also hold string hashes)
+#include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/strings.hpp"
@@ -468,6 +477,213 @@ int cmd_find(PackageManager& pm, uint32_t cls) {
     return 0;
 }
 
+// Component tags (8080BADB) by the classes of their two resources (0x10, 0x18).
+int cmd_components(PackageManager& pm, uint32_t want) {
+    std::map<std::pair<uint32_t, uint32_t>, size_t> hist;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassComponent) continue;
+            const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+            std::vector<uint8_t> d;
+            try { d = pm.read(t); } catch (...) { continue; }
+            BinaryReader r(d);
+            auto cls = [&](size_t o) -> uint32_t {
+                const uint64_t v = r.u64_at(o);
+                return v && o + v >= 4 && o + v < d.size() ? r.u32_at(o + size_t(v) - 4) : 0;
+            };
+            const uint32_t a = cls(0x10), b = cls(0x18);
+            hist[{a, b}]++;
+            if (want && (a == want || b == want)) std::println("{}  {:08X} {:08X}  size {}", t.str(), a, b, d.size());
+        }
+    }
+    if (!want)
+        for (const auto& [k, n] : hist) std::println("{:08X} {:08X}  {}", k.first, k.second, n);
+    return 0;
+}
+
+// ---- skeletons / animation -----------------------------------------------------------------------
+int cmd_skeleton(PackageManager& pm, TagHash tag) {
+    Skeleton sk = load_skeleton(pm, tag);
+    std::println("skeleton {} bones {}", tag.str(), sk.size());
+    for (size_t i = 0; i < sk.size(); ++i) {
+        const auto& b = sk.bind[i];
+        const auto& l = sk.local_bind[i];
+        std::println("{:3} {:08X} parent {:3}  object pos ({:8.4f},{:8.4f},{:8.4f}) rot ({:6.3f},{:6.3f},{:6.3f},{:6.3f}) scale {:.3f}"
+                     "  local pos ({:7.4f},{:7.4f},{:7.4f})",
+                     i, sk.hashes[i], sk.parents[i], b.translation[0], b.translation[1], b.translation[2], b.rotation[0],
+                     b.rotation[1], b.rotation[2], b.rotation[3], b.scale, l.translation[0], l.translation[1], l.translation[2]);
+    }
+    return 0;
+}
+
+// Skinned models with the skeleton and rig of their entity, and how many clips have the rig's bone count.
+int cmd_skeletons(PackageManager& pm) {
+    auto materials = index_dynamic_model_materials(pm);
+    auto skeletons = index_model_skeletons(pm, materials);
+    std::map<uint32_t, size_t> clips_by_bones;
+    for (const auto& c : index_animation_clips(pm)) clips_by_bones[c.bones]++;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> by_skeleton;
+    for (const auto& [model, mr] : skeletons) by_skeleton[{mr.skeleton.value, mr.rig.value}].push_back(model);
+    for (auto& [key, models] : by_skeleton) {
+        size_t bones = 0, rig_bones = 0;
+        try { bones = load_skeleton(pm, TagHash(key.first)).size(); } catch (...) {}
+        try { if (!TagHash(key.second).is_none()) rig_bones = load_animation_rig(pm, TagHash(key.second)).size(); } catch (...) {}
+        std::sort(models.begin(), models.end());
+        std::print("{}  bones {:3}  rig {} ({:3})  clips {:4}  models", TagHash(key.first).str(), bones, TagHash(key.second).str(),
+                   rig_bones, rig_bones ? clips_by_bones[uint32_t(rig_bones)] : 0);
+        for (uint32_t m : models) std::print(" {}", TagHash(m).str());
+        std::println("");
+    }
+    std::println("{} models, {} skeletons", skeletons.size(), by_skeleton.size());
+    return 0;
+}
+
+int cmd_clip(PackageManager& pm, TagHash tag, int frame) {
+    AnimationClip c = load_animation_clip(pm, tag);
+    std::println("clip {} codec {} frames {} bones {} name {:08X}  tracks: rotation {} translation {} scale {}", tag.str(),
+                 clip_codec_name(c.codec), c.frame_count, c.bone_count, c.name_hash, c.rotations.size(),
+                 c.translations.size(), c.scales.size());
+    auto at = [&](size_t n) { return std::min<size_t>(size_t(std::max(frame, 0)), n - 1); };
+    for (const auto& t : c.rotations) {
+        const auto& q = t.frames[at(t.frames.size())];
+        std::println("  rot   bone {:3} {:3} frames  ({:7.4f},{:7.4f},{:7.4f},{:7.4f})", t.bone, t.frames.size(), q[0], q[1], q[2], q[3]);
+    }
+    for (const auto& t : c.translations) {
+        const auto& p = t.frames[at(t.frames.size())];
+        std::println("  pos   bone {:3} {:3} frames  ({:8.4f},{:8.4f},{:8.4f})", t.bone, t.frames.size(), p[0], p[1], p[2]);
+    }
+    for (const auto& t : c.scales) std::println("  scale bone {:3} {:3} frames  {:.4f}", t.bone, t.frames.size(), t.frames[at(t.frames.size())]);
+    return 0;
+}
+
+// Decodes every clip; codec histogram and failures.
+int cmd_clips(PackageManager& pm, uint32_t bones) {
+    std::map<std::string, size_t> codecs;
+    size_t failed = 0;
+    for (const auto& info : index_animation_clips(pm)) {
+        if (bones && info.bones != bones) continue;
+        try {
+            AnimationClip c = load_animation_clip(pm, info.tag);
+            codecs[clip_codec_name(c.codec)]++;
+            if (bones) std::println("{}  {:7} frames {:4} tracks {}/{}/{}", info.tag.str(), clip_codec_name(c.codec), c.frame_count,
+                                    c.rotations.size(), c.translations.size(), c.scales.size());
+        } catch (const std::exception& ex) {
+            std::println("{}  error: {}", info.tag.str(), ex.what());
+            ++failed;
+        }
+    }
+    for (const auto& [k, n] : codecs) std::println("{:8} {}", k, n);
+    std::println("{} failed", failed);
+    return failed ? 1 : 0;
+}
+
+// Skin weights of a dynamic model's meshes.
+int cmd_skin(PackageManager& pm, TagHash tag) {
+    DynamicModel m = load_dynamic_model(pm, tag);
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const auto& d = m.meshes[i];
+        if (d.skinning.is_none()) {
+            std::println(" mesh {} rigid", i);
+            continue;
+        }
+        VertexBuffer vb0 = load_vertex_buffer(pm, d.vertex0), sk = load_vertex_buffer(pm, d.skinning);
+        SkinWeights w = decode_skin_weights(vb0, sk);
+        size_t single = 0, two = 0, four = 0;
+        for (size_t v = 0; v < w.bones.size(); ++v) {
+            int16_t pw;
+            std::memcpy(&pw, vb0.data.data() + v * vb0.stride + 6, 2);
+            (std::abs(int(pw)) < 0x800 ? single : pw < 0 ? four : two)++;
+        }
+        std::println(" mesh {} vertices {} (single {}, two {}, four {}) skin buffer {} B stride {}  max bone {}", i, w.bones.size(),
+                     single, two, four, sk.data.size(), sk.stride, w.max_bone);
+    }
+    return 0;
+}
+
+int cmd_rig(PackageManager& pm, TagHash tag) {
+    AnimationRig rig = load_animation_rig(pm, tag);
+    std::println("rig {} bones {}", tag.str(), rig.size());
+    for (size_t i = 0; i < rig.size(); ++i) {
+        const auto& t = rig.default_pose[i];
+        std::println("{:3} -> skeleton {:3}  {:6}  rot ({:6.3f},{:6.3f},{:6.3f},{:6.3f}) pos ({:7.4f},{:7.4f},{:7.4f})", i,
+                     rig.skeleton_bone[i], rig.object_space[i] ? "object" : "local", t.rotation[0], t.rotation[1], t.rotation[2],
+                     t.rotation[3], t.translation[0], t.translation[1], t.translation[2]);
+    }
+    return 0;
+}
+
+// Poses a model's skeleton with every clip of its rig's bone count and reports, per codec, how
+// far bones move from the bind pose and how low the lowest bone goes (a wrong decoder or rig
+// mapping shows up as large displacements and bones far below the ground).
+int cmd_clipfit(PackageManager& pm, TagHash model) {
+    auto skeletons = index_model_skeletons(pm, index_dynamic_model_materials(pm));
+    auto f = skeletons.find(model.value);
+    if (f == skeletons.end() || f->second.rig.is_none()) {
+        std::println("{}: no skeleton with a rig", model.str());
+        return 1;
+    }
+    Skeleton sk = load_skeleton(pm, f->second.skeleton);
+    AnimationRig rig = load_animation_rig(pm, f->second.rig);
+    std::println("model {} skeleton {} ({} bones) rig {} ({} bones)", model.str(), sk.component.str(), sk.size(), rig.component.str(),
+                 rig.size());
+    std::map<std::string, std::vector<float>> moved, lowest, to_default;
+    size_t additive = 0;
+    std::vector<BoneTransform> object;
+    for (const auto& info : index_animation_clips(pm)) {
+        if (info.bones != rig.size()) continue;
+        AnimationClip c;
+        try { c = load_animation_clip(pm, info.tag); } catch (...) { continue; }
+        float sum = 0, low = 1e9f;
+        size_t count = 0;
+        std::vector<float> ang;
+        for (const auto& t : c.rotations) {
+            if (t.bone >= rig.size() || t.frames.size() < 2) continue;
+            const auto& q = t.frames[0];
+            const auto& d = rig.default_pose[t.bone].rotation;
+            ang.push_back(2 * std::acos(std::min(1.0f, std::fabs(q[0] * d[0] + q[1] * d[1] + q[2] * d[2] + q[3] * d[3]))) * 57.29578f);
+        }
+        if (!ang.empty()) {
+            std::sort(ang.begin(), ang.end());
+            to_default[clip_codec_name(c.codec)].push_back(ang[ang.size() / 2]);
+            if (is_additive(rig, c)) to_default["additive"].push_back(ang[ang.size() / 2]);
+        }
+        for (uint32_t fr = 0; fr < c.frame_count; fr += std::max(1u, c.frame_count / 8)) {
+            pose_skeleton(sk, rig, c, float(fr), object);
+            for (size_t b = 0; b < sk.size(); ++b) {
+                const auto& p = object[b].translation;
+                const auto& q = sk.bind[b].translation;
+                sum += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]));
+                low = std::min(low, p[2]);
+                ++count;
+            }
+        }
+        if (is_additive(rig, c)) ++additive;
+        moved[clip_codec_name(c.codec)].push_back(sum / float(std::max<size_t>(1, count)));
+        lowest[clip_codec_name(c.codec)].push_back(low);
+    }
+    auto pct = [](std::vector<float>& v, int p) { return v.empty() ? 0.0f : v[v.size() * size_t(p) / 100]; };
+    std::println("additive clips {}", additive);
+    for (auto& [k, a] : to_default) {
+        if (moved.count(k)) continue;
+        std::sort(a.begin(), a.end());
+        std::println("{:12} clips {:4}  vs rig default p25 {:.1f} p50 {:.1f} p90 {:.1f}", k, a.size(), pct(a, 25), pct(a, 50), pct(a, 90));
+    }
+    for (auto& [k, v] : moved) {
+        auto& l = lowest[k];
+        std::sort(v.begin(), v.end());
+        std::sort(l.begin(), l.end());
+        std::println("{:8} clips {:4}  mean bone displacement p25 {:.3f} p50 {:.3f} p90 {:.3f}   lowest bone z p10 {:.3f} p50 {:.3f}", k,
+                     v.size(), pct(v, 25), pct(v, 50), pct(v, 90), pct(l, 10), pct(l, 50));
+        auto& a = to_default[k];
+        std::sort(a.begin(), a.end());
+        std::println("{:8}             animated rotations vs rig default pose, median angle p25 {:.1f} p50 {:.1f} p90 {:.1f} deg", "", pct(a, 25),
+                     pct(a, 50), pct(a, 90));
+    }
+    return 0;
+}
+
 const char* kStageNames[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 
 // Tags of class `cls` (type 8) whose bytes hold `tag` at a 4-byte aligned offset.
@@ -742,6 +958,14 @@ int main(int argc, char** argv) {
         if (cmd == "fonts") return cmd_fonts(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "scope" && args.size() >= 2) return cmd_scope(pm, TagHash(parse_hex(args[1])));
         if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "skeleton" && args.size() >= 2) return cmd_skeleton(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "clipfit" && args.size() >= 2) return cmd_clipfit(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "rig" && args.size() >= 2) return cmd_rig(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "skeletons") return cmd_skeletons(pm);
+        if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
+        if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
+        if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "components") return cmd_components(pm, args.size() >= 2 ? parse_hex(args[1]) : 0);
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});
         if (cmd == "h64") return cmd_h64(pm, {args.begin() + 1, args.end()});

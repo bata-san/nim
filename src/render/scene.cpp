@@ -220,6 +220,8 @@ void StaticMeshScene::release(Gpu& gpu) {
     notes_.clear();
     inst_vb_.Reset(); zero_vb_.Reset(); t2_.Reset(); fallback_.Reset();
     dynamic_ = false;
+    skinned_ = skin_dirty_ = false;
+    skin_pose_.clear();
     tag_ = TagHash();
 }
 
@@ -308,24 +310,33 @@ std::pair<float, float> oct_encode(V3 v) {
 }
 float s16(const uint8_t* p) { return float(*reinterpret_cast<const int16_t*>(p)) / 32767.0f; }
 
+// One vertex in the layout the game's compute skinning writes: `p` is the packed position
+// ((position - offset) / range, in [-1, 1]); normal and tangent go octahedral.
+void pack_skin_vertex(V3 p, V3 normal, V3 tangent, uint32_t* pos, uint32_t* nrm) {
+    const int32_t x = quant_snorm(p.x, 21), y = quant_snorm(p.y, 21), z = quant_snorm(p.z, 22);
+    pos[0] = (uint32_t(x) & 0x1FFFFF) | ((uint32_t(y) & 0x7FF) << 21);
+    pos[1] = ((uint32_t(y) >> 11) & 0x3FF) | ((uint32_t(z) & 0x3FFFFF) << 10);
+    auto [nu, nv] = oct_encode(normal);
+    auto [tu, tv] = oct_encode(tangent);
+    nrm[0] = (uint32_t(quant_snorm(nv, 16)) << 16) | (uint32_t(quant_snorm(nu, 16)) & 0xFFFF);
+    nrm[1] = (uint32_t(quant_snorm(tv, 16)) << 16) | (uint32_t(quant_snorm(tu, 16)) & 0xFFFF);
+}
+
+// Packed positions of skinned meshes span twice the model's half-extent, so posed vertices that
+// leave the bind-pose box still fit.
+constexpr float kSkinRange = 2.0f;
+
 // The bind pose in the layout the game's compute skinning writes (24-byte layout-7 vertices).
-bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float scale_1d, std::vector<uint32_t>& pos,
+bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vector<uint32_t>& pos,
                        std::vector<uint32_t>& nrm) {
-    if (vb0.stride != 24 || scale_1d <= 1e-8f || vb0.data.size() % 24) return false;
+    if (vb0.stride != 24 || range <= 1e-8f || vb0.data.size() % 24) return false;
     const size_t n = vb0.data.size() / 24;
     pos.resize(n * 2);
     nrm.resize(n * 2);
     for (size_t i = 0; i < n; ++i) {
         const uint8_t* v = vb0.data.data() + i * 24;
-        const int32_t x = quant_snorm(s16(v) * scale.x / scale_1d, 21);
-        const int32_t y = quant_snorm(s16(v + 2) * scale.y / scale_1d, 21);
-        const int32_t z = quant_snorm(s16(v + 4) * scale.z / scale_1d, 22);
-        pos[i * 2] = (uint32_t(x) & 0x1FFFFF) | ((uint32_t(y) & 0x7FF) << 21);
-        pos[i * 2 + 1] = ((uint32_t(y) >> 11) & 0x3FF) | ((uint32_t(z) & 0x3FFFFF) << 10);
-        auto [nu, nv] = oct_encode({s16(v + 8), s16(v + 10), s16(v + 12)});
-        auto [tu, tv] = oct_encode({s16(v + 16), s16(v + 18), s16(v + 20)});
-        nrm[i * 2] = (uint32_t(quant_snorm(nv, 16)) << 16) | (uint32_t(quant_snorm(nu, 16)) & 0xFFFF);
-        nrm[i * 2 + 1] = (uint32_t(quant_snorm(tv, 16)) << 16) | (uint32_t(quant_snorm(tu, 16)) & 0xFFFF);
+        pack_skin_vertex({s16(v) * scale.x / range, s16(v + 2) * scale.y / range, s16(v + 4) * scale.z / range},
+                         {s16(v + 8), s16(v + 10), s16(v + 12)}, {s16(v + 16), s16(v + 18), s16(v + 20)}, &pos[i * 2], &nrm[i * 2]);
     }
     return true;
 }
@@ -381,7 +392,15 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
             continue;
         }
         const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
-        const bool packed = !mesh.skinning.is_none() && pack_skin_streams(bufs.vb0, scale, s1, bufs.skin_pos, bufs.skin_normal);
+        const bool packed =
+            !mesh.skinning.is_none() && pack_skin_streams(bufs.vb0, scale, s1 * kSkinRange, bufs.skin_pos, bufs.skin_normal);
+        if (packed) {
+            try {
+                bufs.skin = decode_skin_weights(bufs.vb0, load_vertex_buffer(pm, mesh.skinning));
+            } catch (const std::exception& ex) {
+                out.notes.push_back(std::format("mesh {}: skin weights: {}", mi, ex.what()));
+            }
+        }
         const uint32_t set = uint32_t(out.buffers.size());
         bool used = false;
         for (size_t k = first; k < last; ++k) {
@@ -436,7 +455,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     // c8-c11 skinning transform (identity), c12/c13 packed-position offset + 1D scale, c15-c18 identity.
     const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
     cb[8] = {1, 0, 0, 0}; cb[9] = {0, 1, 0, 0}; cb[10] = {0, 0, 1, 0}; cb[11] = {0, 0, 0, 1};
-    cb[12] = cb[13] = {offset.x, offset.y, offset.z, s1};
+    cb[12] = cb[13] = {offset.x, offset.y, offset.z, s1 * kSkinRange};
     cb[15] = {1, 0, 0, 0}; cb[16] = {0, 1, 0, 0}; cb[17] = {0, 0, 1, 0}; cb[18] = {0, 0, 0, 1};
     return out;
 }
@@ -524,6 +543,9 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     lod_ = mesh.lod;
     dynamic_ = mesh.dynamic;
     model_cb_ = mesh.model_cb;
+    skin_scale_ = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
+    skin_offset_ = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
+    skin_range_ = mesh.model_cb[13][3] > 1e-8f ? mesh.model_cb[13][3] : 1.0f;
     notes_ = mesh.notes;
 
     const uint32_t instance_index = 0;
@@ -548,8 +570,19 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
             auto up = [&](const std::vector<uint32_t>& v) {
                 return v.empty() ? gpu.upload(zero, sizeof(zero)) : gpu.upload(v.data(), v.size() * 4);
             };
-            set.skin_pos = up(b.skin_pos);
-            set.skin_normal = up(b.skin_normal);
+            if (!b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
+                // Posed on the CPU (update_skin); the first render uploads the bind pose.
+                const size_t bytes = b.skin_pos.size() * 4;
+                set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+                set.skin_normal = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+                for (auto& u : set.skin_upload) u = gpu.buffer(bytes * 2, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                set.vb0_cpu = b.vb0.data;
+                set.skin = b.skin;
+                skinned_ = skin_dirty_ = true;
+            } else {
+                set.skin_pos = up(b.skin_pos);
+                set.skin_normal = up(b.skin_normal);
+            }
             const uint8_t white[4] = {255, 255, 255, 255};
             set.color = b.color.size() >= 4 ? gpu.upload(b.color.data(), b.color.size() & ~size_t(3)) : gpu.upload(white, 4);
             set.srv_first = gpu.srv().alloc(5);
@@ -670,7 +703,76 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     tag_ = mesh.tag;
 }
 
+void StaticMeshScene::set_skin_pose(std::vector<BoneTransform> bones) {
+    skin_pose_ = std::move(bones);
+    skin_dirty_ = skinned_;
+}
+
+// Linear blend skinning of every skinned buffer set, packed into this frame's upload buffer and
+// copied into the streams the vertex shaders read. Runs at most once per frame (from
+// render_gbuffer), so alternating between the kFramesInFlight upload buffers is safe.
+void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
+    skin_dirty_ = false;
+    const uint32_t slot = skin_frame_++ % Gpu::kFramesInFlight;
+    struct Mat { float m[12]; };  // rows: rotation * scale | translation
+    std::vector<Mat> mats(skin_pose_.size());
+    for (size_t b = 0; b < mats.size(); ++b) {
+        const auto& t = skin_pose_[b];
+        const float x = t.rotation[0], y = t.rotation[1], z = t.rotation[2], w = t.rotation[3], s = t.scale;
+        mats[b] = {{(1 - 2 * (y * y + z * z)) * s, 2 * (x * y - z * w) * s, 2 * (x * z + y * w) * s, t.translation[0],
+                    2 * (x * y + z * w) * s, (1 - 2 * (x * x + z * z)) * s, 2 * (y * z - x * w) * s, t.translation[1],
+                    2 * (x * z - y * w) * s, 2 * (y * z + x * w) * s, (1 - 2 * (x * x + y * y)) * s, t.translation[2]}};
+    }
+    for (auto& set : sets_) {
+        if (!set.skin_upload[0]) continue;
+        const size_t n = set.skin.bones.size();
+        ID3D12Resource* upload = set.skin_upload[slot].Get();
+        uint32_t* dst = nullptr;
+        const D3D12_RANGE none{0, 0};
+        check_hr(upload->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* v = set.vb0_cpu.data() + i * 24;
+            V3 p{s16(v) * skin_scale_.x + skin_offset_.x, s16(v + 2) * skin_scale_.y + skin_offset_.y,
+                 s16(v + 4) * skin_scale_.z + skin_offset_.z};
+            V3 nr{s16(v + 8), s16(v + 10), s16(v + 12)}, tg{s16(v + 16), s16(v + 18), s16(v + 20)};
+            if (!mats.empty()) {
+                float m[12]{};
+                float total = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const float wk = set.skin.weights[i][k];
+                    const uint16_t bk = set.skin.bones[i][k];
+                    if (wk <= 0 || bk >= mats.size()) continue;
+                    for (int j = 0; j < 12; ++j) m[j] += mats[bk].m[j] * wk;
+                    total += wk;
+                }
+                if (total > 0) {
+                    auto xf = [&](V3 a, float w1) {
+                        return V3{m[0] * a.x + m[1] * a.y + m[2] * a.z + m[3] * w1, m[4] * a.x + m[5] * a.y + m[6] * a.z + m[7] * w1,
+                                  m[8] * a.x + m[9] * a.y + m[10] * a.z + m[11] * w1};
+                    };
+                    p = xf(p, 1);
+                    nr = xf(nr, 0);
+                    tg = xf(tg, 0);
+                }
+            }
+            pack_skin_vertex((p - skin_offset_) * (1.0f / skin_range_), normalize(nr), normalize(tg), dst + i * 2, dst + n * 2 + i * 2);
+        }
+        upload->Unmap(0, nullptr);
+        constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        if (set.skin_readable) {
+            Gpu::barrier(cl, set.skin_pos.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+            Gpu::barrier(cl, set.skin_normal.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        cl->CopyBufferRegion(set.skin_pos.Get(), 0, upload, 0, n * 8);
+        cl->CopyBufferRegion(set.skin_normal.Get(), 0, upload, n * 8, n * 8);
+        Gpu::barrier(cl, set.skin_pos.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        Gpu::barrier(cl, set.skin_normal.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
+        set.skin_readable = true;
+    }
+}
+
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
+    if (skin_dirty_) update_skin(cl);
     const float clear[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) cl->ClearRenderTargetView(gb.rtv[i], clear, 0, nullptr);
     cl->ClearDepthStencilView(gb.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);

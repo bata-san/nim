@@ -4,6 +4,7 @@
 // big buttons, and browsers whose right-hand panel is a live 3D view. Meshes are drawn with the
 // game's own G-buffer shaders and, by default, shaded by the game's own deferred lighting pass;
 // the UI itself is set in the game's fonts, read from the user's install at startup.
+#include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/strings.hpp"
@@ -429,6 +430,10 @@ public:
         std::optional<PreparedMesh> mesh;
         std::string error;
         double ms = 0;
+        // Skinned live models: the entity's skeleton and rig, and the clips with the rig's bone count.
+        std::optional<Skeleton> skeleton;
+        std::optional<AnimationRig> rig;
+        std::vector<ClipInfo> clips;
     };
 
     void start(const fs::path& install) {
@@ -528,6 +533,7 @@ private:
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
                     auto it = materials_->find(tag.value);
                     r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation);
+                    if (!thumb) find_animation(*pm, r);
                 } else {
                     r.mesh = prepare_static_mesh(*pm, tag);
                 }
@@ -541,6 +547,27 @@ private:
         }
     }
 
+    // Skeleton, rig and clips for a skinned dynamic model (the indexes are built on first use).
+    void find_animation(PackageManager& pm, Result& r) {
+        bool skinned = false;
+        for (const auto& b : r.mesh->buffers) skinned |= !b.skin.bones.empty();
+        if (!skinned) return;
+        try {
+            if (!rigs_) rigs_ = index_model_skeletons(pm, *materials_);
+            auto f = rigs_->find(r.tag.value);
+            if (f == rigs_->end() || f->second.rig.is_none()) return;
+            r.skeleton = load_skeleton(pm, f->second.skeleton);
+            r.rig = load_animation_rig(pm, f->second.rig);
+            if (!clips_) clips_ = index_animation_clips(pm);
+            for (const auto& c : *clips_)
+                if (c.bones == r.rig->size()) r.clips.push_back(c);
+        } catch (const std::exception& ex) {
+            r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
+            r.skeleton.reset();
+            r.rig.reset();
+        }
+    }
+
     std::thread thread_;
     std::mutex m_;
     std::condition_variable cv_;
@@ -548,6 +575,8 @@ private:
     std::optional<TagHash> live_;
     int live_permutation_ = -1;
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
+    std::optional<std::unordered_map<uint32_t, ModelRig>> rigs_;
+    std::optional<std::vector<ClipInfo>> clips_;
     std::deque<TagHash> thumbs_;
     std::deque<Result> results_;
 };
@@ -693,6 +722,21 @@ public:
     uint32_t scene_permutation = 0, scene_permutation_count = 0;
     bool keep_camera = false;
 
+    // Skeletal animation of the live model (clips are sampled at 30 fps).
+    struct Animation {
+        TagHash model;
+        Skeleton skeleton;
+        AnimationRig rig;
+        std::vector<ClipInfo> clips;
+        int clip = -1;  // index into clips
+        AnimationClip loaded;
+        std::string error;
+        bool playing = true, dirty = false;
+        float frame = 0, speed = 1;
+    };
+    std::optional<Animation> anim;
+    static constexpr float kClipFps = 30;
+
     // thumbnails
     StaticMeshScene thumb_scene;
     GBuffer thumb_gb;
@@ -809,6 +853,13 @@ public:
                     scene_permutation_count = r->mesh->permutation_count;
                     const TagHash prev = scene.tag();
                     scene.upload(g, std::move(*r->mesh), layouts);
+                    if (!r->skeleton || !r->rig) {
+                        anim.reset();
+                    } else if (!anim || anim->model != r->tag) {
+                        anim = Animation{r->tag, std::move(*r->skeleton), std::move(*r->rig), std::move(r->clips)};
+                    } else {
+                        anim->dirty = true;  // same model reloaded (variant / channels): pose it again
+                    }
                     keep_camera = prev == scene.tag();
                     if (!keep_camera) frame_scene();
                     double up = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -897,8 +948,94 @@ public:
         return v;
     }
 
+    void select_clip(int i) {
+        if (!anim || i < 0 || i >= int(anim->clips.size())) return;
+        anim->clip = i;
+        anim->frame = 0;
+        anim->error.clear();
+        try {
+            anim->loaded = load_animation_clip(*pm, anim->clips[size_t(i)].tag);
+        } catch (const std::exception& ex) {
+            anim->loaded = AnimationClip{};
+            anim->error = ex.what();
+        }
+        anim->dirty = true;
+    }
+
+    // Advances the clip and hands the skin pose (pose * inverse bind per bone) to the scene.
+    void update_animation(float dt) {
+        if (!anim || !scene.skinned()) return;
+        Animation& a = *anim;
+        if (a.clip < 0 || a.loaded.rotations.empty()) {
+            if (a.dirty) scene.set_skin_pose({});
+            a.dirty = false;
+            return;
+        }
+        const float frames = float(std::max(1u, a.loaded.frame_count - 1));
+        if (a.playing && frames > 0) {
+            a.frame = std::fmod(a.frame + dt * kClipFps * a.speed, frames);
+            if (a.frame < 0) a.frame += frames;
+            a.dirty = true;
+        }
+        if (!a.dirty) return;
+        a.dirty = false;
+        std::vector<BoneTransform> object;
+        pose_skeleton(a.skeleton, a.rig, a.loaded, a.frame, object);
+        for (size_t b = 0; b < object.size(); ++b) object[b] = object[b] * a.skeleton.inverse_bind[b];
+        scene.set_skin_pose(std::move(object));
+    }
+
+    void animation_panel() {
+        if (!anim || !scene.skinned()) return;
+        Animation& a = *anim;
+        ImGui::Spacing();
+        if (!ImGui::CollapsingHeader(std::format("アニメーション (クリップ {})###anim", a.clips.size()).c_str(),
+                                     ImGuiTreeNodeFlags_DefaultOpen))
+            return;
+        ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", a.skeleton.component.str().c_str(), a.skeleton.size(),
+                            a.rig.component.str().c_str());
+        const float em = ImGui::GetFontSize();
+        ImGui::SetNextItemWidth(-1);
+        const std::string preview = a.clip < 0 ? std::string("バインドポーズ")
+                                               : std::format("{}  ({} フレーム)", a.clips[size_t(a.clip)].tag.str(),
+                                                             a.clips[size_t(a.clip)].frames);
+        if (ImGui::BeginCombo("##clip", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+            if (ImGui::Selectable("バインドポーズ", a.clip < 0)) {
+                a.clip = -1;
+                a.dirty = true;
+            }
+            ImGuiListClipper clip;
+            clip.Begin(int(a.clips.size()));
+            while (clip.Step())
+                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                    const auto& c = a.clips[size_t(i)];
+                    if (ImGui::Selectable(std::format("{}  {} フレーム##{}", c.tag.str(), c.frames, i).c_str(), a.clip == i)) select_clip(i);
+                }
+            ImGui::EndCombo();
+        }
+        if (!a.error.empty()) ImGui::TextColored({1, 0.45f, 0.4f, 1}, "%s", a.error.c_str());
+        if (a.clip < 0) return;
+        if (ImGui::Button(a.playing ? "一時停止" : "再生", {em * 5, 0})) a.playing = !a.playing;
+        ImGui::SameLine();
+        if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(a.clips.size()) - 1);
+        ImGui::SameLine();
+        if (ImGui::Button(">")) select_clip((a.clip + 1) % int(a.clips.size()));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(a.rig, a.loaded) ? "加算  " : "",
+                            std::format("{:.1f} 秒", float(a.loaded.frame_count) / kClipFps).c_str());
+        ImGui::SetNextItemWidth(-1);
+        const float last = float(std::max(1u, a.loaded.frame_count) - 1);
+        if (ImGui::SliderFloat("##frame", &a.frame, 0, last, "フレーム %.1f")) {
+            a.playing = false;
+            a.dirty = true;
+        }
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##speed", &a.speed, 0.1f, 2.0f, "速度 %.2fx");
+    }
+
     void record(ID3D12GraphicsCommandList* cl) {
         if (!gb.lit) return;
+        update_animation(ImGui::GetIO().DeltaTime);
         ViewMatrices vm = make_view(current_view());
         scene.render_gbuffer(gpu, cl, gb, vm);
         if (engine == Engine::Game && game_ready && light.mode == ViewMode::Lit)
@@ -1470,6 +1607,7 @@ public:
             }
             for (const auto& n : scene.notes()) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "%s", n.c_str());
         }
+        animation_panel();
         if (engine == Engine::Game && game_ready)
             ImGui::TextDisabled("シェーディング: %s (ゲームの global_lighting_and_shading)",
                                 game_lighting.shading_technique().str().c_str());

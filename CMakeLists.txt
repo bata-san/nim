@@ -28,6 +28,7 @@ add_library(nim_core STATIC
   src/content/tfx.cpp
   src/content/tfx_vm.cpp
   src/content/fonts.cpp
+  src/content/animation.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)

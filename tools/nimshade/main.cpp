@@ -8,10 +8,13 @@
 // (composite_game.png).
 //
 //   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]
+//            [--clip CLIP_TAG [--frame F]]   (skinned dynamic models: posed with an animation clip)
+#include "nim/content/animation.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/render/scene.hpp"
 
+#include <optional>
 #include <wincodec.h>
 
 #include <algorithm>
@@ -59,6 +62,8 @@ int run(int argc, char** argv) {
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
     float fog = 0;
+    std::optional<TagHash> clip_tag;
+    float clip_frame = 0;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
@@ -66,6 +71,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--warp") warp = true;
         else if (args[i] == "--game") game = true;
         else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
+        else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
+        else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
@@ -100,6 +107,20 @@ int run(int argc, char** argv) {
                      it == mats.end() ? "none" : it->second.component.str());
         scene.upload(gpu, prepare_dynamic_model(pm, mesh_tag, it == mats.end() ? nullptr : &it->second), layouts);
         for (const auto& n : scene.notes()) std::println("  note: {}", n);
+        if (clip_tag) {
+            auto rigs = index_model_skeletons(pm, mats);
+            auto r = rigs.find(mesh_tag.value);
+            if (r == rigs.end() || r->second.rig.is_none()) throw std::runtime_error("--clip: the model has no skeleton with a rig");
+            Skeleton sk = load_skeleton(pm, r->second.skeleton);
+            AnimationRig rig = load_animation_rig(pm, r->second.rig);
+            AnimationClip clip = load_animation_clip(pm, *clip_tag);
+            std::vector<BoneTransform> bones;
+            pose_skeleton(sk, rig, clip, clip_frame, bones);
+            for (size_t b = 0; b < bones.size(); ++b) bones[b] = bones[b] * sk.inverse_bind[b];
+            scene.set_skin_pose(std::move(bones));
+            std::println("posed with clip {} ({}, {} frames{}) at frame {}", clip_tag->str(), clip_codec_name(clip.codec), clip.frame_count,
+                         is_additive(rig, clip) ? ", additive" : "", clip_frame);
+        }
     } else {
         scene.load(pm, gpu, mesh_tag, layouts);
     }

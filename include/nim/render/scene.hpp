@@ -1,4 +1,5 @@
 #pragma once
+#include "nim/content/animation.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/render/gpu.hpp"
@@ -79,6 +80,7 @@ struct PreparedMesh {
         // shader (t2/t4 positions, 21/21/22-bit snorm pairs; t3 octahedral normal + tangent).
         std::vector<uint32_t> skin_pos, skin_normal;
         std::vector<uint8_t> color;  // dynamic models: per-vertex RGBA8 the VS reads as t0
+        SkinWeights skin;            // skinned meshes: per-vertex bones and weights (CPU skinning)
     };
     struct Group {
         StaticMeshPart part;
@@ -106,7 +108,7 @@ struct PreparedMesh {
 // Throws on failure.
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
-// material variants. Skinned meshes are drawn in their bind pose.
+// material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_pose.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
@@ -125,6 +127,10 @@ public:
 
     // Clears the G-buffer and draws every G-buffer group. Leaves targets in RENDER_TARGET.
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
+    // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
+    // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
+    bool skinned() const { return skinned_; }
+    void set_skin_pose(std::vector<BoneTransform> bones);
 
     TagHash tag() const { return tag_; }
     V3 center() const { return center_; }
@@ -152,12 +158,24 @@ private:
         uint32_t srv_first = UINT32_MAX;  // VS t0-t4 (dynamic models): color, -, skin streams
         D3D12_INDEX_BUFFER_VIEW ibv{};
         D3D12_VERTEX_BUFFER_VIEW vbv[4]{};
+        // CPU skinning: bind-pose vertices and weights; each frame's streams go through its own
+        // upload buffer (positions, then normals) into the default-heap skin_pos / skin_normal.
+        std::vector<uint8_t> vb0_cpu;
+        SkinWeights skin;
+        std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
+        bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
     };
+    void update_skin(ID3D12GraphicsCommandList* cl);
     std::vector<BufferSet> sets_;
     std::vector<std::string> notes_;
     ComPtr<ID3D12Resource> inst_vb_, zero_vb_, t2_, fallback_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;
+    bool skinned_ = false, skin_dirty_ = false;
+    std::vector<BoneTransform> skin_pose_;
+    uint32_t skin_frame_ = 0;
+    V3 skin_scale_, skin_offset_;
+    float skin_range_ = 1;  // packed positions are (p - offset) / range
     uint32_t srv_count_ = 0;
     V3 center_;
     float radius_ = 1;
