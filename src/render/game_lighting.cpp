@@ -1014,6 +1014,10 @@ void estimate_engine_frame(ExternStore& ext, float t, float dt) {
     est(0x250, {1, 0, 1, 0});
     est(0x280, {1, 1, 1, 1});
     est(0x1F0, {0, 0, 1, 0});  // .z scales light_specular_ibl
+    // .x / .y: Lambert weight of opaque / translucent surfaces in the deferred light PS (lerp by the
+    // G-buffer translucency; zero turns local-light diffuse off), .z: its wrap floor; .w scales two
+    // shading-pass terms. Engine values unknown: full Lambert, no wrap, full scale.
+    if (!ext.has(ext::Frame, 0x240, 16)) ext.estimate(ext::Frame, 0x240, float4{1, 1, 0, 1}, "deferred diffuse weights (meaning read from the light PS, value chosen)");
     if (!ext.zero_policy(ext::Frame)) ext.zero_when_missing(ext::Frame, "engine frame value with no known meaning: zero");
     if (ext.has_frame_constants()) return;
     std::array<float4, 16> f{};
@@ -1304,9 +1308,14 @@ M4 m4(const std::array<float, 16>& a) {
     for (int c = 0; c < 4; ++c) m.c[c] = {a[size_t(c * 4)], a[size_t(c * 4 + 1)], a[size_t(c * 4 + 2)], a[size_t(c * 4 + 3)]};
     return m;
 }
-float det3(const M4& m) {
-    const auto& a = m.c[0]; const auto& b = m.c[1]; const auto& c = m.c[2];
-    return a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1]) + c[0] * (a[1] * b[2] - a[2] * b[1]);
+// The orientation of a projective map (its Jacobian is det(M) / w^4): the sign of the 4x4 determinant.
+float det4(const M4& m) {
+    auto d3 = [&](int c0, int c1, int c2, int r0, int r1, int r2) {
+        auto e = [&](int c, int r) { return m.c[c][size_t(r)]; };
+        return e(c0, r0) * (e(c1, r1) * e(c2, r2) - e(c2, r1) * e(c1, r2)) - e(c1, r0) * (e(c0, r1) * e(c2, r2) - e(c2, r1) * e(c0, r2)) +
+               e(c2, r0) * (e(c0, r1) * e(c1, r2) - e(c1, r1) * e(c0, r2));
+    };
+    return m.c[0][0] * d3(1, 2, 3, 1, 2, 3) - m.c[1][0] * d3(0, 2, 3, 1, 2, 3) + m.c[2][0] * d3(0, 1, 3, 1, 2, 3) - m.c[3][0] * d3(0, 1, 2, 1, 2, 3);
 }
 M4 inverse(const M4& m) {
     float a[16], inv[16];
@@ -1420,8 +1429,8 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
     }
     for (const auto& [why, n] : failures) light_notes_.push_back(std::format("{} lights left out: {}", n, why));
     if (!lights_.empty())
-        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1), +0x150 = 1, +0x154 = +0x158 = 0",
-                           "goriath's DeferredLight defaults (plane masks off, full strength)");
+        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1) (plane masks off), +0x150 = 1, +0x154 = 0, +0x158 = 1 (fade: fully on)",
+                           "goriath DeferredLight layout; +0x158 read from the light PS (output scale)");
 }
 
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
@@ -1436,6 +1445,14 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
     cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
     if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
     if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
+    // View +0x2E0 (goriath tptow_no_proj_w): (pixel x, pixel y, depth, 1) -> camera-relative world,
+    // homogeneous; the light PS rebuilds each pixel's position with it.
+    M4 pixel_to_ndc;
+    pixel_to_ndc.c[0] = {2.0f / float(w_), 0, 0, 0};
+    pixel_to_ndc.c[1] = {0, -2.0f / float(h_), 0, 0};
+    pixel_to_ndc.c[2] = {0, 0, 1, 0};
+    pixel_to_ndc.c[3] = {-1, 1, 0, 1};
+    ext_.set(ext::View, 0x2E0, mul(inverse(vm.vp_rel), pixel_to_ndc));
     M4 to_rel;  // world -> camera-relative world
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
@@ -1466,13 +1483,21 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         ext_.set(ext::DeferredLight, 0x150, 1.0f);
         ext_.set(ext::DeferredLight, 0x154, 0.0f);
-        ext_.set(ext::DeferredLight, 0x158, 0.0f);
+        ext_.set(ext::DeferredLight, 0x158, 1.0f);  // the PS multiplies both outputs by saturate(+0x158): light fade, fully on
         // Only the far side of the volume is drawn (the camera may be inside it); the cube's
         // winding on screen flips with the handedness of its transform.
-        const bool mirrored = det3(volume) * (space.c[3][3] + space.c[2][3] < 0 ? -1.0f : 1.0f) < 0;
+        const bool mirrored = det4(volume) > 0;  // the clip-space map flips handedness when its determinant is positive (D3D NDC is left-handed)
         GamePipeline& gp = *light_pipelines_[ll.pipeline + (mirrored ? 1 : 0)];
         try {
             gp.draw_volume(gpu, cl, ext_, scopes, *ll.technique, cube_vbv_, cube_ibv_, 36);
+            if (std::getenv("NIM_LIGHT_DEBUG") && lights_drawn_ < 2) {
+                const auto& vs = gp.stage_constants(0);
+                const auto& ps = gp.stage_constants(1);
+                std::string t = std::format("light {} mirrored {}\n", ll.technique->tag.str(), mirrored);
+                for (size_t k = 0; k < 4; ++k) t += std::format(" vs{:2} {:.3g} {:.3g} {:.3g} {:.3g}\n", 0x23 + k, vs[0x23 + k][0], vs[0x23 + k][1], vs[0x23 + k][2], vs[0x23 + k][3]);
+                for (size_t k = 0; k < 0x2B && k < ps.size(); ++k) t += std::format(" ps{:2X} {:.4g} {:.4g} {:.4g} {:.4g}\n", k, ps[k][0], ps[k][1], ps[k][2], ps[k][3]);
+                std::fputs(t.c_str(), stdout);
+            }
             ++lights_drawn_;
         } catch (const std::exception& ex) {
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));

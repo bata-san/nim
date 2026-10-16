@@ -129,6 +129,7 @@ public:
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
 
     std::vector<std::string> notes;  // binding diagnostics, for the UI / nimshade
+    const std::vector<float4>& stage_constants(size_t i) const { return stages_.at(i).constants; }  // last draw's cbuffer
     bool cache_bindings = true;
 
 private:
