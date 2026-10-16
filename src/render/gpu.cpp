@@ -61,6 +61,7 @@ void Gpu::init(bool warp) {
     DXGI_ADAPTER_DESC1 desc{};
     ad->GetDesc1(&desc);
     for (wchar_t* p = desc.Description; *p; ++p) adapter_ += char(*p < 128 ? *p : '?');
+    ad.As(&adapter3_);
     check_hr(D3D12CreateDevice(ad.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)), "D3D12CreateDevice");
 
     D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
@@ -103,6 +104,17 @@ void Gpu::flush() {
     keep_.clear();
     check_hr(alloc_->Reset(), "allocator Reset");
     check_hr(list_->Reset(alloc_.Get(), nullptr), "list Reset");
+}
+
+uint64_t Gpu::vram_usage() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+    if (adapter3_ && SUCCEEDED(adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return mi.CurrentUsage;
+    return 0;
+}
+uint64_t Gpu::vram_budget() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+    if (adapter3_ && SUCCEEDED(adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) return mi.Budget;
+    return 0;
 }
 
 void Gpu::begin_frame(uint32_t frame_index) {
@@ -176,10 +188,11 @@ ComPtr<ID3D12Resource> Gpu::texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format
 ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const bool is3d = t.depth > 1;
+    rd.Dimension = is3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = t.width;
     rd.Height = t.height;
-    rd.DepthOrArraySize = 1;
+    rd.DepthOrArraySize = is3d ? t.depth : std::max<uint16_t>(1, t.array_size);
     rd.MipLevels = t.mip_count;
     rd.Format = DXGI_FORMAT(t.dxgi_format);
     rd.SampleDesc.Count = 1;
@@ -188,24 +201,26 @@ ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
                                               IID_PPV_ARGS(&r)),
              "CreateCommittedResource(texture)");
 
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(t.mip_count);
-    std::vector<UINT> rows(t.mip_count);
-    std::vector<UINT64> row_bytes(t.mip_count);
+    const UINT subs = UINT(t.mip_count) * (is3d ? 1u : std::max<UINT>(1, t.array_size));
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(subs);
+    std::vector<UINT> rows(subs);
+    std::vector<UINT64> row_bytes(subs);
     UINT64 total = 0;
-    device_->GetCopyableFootprints(&rd, 0, t.mip_count, 0, fp.data(), rows.data(), row_bytes.data(), &total);
+    device_->GetCopyableFootprints(&rd, 0, subs, 0, fp.data(), rows.data(), row_bytes.data(), &total);
     auto up = buffer(size_t(total), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     uint8_t* p = nullptr;
     check_hr(up->Map(0, nullptr, reinterpret_cast<void**>(&p)), "Map");
     size_t src = 0;
-    for (uint32_t m = 0; m < t.mip_count; ++m)
-        for (UINT y = 0; y < rows[m]; ++y) {
-            size_t n = size_t(row_bytes[m]);
-            if (src + n > t.data.size()) break;
-            std::memcpy(p + fp[m].Offset + size_t(y) * fp[m].Footprint.RowPitch, t.data.data() + src, n);
-            src += n;
-        }
+    for (uint32_t m = 0; m < subs; ++m)
+        for (UINT z = 0; z < fp[m].Footprint.Depth; ++z)
+            for (UINT y = 0; y < rows[m]; ++y) {
+                size_t n = size_t(row_bytes[m]);
+                if (src + n > t.data.size()) break;
+                std::memcpy(p + fp[m].Offset + (size_t(z) * rows[m] + y) * fp[m].Footprint.RowPitch, t.data.data() + src, n);
+                src += n;
+            }
     up->Unmap(0, nullptr);
-    for (uint32_t m = 0; m < t.mip_count; ++m) {
+    for (uint32_t m = 0; m < subs; ++m) {
         D3D12_TEXTURE_COPY_LOCATION dst{r.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
         dst.SubresourceIndex = m;
         D3D12_TEXTURE_COPY_LOCATION s{up.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};

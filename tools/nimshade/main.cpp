@@ -4,8 +4,12 @@
 // constants evaluated by nim's TFX VM, and the game's BC textures; then runs nim's deferred
 // lighting over the G-buffer the game's PS wrote. Writes the G-buffer and the lit image as PNGs.
 //
-//   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp]
+// With --game the lit image also goes through the game's own global_lighting_and_shading pass
+// (composite_game.png).
+//
+//   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]
 #include "nim/core/package_manager.hpp"
+#include "nim/render/game_lighting.hpp"
 #include "nim/render/scene.hpp"
 
 #include <wincodec.h>
@@ -49,16 +53,17 @@ int run(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     fs::path install;
     uint32_t width = 1600, height = 1000;
-    bool warp = false;
+    bool warp = false, game = false;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
         else if (args[i] == "--size" && i + 1 < args.size()) sscanf_s(args[++i].c_str(), "%ux%u", &width, &height);
         else if (args[i] == "--warp") warp = true;
+        else if (args[i] == "--game") game = true;
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp]");
+        std::println(stderr, "usage: nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]");
         return 2;
     }
     if (install.empty()) {
@@ -105,6 +110,18 @@ int run(int argc, char** argv) {
     gpu.flush();
     std::vector<uint8_t> lit = gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
     write_png(out_dir / "composite.png", width, height, lit);
+
+    if (game) {
+        GameLighting gl;
+        gl.init(pm, gpu);
+        std::println("game shading: technique {}", gl.shading_technique().str());
+        for (const auto& n : gl.notes()) std::println("  {}", n);
+        gl.render(gpu, gpu.immediate(), gb, vm, LightingParams{});
+        gpu.flush();
+        write_png(out_dir / "composite_game.png", width, height,
+                  gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+        for (const auto& n : gl.notes()) std::println("  {}", n);
+    }
 
     // Debug views of the game's G-buffer through the same pass.
     const std::pair<ViewMode, const char*> views[] = {{ViewMode::Albedo, "gbuffer0_albedo.png"},

@@ -15,10 +15,12 @@
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
+//   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/dialogue.hpp"
+#include "nim/content/fonts.hpp"
 #include "nim/content/strings.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
@@ -533,6 +535,60 @@ int cmd_extract(PackageManager& pm, uint16_t pkg_id, int type, const std::string
     return 0;
 }
 
+int cmd_globals(PackageManager& pm) {
+    pm.build_hash64_index();
+    RenderGlobals g = load_render_globals(pm);
+    std::println("render globals {}: {} scopes, {} pipelines, {} global channels", g.tag.str(), g.scopes.size(),
+                 g.pipelines.size(), g.channel_ids.size());
+    std::println("lookup textures: tint {} lobe {} lobe3d {} iridescence {}", g.specular_tint_lookup.str(),
+                 g.specular_lobe_lookup.str(), g.specular_lobe_3d_lookup.str(), g.iridescence_lookup.str());
+    for (const auto& [n, t] : g.scopes) {
+        Scope s = load_scope(pm, t);
+        std::string slots;
+        for (size_t i = 0; i < s.stages.size(); ++i)
+            if (s.stages[i].cbuffer_slot >= 0)
+                slots += std::format(" {}:cb{}({}r,{}B)", "PVGHCD"[i], s.stages[i].cbuffer_slot,
+                                     s.stages[i].cbuffer_init.size(), s.stages[i].bytecode.size());
+        std::println("  scope    {:<40} {}{}", n, t.str(), slots);
+    }
+    for (const auto& [n, t] : g.pipelines) std::println("  pipeline {:<40} {}", n, t.str());
+    for (size_t i = 0; i < g.channel_ids.size(); ++i) {
+        auto v = i < g.channel_defaults.size() ? g.channel_defaults[i] : std::array<float, 4>{};
+        std::println("  channel {:3} {:08X} = ({}, {}, {}, {})", i, g.channel_ids[i], v[0], v[1], v[2], v[3]);
+    }
+    return 0;
+}
+
+// Disassembles a scope's stages (the bytecode that builds a shared cbuffer from externs).
+int cmd_fonts(PackageManager& pm, const char* out_dir) {
+    auto fonts = load_game_fonts(pm);
+    for (const auto& f : fonts) {
+        std::println("{}  {:>8} B  {} / {} ({})", f.tag.str(), f.data.size(), f.family, f.subfamily, f.postscript);
+        if (out_dir) {
+            fs::create_directories(out_dir);
+            std::ofstream(fs::path(out_dir) / (f.postscript.empty() ? f.tag.str() : f.postscript) += ".otf",
+                          std::ios::binary)
+                .write(reinterpret_cast<const char*>(f.data.data()), std::streamsize(f.data.size()));
+        }
+    }
+    std::println("{} fonts", fonts.size());
+    return 0;
+}
+
+int cmd_scope(PackageManager& pm, TagHash tag) {
+    pm.build_hash64_index();
+    Scope s = load_scope(pm, tag);
+    std::println("scope {} \"{}\"", tag.str(), s.name);
+    for (size_t i = 0; i < s.stages.size(); ++i) {
+        const auto& st = s.stages[i];
+        if (st.cbuffer_slot < 0 && st.bytecode.empty() && st.textures.empty()) continue;
+        std::println(" stage {} cbuffer slot {} regs {} constants {} textures {} samplers {}", "PVGHCD"[i],
+                     st.cbuffer_slot, st.cbuffer_init.size(), st.constants.size(), st.textures.size(), st.samplers.size());
+        std::print("{}", disassemble_tfx(st.bytecode));
+    }
+    return 0;
+}
+
 int cmd_technique(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     Technique t = load_technique(pm, tag);
@@ -560,6 +616,10 @@ int cmd_technique(PackageManager& pm, TagHash tag) {
             std::vector<float4> cb(st.cbuffer_init.begin(), st.cbuffer_init.end());
             if (cb.size() < 128) cb.resize(128);
             auto before = cb;
+            for (size_t i = 0; i < st.cbuffer_init.size(); ++i)
+                if (st.cbuffer_init[i] != float4{})
+                    std::println("   init[{}] = ({:.4f}, {:.4f}, {:.4f}, {:.4f})", i, st.cbuffer_init[i][0],
+                                 st.cbuffer_init[i][1], st.cbuffer_init[i][2], st.cbuffer_init[i][3]);
             try {
                 auto res = run_tfx(st.bytecode, st.constants, cb);
                 std::println("   vm: {} instructions, cbuffer {} regs", res.instructions, st.cbuffer_init.size());
@@ -615,6 +675,9 @@ int main(int argc, char** argv) {
             return cmd_shader(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "extract" && args.size() >= 4)
             return cmd_extract(pm, uint16_t(parse_hex(args[1])), std::stoi(args[2]), args[3]);
+        if (cmd == "globals") return cmd_globals(pm);
+        if (cmd == "fonts") return cmd_fonts(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
+        if (cmd == "scope" && args.size() >= 2) return cmd_scope(pm, TagHash(parse_hex(args[1])));
         if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});

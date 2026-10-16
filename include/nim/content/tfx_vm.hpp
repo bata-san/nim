@@ -22,11 +22,17 @@ struct TfxEnvironment {
 struct TfxExternTexture {
     uint32_t slot = 0;        // destination texture register (PopTextureView)
     uint8_t extern_id = 0;    // extern block the texture view comes from
-    uint8_t offset = 0;
+    uint8_t offset = 0;       // in 8-byte units (byte offset = offset * 8)
+};
+
+struct TfxSampler {
+    uint32_t slot = 0;   // destination sampler register (PopSampler & 0x1F)
+    uint8_t index = 0;   // index into the stage's sampler list (PushSampler)
 };
 
 struct TfxResult {
     std::vector<TfxExternTexture> extern_textures;
+    std::vector<TfxSampler> samplers;
     std::vector<std::string> unsupported;  // opcodes that were stubbed, for diagnostics
     size_t instructions = 0;
 };

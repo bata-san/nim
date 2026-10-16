@@ -5,6 +5,9 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace nim {
@@ -98,5 +101,56 @@ struct InputElement {
 };
 // Index = the input_layout byte on mesh groups.
 std::vector<std::vector<InputElement>> load_input_layouts(PackageManager& pm);
+
+// ---- Render globals (class 8080B61C -> data 80808070) ---------------------------------------
+// The engine's own named pipelines (deferred_shading, global_lighting, final_combine, ...),
+// the scopes that fill the shared cbuffers (view -> cb12, frame -> cb13, ...), the BRDF lookup
+// textures, and the global channel defaults.
+struct RenderGlobals {
+    TagHash tag;
+    std::vector<std::pair<std::string, TagHash>> pipelines;  // name -> technique
+    std::vector<std::pair<std::string, TagHash>> scopes;     // name -> scope
+    TagHash specular_tint_lookup, specular_lobe_lookup, specular_lobe_3d_lookup, iridescence_lookup;
+    std::vector<uint32_t> channel_ids;
+    std::vector<std::array<float, 4>> channel_defaults;
+    TagHash pipeline(std::string_view name) const;
+    TagHash scope(std::string_view name) const;
+};
+RenderGlobals load_render_globals(PackageManager& pm);
+
+// Scope (class 808031DC): a technique-like set of stages with no shaders, run each frame to
+// build a shared cbuffer from extern values.
+enum class ScopeStage : uint8_t { Pixel, Vertex, Geometry, Hull, Compute, Domain, Count };
+struct Scope {
+    TagHash tag;
+    std::string name;
+    std::array<TechniqueStage, size_t(ScopeStage::Count)> stages;
+};
+Scope load_scope(PackageManager& pm, TagHash tag);
+
+// ---- Shader bindings (DXBC PSV0 part) ---------------------------------------------------------
+// What a compiled shader binds, read from the pipeline-state-validation part dxc embeds. Lets nim
+// build a root signature for a game shader without reflection DLLs.
+enum class BindingType : uint8_t { Invalid, Sampler, Cbv, Srv, Uav };
+enum class BindingKind : uint8_t {  // DXIL resource kind
+    Invalid, Texture1D, Texture2D, Texture2DMS, Texture3D, TextureCube, Texture1DArray, Texture2DArray,
+    Texture2DMSArray, TextureCubeArray, TypedBuffer, RawBuffer, StructuredBuffer, CBuffer, Sampler
+};
+struct ShaderBinding {
+    BindingType type = BindingType::Invalid;
+    BindingKind kind = BindingKind::Invalid;
+    uint32_t space = 0, lower = 0, upper = 0;
+};
+std::vector<ShaderBinding> shader_bindings(std::span<const uint8_t> dxbc);
+
+// Sampler tag -> the raw D3D12_SAMPLER_DESC it references (same layout).
+struct SamplerDesc {
+    uint32_t filter = 0, address_u = 1, address_v = 1, address_w = 1;
+    float mip_lod_bias = 0;
+    uint32_t max_anisotropy = 1, comparison_func = 1;
+    float border_color[4]{};
+    float min_lod = 0, max_lod = 3.402823466e+38f;
+};
+SamplerDesc load_sampler(PackageManager& pm, TagHash tag);
 
 } // namespace nim

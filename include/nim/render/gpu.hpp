@@ -47,6 +47,8 @@ public:
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
     IDXGIFactory6* factory() const { return factory_.Get(); }
     const std::string& adapter_name() const { return adapter_; }
+    uint64_t vram_usage() const;   // bytes of local video memory this process uses
+    uint64_t vram_budget() const;
     DescriptorAllocator& srv() { return srv_; }
 
     // Command list for uploads and headless work; flush() submits it and waits for the GPU.
@@ -73,6 +75,7 @@ public:
 
 private:
     ComPtr<IDXGIFactory6> factory_;
+    ComPtr<IDXGIAdapter3> adapter3_;
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<ID3D12CommandAllocator> alloc_;
@@ -86,7 +89,7 @@ private:
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
     std::string adapter_;
-    static constexpr size_t kDynamicPerFrame = 1 << 20;
+    static constexpr size_t kDynamicPerFrame = 4 << 20;
 };
 
 } // namespace nim

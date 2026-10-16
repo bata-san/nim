@@ -51,7 +51,7 @@ OpInfo op_info(uint8_t op) {
     case 0x63: return {"push_global_channel", 2}; case 0x64: return {"push_global_channel_", 2};
     case 0x65: return {"unk65", 1};      case 0x66: return {"push_tex_dimensions", 2};
     case 0x67: return {"push_tex_tiling", 3}; case 0x68: return {"push_tex_layer_count", 3};
-    case 0x69: return {"unk69", 3};
+    case 0x69: return {"push_extern_u32_", 3};
     case 0x6A: case 0x6B: case 0x6C: case 0x6D: return {"unk6x", 1};
     case 0x10: case 0x11: case 0x12: case 0x17: case 0x1E: case 0x2B: case 0x2C: case 0x2D:
     case 0x33: case 0x34: case 0x3B: case 0x3D: case 0x3F: case 0x40: case 0x41: return {"unk", 1};
@@ -193,7 +193,7 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
     TfxResult res;
     Vm vm(constants, out, env);
     std::vector<int> pending_textures;  // stack depth bookkeeping for texture views
-    uint8_t last_extern_id = 0, last_extern_offset = 0;
+    uint8_t last_extern_id = 0, last_extern_offset = 0, last_sampler = 0;
 
     auto note = [&](const char* name) {
         if (std::find(res.unsupported.begin(), res.unsupported.end(), name) == res.unsupported.end())
@@ -358,7 +358,9 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             last_extern_offset = a2;
             vm.push(float4{});
             break;
-        case 0x4E: vm.push(float4{}); note(name); break;
+        case 0x4E: case 0x69:  // raw u32 bits, splatted (reading the bytes as a float keeps them)
+            vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : 0.0f));
+            break;
         case 0x51: vm.push(vm.output(a1)); break;
         case 0x53: vm.output(a1) = vm.pop(); break;
         case 0x54: vm.pop(); note(name); break;
@@ -373,8 +375,12 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             res.extern_textures.push_back({uint32_t(a1 & 0x1F), last_extern_id, last_extern_offset});
             vm.pop();
             break;
-        case 0x5D: case 0x5E: vm.pop(); break;          // sampler / UAV binds
-        case 0x61: vm.push(float4{}); break;            // sampler handle
+        case 0x5D:
+            res.samplers.push_back({uint32_t(a1 & 0x1F), last_sampler});
+            vm.pop();
+            break;
+        case 0x5E: vm.pop(); break;                     // UAV bind
+        case 0x61: last_sampler = a1; vm.push(float4{}); break;  // sampler handle
         case 0x62: {
             uint32_t h = uint32_t(bc[ip + 1]) << 24 | uint32_t(bc[ip + 2]) << 16 | uint32_t(bc[ip + 3]) << 8 | bc[ip + 4];
             vm.push(env.object_channel ? env.object_channel(h) : splat(1.0f));

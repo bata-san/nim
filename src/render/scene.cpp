@@ -194,32 +194,34 @@ void StaticMeshScene::release(Gpu& gpu) {
     tag_ = TagHash();
 }
 
-void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std::vector<std::vector<InputElement>>& layouts) {
-    release(gpu);
+PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag) {
+    PreparedMesh out;
+    out.tag = tag;
     StaticMesh mesh = load_static_mesh(pm, tag);
-    ID3D12Device* dev = gpu.device();
-    if (!root_sig_) root_sig_ = make_gbuffer_root_signature(dev);
 
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
     std::vector<Pending> pending;
-    lod_ = 0xFF;
+    uint8_t lod = 0xFF;
     for (const auto& g : mesh.groups)
-        if (g.render_stage == 0) lod_ = std::min(lod_, mesh.parts.at(g.part_index).lod_category);
+        if (g.render_stage == 0) lod = std::min(lod, mesh.parts.at(g.part_index).lod_category);
     for (size_t g = 0; g < mesh.groups.size(); ++g) {
         const auto& gr = mesh.groups[g];
         if (gr.render_stage != 0 || g >= mesh.techniques.size()) continue;
         const auto& part = mesh.parts.at(gr.part_index);
-        if (part.lod_category != lod_) continue;
+        if (part.lod_category != lod) continue;
         Technique t = load_technique(pm, mesh.techniques[g]);
         if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
         pending.push_back({gr, part, std::move(t)});
     }
     if (pending.empty()) throw std::runtime_error("mesh has no G-buffer groups with a vertex + pixel shader");
+    out.lod = lod;
 
     const auto& bufs = mesh.buffers.at(pending[0].part.buffer_index);
-    IndexBuffer ib = load_index_buffer(pm, bufs.index);
-    VertexBuffer vb0 = load_vertex_buffer(pm, bufs.vertex0);
-    VertexBuffer vb1 = bufs.vertex1.is_none() ? VertexBuffer{} : load_vertex_buffer(pm, bufs.vertex1);
+    out.ib = load_index_buffer(pm, bufs.index);
+    out.vb0 = load_vertex_buffer(pm, bufs.vertex0);
+    if (!bufs.vertex1.is_none()) out.vb1 = load_vertex_buffer(pm, bufs.vertex1);
+    const IndexBuffer& ib = out.ib;
+    const VertexBuffer& vb0 = out.vb0;
 
     // Bounds of the drawn geometry, in the space the VS produces (pos * scale + offset).
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
@@ -237,26 +239,86 @@ void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std:
             lo = {std::min(lo.x, q.x), std::min(lo.y, q.y), std::min(lo.z, q.z)};
             hi = {std::max(hi.x, q.x), std::max(hi.y, q.y), std::max(hi.z, q.z)};
         }
-    center_ = (lo + hi) * 0.5f;
-    radius_ = std::max(0.01f, std::sqrt(dot(hi - lo, hi - lo)) * 0.5f);
+    out.center = (lo + hi) * 0.5f;
+    out.radius = std::max(0.01f, std::sqrt(dot(hi - lo, hi - lo)) * 0.5f);
 
     // t2 instance data: one 80-byte record (3x4 rows, translation in w; +60 = mesh block offset),
     // then the mesh block: (offset.xyz, scale), (uv scale, uv offset).
-    std::vector<uint8_t> inst(128, 0);
+    out.instance.assign(128, 0);
     const float rows[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-    std::memcpy(inst.data(), rows, sizeof(rows));
+    std::memcpy(out.instance.data(), rows, sizeof(rows));
     const uint32_t block = 80;
-    std::memcpy(inst.data() + 60, &block, 4);
+    std::memcpy(out.instance.data() + 60, &block, 4);
     const float mb[8] = {mesh.mesh_offset[0], mesh.mesh_offset[1], mesh.mesh_offset[2], mesh.mesh_scale,
                          mesh.texcoord_scale, mesh.texcoord_offset[0], mesh.texcoord_offset[1], 0};
-    std::memcpy(inst.data() + 80, mb, sizeof(mb));
+    std::memcpy(out.instance.data() + 80, mb, sizeof(mb));
+
+    const TfxEnvironment env = default_environment();
+    for (auto& p : pending) {
+        PreparedMesh::Group g;
+        g.part = p.part;
+        g.input_layout = p.group.input_layout;
+        const auto& vs_stage = p.tech.stage(ShaderStage::Vertex);
+        const auto& ps_stage = p.tech.stage(ShaderStage::Pixel);
+        auto& info = g.info;
+        info.part = p.group.part_index;
+        info.index_count = p.part.index_count;
+        info.technique = p.tech.tag;
+        info.vs = vs_stage.shader;
+        info.ps = ps_stage.shader;
+        g.vs = load_shader_bytecode(pm, vs_stage.shader);
+        g.ps = load_shader_bytecode(pm, ps_stage.shader);
+
+        g.cb0.assign(ps_stage.cbuffer_init.begin(), ps_stage.cbuffer_init.end());
+        info.cbuffer_regs = g.cb0.size();
+        g.cb0.resize(std::max<size_t>(g.cb0.size(), 128));
+        if (!ps_stage.bytecode.empty()) {
+            TfxResult r = run_tfx(ps_stage.bytecode, ps_stage.constants, g.cb0, env);
+            info.vm_instructions = r.instructions;
+            info.stubbed_ops = r.unsupported;
+            info.extern_textures = r.extern_textures;
+        }
+        for (auto& v : g.cb0)
+            for (auto& c : v)
+                if (!std::isfinite(c)) c = 0;
+
+        for (const auto& tb : ps_stage.textures) {
+            SceneTextureInfo ti{tb.slot, tb.texture, 0, 0, 0, 0, {}};
+            try {
+                Texture tx = load_texture(pm, tb.texture);
+                ti.format = tx.dxgi_format;
+                ti.width = tx.width;
+                ti.height = tx.height;
+                ti.mips = tx.mip_count;
+                if (tx.depth != 1 || tx.array_size != 1) ti.error = "not a 2D texture (fallback bound)";
+                else g.textures[tb.slot] = std::move(tx);
+            } catch (const std::exception& ex) {
+                ti.error = ex.what();
+            }
+            info.textures.push_back(std::move(ti));
+        }
+        out.groups.push_back(std::move(g));
+    }
+    return out;
+}
+
+void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts) {
+    release(gpu);
+    ID3D12Device* dev = gpu.device();
+    if (!root_sig_) root_sig_ = make_gbuffer_root_signature(dev);
+    center_ = mesh.center;
+    radius_ = mesh.radius;
+    lod_ = mesh.lod;
+    const IndexBuffer& ib = mesh.ib;
+    const VertexBuffer& vb0 = mesh.vb0;
+    const VertexBuffer& vb1 = mesh.vb1;
 
     ib_ = gpu.upload(ib.data.data(), ib.data.size());
     vb0_ = gpu.upload(vb0.data.data(), vb0.data.size());
     if (!vb1.data.empty()) vb1_ = gpu.upload(vb1.data.data(), vb1.data.size());
     const uint32_t instance_index = 0;
     inst_vb_ = gpu.upload(&instance_index, 4);
-    t2_ = gpu.upload(inst.data(), inst.size());
+    t2_ = gpu.upload(mesh.instance.data(), mesh.instance.size());
     ibv_ = {ib_->GetGPUVirtualAddress(), UINT(ib.data.size()), ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
     vbv_[0] = {vb0_->GetGPUVirtualAddress(), UINT(vb0.data.size()), vb0.stride};
     vbv_[1] = vb1_ ? D3D12_VERTEX_BUFFER_VIEW{vb1_->GetGPUVirtualAddress(), UINT(vb1.data.size()), vb1.stride}
@@ -269,50 +331,11 @@ void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std:
     grey.data = {128, 128, 128, 255};
     fallback_ = gpu.texture(grey);
 
-    const TfxEnvironment env = default_environment();
-    for (auto& p : pending) {
+    for (auto& g : mesh.groups) {
         Item item;
-        SceneGroupInfo info;
-        item.part = p.part;
-        const auto& vs_stage = p.tech.stage(ShaderStage::Vertex);
-        const auto& ps_stage = p.tech.stage(ShaderStage::Pixel);
-        info.part = p.group.part_index;
-        info.index_count = p.part.index_count;
-        info.technique = p.tech.tag;
-        info.vs = vs_stage.shader;
-        info.ps = ps_stage.shader;
-        auto vs = load_shader_bytecode(pm, vs_stage.shader);
-        auto ps = load_shader_bytecode(pm, ps_stage.shader);
-
-        std::vector<float4> cb0(ps_stage.cbuffer_init.begin(), ps_stage.cbuffer_init.end());
-        info.cbuffer_regs = cb0.size();
-        cb0.resize(std::max<size_t>(cb0.size(), 128));
-        if (!ps_stage.bytecode.empty()) {
-            TfxResult r = run_tfx(ps_stage.bytecode, ps_stage.constants, cb0, env);
-            info.vm_instructions = r.instructions;
-            info.stubbed_ops = r.unsupported;
-            info.extern_textures = r.extern_textures;
-        }
-        for (auto& v : cb0)
-            for (auto& c : v)
-                if (!std::isfinite(c)) c = 0;
-        item.cb0 = gpu.upload(cb0.data(), cb0.size() * sizeof(float4));
-
-        for (const auto& tb : ps_stage.textures) {
-            SceneTextureInfo ti{tb.slot, tb.texture, 0, 0, 0, 0, {}};
-            try {
-                Texture tx = load_texture(pm, tb.texture);
-                ti.format = tx.dxgi_format;
-                ti.width = tx.width;
-                ti.height = tx.height;
-                ti.mips = tx.mip_count;
-                if (tx.depth != 1 || tx.array_size != 1) ti.error = "not a 2D texture (fallback bound)";
-                else item.textures[tb.slot] = gpu.texture(tx);
-            } catch (const std::exception& ex) {
-                ti.error = ex.what();
-            }
-            info.textures.push_back(std::move(ti));
-        }
+        item.part = g.part;
+        item.cb0 = gpu.upload(g.cb0.data(), g.cb0.size() * sizeof(float4));
+        for (auto& [slot, tx] : g.textures) item.textures[slot] = gpu.texture(tx);
         item.srv_first = gpu.srv().alloc(20);
         for (UINT s = 0; s < 20; ++s) {
             auto f = item.textures.find(s);
@@ -328,7 +351,7 @@ void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std:
 
         // Input layout straight from the game's vertex layout table.
         std::vector<D3D12_INPUT_ELEMENT_DESC> ied;
-        for (const auto& e : layouts.at(p.group.input_layout)) {
+        for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
             d.SemanticName = e.semantic;
             d.SemanticIndex = e.semantic_index;
@@ -341,8 +364,8 @@ void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std:
         }
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = root_sig_.Get();
-        pd.VS = {vs.data(), vs.size()};
-        pd.PS = {ps.data(), ps.size()};
+        pd.VS = {g.vs.data(), g.vs.size()};
+        pd.PS = {g.ps.data(), g.ps.size()};
         pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
         pd.SampleMask = UINT_MAX;
         pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -360,10 +383,10 @@ void StaticMeshScene::load(PackageManager& pm, Gpu& gpu, TagHash tag, const std:
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&item.pso)), "CreateGraphicsPipelineState (game DXIL)");
 
         items_.push_back(std::move(item));
-        info_.push_back(std::move(info));
+        info_.push_back(std::move(g.info));
     }
     gpu.flush();  // texture uploads
-    tag_ = tag;
+    tag_ = mesh.tag;
 }
 
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {

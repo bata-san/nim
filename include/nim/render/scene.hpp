@@ -69,10 +69,35 @@ struct SceneGroupInfo {
     std::vector<SceneTextureInfo> textures;
 };
 
+// Everything a StaticMeshScene needs, read and evaluated on the CPU (safe on a worker thread with
+// its own PackageManager); StaticMeshScene::upload() then only creates GPU objects.
+struct PreparedMesh {
+    struct Group {
+        StaticMeshPart part;
+        uint8_t input_layout = 0;
+        SceneGroupInfo info;
+        std::vector<uint8_t> vs, ps;
+        std::vector<float4> cb0;
+        std::map<uint32_t, Texture> textures;
+    };
+    TagHash tag;
+    std::vector<Group> groups;
+    IndexBuffer ib;
+    VertexBuffer vb0, vb1;
+    std::vector<uint8_t> instance;
+    V3 center;
+    float radius = 1;
+    uint8_t lod = 0;
+};
+// Throws on failure.
+PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh);
+
 class StaticMeshScene {
 public:
-    // Throws on failure. `layouts` comes from load_input_layouts().
-    void load(PackageManager& pm, Gpu& gpu, TagHash mesh, const std::vector<std::vector<InputElement>>& layouts);
+    void load(PackageManager& pm, Gpu& gpu, TagHash mesh, const std::vector<std::vector<InputElement>>& layouts) {
+        upload(gpu, prepare_static_mesh(pm, mesh), layouts);
+    }
+    void upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts);
     void release(Gpu& gpu);  // caller must make sure the GPU is idle
     bool loaded() const { return !items_.empty(); }
 

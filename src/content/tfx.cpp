@@ -1,6 +1,7 @@
 #include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <stdexcept>
@@ -21,10 +22,9 @@ constexpr ElemFormat kElemFormats[34] = {
 constexpr const char* kSemantics[9] = {"POSITION", "BLENDWEIGHT", "BLENDINDICES", "NORMAL", "PSIZE",
                                        "TEXCOORD", "TANGENT",     "BINORMAL",     "COLOR"};
 
-TechniqueStage read_stage(PackageManager& pm, const TagReader& r, size_t o) {
+// Reads a dynamic core (textures, bytecode, constants, samplers, cbuffer) starting at `core`.
+TechniqueStage read_core(PackageManager& pm, const TagReader& r, size_t core) {
     TechniqueStage st;
-    st.shader = r.tag_at(o);
-    size_t core = o + 8;
 
     auto tex = r.vec_at(core + 0x00);  // 24-byte entries: u32 slot, pad, WideHash {u32 h32, pad, u64 h64}
     for (uint64_t i = 0; i < tex.count; ++i) {
@@ -58,6 +58,14 @@ TechniqueStage read_stage(PackageManager& pm, const TagReader& r, size_t o) {
     }
     return st;
 }
+
+TechniqueStage read_stage(PackageManager& pm, const TagReader& r, size_t o) {
+    TechniqueStage st = read_core(pm, r, o + 8);
+    st.shader = r.tag_at(o);
+    return st;
+}
+
+std::string c_string_at(const TagReader& r, size_t off) { return r.cstr_at(off); }
 
 size_t bits_per_pixel(uint32_t f) {
     switch (f) {
@@ -190,6 +198,75 @@ Texture load_texture(PackageManager& pm, TagHash header) {
     return t;
 }
 
+TagHash RenderGlobals::pipeline(std::string_view name) const {
+    for (const auto& [n, t] : pipelines)
+        if (n == name) return t;
+    return TagHash();
+}
+TagHash RenderGlobals::scope(std::string_view name) const {
+    for (const auto& [n, t] : scopes)
+        if (n == name) return t;
+    return TagHash();
+}
+
+RenderGlobals load_render_globals(PackageManager& pm) {
+    RenderGlobals g;
+    // Class 8080B61C is shared by many small tables; the engine looks this one up by name.
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (const auto& nt : p.named_tags())
+            if (nt.name == "render_globals" && (g.tag.is_none() || info.name.find("patchable") != std::string::npos))
+                g.tag = nt.hash;
+    }
+    if (g.tag.is_none()) throw std::runtime_error("no named tag \"render_globals\"");
+    auto top_bytes = pm.read(g.tag);
+    TagReader top(top_bytes);
+    auto list = top.vec_at(0x08);  // 0x10-byte entries, data Tag at +8
+    if (!list.count) throw std::runtime_error("render globals: empty");
+    auto bytes = pm.read(top.tag_at(list.data + 8));
+    TagReader r(bytes);
+    auto named = [&](size_t vec_off, auto& out) {
+        auto v = r.vec_at(vec_off);  // 0x10-byte entries: name pointer, u32, Tag
+        for (uint64_t i = 0; i < v.count; ++i) {
+            size_t e = v.data + size_t(i) * 0x10;
+            out.emplace_back(c_string_at(r, r.pointer_at(e)), r.tag_at(e + 0x0C));
+        }
+    };
+    named(0x10, g.scopes);
+    named(0x20, g.pipelines);
+    if (TagHash lut = r.tag_at(0x30); !lut.is_none()) {
+        auto lb = pm.read(lut);
+        TagReader l(lb);
+        g.specular_tint_lookup = l.tag_at(0x08);
+        g.specular_lobe_lookup = l.tag_at(0x0C);
+        g.specular_lobe_3d_lookup = l.tag_at(0x10);
+        g.iridescence_lookup = l.tag_at(0x14);
+    }
+    if (TagHash ch = r.tag_at(0x34); !ch.is_none()) {
+        auto cb = pm.read(ch);
+        TagReader c(cb);
+        auto ids = c.vec_at(0x08);
+        for (uint64_t i = 0; i < ids.count; ++i) g.channel_ids.push_back(c.u32_at(ids.data + size_t(i) * 4));
+        auto vals = c.vec_at(0x18);
+        for (uint64_t i = 0; i < vals.count; ++i) {
+            std::array<float, 4> v;
+            for (int k = 0; k < 4; ++k) v[k] = c.f32_at(vals.data + size_t(i) * 16 + k * 4);
+            g.channel_defaults.push_back(v);
+        }
+    }
+    return g;
+}
+
+Scope load_scope(PackageManager& pm, TagHash tag) {
+    auto bytes = pm.read(tag);
+    TagReader r(bytes);
+    Scope s;
+    s.tag = tag;
+    s.name = c_string_at(r, r.pointer_at(0x08));
+    for (size_t i = 0; i < size_t(ScopeStage::Count); ++i) s.stages[i] = read_core(pm, r, 0x48 + i * 0x80);
+    return s;
+}
+
 std::vector<std::vector<InputElement>> load_input_layouts(PackageManager& pm) {
     // The newest copy of the layout table lives in the patchable bootstrap package.
     std::optional<TagHash> table;
@@ -240,6 +317,57 @@ std::vector<std::vector<InputElement>> load_input_layouts(PackageManager& pm) {
         }
     }
     return out;
+}
+
+std::vector<ShaderBinding> shader_bindings(std::span<const uint8_t> bc) {
+    auto u32 = [&](size_t o) {
+        if (o + 4 > bc.size()) throw std::runtime_error("DXBC truncated");
+        uint32_t v;
+        std::memcpy(&v, bc.data() + o, 4);
+        return v;
+    };
+    if (bc.size() < 32 || std::memcmp(bc.data(), "DXBC", 4) != 0) throw std::runtime_error("not DXBC");
+    std::vector<ShaderBinding> out;
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts; ++i) {
+        const size_t part = u32(32 + size_t(i) * 4);
+        if (std::memcmp(bc.data() + part, "PSV0", 4) != 0) continue;
+        size_t o = part + 8;
+        o += 4 + u32(o);  // PSVRuntimeInfo
+        const uint32_t count = u32(o);
+        o += 4;
+        if (!count) return out;
+        const uint32_t stride = u32(o);
+        o += 4;
+        for (uint32_t r = 0; r < count; ++r, o += stride) {
+            ShaderBinding b;
+            switch (u32(o)) {  // PSVResourceType
+            case 1: b.type = BindingType::Sampler; break;
+            case 2: b.type = BindingType::Cbv; break;
+            case 3: case 4: case 5: b.type = BindingType::Srv; break;
+            case 6: case 7: case 8: case 9: b.type = BindingType::Uav; break;
+            default: break;
+            }
+            b.space = u32(o + 4);
+            b.lower = u32(o + 8);
+            b.upper = u32(o + 12);
+            if (stride >= 20) b.kind = BindingKind(std::min<uint32_t>(u32(o + 16), uint32_t(BindingKind::Sampler)));
+            out.push_back(b);
+        }
+        return out;
+    }
+    throw std::runtime_error("DXBC has no PSV0 part");
+}
+
+SamplerDesc load_sampler(PackageManager& pm, TagHash tag) {
+    const Entry* e = pm.entry(tag);
+    if (!e) throw std::runtime_error("missing sampler " + tag.str());
+    auto data = pm.read(TagHash(e->reference));
+    SamplerDesc d;
+    static_assert(sizeof(SamplerDesc) == 52);
+    if (data.size() < sizeof(d)) throw std::runtime_error("short sampler " + tag.str());
+    std::memcpy(&d, data.data(), sizeof(d));
+    return d;
 }
 
 } // namespace nim
