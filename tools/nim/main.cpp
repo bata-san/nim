@@ -90,7 +90,7 @@ std::string icon(uint32_t cp) {
 namespace ico {
 constexpr uint32_t Home = 0xE80F, Settings = 0xE713, Statics = 0xE7B8, Text = 0xE8D2, Dialogue = 0xE8BD,
                    Packages = 0xE8B7, Log = 0xE9D9, Tune = 0xE9E9, Frame = 0xE740, Save = 0xE74E, Light = 0xE706,
-                   Search = 0xE721, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890;
+                   Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890;
 }
 std::string format_bytes(uint64_t b) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -354,6 +354,8 @@ struct Catalog {
     std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, done{false};
     std::vector<MeshEntry> meshes;
     std::vector<PackageGroup> packages;  // packages that hold static meshes
+    std::vector<MeshEntry> dynamics;     // dynamic models (entity meshes)
+    std::vector<PackageGroup> dyn_packages;
     StringTable strings;
     std::vector<DialogueLine> dialogue;
     std::string error;
@@ -366,24 +368,31 @@ void load_catalog(fs::path install, Catalog* cat) {
             std::lock_guard lk(cat->mutex);
             cat->status = "静的メッシュを列挙中…";
         }
-        std::vector<MeshEntry> meshes;
-        std::vector<PackageGroup> groups;
+        std::vector<MeshEntry> meshes, dynamics;
+        std::vector<PackageGroup> groups, dyn_groups;
         for (const auto& info : pm.packages()) {
             Package& p = pm.open(info);
-            PackageGroup g{info.pkg_id, info.name, {}};
+            PackageGroup g{info.pkg_id, info.name, {}}, dg{info.pkg_id, info.name, {}};
             for (uint32_t i = 0; i < p.entries().size(); ++i) {
                 const Entry& e = p.entries()[i];
-                if (e.type == 8 && e.reference == kClassStaticMesh) {
+                if (e.type != 8) continue;
+                if (e.reference == kClassStaticMesh) {
                     g.meshes.push_back(uint32_t(meshes.size()));
                     meshes.push_back({TagHash::make(info.pkg_id, uint16_t(i)), e.file_size, info.pkg_id});
+                } else if (e.reference == kClassDynamicModel) {
+                    dg.meshes.push_back(uint32_t(dynamics.size()));
+                    dynamics.push_back({TagHash::make(info.pkg_id, uint16_t(i)), e.file_size, info.pkg_id});
                 }
             }
             if (!g.meshes.empty()) groups.push_back(std::move(g));
+            if (!dg.meshes.empty()) dyn_groups.push_back(std::move(dg));
         }
         {
             std::lock_guard lk(cat->mutex);
             cat->meshes = std::move(meshes);
             cat->packages = std::move(groups);
+            cat->dynamics = std::move(dynamics);
+            cat->dyn_packages = std::move(dyn_groups);
             cat->status = "テキストを読込中…";
         }
         cat->meshes_ready = true;
@@ -438,10 +447,11 @@ public:
         thumbs_.clear();
         results_.clear();
     }
-    void request_live(TagHash t) {
+    void request_live(TagHash t, int permutation = -1) {
         {
             std::lock_guard lk(m_);
             live_ = t;
+            live_permutation_ = permutation;
         }
         cv_.notify_all();
     }
@@ -480,12 +490,14 @@ private:
         for (;;) {
             TagHash tag;
             bool thumb = false;
+            int permutation = -1;
             {
                 std::unique_lock lk(m_);
                 cv_.wait(lk, [&] { return quit_ || live_ || !thumbs_.empty(); });
                 if (quit_) return;
                 if (live_) {
                     tag = *live_;
+                    permutation = live_permutation_;
                     live_.reset();
                     working_live_ = true;
                 } else {
@@ -510,7 +522,15 @@ private:
             r.thumbnail = thumb;
             auto t0 = std::chrono::steady_clock::now();
             try {
-                r.mesh = prepare_static_mesh(*pm, tag);
+                const Entry* e = pm->entry(tag);
+                if (e && e->reference == kClassDynamicModel) {
+                    // The entity components hold the materials; index them once.
+                    if (!materials_) materials_ = index_dynamic_model_materials(*pm);
+                    auto it = materials_->find(tag.value);
+                    r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation);
+                } else {
+                    r.mesh = prepare_static_mesh(*pm, tag);
+                }
             } catch (const std::exception& ex) {
                 r.error = ex.what();
             }
@@ -526,6 +546,8 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, working_live_ = false;
     std::optional<TagHash> live_;
+    int live_permutation_ = -1;
+    std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
     std::deque<TagHash> thumbs_;
     std::deque<Result> results_;
 };
@@ -625,11 +647,12 @@ struct Camera {
 
 enum class Engine : int { Game, Nim };
 
-enum Tab : int { TabHome, TabSettings, TabStatics, TabText, TabDialogue, TabPackages, TabLog, TabCount };
+enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabText, TabDialogue, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; const char* title; const char* id; bool closable; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, "HOME", "home", false},         {ico::Settings, "", "settings", false},
-    {ico::Statics, "STATICS", "statics", true}, {ico::Text, "TEXT", "text", true},
+    {ico::Statics, "STATICS", "statics", true}, {ico::Entities, "ENTITIES", "entities", true},
+    {ico::Text, "TEXT", "text", true},
     {ico::Dialogue, "DIALOGUE", "dialogue", true}, {ico::Packages, "PACKAGES", "packages", true},
     {ico::Log, "LOG", "log", true},
 };
@@ -666,6 +689,9 @@ public:
     std::optional<TagHash> loading;
     bool capture_requested = false;
     bool show_fps = true;
+    TagHash scene_component;
+    uint32_t scene_permutation = 0, scene_permutation_count = 0;
+    bool keep_camera = false;
 
     // thumbnails
     StaticMeshScene thumb_scene;
@@ -678,15 +704,18 @@ public:
 
     std::deque<LogLine> log;
     int language = 1;  // second column language (ja by default)
-    bool tab_open[TabCount] = {true, true, true, true, true, true, false};
+    bool tab_open[TabCount] = {true, true, true, true, true, true, true, false};
     int focus_tab = -1, focus_frames = 0;
 
     // statics browser
-    char static_filter[64] = "";
-    int sort_mode = 0;  // 0 id, 1 name, 2 count
-    int current_pkg = -1;
-    std::vector<int> pkg_order;
-    int pkg_order_sort = -1;
+    struct Browser {
+        char filter[64] = "";
+        int sort_mode = 0;  // 0 id, 1 name, 2 count
+        int current_pkg = -1;
+        std::vector<int> order;
+        int order_sort = -1;
+    };
+    Browser browsers[2];  // statics, entities
     float right_w = 0;
     float details_h = 0;
 
@@ -775,8 +804,13 @@ public:
             if (r->mesh) {
                 try {
                     auto t0 = std::chrono::steady_clock::now();
+                    scene_component = r->mesh->component;
+                    scene_permutation = r->mesh->permutation;
+                    scene_permutation_count = r->mesh->permutation_count;
+                    const TagHash prev = scene.tag();
                     scene.upload(g, std::move(*r->mesh), layouts);
-                    frame_scene();
+                    keep_camera = prev == scene.tag();
+                    if (!keep_camera) frame_scene();
                     double up = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     size_t stubbed = 0;
                     for (const auto& gi : scene.groups()) stubbed += gi.stubbed_ops.size();
@@ -923,7 +957,7 @@ public:
                 if (++focus_frames > 2) focus_tab = -1, focus_frames = 0;  // docking settles over a few frames
             }
             ImGui::SetNextWindowDockID(dock, ImGuiCond_FirstUseEver);
-            const bool pad0 = t == TabStatics;
+            const bool pad0 = t == TabStatics || t == TabEntities;
             if (pad0) ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
             bool visible = ImGui::Begin(tab_title(t).c_str(), kTabs[t].closable ? &tab_open[t] : nullptr,
                                         ImGuiWindowFlags_NoCollapse);
@@ -932,7 +966,8 @@ public:
                 switch (t) {
                 case TabHome: home_tab(); break;
                 case TabSettings: settings_tab(); break;
-                case TabStatics: statics_tab(); break;
+                case TabStatics: statics_tab(false); break;
+                case TabEntities: statics_tab(true); break;
                 case TabText: strings_tab(); break;
                 case TabDialogue: dialogue_tab(); break;
                 case TabPackages: packages_tab(); break;
@@ -1002,6 +1037,8 @@ public:
             ImGui::Dummy({0, 4 * sc});
             if (dbutton((icon(ico::Statics) + "  STATICS").c_str(), bw)) open_tab(TabStatics);
             ImGui::SetItemTooltip("静的メッシュをライブ 3D サムネイルで一覧し、ゲームのシェーダで表示");
+            if (dbutton((icon(ico::Entities) + "  ENTITIES").c_str(), bw)) open_tab(TabEntities);
+            ImGui::SetItemTooltip("エンティティのダイナミックモデル (剛体・スキン) をエンティティのマテリアルで表示");
             ImGui::TableNextColumn();
             heading("2D");
             ImGui::Dummy({0, 4 * sc});
@@ -1062,27 +1099,32 @@ public:
     }
 
     // -- STATICS --
-    void sort_packages() {
-        const auto& pk = catalog->packages;
-        pkg_order.resize(pk.size());
-        for (size_t i = 0; i < pk.size(); ++i) pkg_order[i] = int(i);
-        std::sort(pkg_order.begin(), pkg_order.end(), [&](int a, int b) {
-            if (sort_mode == 1) return pk[a].name < pk[b].name;
-            if (sort_mode == 2) return pk[a].meshes.size() > pk[b].meshes.size();
-            return pk[a].pkg_id < pk[b].pkg_id;
+    void sort_packages(Browser& b, const std::vector<PackageGroup>& pk) {
+        b.order.resize(pk.size());
+        for (size_t i = 0; i < pk.size(); ++i) b.order[i] = int(i);
+        std::sort(b.order.begin(), b.order.end(), [&](int x, int y) {
+            if (b.sort_mode == 1) return pk[x].name < pk[y].name;
+            if (b.sort_mode == 2) return pk[x].meshes.size() > pk[y].meshes.size();
+            return pk[x].pkg_id < pk[y].pkg_id;
         });
-        pkg_order_sort = sort_mode;
+        b.order_sort = b.sort_mode;
     }
 
-    void statics_tab() {
+    // STATICS (static meshes) and ENTITIES (dynamic models) share the browser layout.
+    void statics_tab(bool dynamic) {
         if (!catalog || !catalog->meshes_ready) {
             ImGui::SetCursorPos({20, 20});
-            ImGui::TextDisabled("静的メッシュを列挙中…");
+            ImGui::TextDisabled("メッシュを列挙中…");
             return;
         }
-        const auto& pk = catalog->packages;
-        const auto& meshes = catalog->meshes;
-        if (pkg_order_sort != sort_mode || pkg_order.size() != pk.size()) sort_packages();
+        Browser& B = browsers[dynamic ? 1 : 0];
+        auto& static_filter = B.filter;
+        auto& sort_mode = B.sort_mode;
+        auto& current_pkg = B.current_pkg;
+        auto& pkg_order = B.order;
+        const auto& pk = dynamic ? catalog->dyn_packages : catalog->packages;
+        const auto& meshes = dynamic ? catalog->dynamics : catalog->meshes;
+        if (B.order_sort != sort_mode || pkg_order.size() != pk.size()) sort_packages(B, pk);
         if (current_pkg < 0 && !pk.empty()) current_pkg = pkg_order[0];
 
         const float sc = ImGui::GetStyle().FontScaleDpi;
@@ -1405,11 +1447,29 @@ public:
             return;
         }
         ImGui::PushFont(g_fonts.bold, 0);
-        ImGui::Text("STATIC %s", scene.tag().str().c_str());
+        ImGui::Text("%s %s", scene.dynamic() ? "DYNAMIC" : "STATIC", scene.tag().str().c_str());
         ImGui::PopFont();
         ImGui::SameLine();
         if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(scene.tag().str().c_str());
         ImGui::TextDisabled("LOD %u   グループ %zu   半径 %.3f", scene.lod(), scene.groups().size(), scene.radius());
+        if (scene.dynamic()) {
+            if (scene_component.is_none()) {
+                ImGui::TextDisabled("エンティティコンポーネント: なし (パート自身のテクニックのみ)");
+            } else {
+                ImGui::TextDisabled("エンティティコンポーネント %s", scene_component.str().c_str());
+                if (scene_permutation_count > 1) {
+                    int perm = int(scene_permutation);
+                    ImGui::SetNextItemWidth(200 * ImGui::GetStyle().FontScaleDpi);
+                    if (ImGui::SliderInt("マテリアル バリアント", &perm, 0, int(scene_permutation_count) - 1) &&
+                        perm != int(scene_permutation)) {
+                        loading = scene.tag();
+                        worker.request_live(scene.tag(), perm);
+                        scene_permutation = uint32_t(perm);
+                    }
+                }
+            }
+            for (const auto& n : scene.notes()) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "%s", n.c_str());
+        }
         if (engine == Engine::Game && game_ready)
             ImGui::TextDisabled("シェーディング: %s (ゲームの global_lighting_and_shading)",
                                 game_lighting.shading_technique().str().c_str());
@@ -1641,9 +1701,10 @@ public:
                         } catch (const std::exception& ex) {
                             entry_preview_error = ex.what();
                         }
-                        if (ImGui::IsMouseDoubleClicked(0) && r.type == 8 && r.reference == kClassStaticMesh) {
+                        if (ImGui::IsMouseDoubleClicked(0) && r.type == 8 &&
+                            (r.reference == kClassStaticMesh || r.reference == kClassDynamicModel)) {
                             request_load(r.tag);
-                            open_tab(TabStatics);
+                            open_tab(r.reference == kClassStaticMesh ? TabStatics : TabEntities);
                         }
                     }
                     ImGui::TableNextColumn();
@@ -1651,7 +1712,10 @@ public:
                     ImGui::TableNextColumn();
                     ImGui::Text("%08X", r.reference);
                     ImGui::TableNextColumn();
-                    ImGui::Text("%u%s", r.size, r.reference == kClassStaticMesh && r.type == 8 ? "  (static mesh)" : "");
+                    ImGui::Text("%u%s", r.size, r.type != 8                          ? ""
+                                                     : r.reference == kClassStaticMesh   ? "  (static mesh)"
+                                                     : r.reference == kClassDynamicModel ? "  (dynamic model)"
+                                                                                         : "");
                 }
             ImGui::EndTable();
         }
@@ -1785,7 +1849,8 @@ int run(const std::wstring& cmdline) {
     app->info(std::format("nim {} — GPU: {}", kVersion, app->gpu.adapter_name()));
     if (tag_arg && app->pm) {
         app->request_load(*tag_arg);
-        app->focus_tab = TabStatics;
+        const Entry* e = app->pm->entry(*tag_arg);
+        app->focus_tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
     }
 
     uint64_t frame = 0;

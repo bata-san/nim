@@ -470,6 +470,66 @@ int cmd_find(PackageManager& pm, uint32_t cls) {
 
 const char* kStageNames[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 
+// Tags of class `cls` (type 8) whose bytes hold `tag` at a 4-byte aligned offset.
+int cmd_refs(PackageManager& pm, TagHash tag, uint32_t cls) {
+    size_t n = 0;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || (cls && e.reference != cls)) continue;
+            const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+            std::vector<uint8_t> d;
+            try { d = pm.read(t); } catch (...) { continue; }
+            for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, d.data() + o, 4);
+                if (v == tag.value) {
+                    std::println("{}  class {:08X}  +0x{:X}  size {}", t.str(), e.reference, o, d.size());
+                    ++n;
+                }
+            }
+        }
+    }
+    std::println("{} references", n);
+    return 0;
+}
+
+int cmd_dynamic(PackageManager& pm, TagHash tag) {
+    pm.build_hash64_index();
+    DynamicModel m = load_dynamic_model(pm, tag);
+    std::println("dynamic {} scale ({:.4f},{:.4f},{:.4f},{:.4f}) offset ({:.4f},{:.4f},{:.4f},{:.4f}) uv ({:.3f},{:.3f})+({:.3f},{:.3f})",
+                 m.tag.str(), m.model_scale[0], m.model_scale[1], m.model_scale[2], m.model_scale[3], m.model_offset[0],
+                 m.model_offset[1], m.model_offset[2], m.model_offset[3], m.texcoord_scale[0], m.texcoord_scale[1],
+                 m.texcoord_offset[0], m.texcoord_offset[1]);
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const auto& d = m.meshes[i];
+        std::println(" mesh {} vb0 {} vb1 {} ib {} color {} skin {} parts {} gbuffer [{}, {}) layout {}", i, d.vertex0.str(),
+                     d.vertex1.str(), d.index.str(), d.color.str(), d.skinning.str(), d.parts.size(), d.part_range[0],
+                     d.part_range[1], d.input_layout[0]);
+        for (size_t k = 0; k < d.parts.size(); ++k) {
+            const auto& p = d.parts[k];
+            std::string stages;
+            for (size_t s = 0; s < kRenderStageCount; ++s)
+                if (k >= d.part_range[s] && k < d.part_range[s + 1]) stages += std::format("{} ", s);
+            std::println("   part {:2} tech {} variant {:5} prim {} idx {}+{} id {} lod {:02X} stages {}", k, p.technique.str(),
+                         p.variant_shader_index, p.primitive_type, p.index_start, p.index_count, p.external_identifier,
+                         p.lod_category, stages);
+        }
+    }
+    auto layouts = load_input_layouts(pm);
+    std::set<int> used;
+    for (const auto& d : m.meshes) used.insert(d.input_layout[0]);
+    for (int l : used) {
+        std::print("  layout {}:", l);
+        for (const auto& e : layouts[l])
+            std::print(" [{}]{}{} fmt{} ({}B){}", e.buffer, e.semantic, e.semantic_index, e.dxgi_format, e.size,
+                       e.instanced ? " inst" : "");
+        std::println("");
+    }
+    return 0;
+}
+
 int cmd_static(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     StaticMesh m = load_static_mesh(pm, tag);
@@ -670,6 +730,9 @@ int main(int argc, char** argv) {
                                args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
+        if (cmd == "refs" && args.size() >= 2)
+            return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
+        if (cmd == "dynamic" && args.size() >= 2) return cmd_dynamic(pm, TagHash(parse_hex(args[1])));
         if (cmd == "static" && args.size() >= 2) return cmd_static(pm, TagHash(parse_hex(args[1])));
         if (cmd == "shader" && args.size() >= 2)
             return cmd_shader(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);

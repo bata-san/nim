@@ -72,30 +72,51 @@ struct SceneGroupInfo {
 // Everything a StaticMeshScene needs, read and evaluated on the CPU (safe on a worker thread with
 // its own PackageManager); StaticMeshScene::upload() then only creates GPU objects.
 struct PreparedMesh {
+    struct Buffers {
+        IndexBuffer ib;
+        VertexBuffer vb0, vb1;
+        // Skinned meshes: the packed streams the game's compute skinning writes for the vertex
+        // shader (t2/t4 positions, 21/21/22-bit snorm pairs; t3 octahedral normal + tangent).
+        std::vector<uint32_t> skin_pos, skin_normal;
+    };
     struct Group {
         StaticMeshPart part;
         uint8_t input_layout = 0;
+        uint32_t buffers = 0;  // index into PreparedMesh::buffers
         SceneGroupInfo info;
         std::vector<uint8_t> vs, ps;
         std::vector<float4> cb0;
         std::map<uint32_t, Texture> textures;
     };
     TagHash tag;
+    bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     std::vector<Group> groups;
-    IndexBuffer ib;
-    VertexBuffer vb0, vb1;
-    std::vector<uint8_t> instance;
+    std::vector<Buffers> buffers;
+    std::vector<uint8_t> instance;  // static meshes: t2 instance data
+    // Dynamic models: the rigid_model scope cbuffer (cb1). c0-c3 mesh-to-world, c4 position scale, c5 offset, c6 texcoord scale/offset.
+    std::array<float4, 20> model_cb{};
     V3 center;
     float radius = 1;
     uint8_t lod = 0;
+    std::vector<std::string> notes;  // parts that could not be drawn, and why
+    TagHash component;               // dynamic models: the component the materials came from
+    uint32_t permutation = 0, permutation_count = 0;
 };
 // Throws on failure.
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh);
+// Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
+// material variants. Skinned meshes are drawn in their bind pose.
+// `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
+// own; permutation < 0 = the component's default.
+PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
+                                   int permutation = -1);
+// Either of the above, by the tag's class.
+PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr);
 
 class StaticMeshScene {
 public:
     void load(PackageManager& pm, Gpu& gpu, TagHash mesh, const std::vector<std::vector<InputElement>>& layouts) {
-        upload(gpu, prepare_static_mesh(pm, mesh), layouts);
+        upload(gpu, prepare_mesh(pm, mesh), layouts);
     }
     void upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts);
     void release(Gpu& gpu);  // caller must make sure the GPU is idle
@@ -108,11 +129,14 @@ public:
     V3 center() const { return center_; }
     float radius() const { return radius_; }
     uint8_t lod() const { return lod_; }
+    bool dynamic() const { return dynamic_; }
     const std::vector<SceneGroupInfo>& groups() const { return info_; }
+    const std::vector<std::string>& notes() const { return notes_; }
 
 private:
     struct Item {
         StaticMeshPart part;
+        uint32_t buffers = 0;
         ComPtr<ID3D12PipelineState> pso;
         ComPtr<ID3D12Resource> cb0;
         uint32_t srv_first = 0;
@@ -121,10 +145,18 @@ private:
     TagHash tag_;
     std::vector<Item> items_;
     std::vector<SceneGroupInfo> info_;
-    ComPtr<ID3D12RootSignature> root_sig_;
-    ComPtr<ID3D12Resource> ib_, vb0_, vb1_, inst_vb_, t2_, fallback_;
-    D3D12_INDEX_BUFFER_VIEW ibv_{};
-    D3D12_VERTEX_BUFFER_VIEW vbv_[3]{};
+    ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
+    struct BufferSet {
+        ComPtr<ID3D12Resource> ib, vb0, vb1, skin_pos, skin_normal;
+        uint32_t srv_first = UINT32_MAX;  // t2, t3, t4 (dynamic models)
+        D3D12_INDEX_BUFFER_VIEW ibv{};
+        D3D12_VERTEX_BUFFER_VIEW vbv[4]{};
+    };
+    std::vector<BufferSet> sets_;
+    std::vector<std::string> notes_;
+    ComPtr<ID3D12Resource> inst_vb_, zero_vb_, t2_, fallback_;
+    std::array<float4, 20> model_cb_{};
+    bool dynamic_ = false;
     uint32_t srv_count_ = 0;
     V3 center_;
     float radius_ = 1;

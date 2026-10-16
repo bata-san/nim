@@ -91,7 +91,18 @@ int run(int argc, char** argv) {
     std::println("adapter: {}", gpu.adapter_name());
 
     StaticMeshScene scene;
-    scene.load(pm, gpu, mesh_tag, layouts);
+    if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
+        auto t0 = std::chrono::steady_clock::now();
+        auto mats = index_dynamic_model_materials(pm);
+        auto it = mats.find(mesh_tag.value);
+        std::println("dynamic model: {} components indexed in {:.1f}s, materials {}", mats.size(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                     it == mats.end() ? "none" : it->second.component.str());
+        scene.upload(gpu, prepare_dynamic_model(pm, mesh_tag, it == mats.end() ? nullptr : &it->second), layouts);
+        for (const auto& n : scene.notes()) std::println("  note: {}", n);
+    } else {
+        scene.load(pm, gpu, mesh_tag, layouts);
+    }
     std::println("mesh {}: {} G-buffer group(s) at lod {}, radius {:.2f}", mesh_tag.str(), scene.groups().size(),
                  scene.lod(), scene.radius());
     for (const auto& g : scene.groups()) {
@@ -107,6 +118,7 @@ int run(int argc, char** argv) {
     gb.resize(gpu, width, height);
     LightingPass lighting;
     lighting.init(gpu);
+    std::println("bounds center ({:.3f},{:.3f},{:.3f}) radius {:.3f}", scene.center().x, scene.center().y, scene.center().z, scene.radius());
     ViewMatrices vm = make_view(frame_sphere(scene.center(), scene.radius(), width, height));
 
     auto* cl = gpu.immediate();

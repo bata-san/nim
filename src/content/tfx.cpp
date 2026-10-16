@@ -142,6 +142,113 @@ StaticMesh load_static_mesh(PackageManager& pm, TagHash tag) {
     return m;
 }
 
+// SDynamicModel (8080881C): meshes (808087CB, 0x88 bytes) of parts (808087D1, 0x28 bytes), then
+// the position scale / offset and texcoord transform the vertex shader applies.
+DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
+    DynamicModel m;
+    m.tag = tag;
+    auto bytes = pm.read(tag);
+    TagReader r(bytes);
+    auto meshes = r.vec_at(0x10);
+    for (uint64_t i = 0; i < meshes.count; ++i) {
+        const size_t o = meshes.data + size_t(i) * 0x88;
+        DynamicMesh dm;
+        dm.vertex0 = r.tag_at(o + 0x00);
+        dm.vertex1 = r.tag_at(o + 0x04);
+        dm.index = r.tag_at(o + 0x10);
+        dm.color = r.tag_at(o + 0x14);
+        dm.skinning = r.tag_at(o + 0x18);
+        auto parts = r.vec_at(o + 0x20);
+        for (uint64_t k = 0; k < parts.count; ++k) {
+            const size_t q = parts.data + size_t(k) * 0x28;
+            DynamicMeshPart p;
+            p.technique = r.tag_at(q);
+            p.variant_shader_index = r.u16_at(q + 4);
+            p.primitive_type = r.u8_at(q + 6);
+            p.index_start = r.u32_at(q + 8);
+            p.index_count = r.u32_at(q + 0x0C);
+            p.external_identifier = r.u16_at(q + 0x14);
+            p.lod_category = r.u8_at(q + 0x21);
+            dm.parts.push_back(p);
+        }
+        for (size_t s = 0; s <= kRenderStageCount; ++s) dm.part_range[s] = r.u16_at(o + 0x30 + s * 2);
+        for (size_t s = 0; s < kRenderStageCount; ++s) dm.input_layout[s] = r.u8_at(o + 0x64 + s);
+        m.meshes.push_back(std::move(dm));
+    }
+    for (int c = 0; c < 4; ++c) {
+        m.model_scale[c] = r.f32_at(0xA0 + c * 4);
+        m.model_offset[c] = r.f32_at(0xB0 + c * 4);
+    }
+    m.texcoord_scale = {r.f32_at(0xC0), r.f32_at(0xC4)};
+    m.texcoord_offset = {r.f32_at(0xC8), r.f32_at(0xCC)};
+    return m;
+}
+
+TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation) const {
+    if (variant == 0xFFFF || variant >= technique_map.size()) return TagHash();
+    const Range& r = technique_map[variant];
+    if (r.count == 0) return TagHash();
+    const size_t i = size_t(r.start) + permutation % r.count;
+    return i < techniques.size() ? techniques[i] : TagHash();
+}
+
+std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm) {
+    // Offsets inside SDynamicModelComponent (goriath): model 0x234, technique map 0x3D8,
+    // techniques 0x418. The struct sits somewhere inside the component tag, so find it by its
+    // model tag and validate the vectors around it.
+    std::unordered_map<uint32_t, bool> models;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i)
+            if (p.entries()[i].type == 8 && p.entries()[i].reference == kClassDynamicModel)
+                models[TagHash::make(info.pkg_id, uint16_t(i)).value] = true;
+    }
+    std::unordered_map<uint32_t, DynamicModelMaterials> out;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassComponent) continue;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            std::vector<uint8_t> bytes;
+            try {
+                bytes = pm.read(tag);
+            } catch (...) {
+                continue;
+            }
+            TagReader r(bytes);
+            for (size_t o = 0x234; o + 4 <= bytes.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, bytes.data() + o, 4);
+                if (!models.count(v) || out.count(v)) continue;
+                const size_t base = o - 0x234;
+                if (base + 0x428 > bytes.size()) continue;
+                try {
+                    auto map = r.vec_at(base + 0x3D8);
+                    auto techs = r.vec_at(base + 0x418);
+                    if (map.count == 0 || map.element_class != 0x80808681 || techs.count == 0 || techs.count > 4096) continue;
+                    DynamicModelMaterials m;
+                    m.component = tag;
+                    for (uint64_t k = 0; k < map.count; ++k) {
+                        const size_t q = map.data + size_t(k) * 12;
+                        m.technique_map.push_back({r.u32_at(q), r.u32_at(q + 4), r.u32_at(q + 8)});
+                    }
+                    for (uint64_t k = 0; k < techs.count; ++k) m.techniques.push_back(r.tag_at(techs.data + size_t(k) * 4));
+                    for (const auto& rg : m.technique_map)
+                        if (rg.unk8 == 0) {
+                            m.permutation_count = std::max(1u, rg.count);
+                            break;
+                        }
+                    m.default_permutation = m.permutation_count > 2 ? m.permutation_count - 1 : 0;
+                    out.emplace(v, std::move(m));
+                } catch (...) {
+                }
+            }
+        }
+    }
+    return out;
+}
+
 VertexBuffer load_vertex_buffer(PackageManager& pm, TagHash header) {
     auto h = pm.read(header);
     BinaryReader r(h);
@@ -314,6 +421,35 @@ std::vector<std::vector<InputElement>> load_input_layouts(PackageManager& pm) {
                 e.instanced = instanced;
                 out[index].push_back(e);
             }
+        }
+    }
+    return out;
+}
+
+std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> bc) {
+    auto u32 = [&](size_t o) {
+        if (o + 4 > bc.size()) throw std::runtime_error("DXBC truncated");
+        uint32_t v;
+        std::memcpy(&v, bc.data() + o, 4);
+        return v;
+    };
+    if (bc.size() < 32 || std::memcmp(bc.data(), "DXBC", 4) != 0) throw std::runtime_error("not DXBC");
+    std::vector<ShaderInput> out;
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts; ++i) {
+        const size_t part = u32(32 + size_t(i) * 4);
+        if (std::memcmp(bc.data() + part, "ISG1", 4) != 0) continue;
+        const size_t base = part + 8;
+        const uint32_t count = u32(base);
+        size_t o = base + u32(base + 4);
+        for (uint32_t k = 0; k < count; ++k, o += 32) {  // stream, name, index, sysvalue, type, reg, mask, min precision
+            const uint32_t name = u32(o + 4), sysvalue = u32(o + 12);
+            if (sysvalue != 0) continue;
+            ShaderInput in;
+            for (size_t c = base + name; c < bc.size() && bc[c]; ++c) in.semantic += char(bc[c]);
+            in.index = u32(o + 8);
+            in.reg = u32(o + 20);
+            out.push_back(std::move(in));
         }
     }
     return out;

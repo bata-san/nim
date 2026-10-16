@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace nim {
@@ -18,6 +19,7 @@ constexpr uint32_t kClassTechnique = 0x808031D8;
 constexpr uint32_t kClassStaticMesh = 0x80808635;
 constexpr uint32_t kClassStaticMeshData = 0x80808620;
 constexpr uint32_t kClassRenderGlobals = 0x8080B61C;
+constexpr uint32_t kClassDynamicModel = 0x8080881C;
 
 enum class ShaderStage : uint8_t { Vertex, Hull, Domain, Geometry, Pixel, Compute, Count };
 
@@ -75,6 +77,47 @@ struct StaticMesh {
     std::array<float, 2> texcoord_offset{};
 };
 StaticMesh load_static_mesh(PackageManager& pm, TagHash tag);
+
+// ---- Dynamic models (entity meshes: rigid and skinned) -------------------------------------------
+// Render stages index the per-mesh part ranges (0 = GenerateGbuffer, 8 = Transparents ...).
+constexpr size_t kRenderStageCount = 25;
+struct DynamicMeshPart {
+    TagHash technique;
+    uint16_t variant_shader_index = 0xFFFF;  // into the entity component's technique map
+    uint8_t primitive_type = 3;              // 3 triangles, 5 strip
+    uint32_t index_start = 0, index_count = 0;
+    uint16_t external_identifier = 0;
+    uint8_t lod_category = 0;                // bit 0 = highest detail
+};
+struct DynamicMesh {
+    TagHash vertex0, vertex1, index, color, skinning;
+    std::vector<DynamicMeshPart> parts;
+    std::array<uint16_t, kRenderStageCount + 1> part_range{};  // stage s: [range[s], range[s+1])
+    std::array<uint8_t, kRenderStageCount> input_layout{};
+};
+struct DynamicModel {
+    TagHash tag;
+    std::vector<DynamicMesh> meshes;
+    std::array<float, 4> model_scale{1, 1, 1, 0}, model_offset{};
+    std::array<float, 2> texcoord_scale{1, 1}, texcoord_offset{};
+};
+DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag);
+
+// The entity component that places a dynamic model (SDynamicModelComponent, inside a component
+// tag of class 8080BADB) carries the materials of parts whose own technique is none: part
+// variant_shader_index -> technique_map[i] = {count, start} -> techniques[start + permutation % count].
+constexpr uint32_t kClassComponent = 0x8080BADB;
+struct DynamicModelMaterials {
+    TagHash component;  // the component tag it came from
+    struct Range { uint32_t count = 0, start = 0, unk8 = 0; };
+    std::vector<Range> technique_map;
+    std::vector<TagHash> techniques;
+    uint32_t permutation_count = 1;
+    uint32_t default_permutation = 0;  // goriath: the last permutation when there are more than two
+    TagHash technique(uint16_t variant, uint32_t permutation) const;
+};
+// Model tag -> materials, from one pass over every component tag (a few seconds).
+std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm);
 
 // ---- Buffers / textures ---------------------------------------------------------------------
 struct VertexBuffer { uint32_t stride = 0; uint16_t vtype = 0; std::vector<uint8_t> data; };
@@ -142,6 +185,10 @@ struct ShaderBinding {
     uint32_t space = 0, lower = 0, upper = 0;
 };
 std::vector<ShaderBinding> shader_bindings(std::span<const uint8_t> dxbc);
+// Vertex inputs a shader declares (DXBC ISG1 part), system values excluded. D3D12 refuses a PSO
+// whose input layout lacks any of them, even unused ones.
+struct ShaderInput { std::string semantic; uint32_t index = 0, reg = 0; };
+std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> dxbc);
 
 // Sampler tag -> the raw D3D12_SAMPLER_DESC it references (same layout).
 struct SamplerDesc {
