@@ -4,6 +4,8 @@ project(nim LANGUAGES CXX VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# Static CRT so the released exes run without the VC++ redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 if(NOT WIN32)
   message(FATAL_ERROR "nim targets Windows only (D3D12, game ships Win64 packages)")

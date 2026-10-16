@@ -4,3 +4,4 @@ out/
 *.pkg
 extracted/
 keys.txt
+build-*/
