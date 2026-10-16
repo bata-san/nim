@@ -921,6 +921,7 @@ struct Thumb {
     uint32_t srv = UINT32_MAX;
     uint64_t last_used = 0;
     bool failed = false;
+    bool no_drawable = false;
     std::string error;
 };
 
@@ -965,6 +966,8 @@ public:
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;
     std::optional<TagHash> loading;
+    std::optional<TagHash> no_drawable_tag;
+    std::string no_drawable_reason;
     bool capture_requested = false;
     bool show_fps = true;
     TagHash scene_component;
@@ -1164,6 +1167,8 @@ public:
         stop_map();
         channel_overrides.clear();
         loading = tag;
+        no_drawable_tag.reset();
+        no_drawable_reason.clear();
         worker.request_live(tag);
     }
 
@@ -1178,7 +1183,14 @@ public:
             if (expected) loading.reset();
             if (map_scene && !expected) return;  // requested before a map replaced the live scene
             g.wait_idle();
-            if (r->mesh) {
+            const bool no_drawable = r->mesh && r->mesh->no_drawable;
+            if (no_drawable) {
+                scene.release(g);
+                no_drawable_tag = r->tag;
+                no_drawable_reason = r->mesh->notes.empty() ? "no drawable geometry" : r->mesh->notes.front();
+                info(std::format("{}: {}", r->tag.str(), no_drawable_reason));
+            }
+            if (r->mesh && !no_drawable) {
                 try {
                     auto t0 = std::chrono::steady_clock::now();
                     scene_component = r->mesh->component;
@@ -1210,7 +1222,7 @@ public:
                     scene.release(g);
                     error(std::format("{} を描画できません: {}", r->tag.str(), ex.what()));
                 }
-            } else {
+            } else if (!no_drawable) {
                 error(std::format("{} を読めません: {}", r->tag.str(), r->error));
             }
         }
@@ -1435,6 +1447,13 @@ public:
         if (!r) return;
         Thumb& t = thumbs[r->tag.value];
         t.last_used = frame_no;
+        t.failed = false;
+        t.no_drawable = false;
+        if (r->mesh && r->mesh->no_drawable) {
+            t.no_drawable = true;
+            t.error = r->mesh->notes.empty() ? "no drawable geometry" : r->mesh->notes.front();
+            return;
+        }
         if (!r->mesh) {
             t.failed = true;
             t.error = r->error;
@@ -1982,6 +2001,11 @@ public:
             ImVec2 ts = ImGui::CalcTextSize(t);
             dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(200, 80, 80, 255), t);
             if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
+        } else if (it != thumbs.end() && it->second.no_drawable) {
+            const char* t = "NO G-BUFFER";
+            ImVec2 ts = ImGui::CalcTextSize(t);
+            dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(170, 170, 170, 255), t);
+            if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
         } else if (thumbnails_enabled) {
             spinner(dl, {p.x + card * 0.5f, p.y + card * 0.5f}, 14 * sc, IM_COL32(255, 255, 255, 90));
         }
@@ -1989,7 +2013,7 @@ public:
         std::string label = m.tag.str();
         ImVec2 ts = ImGui::CalcTextSize(label.c_str());
         dl->AddText({p.x + 8 * sc, q.y + (footer - ts.y) * 0.5f}, IM_COL32_WHITE, label.c_str());
-        const bool selected = scene.loaded() && scene.tag() == m.tag;
+        const bool selected = (scene.loaded() && scene.tag() == m.tag) || (no_drawable_tag && *no_drawable_tag == m.tag);
         const bool is_loading = loading && *loading == m.tag;
         if (selected || is_loading) dl->AddRect(p, {q.x, q.y + footer}, kGreen, 0, 0, 2 * sc);
         else if (hovered) dl->AddRect(p, {q.x, q.y + footer}, IM_COL32_WHITE, 0, 0, 1.5f * sc);
@@ -2174,6 +2198,11 @@ public:
             return;
         }
         if (!scene.loaded()) {
+            if (no_drawable_tag) {
+                ImGui::Text("ENTITY %s", no_drawable_tag->str().c_str());
+                ImGui::TextDisabled("No G-buffer geometry: %s", no_drawable_reason.c_str());
+                return;
+            }
             ImGui::TextDisabled("メッシュ未選択");
             return;
         }

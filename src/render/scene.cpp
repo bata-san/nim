@@ -591,7 +591,7 @@ int32_t quant_snorm(float v, int bits) {
 }
 std::pair<float, float> oct_encode(V3 v) {
     const float sum = std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z);
-    if (sum <= 1e-12f) return {0, 0};
+    if (sum <= 1e-12f) return {0.0f, 0.0f};
     float x = v.x / sum, y = v.y / sum;
     if (v.z / sum < 0) {
         const float ox = x;
@@ -667,11 +667,13 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     const V3 offset{model.model_offset[0], model.model_offset[1], model.model_offset[2]};
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
     uint8_t lod = 0xFF;
+    bool has_gbuffer_parts = false;
     for (size_t mi = 0; mi < model.meshes.size(); ++mi) {
         const DynamicMesh& mesh = model.meshes[mi];
         bool any_stage = false;
         for (uint8_t st : kDrawnStages) any_stage |= mesh.part_range[st] < std::min<size_t>(mesh.part_range[st + 1], mesh.parts.size());
         if (!any_stage) continue;
+        has_gbuffer_parts = true;
         PreparedMesh::Buffers bufs;
         try {
             bufs.ib = load_index_buffer(pm, mesh.index);
@@ -739,6 +741,11 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         }
         }
         if (used) out.buffers.push_back(std::move(bufs));
+    }
+    if (out.groups.empty() && !has_gbuffer_parts) {
+        out.no_drawable = true;
+        out.notes.push_back("no G-buffer or transparent parts; other render stages are not drawable in this viewer");
+        return out;
     }
     if (!out.notes.empty()) throw std::runtime_error(out.notes.front());
     if (out.groups.empty())

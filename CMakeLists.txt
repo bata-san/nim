@@ -46,6 +46,7 @@ add_library(nim_render STATIC
   src/render/game_lighting.cpp
 )
 target_link_libraries(nim_render PUBLIC nim_core d3d12 dxgi d3dcompiler)
+target_link_libraries(nimcli PRIVATE nim_render)
 
 # ---- nimshade: headless shading test -----------------------------------------
 add_executable(nimshade tools/nimshade/main.cpp)

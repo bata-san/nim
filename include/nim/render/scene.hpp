@@ -142,6 +142,7 @@ struct PreparedMesh {
     };
     TagHash tag;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
+    bool no_drawable = false;  // dynamic model has no GenerateGbuffer parts
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
     std::vector<uint8_t> instance;  // static meshes: t2 instance data

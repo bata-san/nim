@@ -26,6 +26,7 @@
 //   nimcli [--install DIR] clips [BONES]                decode every clip (or those with BONES bones)
 //   nimcli [--install DIR] clipfit MODEL                pose the model's skeleton with every clip of its rig
 //   nimcli [--install DIR] skin MODEL                   skin weight summary of a dynamic model
+//   nimcli [--install DIR] survey-entities               prepare every ENTITIES entry and histogram outcomes
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/animation.hpp"
@@ -38,6 +39,7 @@
 #include "nim/core/binary.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/core/tag_reader.hpp"
+#include "nim/render/scene.hpp"
 
 #include <algorithm>
 #include <set>
@@ -45,11 +47,11 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
-#include <map>
 #include <unordered_set>
 #include <print>
 #include <string>
 #include <vector>
+#include <map>
 
 using namespace nim;
 namespace fs = std::filesystem;
@@ -107,6 +109,57 @@ int cmd_types(PackageManager& pm) {
     for (auto& [k, s] : v)
         std::println("type {:>3}/{}  ref {:08X}  count {:>7}  bytes {:>12}", std::get<0>(k), std::get<1>(k),
                      std::get<2>(k), s.count, s.bytes);
+    return 0;
+}
+
+// Match the ENTITIES browser: every type-8 entry whose resource class is a dynamic model.
+// Preparation is the same CPU path the GUI worker uses before GPU upload.
+int cmd_survey_entities(PackageManager& pm) {
+    pm.build_hash64_index();
+    const auto materials = index_dynamic_model_materials(pm);
+    struct Failure { size_t count = 0; std::vector<TagHash> examples; };
+    std::map<std::string, Failure> failures;
+    size_t total = 0, drawable = 0, no_drawable = 0;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassDynamicModel) continue;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            ++total;
+            try {
+                const auto it = materials.find(tag.value);
+                PreparedMesh mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second);
+                if (mesh.groups.empty()) {
+                    ++no_drawable;
+                } else {
+                    ++drawable;
+                    for (const auto& note : mesh.notes) {
+                        auto& f = failures["partial: " + note.substr(0, 120)];
+                        ++f.count;
+                        if (f.examples.size() < 3) f.examples.push_back(tag);
+                    }
+                }
+            } catch (const std::exception& ex) {
+                std::string reason = ex.what();
+                if (reason.size() > 160) reason.resize(160);
+                auto& f = failures[reason];
+                ++f.count;
+                if (f.examples.size() < 5) f.examples.push_back(tag);
+            } catch (...) {
+                auto& f = failures["unknown non-standard exception"];
+                ++f.count;
+                if (f.examples.size() < 5) f.examples.push_back(tag);
+            }
+        }
+    }
+    std::println("entities {} drawable {} no-drawable {} failures {} material-components {}", total, drawable,
+                 no_drawable, total - drawable - no_drawable, materials.size());
+    for (const auto& [reason, f] : failures) {
+        std::print("{}  {}", f.count, reason);
+        for (TagHash tag : f.examples) std::print(" {}", tag.str());
+        std::println("");
+    }
     return 0;
 }
 
@@ -1166,6 +1219,7 @@ int main(int argc, char** argv) {
         if (cmd == "pkgs") return cmd_pkgs(pm);
         if (cmd == "ls" && args.size() >= 2) return cmd_ls(pm, uint16_t(parse_hex(args[1])));
         if (cmd == "types") return cmd_types(pm);
+        if (cmd == "survey-entities") return cmd_survey_entities(pm);
         if (cmd == "read" && args.size() >= 2)
             return cmd_read(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "grep" && args.size() >= 2) return cmd_grep(pm, args[1], args.size() >= 3 ? std::stoi(args[2]) : -1);
