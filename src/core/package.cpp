@@ -1,0 +1,143 @@
+#include "nim/core/package.hpp"
+#include "nim/core/binary.hpp"
+#include "nim/core/oodle.hpp"
+
+#include <cstring>
+#include <format>
+#include <stdexcept>
+
+namespace nim {
+namespace {
+
+// "w64_sr_globals_0120_3" -> ("w64_sr_globals_0120", 3)
+std::pair<std::string, int> split_patch(const std::string& stem) {
+    auto pos = stem.rfind('_');
+    if (pos == std::string::npos) return {stem, 0};
+    return {stem.substr(0, pos), std::stoi(stem.substr(pos + 1))};
+}
+
+} // namespace
+
+Package::Package(const std::filesystem::path& path) : dir_(path.parent_path()) {
+    auto [base, patch] = split_patch(path.stem().string());
+    name_ = base;
+    files_[uint16_t(patch)] = std::make_unique<MappedFile>(path);
+    parse();
+    cipher_ = std::make_unique<PackageCipher>(header_.pkg_id);
+}
+
+void Package::parse() {
+    BinaryReader r(files_.begin()->second->bytes());
+    PackageHeader& h = header_;
+    h.version = r.u16_at(0x00);
+    if (h.version != 0x35)
+        throw std::runtime_error(std::format("{}: unsupported package version 0x{:X}", name_, h.version));
+    h.platform = r.u16_at(0x02);
+    h.group_id = r.u64_at(0x08);
+    h.pkg_id = r.u16_at(0x10);
+    h.unpatchable = r.u8_at(0x12) != 0;
+    h.build_time = r.u64_at(0x20);
+    h.patch_id = r.u16_at(0x30);
+    h.language = r.u16_at(0x32);
+    h.entry_count = r.u32_at(0x60);
+    h.entry_offset = r.u32_at(0x64);
+    h.block_count = r.u32_at(0x68);
+    h.block_offset = r.u32_at(0x6C);
+    h.named_tag_count = r.u32_at(0x78);
+    h.named_tag_offset = r.u32_at(0x7C);
+    h.h64_count = r.u32_at(0xB8);
+    h.h64_offset = r.u32_at(0xBC);
+    h.file_size = r.u32_at(0x120);
+
+    entries_.resize(h.entry_count);
+    for (uint32_t i = 0; i < h.entry_count; ++i) {
+        size_t o = h.entry_offset + size_t(i) * 16;
+        uint32_t type_info = r.u32_at(o + 4);
+        uint64_t bi = r.u64_at(o + 8);
+        Entry& e = entries_[i];
+        e.reference = r.u32_at(o);
+        e.type = uint8_t((type_info >> 9) & 0x7F);
+        e.subtype = uint8_t((type_info >> 6) & 0x7);
+        e.starting_block = uint32_t(bi & 0x3FFF);
+        e.starting_block_offset = uint32_t(((bi >> 14) & 0x3FFF) << 4);
+        e.file_size = uint32_t(bi >> 28);
+    }
+
+    blocks_.resize(h.block_count);
+    for (uint32_t i = 0; i < h.block_count; ++i) {
+        size_t o = h.block_offset + size_t(i) * 0x30;
+        Block& b = blocks_[i];
+        b.offset = r.u32_at(o);
+        b.size = r.u32_at(o + 4);
+        b.patch_id = r.u16_at(o + 8);
+        b.flags = r.u16_at(o + 10);
+        r.copy_at(o + 12, b.sha1);
+        r.copy_at(o + 32, b.gcm_tag);
+    }
+
+    named_tags_.resize(h.named_tag_count);
+    for (uint32_t i = 0; i < h.named_tag_count; ++i) {
+        size_t o = h.named_tag_offset + 0x30 + size_t(i) * 16;
+        NamedTag& t = named_tags_[i];
+        t.hash = TagHash(r.u32_at(o));
+        t.class_hash = r.u32_at(o + 4);
+        t.name = r.cstr_at(o + 8 + size_t(r.u64_at(o + 8)));
+    }
+
+    if (h.h64_count) {
+        size_t base = h.h64_offset + 0x20 + size_t(int64_t(r.u64_at(h.h64_offset + 0x10)));
+        hash64s_.resize(h.h64_count);
+        for (uint32_t i = 0; i < h.h64_count; ++i) {
+            size_t o = base + size_t(i) * 16;
+            hash64s_[i] = {r.u64_at(o), TagHash(r.u32_at(o + 8)), r.u32_at(o + 12)};
+        }
+    }
+}
+
+const MappedFile& Package::file_for_patch(uint16_t patch) const {
+    std::lock_guard lock(files_mutex_);
+    auto it = files_.find(patch);
+    if (it != files_.end()) return *it->second;
+    auto path = dir_ / std::format("{}_{}.pkg", name_, patch);
+    return *files_.emplace(patch, std::make_unique<MappedFile>(path)).first->second;
+}
+
+std::vector<uint8_t> Package::read_block(uint32_t index) const {
+    const Block& b = blocks_.at(index);
+    auto src = file_for_patch(b.patch_id).bytes();
+    if (size_t(b.offset) + b.size > src.size())
+        throw std::runtime_error(std::format("{}: block {} out of file bounds", name_, index));
+
+    std::vector<uint8_t> raw(src.begin() + b.offset, src.begin() + b.offset + b.size);
+    if (b.flags & kBlockRedacted)
+        throw std::runtime_error(std::format("{}: block {} is redacted (needs group key)", name_, index));
+    if (b.flags & kBlockEncrypted) {
+        if (!cipher_->decrypt(b.flags & kBlockAltKey, b.gcm_tag, raw))
+            throw std::runtime_error(std::format("{}: block {} failed GCM authentication", name_, index));
+    }
+    if (!(b.flags & kBlockCompressed)) return raw;
+
+    std::vector<uint8_t> out(kBlockSize);
+    size_t n = Oodle::decompress(raw, out);
+    if (n == 0) throw std::runtime_error(std::format("{}: block {} failed to decompress", name_, index));
+    out.resize(n);
+    return out;
+}
+
+std::vector<uint8_t> Package::read_entry(uint32_t index) const {
+    const Entry& e = entries_.at(index);
+    std::vector<uint8_t> out;
+    out.reserve(e.file_size);
+    uint32_t block = e.starting_block;
+    size_t offset = e.starting_block_offset;
+    while (out.size() < e.file_size) {
+        auto data = read_block(block++);
+        if (offset >= data.size()) throw std::runtime_error("entry offset beyond block");
+        size_t n = std::min(data.size() - offset, size_t(e.file_size) - out.size());
+        out.insert(out.end(), data.begin() + offset, data.begin() + offset + n);
+        offset = 0;
+    }
+    return out;
+}
+
+} // namespace nim
