@@ -27,6 +27,7 @@ float4 filler_value(uint8_t id, uint32_t byte_offset) {
         // 0x108: the froxel volume (x = transmittance, y = sky visibility, z = in-scatter amount):
         // clear air. Everything else: black, opaque.
         if (byte_offset == 0x108) return {1, 1, 0, 1};
+        if (byte_offset == 0x80) return {1, 1, 1, 1};  // fog density noise: none
         return {0, 0, 0, 1};
     case ext::Transparent: return byte_offset == 0x50 ? float4{1, 1, 1, 1} : float4{0, 0, 0, 0};
     default: return {0, 0, 0, 0};
@@ -437,6 +438,11 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
                 notes.push_back(std::format("{}: TFX error {}", st.tfx.shader.str(), ex.what()));
             }
         }
+        if (st.which == ShaderStage::Pixel)
+            for (auto [reg, v] : ps_overrides) {
+                if (reg >= cb.size()) cb.resize(reg + 1);
+                cb[reg] = v;
+            }
         sanitize(cb);
         DynamicAlloc a = gpu.dynamic(cb.size() * sizeof(float4));
         std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
@@ -505,6 +511,9 @@ cbuffer P : register(b0) {
     float3 ground;      float pad0;
     float3 bg_top;      float pad1;
     float3 bg_bottom;   float pad2;
+    float3 fog_color;   float fog_on;
+    float3 sun_dir;     float sun_glow;
+    float3 sun_col;     float pad3;
 };
 Texture2D<float4> hdr : register(t0);
 Texture2D<float>  depth : register(t1);
@@ -535,6 +544,25 @@ float4 ps_ibl(float4 pos : SV_Position) : SV_Target {
     float3 blurred = lerp(sky(-n) * 0.25 + ground * 0.25, sky(n), saturate(n.z * 0.5 + 0.5));
     return float4(lerp(blurred, sky(r), smooth * smooth), 1);
 }
+float3 view_ray(float4 pos) {
+    float2 ndc = float2(pos.x * inv_w * 2 - 1, 1 - pos.y * inv_h * 2);
+    return normalize(fwd + right * (ndc.x / fx) + up * (ndc.y / fy));
+}
+// What the game's sky lookups would hold along this ray: the fog colour, brighter toward the sun.
+float3 inscatter(float3 r) {
+    float mu = saturate(dot(r, sun_dir));
+    return fog_color * sky_intensity + sun_col * (sun_glow * pow(mu, 8) * 0.25);
+}
+float4 ps_fog(float4 pos : SV_Position) : SV_Target { return float4(inscatter(view_ray(pos)), 1); }
+// Exposed linear HDR for final_combine; the background where nothing was drawn.
+float4 ps_post(float4 pos : SV_Position) : SV_Target {
+    int3 p = int3(pos.xy, 0);
+    if (depth.Load(p) <= 0) {
+        if (fog_on > 0) return float4(inscatter(view_ray(pos)) * exposure, 1);
+        return float4(lerp(bg_top, bg_bottom, pos.y * inv_h), 1);
+    }
+    return float4(max(hdr.Load(p).rgb, 0) * exposure, 1);
+}
 float4 ps_tonemap(float4 pos : SV_Position) : SV_Target {
     int3 p = int3(pos.xy, 0);
     if (depth.Load(p) <= 0) return float4(srgb(lerp(bg_top, bg_bottom, pos.y * inv_h)), 1);
@@ -562,6 +590,9 @@ struct UtilConstants {
     V3 ground; float pad0;
     V3 bg_top; float pad1;
     V3 bg_bottom; float pad2;
+    V3 fog_color; float fog_on;
+    V3 sun_dir; float sun_glow;
+    V3 sun_col; float pad3;
 };
 
 ComPtr<ID3D12Resource> load_lookup(PackageManager& pm, Gpu& gpu, TagHash tag, std::vector<std::string>& notes) {
@@ -580,6 +611,7 @@ float4 v4(V3 v, float w) { return {v.x, v.y, v.z, w}; }
 
 void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
+    final_combine_.release(gpu);
     fillers_.release();
     for (auto& t : targets_) t.Reset();
     if (srv_first_ != UINT32_MAX) gpu.srv().free(srv_first_, 3);
@@ -600,6 +632,14 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     if (shading.is_none()) throw std::runtime_error("render globals have no global_lighting_and_shading pipeline");
     shading_.load(pm, gpu, shading, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     shading_.prewarm(gpu, fillers_);
+    if (TagHash fc = globals_.pipeline("final_combine"); !fc.is_none()) {
+        try {
+            final_combine_.load(pm, gpu, fc, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+            final_combine_.prewarm(gpu, fillers_);
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("final_combine: {} (nim tonemap used)", ex.what()));
+        }
+    }
     tint_lookup_ = load_lookup(pm, gpu, globals_.specular_tint_lookup, shading_.notes);
     lobe_lookup_ = load_lookup(pm, gpu, globals_.specular_lobe_lookup, shading_.notes);
     lobe3d_lookup_ = load_lookup(pm, gpu, globals_.specular_lobe_3d_lookup, shading_.notes);
@@ -618,6 +658,8 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     util_rs_ = serialize(dev, rsd, "game util root signature");
     auto vs = compile_util("vs_main", "vs_5_0");
     for (auto [entry, pso, fmt] : {std::tuple{"ps_ibl", &ibl_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
+                                   std::tuple{"ps_fog", &fog_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
+                                   std::tuple{"ps_post", &post_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
                                    std::tuple{"ps_tonemap", &tonemap_pso_, DXGI_FORMAT_R8G8B8A8_UNORM}}) {
         auto ps = compile_util(entry, "ps_5_0");
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
@@ -634,7 +676,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.SampleDesc.Count = 1;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso)), "game util PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kTargets};
     check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game lighting rtv heap");
     gpu.flush();  // lookup / filler / static texture uploads
 }
@@ -644,7 +686,7 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     w_ = w;
     h_ = h;
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kTargets; ++i) {
         D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
         targets_[i] = gpu.texture2d(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -741,6 +783,10 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set_channel("skybox_down_ambient_intensity", float4{ka, 0, 0, 0});
     if (ext_.channels.size() > 130) ext_.channels[130] = {1, 0, 0, 0};  // near-field ambient strength
 
+    // Atmosphere: the near / far sky in-scatter lookups the fog blends between (nim's stand-in).
+    ext_.set_texture(ext::Atmosphere, 0xE0, targets_[4].Get());
+    ext_.set_texture(ext::Atmosphere, 0xF0, targets_[4].Get());
+
     // ShadowMask: no sun shadow / AO rendered yet (fillers are white); full strength, simple filter.
     ext_.set(ext::ShadowMask, 0x30, 1.0f);
     ext_.set(ext::ShadowMask, 0x34, 0.0f);
@@ -785,6 +831,12 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     uc.ground = p.ground;
     uc.bg_top = p.background_top;
     uc.bg_bottom = p.background_bottom;
+    uc.fog_color = p.fog_color;
+    uc.fog_on = p.fog ? 1.0f : 0.0f;
+    uc.sun_dir = normalize(V3{std::cos(p.sun_azimuth) * std::cos(p.sun_elevation),
+                              std::sin(p.sun_azimuth) * std::cos(p.sun_elevation), std::sin(p.sun_elevation)});
+    uc.sun_glow = p.fog_sun_glow;
+    uc.sun_col = p.sun_color * p.sun_intensity;
     DynamicAlloc ucb = gpu.dynamic(sizeof(uc));
     std::memcpy(ucb.cpu, &uc, sizeof(uc));
     auto util_pass = [&](ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE target) {
@@ -799,6 +851,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->DrawInstanced(3, 1, 0, 0);
     };
     util_pass(ibl_pso_.Get(), rtv(2));
+    util_pass(fog_pso_.Get(), rtv(4));
+    Gpu::barrier(cl, targets_[4].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     for (int i = 0; i < 3; ++i)
         Gpu::barrier(cl, targets_[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -830,13 +884,41 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         return 0;
     };
 
+    // Height fog, evaluated by the shading pass itself (two exponential layers over world height,
+    // optical depth = 0.001 * distance * density). In game these registers come from the map's
+    // atmosphere settings; nim drives them from LightingParams.
+    auto& ov = shading_.ps_overrides;
+    ov[8] = {1, 0, 0, 0};                              // in-scatter intensity
+    ov[13] = {p.fog_height, 0, 0, 0};                  // layer 0 base height
+    ov[18] = {p.fog_height, 0, 0, 0};                  // layer 1 base height
+    ov[40] = {p.fog_falloff, p.fog_falloff, 0, 0};     // per-km height falloff
+    ov[41] = {p.fog ? p.fog_density : 0.0f, 0, 0, 0};  // per-km density
+    ov[42] = {0, 0, 0.5f, 0.5f};                       // density noise uv (constant)
+    ov[45] = {0, 1, 0, 0};                             // near/far lookup blend: near
+    ov[104] = ov[105] = ov[107] = ov[108] = {0, 0, 0, 0};  // no sky-visibility / froxel terms
+    ov[106] = {0, 0, 0, 0};                            // surface fully attenuated
+    {
+        float4 r109 = ext_.get_v(ext::Atmosphere, 0x130);
+        r109[1] = p.fog_start;
+        ov[109] = r109;
+    }
+
     D3D12_CPU_DESCRIPTOR_HANDLE hdr = rtv(3);
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
     shading_.draw(gpu, cl, ext_, scopes, fillers_);
     Gpu::barrier(cl, targets_[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    // The game's own film curve (final_combine) over the exposed HDR.
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    util_pass(tonemap_pso_.Get(), gb.lit_rtv);
+    if (final_combine_.loaded()) {
+        util_pass(post_pso_.Get(), rtv(5));
+        Gpu::barrier(cl, targets_[5].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ext_.set_texture(ext::Postprocess, 0x00, targets_[5].Get());
+        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        final_combine_.draw(gpu, cl, ext_, scopes, fillers_);
+    } else {
+        util_pass(tonemap_pso_.Get(), gb.lit_rtv);
+    }
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     for (auto& r : gb.rt)

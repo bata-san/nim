@@ -44,7 +44,11 @@ void write_png(const fs::path& path, uint32_t w, uint32_t h, const std::vector<u
     check_hr(frame->SetSize(w, h), "SetSize");
     WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
     check_hr(frame->SetPixelFormat(&fmt), "SetPixelFormat");
-    check_hr(frame->WritePixels(h, w * 4, UINT(rgba.size()), const_cast<uint8_t*>(rgba.data())), "WritePixels");
+    // The PNG encoder may answer with the closest format it supports (32bppBGRA): swizzle to it.
+    std::vector<uint8_t> px = rgba;
+    if (fmt != GUID_WICPixelFormat32bppRGBA)
+        for (size_t i = 0; i + 3 < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+    check_hr(frame->WritePixels(h, w * 4, UINT(px.size()), px.data()), "WritePixels");
     check_hr(frame->Commit(), "frame Commit");
     check_hr(enc->Commit(), "encoder Commit");
 }
@@ -54,16 +58,18 @@ int run(int argc, char** argv) {
     fs::path install;
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
+    float fog = 0;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
         else if (args[i] == "--size" && i + 1 < args.size()) sscanf_s(args[++i].c_str(), "%ux%u", &width, &height);
         else if (args[i] == "--warp") warp = true;
         else if (args[i] == "--game") game = true;
+        else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]");
+        std::println(stderr, "usage: nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game [--fog DENSITY_PER_KM]]");
         return 2;
     }
     if (install.empty()) {
@@ -120,6 +126,15 @@ int run(int argc, char** argv) {
         gpu.flush();
         write_png(out_dir / "composite_game.png", width, height,
                   gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+        if (fog > 0) {
+            LightingParams lp;
+            lp.fog = true;
+            lp.fog_density = fog;
+            gl.render(gpu, gpu.immediate(), gb, vm, lp);
+            gpu.flush();
+            write_png(out_dir / "composite_game_fog.png", width, height,
+                      gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+        }
         for (const auto& n : gl.notes()) std::println("  {}", n);
     }
 

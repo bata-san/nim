@@ -132,7 +132,11 @@ void write_png(const fs::path& path, uint32_t w, uint32_t h, const std::vector<u
     check_hr(frame->SetSize(w, h), "SetSize");
     WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
     check_hr(frame->SetPixelFormat(&fmt), "SetPixelFormat");
-    check_hr(frame->WritePixels(h, w * 4, UINT(rgba.size()), const_cast<uint8_t*>(rgba.data())), "WritePixels");
+    // The PNG encoder may answer with the closest format it supports (32bppBGRA): swizzle to it.
+    std::vector<uint8_t> px = rgba;
+    if (fmt != GUID_WICPixelFormat32bppRGBA)
+        for (size_t i = 0; i + 3 < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+    check_hr(frame->WritePixels(h, w * 4, UINT(px.size()), px.data()), "WritePixels");
     check_hr(frame->Commit(), "frame Commit");
     check_hr(enc->Commit(), "encoder Commit");
 }
@@ -1274,6 +1278,16 @@ public:
             ImGui::ColorEdit3("地面", &light.ground.x);
             ImGui::ColorEdit3("背景 (上)", &light.background_top.x);
             ImGui::ColorEdit3("背景 (下)", &light.background_bottom.x);
+            ImGui::SeparatorText("フォグ (ゲームのシェーダで評価)");
+            ImGui::Checkbox("高さフォグ", &light.fog);
+            ImGui::BeginDisabled(!light.fog || engine != Engine::Game);
+            ImGui::SliderFloat("密度 (/km)", &light.fog_density, 0.1f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("高さ減衰 (/km)", &light.fog_falloff, 0.0f, 100.0f, "%.1f");
+            ImGui::DragFloat("基準高さ (m)", &light.fog_height, 0.1f);
+            ImGui::DragFloat("開始距離 (m)", &light.fog_start, 0.1f, 0.0f, 1e5f);
+            ImGui::ColorEdit3("フォグの色", &light.fog_color.x);
+            ImGui::SliderFloat("太陽方向の散乱", &light.fog_sun_glow, 0.0f, 8.0f);
+            ImGui::EndDisabled();
             if (ImGui::Button("既定値に戻す")) {
                 ViewMode m = light.mode;
                 light = LightingParams{};

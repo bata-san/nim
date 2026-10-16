@@ -144,6 +144,12 @@ struct LightingParams {
     float sky_intensity = 1.0f;
     V3 sky_top{0.42f, 0.55f, 0.75f}, sky_horizon{0.80f, 0.82f, 0.84f}, ground{0.28f, 0.26f, 0.24f};
     V3 background_top{0.20f, 0.21f, 0.23f}, background_bottom{0.11f, 0.11f, 0.12f};
+    // Height fog (game lighting only; evaluated by the game's own shading pass). Density is the
+    // game's unit: optical depth per kilometre at the base height, falling off with height.
+    bool fog = false;
+    float fog_density = 6.0f, fog_falloff = 8.0f, fog_height = 0.0f, fog_start = 0.0f;
+    V3 fog_color{0.55f, 0.62f, 0.70f};
+    float fog_sun_glow = 1.5f;
 };
 
 class LightingPass {

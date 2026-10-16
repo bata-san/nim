@@ -78,6 +78,8 @@ public:
               FillerTextures& fillers);
 
     std::vector<std::string> notes;  // binding diagnostics, for the UI / nimshade
+    // Pixel-stage cb0 registers forced after the TFX ran (inputs whose engine passes nim lacks).
+    std::map<uint32_t, float4> ps_overrides;
 
 private:
     struct Stage {
@@ -104,7 +106,8 @@ std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const E
 
 // The deferred shading the game itself runs over the G-buffer: global_lighting_and_shading with
 // the sun / ambient fed through the GlobalLighting extern, a sky-reflection stand-in written to
-// light_specular_ibl, then a tonemap to gb.lit.
+// light_specular_ibl and a fog in-scatter stand-in for the atmosphere lookups (the height fog
+// itself is the game shader's), then the game's final_combine film curve to gb.lit.
 class GameLighting {
 public:
     void init(PackageManager& pm, Gpu& gpu);
@@ -124,15 +127,16 @@ private:
     Scope frame_scope_, view_scope_;
     ExternStore ext_;
     FillerTextures fillers_;
-    GamePipeline shading_;
+    GamePipeline shading_, final_combine_;
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
-    // light_diffuse, light_specular, light_specular_ibl, hdr
-    ComPtr<ID3D12Resource> targets_[4];
+    // light_diffuse, light_specular, light_specular_ibl, hdr, fog in-scatter, exposed hdr
+    static constexpr int kTargets = 6;
+    ComPtr<ID3D12Resource> targets_[kTargets];
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     uint32_t srv_first_ = UINT32_MAX;  // hdr, depth, rt1 (for nim's passes)
     uint32_t w_ = 0, h_ = 0;
     ComPtr<ID3D12RootSignature> util_rs_;
-    ComPtr<ID3D12PipelineState> ibl_pso_, tonemap_pso_;
+    ComPtr<ID3D12PipelineState> ibl_pso_, tonemap_pso_, fog_pso_, post_pso_;
     float time_ = 0;
 };
 
