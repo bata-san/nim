@@ -29,7 +29,8 @@ bool structural(uint32_t cls) {
     }
 }
 
-std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr) {
+std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr,
+                                        std::vector<TagHash>* node_tables = nullptr) {
     pm.build_hash64_index();
     std::vector<TagHash> queue{bubble}, found;
     std::set<uint32_t> seen{bubble.value};
@@ -41,6 +42,7 @@ std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std:
             found.push_back(t);
             continue;
         }
+        if (node_tables && e->reference == kClassMapNodeTable) node_tables->push_back(t);
         std::vector<uint8_t> data;
         try {
             data = pm.read(t);
@@ -121,6 +123,128 @@ Terrain load_terrain(PackageManager& pm, TagHash tag) {
     return t;
 }
 
+namespace {
+
+using Mat = std::array<float, 16>;
+Mat mat_mul(const Mat& a, const Mat& b) {  // column-major a * b
+    Mat r{};
+    for (int c = 0; c < 4; ++c)
+        for (int row = 0; row < 4; ++row) {
+            float v = 0;
+            for (int k = 0; k < 4; ++k) v += a[size_t(k * 4 + row)] * b[size_t(c * 4 + k)];
+            r[size_t(c * 4 + row)] = v;
+        }
+    return r;
+}
+// Rotation quaternion (x, y, z, w), translation and uniform scale -> column-major matrix.
+Mat quat_transform(float x, float y, float z, float w, float tx, float ty, float tz, float s) {
+    Mat m{};
+    m[0] = (1 - 2 * (y * y + z * z)) * s; m[1] = 2 * (x * y + z * w) * s; m[2] = 2 * (x * z - y * w) * s;
+    m[4] = 2 * (x * y - z * w) * s; m[5] = (1 - 2 * (x * x + z * z)) * s; m[6] = 2 * (y * z + x * w) * s;
+    m[8] = 2 * (x * z + y * w) * s; m[9] = 2 * (y * z - x * w) * s; m[10] = (1 - 2 * (x * x + y * y)) * s;
+    m[12] = tx; m[13] = ty; m[14] = tz; m[15] = 1;
+    return m;
+}
+Mat read_quat_transform(const TagReader& r, size_t o) {
+    return quat_transform(r.f32_at(o), r.f32_at(o + 4), r.f32_at(o + 8), r.f32_at(o + 12),
+                          r.f32_at(o + 16), r.f32_at(o + 20), r.f32_at(o + 24), 1.0f);
+}
+Mat read_mat(const TagReader& r, size_t o) {
+    Mat m{};
+    for (size_t i = 0; i < 16; ++i) m[i] = r.f32_at(o + i * 4);
+    return m;
+}
+// SLight / SShadowingLight share the layout up to +0xBC; `technique` is the lighting-apply offset.
+MapLight read_light(const TagReader& r, size_t o, size_t technique, const Mat& node, TagHash source, bool shadowing) {
+    MapLight l;
+    l.source = source;
+    l.shadowing = shadowing;
+    l.node = node;
+    l.light_space = read_mat(r, o + 0x60);
+    for (size_t i = 0; i < 20; ++i) l.params[i] = r.f32_at(o + i * 4);
+    l.technique = r.tag_at(o + technique);
+    // Bounds: the unit cube's corners through light space (projective) and the node transform.
+    const Mat to_world = mat_mul(node, l.light_space);
+    l.lo = {1e30f, 1e30f, 1e30f};
+    l.hi = {-1e30f, -1e30f, -1e30f};
+    for (int c = 0; c < 8; ++c) {
+        const float p[4] = {c & 1 ? 1.0f : -1.0f, c & 2 ? 1.0f : -1.0f, c & 4 ? 1.0f : -1.0f, 1.0f};
+        float q[4]{};
+        for (int row = 0; row < 4; ++row)
+            for (int k = 0; k < 4; ++k) q[row] += to_world[size_t(k * 4 + row)] * p[k];
+        const float w = std::fabs(q[3]) > 1e-4f ? q[3] : 1e-4f;
+        for (int a = 0; a < 3; ++a) {
+            l.lo[size_t(a)] = std::min(l.lo[size_t(a)], q[a] / w);
+            l.hi[size_t(a)] = std::max(l.hi[size_t(a)], q[a] / w);
+        }
+    }
+    return l;
+}
+
+}  // namespace
+
+std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map) {
+    std::vector<MapLight> out;
+    std::set<uint32_t> collections;
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(t);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            const Mat node = quat_transform(r.f32_at(e), r.f32_at(e + 4), r.f32_at(e + 8), r.f32_at(e + 12), r.f32_at(e + 0x10),
+                                            r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C));
+            // Components: a list of inline records (type at -4, next relative pointer at +0, payload at +0x10).
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                const uint32_t type = r.u32_at(p - 4);
+                const TagHash payload = r.tag_at(p + 0x10);
+                const Entry* pe = payload.is_none() ? nullptr : pm.entry(payload);
+                try {
+                    if (pe && pe->reference == kClassShadowingLight) {
+                        auto bytes = pm.read(payload);
+                        TagReader lr(bytes);
+                        out.push_back(read_light(lr, 0, 0xD4, node, payload, true));
+                    } else if (pe && pe->reference == kClassLightCollection && collections.insert(payload.value).second) {
+                        auto bytes = pm.read(payload);
+                        TagReader lr(bytes);
+                        const auto lights = lr.vec_at(0x30), transforms = lr.vec_at(0x40);
+                        for (uint64_t k = 0; k < lights.count && k < transforms.count; ++k)
+                            out.push_back(read_light(lr, lights.data + size_t(k) * 0x100, 0xC4,
+                                                     mat_mul(node, read_quat_transform(lr, transforms.data + size_t(k) * 0x20)), payload, false));
+                    }
+                } catch (...) {
+                    // A light whose data cannot be read is left out.
+                }
+                (void)type;
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& lights, std::array<float, 3> center, float radius) {
+    std::vector<const MapLight*> out;
+    for (const auto& l : lights) {
+        float d2 = 0;
+        for (int a = 0; a < 3; ++a) {
+            const float c = center[size_t(a)], d = c < l.lo[size_t(a)] ? l.lo[size_t(a)] - c : c > l.hi[size_t(a)] ? c - l.hi[size_t(a)] : 0;
+            d2 += d * d;
+        }
+        if (d2 <= radius * radius) out.push_back(&l);
+    }
+    return out;
+}
+
 std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius) {
     std::vector<std::pair<float, const Terrain*>> found;
     for (const auto& t : map.terrains) {
@@ -141,7 +265,7 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble) {
     MapLayout out;
     out.bubble = bubble;
     std::vector<TagHash> terrain_tags;
-    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags);
+    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables);
     for (TagHash t : terrain_tags) {
         try {
             out.terrains.push_back(load_terrain(pm, t));

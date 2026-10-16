@@ -37,6 +37,7 @@
 #include "nim/content/tfx_vm.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/package_manager.hpp"
+#include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
 #include <set>
@@ -509,6 +510,70 @@ int cmd_crawl(PackageManager& pm, TagHash root, int max_depth, uint32_t target =
     }
     std::println("{} tags reached", queue.size());
     for (auto& [c, n] : hist) std::println("  class {:08X}  {}", c, n);
+    return 0;
+}
+
+// The node tables of a map: entries (transform, entity by hash64, inline component list) and a
+// histogram of the component resource types and entity classes.
+int cmd_nodes(PackageManager& pm, TagHash bubble, uint32_t show_type) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    std::map<uint32_t, std::pair<size_t, std::string>> components, entities;
+    size_t entries = 0;
+    for (TagHash t : map.node_tables) {
+        const auto data = pm.read(t);
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            ++entries;
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            const uint32_t h32 = r.u32_at(e + 0x28);
+            std::optional<TagHash> ent;
+            if (h32 != 0xFFFFFFFFu) ent = TagHash(h32);
+            else if (h64 && h64 != ~0ull) ent = pm.resolve64(h64);
+            const Entry* ee = ent ? pm.entry(*ent) : nullptr;
+            auto& eh = entities[ee ? ee->reference : 0];
+            if (!eh.first++) eh.second = std::format("{} #{} entity {}", t.str(), i, ent ? ent->str() : "-");
+            size_t pnt = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; pnt != e + 0x78 && pnt >= 4 && pnt + 8 <= data.size() && guard < 64; ++guard) {
+                const uint32_t type = r.u32_at(pnt - 4);
+                auto& ch = components[type];
+                if (!ch.first++) ch.second = std::format("{} #{} at 0x{:X}", t.str(), i, pnt);
+                if (type == show_type) {
+                    std::println("{} #{} type {:08X} pos ({:.2f} {:.2f} {:.2f}) scale {:.2f} entity {}", t.str(), i, type,
+                                 r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C), ent ? ent->str() : "-");
+                    std::string hex;
+                    for (size_t k = 0; k < 0x140 && pnt + 0x10 + k + 4 <= data.size(); k += 4)
+                        hex += std::format("{}{:08X}", k % 32 ? " " : std::format("\n    +{:03X} ", k), r.u32_at(pnt + 0x10 + k));
+                    std::println("{}", hex);
+                }
+                const uint64_t next = r.u64_at(pnt);
+                if (!next) break;
+                pnt += size_t(next);
+            }
+        }
+    }
+    std::println("{} node tables, {} entries", map.node_tables.size(), entries);
+    std::println("component resource types:");
+    for (auto& [c, v] : components) std::println("  {:08X} {:6}  e.g. {}", c, v.first, v.second);
+    std::println("entity classes:");
+    for (auto& [c, v] : entities) std::println("  {:08X} {:6}  e.g. {}", c, v.first, v.second);
+    return 0;
+}
+
+int cmd_lights(PackageManager& pm, TagHash bubble) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    const auto lights = load_map_lights(pm, map);
+    std::map<uint32_t, size_t> techniques;
+    size_t shadowing = 0;
+    for (const auto& l : lights) ++techniques[l.technique.value], shadowing += l.shadowing;
+    std::println("{} lights ({} shadowing), {} distinct lighting-apply techniques", lights.size(), shadowing, techniques.size());
+    for (size_t i = 0; i < lights.size() && i < 12; ++i) {
+        const auto& l = lights[i];
+        std::println("  {} {} tech {} pos ({:.1f} {:.1f} {:.1f}) bounds ({:.1f} {:.1f} {:.1f})-({:.1f} {:.1f} {:.1f})", l.source.str(),
+                     l.shadowing ? "S" : "C", l.technique.str(), l.node[12], l.node[13], l.node[14], l.lo[0], l.lo[1], l.lo[2], l.hi[0], l.hi[1], l.hi[2]);
+    }
     return 0;
 }
 
@@ -1133,6 +1198,9 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "nodes" && args.size() >= 2)
+            return cmd_nodes(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});

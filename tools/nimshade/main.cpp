@@ -75,6 +75,9 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
+    bool no_lights = false;
+    std::optional<V3> eye_arg, look_arg;
+    float sun_arg = -1, sky_arg = -1;
     bool reference = false;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -82,6 +85,15 @@ int run(int argc, char** argv) {
         else if (args[i] == "--size" && i + 1 < args.size()) sscanf_s(args[++i].c_str(), "%ux%u", &width, &height);
         else if (args[i] == "--warp") warp = true;
         else if (args[i] == "--no-shadows") shadows = false;
+        else if (args[i] == "--no-lights") no_lights = true;
+        else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
+            V3 v{};
+            sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
+            (args[i] == "--eye" ? eye_arg : look_arg) = v;
+            ++i;
+        }
+        else if (args[i] == "--sun" && i + 1 < args.size()) sun_arg = std::stof(args[++i]);
+        else if (args[i] == "--sky" && i + 1 < args.size()) sky_arg = std::stof(args[++i]);
         else if (args[i] == "--game") game = true;
         else if (args[i] == "--reference") reference = true;
         else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
@@ -127,6 +139,8 @@ int run(int argc, char** argv) {
     std::println("adapter: {}", gpu.adapter_name());
 
     StaticMeshScene scene;
+    std::vector<MapLight> map_lights;
+    std::vector<const MapLight*> region_lights;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -146,6 +160,11 @@ int run(int argc, char** argv) {
         std::map<std::string, size_t> failures;
         double prep_s = 0, add_s = 0;
         const auto terrain = map_terrain_region(map, focus, map_radius);
+        if (!no_lights) {
+            map_lights = load_map_lights(pm, map);
+            region_lights = map_light_region(map_lights, focus, map_radius);
+            std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
+        }
         // Prepared on every core (one forked PackageManager per thread), then added in order.
         const size_t jobs = terrain.size() + region.size();
         std::vector<std::optional<PreparedMesh>> prepared(jobs);
@@ -238,7 +257,10 @@ int run(int argc, char** argv) {
     LightingPass lighting;
     lighting.init(gpu);
     std::println("bounds center ({:.3f},{:.3f},{:.3f}) radius {:.3f}", scene.center().x, scene.center().y, scene.center().z, scene.radius());
-    ViewMatrices vm = make_view(frame_sphere(scene.center(), scene.radius() * camera_scale, width, height));
+    View view = frame_sphere(scene.center(), scene.radius() * camera_scale, width, height);
+    if (eye_arg) view.eye = *eye_arg;
+    if (look_arg) view.target = *look_arg;
+    ViewMatrices vm = make_view(view);
 
     auto* cl = gpu.immediate();
     scene.set_material_frame(material_time);
@@ -258,6 +280,8 @@ int run(int argc, char** argv) {
                      channel.vs ? " VS" : "", channel.ps ? " PS" : "", channel.value[0], channel.value[1], channel.value[2], channel.value[3]);
     }
     LightingParams lp;
+    if (sun_arg >= 0) lp.sun_intensity = sun_arg;
+    if (sky_arg >= 0) lp.sky_intensity = sky_arg;
     lp.time = material_time;
     lp.optimize = !reference;
     gpu.flush();
@@ -276,9 +300,36 @@ int run(int argc, char** argv) {
     if (game) {
         gl.init(pm, gpu);
         std::println("game shading: technique {}", gl.shading_technique().str());
+        if (!region_lights.empty()) {
+            auto tl = std::chrono::steady_clock::now();
+            gl.set_lights(pm, gpu, region_lights);
+            std::println("local lights: {} prepared in {:.1f}s", gl.light_count(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
+            for (const auto& n : gl.light_notes()) std::println("  {}", n);
+        }
         for (const auto& n : gl.notes()) std::println("  {}", n);
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
+        if (gl.light_count()) {
+            std::println("local lights drawn: {}", gl.lights_drawn());
+            for (int b = 0; b < 2; ++b) {
+                auto px = gpu.read_texture(gl.light_buffer(b), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
+                const uint16_t* h = reinterpret_cast<const uint16_t*>(px.data());
+                size_t lit = 0;
+                float mx = 0;
+                for (size_t k = 0; k < px.size() / 2; k += 4) {
+                    for (int c = 0; c < 3; ++c) {
+                        const uint16_t v = h[k + size_t(c)];
+                        const int ex = (v >> 10) & 31; const float m = float(v & 1023) / 1024.0f;
+                        const float f = ex ? std::ldexp(1.0f + m, ex - 15) : std::ldexp(m, -14);
+                        if (!(v & 0x8000)) mx = std::max(mx, f);
+                    }
+                    lit += (h[k] & 0x7FFF) != 0;
+                }
+                std::println("  light buffer {}: {:.1f}% non-zero, max {:.4g}", b, 100.0 * double(lit) / double(px.size() / 8), mx);
+            }
+            for (const auto& n : gl.light_notes()) std::println("  {}", n);
+        }
         std::println("estimated engine inputs (no game data for these):");
         for (const auto& [what, why] : scene.estimates()) std::println("  material  {}  [{}]", what, why);
         for (const auto& [what, why] : gl.externs().estimates()) std::println("  lighting  {}  [{}]", what, why);

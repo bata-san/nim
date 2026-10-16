@@ -122,7 +122,7 @@ private:
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
     std::string adapter_;
-    static constexpr size_t kDynamicPerFrame = 16 << 20;
+    static constexpr size_t kDynamicPerFrame = 64 << 20;
 };
 
 } // namespace nim

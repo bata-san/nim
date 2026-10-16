@@ -499,7 +499,7 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     }
 
     D3D12_ROOT_SIGNATURE_DESC rsd{UINT(params.size()), params.data(), UINT(samplers.size()), samplers.data(),
-                                  D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                                  opt.volume ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT : D3D12_ROOT_SIGNATURE_FLAG_NONE};
     root_sig_ = serialize(dev, rsd, "game pipeline root signature");
 
     if (compute_) {
@@ -526,6 +526,13 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = FALSE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    const D3D12_INPUT_ELEMENT_DESC position{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    if (opt.volume) {
+        pd.InputLayout = {&position, 1};
+        pd.RasterizerState.CullMode = opt.cull_front ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+        if (std::getenv("NIM_LIGHT_NOCULL")) pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
+    cbuffer_floor_ = opt.cbuffer_floor;
     pd.NumRenderTargets = UINT(1 + opt.additional_rtv_formats.size());
     if (pd.NumRenderTargets > 8) throw std::runtime_error("Too many original render targets");
     pd.RTVFormats[0] = opt.rtv_format;
@@ -547,6 +554,13 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
     execute(gpu, cl, ext, scopes, validated, 0, 0, 0);
 }
 
+void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                               const Technique& materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
+                               uint32_t indices) {
+    const Geometry g{&materials, &vbv, &ibv, indices};
+    execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
 void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                             uint32_t x, uint32_t y, uint32_t z) {
     if (!compute_ || !x || !y || !z || x > 65535 || y > 65535 || z > 65535)
@@ -555,7 +569,7 @@ void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Exter
 }
 
 void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                           bool validated, uint32_t x, uint32_t y, uint32_t z) {
+                           bool validated, uint32_t x, uint32_t y, uint32_t z, const Geometry* geometry) {
     if (!validated) validate(ext, scopes);
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
@@ -568,19 +582,26 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     cl->SetPipelineState(pso_.Get());
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
     cl->SetDescriptorHeaps(1, heaps);
-    if (!compute_) cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    if (geometry) {
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cl->IASetVertexBuffers(0, 1, geometry->vbv);
+        cl->IASetIndexBuffer(geometry->ibv);
+    } else if (!compute_) {
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    }
 
     uint32_t off = 0;
     for (auto& st : stages_) {
+        const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
         auto& cb = st.constants;
-        cb.assign(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
-        cb.resize(std::max<size_t>(cb.size(), 256));
+        cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
+        cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
         std::vector<TfxExternTexture> textures = st.extern_textures;
-        if (!st.tfx.bytecode.empty()) run_tfx(st.tfx.bytecode, st.tfx.constants, cb, env);
+        if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env);
         DynamicAlloc a = gpu.dynamic(cb.size() * sizeof(float4));
         std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
         for (auto [reg, param] : st.cbvs) {
-            D3D12_GPU_VIRTUAL_ADDRESS va = int32_t(reg) == st.tfx.cbuffer_slot ? a.gpu : scopes ? scopes(st.which, reg) : 0;
+            D3D12_GPU_VIRTUAL_ADDRESS va = int32_t(reg) == tfx.cbuffer_slot ? a.gpu : scopes ? scopes(st.which, reg) : 0;
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
@@ -640,6 +661,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         off += st.srv_count + st.uav_count;
     }
     if (compute_) cl->Dispatch(x, y, z);
+    else if (geometry) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
     else cl->DrawInstanced(4, 1, 0, 0);
 }
 
@@ -836,6 +858,12 @@ void GameLighting::release(Gpu& gpu) {
     env_srv_ = UINT32_MAX;
     env_.Reset();
     shadow_mask_.Reset();
+    light_diffuse_.Reset();
+    light_specular_.Reset();
+    cube_.Reset();
+    lights_.clear();
+    for (auto& lp : light_pipelines_) lp->release(gpu);
+    light_pipelines_.clear();
     hdr_.Reset();
     rtv_heap_.Reset();
     w_ = h_ = 0;
@@ -930,7 +958,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.SampleDesc.Count = 1;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow_pso_)), "sun shadow resolve PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     gpu.flush();
 }
@@ -948,6 +976,12 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     shadow_mask_ = gpu.texture2d(w, h, mv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &mv);
     gpu.device()->CreateRenderTargetView(shadow_mask_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 2 * inc});
+    light_diffuse_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    light_specular_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    gpu.device()->CreateRenderTargetView(light_diffuse_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 3 * inc});
+    gpu.device()->CreateRenderTargetView(light_specular_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 4 * inc});
     if (env_srv_ == UINT32_MAX) env_srv_ = gpu.srv().alloc(4);  // env: depth, rt1; shadow: depth, map
     w_ = w;
     h_ = h;
@@ -1065,6 +1099,13 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
                               "no map atmosphere: transmittance 1, in-scatter 0 (clear air)");
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
+    if (!lights_.empty()) {
+        ext_.set_texture(ext::Deferred, 0xC0, light_diffuse_.Get());
+        ext_.set_texture(ext::Deferred, 0xC8, light_specular_.Get());
+    } else if (ext_.texture(ext::Deferred, 0xC0).resource == light_diffuse_.Get()) {
+        ext_.set_texture(ext::Deferred, 0xC0, nullptr);
+        ext_.set_texture(ext::Deferred, 0xC8, nullptr);
+    }
     if (!ext_.texture(ext::Deferred, 0xD0).resource)
         ext_.estimate_texture(ext::Deferred, 0xD0, env_.Get(), "viewer environment: nim sky reflection (no map reflection probes)");
     if (!ext_.zero_policy(ext::Deferred)) ext_.zero_when_missing(ext::Deferred, "deferred-pass value with no known meaning: zero");
@@ -1232,6 +1273,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
+    lights_drawn_ = 0;
+    if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         env_pass(env_ibl_pso_.Get(), env_rtv);
@@ -1239,6 +1282,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
 
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
+    cl->SetGraphicsRootSignature(nullptr);
     shading_.draw(gpu, cl, ext_, scopes, true);
     env_pass(env_bg_pso_.Get(), hdr);
     ext_.note_estimate("background gradient", "viewer environment (no map sky)");
@@ -1250,6 +1294,192 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+}
+
+// ---- Local lights ------------------------------------------------------------------------------
+namespace {
+
+M4 m4(const std::array<float, 16>& a) {
+    M4 m;
+    for (int c = 0; c < 4; ++c) m.c[c] = {a[size_t(c * 4)], a[size_t(c * 4 + 1)], a[size_t(c * 4 + 2)], a[size_t(c * 4 + 3)]};
+    return m;
+}
+float det3(const M4& m) {
+    const auto& a = m.c[0]; const auto& b = m.c[1]; const auto& c = m.c[2];
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1]) + c[0] * (a[1] * b[2] - a[2] * b[1]);
+}
+M4 inverse(const M4& m) {
+    float a[16], inv[16];
+    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) a[c * 4 + r] = m.c[c][size_t(r)];
+    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+    float det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    det = std::fabs(det) > 1e-30f ? 1.0f / det : 0.0f;
+    M4 r;
+    for (int c = 0; c < 4; ++c) for (int rr = 0; rr < 4; ++rr) r.c[c][size_t(rr)] = inv[c * 4 + rr] * det;
+    return r;
+}
+// goriath compute_light_bounds + compute_light_local_to_world: the light volume's box (in light
+// space) as a transform of the unit cube [0,1]^3 with x and z swapped.
+M4 light_box_to_world(const M4& node, const M4& light_space) {
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (int c = 0; c < 8; ++c) {
+        const float4 p{c & 1 ? 1.0f : -1.0f, c & 2 ? 1.0f : -1.0f, c & 4 ? 1.0f : -1.0f, 1.0f};
+        float4 q{};
+        for (int r = 0; r < 4; ++r)
+            for (int k = 0; k < 4; ++k) q[size_t(r)] += light_space.c[k][size_t(r)] * p[size_t(k)];
+        for (int a = 0; a < 3; ++a) {
+            const float v = std::fabs(q[3]) >= 1e-4f ? q[size_t(a)] / q[3] : 0.0f;
+            lo[a] = std::min(lo[a], v);
+            hi[a] = std::max(hi[a], v);
+        }
+    }
+    float4 axis[3], w = node.c[3];
+    for (int a = 0; a < 3; ++a) {
+        const float half = (hi[a] - lo[a]) * 0.5f, centre = (hi[a] + lo[a]) * 0.5f;
+        for (int k = 0; k < 4; ++k) {
+            axis[a][size_t(k)] = node.c[a][size_t(k)] * half;
+            w[size_t(k)] += node.c[a][size_t(k)] * centre;
+        }
+    }
+    M4 m;
+    for (int k = 0; k < 4; ++k) {
+        m.c[2][size_t(k)] = axis[0][size_t(k)] * 2;
+        m.c[1][size_t(k)] = axis[1][size_t(k)] * 2;
+        m.c[0][size_t(k)] = axis[2][size_t(k)] * 2;
+        m.c[3][size_t(k)] = w[size_t(k)] - axis[0][size_t(k)] - axis[1][size_t(k)] - axis[2][size_t(k)];
+    }
+    return m;
+}
+
+}  // namespace
+
+void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
+    lights_.clear();
+    light_notes_.clear();
+    if (!cube_) {
+        // Unit cube, outward-facing counter-clockwise triangles.
+        const float v[8][3] = {{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1}, {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}};
+        const uint16_t idx[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5};
+        std::vector<uint8_t> bytes(sizeof(v) + sizeof(idx));
+        std::memcpy(bytes.data(), v, sizeof(v));
+        std::memcpy(bytes.data() + sizeof(v), idx, sizeof(idx));
+        cube_ = gpu.upload(bytes.data(), bytes.size());
+        cube_vbv_ = {cube_->GetGPUVirtualAddress(), UINT(sizeof(v)), 12};
+        cube_ibv_ = {cube_->GetGPUVirtualAddress() + sizeof(v), UINT(sizeof(idx)), DXGI_FORMAT_R16_UINT};
+    }
+    // One pipeline pair per (shaders, textures, samplers); techniques are cached by tag.
+    std::map<std::string, uint32_t> keys;
+    std::unordered_map<uint32_t, std::shared_ptr<const Technique>> techniques;
+    std::map<std::string, size_t> failures;
+    const Scope* scopes[] = {&frame_scope_, &view_scope_};
+    for (const MapLight* l : lights) {
+        try {
+            auto& tech = techniques[l->technique.value];
+            if (!tech) tech = std::make_shared<const Technique>(load_technique(pm, l->technique));
+            std::string key;
+            for (auto which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+                const auto& st = tech->stage(which);
+                key += std::format("{:08X}:", st.shader.value);
+                for (const auto& t : st.textures) key += std::format("t{}={:08X},", t.slot, t.texture.value);
+                for (const auto& sm : st.samplers) key += std::format("s{:08X},", sm.value);
+                key += '|';
+            }
+            auto it = keys.find(key);
+            if (it == keys.end()) {
+                const uint32_t index = uint32_t(light_pipelines_.size());
+                for (bool front : {true, false}) {
+                    auto lp = std::make_unique<GamePipeline>();
+                    GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
+                    opt.volume = true;
+                    opt.cull_front = front;
+                    opt.cbuffer_floor = 64;
+                    lp->load(pm, gpu, l->technique, scopes, opt);
+                    light_pipelines_.push_back(std::move(lp));
+                }
+                it = keys.emplace(key, index).first;
+            }
+            lights_.push_back({it->second, tech, *l});
+        } catch (const std::exception& ex) {
+            ++failures[std::string(ex.what()).substr(0, 120)];
+        }
+    }
+    for (const auto& [why, n] : failures) light_notes_.push_back(std::format("{} lights left out: {}", n, why));
+    if (!lights_.empty())
+        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1), +0x150 = 1, +0x154 = +0x158 = 0",
+                           "goriath's DeferredLight defaults (plane masks off, full strength)");
+}
+
+void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+    Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + 4 * inc}};
+    const float zero[4]{};
+    cl->ClearRenderTargetView(rtvs[0], zero, 0, nullptr);
+    cl->ClearRenderTargetView(rtvs[1], zero, 0, nullptr);
+    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
+    if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
+    M4 to_rel;  // world -> camera-relative world
+    to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
+    to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    for (const auto& ll : lights_) {
+        const MapLight& l = ll.light;
+        // Off-screen volumes: all eight box corners outside one clip plane.
+        bool outside = false;
+        {
+            int out[5]{};
+            for (int c = 0; c < 8; ++c) {
+                const float4 p{c & 1 ? l.hi[0] - vm.eye.x : l.lo[0] - vm.eye.x, c & 2 ? l.hi[1] - vm.eye.y : l.lo[1] - vm.eye.y,
+                               c & 4 ? l.hi[2] - vm.eye.z : l.lo[2] - vm.eye.z, 1};
+                float4 q{};
+                for (int r = 0; r < 4; ++r)
+                    for (int k = 0; k < 4; ++k) q[size_t(r)] += vm.vp_rel.c[k][size_t(r)] * p[size_t(k)];
+                out[0] += q[0] < -q[3]; out[1] += q[0] > q[3]; out[2] += q[1] < -q[3]; out[3] += q[1] > q[3]; out[4] += q[3] <= 0;
+            }
+            for (int i = 0; i < 5; ++i) outside |= out[i] == 8;
+        }
+        if (outside) continue;
+        const M4 node = m4(l.node), space = m4(l.light_space);
+        const M4 node_rel = mul(to_rel, node);
+        const M4 volume = mul(node_rel, space);  // unit cube -> camera-relative world
+        ext_.set(15, 0x00, mul(vm.vp_rel, volume));
+        ext_.set(ext::DeferredLight, 0x00, 0.0f);
+        ext_.set(ext::DeferredLight, 0x40, inverse(mul(to_rel, light_box_to_world(node, space))));
+        ext_.set(ext::DeferredLight, 0xC0, node_rel);
+        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
+        ext_.set(ext::DeferredLight, 0x150, 1.0f);
+        ext_.set(ext::DeferredLight, 0x154, 0.0f);
+        ext_.set(ext::DeferredLight, 0x158, 0.0f);
+        // Only the far side of the volume is drawn (the camera may be inside it); the cube's
+        // winding on screen flips with the handedness of its transform.
+        const bool mirrored = det3(volume) * (space.c[3][3] + space.c[2][3] < 0 ? -1.0f : 1.0f) < 0;
+        GamePipeline& gp = *light_pipelines_[ll.pipeline + (mirrored ? 1 : 0)];
+        try {
+            gp.draw_volume(gpu, cl, ext_, scopes, *ll.technique, cube_vbv_, cube_ibv_, 36);
+            ++lights_drawn_;
+        } catch (const std::exception& ex) {
+            if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));
+        }
+    }
+    Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 } // namespace nim

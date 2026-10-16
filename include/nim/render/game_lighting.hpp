@@ -3,6 +3,7 @@
 // final_combine, ...) the way the game does: each technique's TFX bytecode reads "externs"
 // (engine-owned blocks of per-frame state such as the view, the G-buffer textures and the sun),
 // and the shared cbuffers (cb12 view, cb13 frame) come from the render globals' scopes.
+#include "nim/content/map.hpp"
 #include "nim/render/scene.hpp"
 
 #include <functional>
@@ -102,6 +103,11 @@ public:
         DXGI_FORMAT rtv_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         bool additive = false;
         std::vector<DXGI_FORMAT> additional_rtv_formats; // exact attachment formats for SV_Target1..7
+        // Light volume: a float3 POSITION0 vertex stream, indexed triangles, faces of one winding
+        // culled (`cull_front`), every target accumulated additively.
+        bool volume = false;
+        bool cull_front = true;
+        uint32_t cbuffer_floor = 256;  // float4s allocated per stage cbuffer (TFX outputs beyond fail)
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -114,6 +120,11 @@ public:
     void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
               bool validated = false);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
+    // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
+    // brings its own technique's TFX, constants and cbuffer (textures and samplers must match).
+    void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                     const Technique& materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
+                     uint32_t indices);
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
 
@@ -137,9 +148,11 @@ private:
         std::array<std::vector<BoundView>, 3> bound_views;
         std::vector<float4> constants;
     };
+    struct Geometry { const Technique* materials; const D3D12_VERTEX_BUFFER_VIEW* vbv; const D3D12_INDEX_BUFFER_VIEW* ibv; uint32_t indices; };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                 bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+                 bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
     bool compute_ = false;
+    uint32_t cbuffer_floor_ = 256;
     TagHash tag_;
     std::vector<Stage> stages_;
     ComPtr<ID3D12RootSignature> root_sig_;
@@ -169,6 +182,16 @@ public:
                 const TransparentFn& transparents = {}, SunShadow* shadow = nullptr);
     void release(Gpu& gpu);
 
+    // A map's local lights (load_map_lights), drawn each frame with their own lighting-apply
+    // techniques into the light buffers the shading pass reads. Lights whose technique cannot be
+    // loaded are left out and listed in light_notes().
+    void set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights);
+    void clear_lights() { lights_.clear(); }
+    size_t light_count() const { return lights_.size(); }
+    size_t lights_drawn() const { return lights_drawn_; }
+    const std::vector<std::string>& light_notes() const { return light_notes_; }
+    ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE
+
     ExternStore& externs() { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
@@ -196,6 +219,21 @@ private:
     uint32_t env_srv_ = UINT32_MAX;
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     uint32_t w_ = 0, h_ = 0;
+
+    void draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    struct LocalLight {
+        uint32_t pipeline = 0;
+        std::shared_ptr<const Technique> technique;
+        MapLight light;
+    };
+    std::vector<std::unique_ptr<GamePipeline>> light_pipelines_;  // two per shader pair: both windings
+    std::vector<LocalLight> lights_;
+    std::vector<std::string> light_notes_;
+    size_t lights_drawn_ = 0;
+    ComPtr<ID3D12Resource> light_diffuse_, light_specular_;  // Deferred +0xC0 / +0xC8
+    ComPtr<ID3D12Resource> cube_;
+    D3D12_VERTEX_BUFFER_VIEW cube_vbv_{};
+    D3D12_INDEX_BUFFER_VIEW cube_ibv_{};
 
 };
 

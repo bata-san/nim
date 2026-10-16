@@ -19,6 +19,7 @@ namespace nim {
 
 inline constexpr uint32_t kClassBubbleParent = 0x8080AB27;
 inline constexpr uint32_t kClassStaticInstances = 0x8080A7F1;
+inline constexpr uint32_t kClassMapNodeTable = 0x8080B1A7;
 inline constexpr uint32_t kClassTerrain = 0x80808567;
 
 // STerrain 80808567 (layout as goriath's, verified on Marathon data): 0x10 bounds min, 0x20 max,
@@ -63,6 +64,7 @@ struct MapStatic {
 struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
+    std::vector<TagHash> node_tables;    // the SMapNodeTables (placed entities, lights, ...)
     std::vector<MapStatic> statics;      // one per distinct mesh
     std::vector<Terrain> terrains;       // terrain patches
     size_t instances = 0;
@@ -77,5 +79,22 @@ std::array<float, 3> map_focus(const MapLayout& map);
 std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> center, float radius);
 // The terrain patches whose bounds come within `radius` of `center`, nearest first.
 std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius);
+
+// A placed local light: an SShadowingLight (80808557) from a node's shadowing-light component
+// (80808544), or one SLight (80808556) of an SLightCollection (8080854B, component 80808335).
+// Matrices are column-major 4x4.
+inline constexpr uint32_t kClassLightCollection = 0x8080854B, kClassShadowingLight = 0x80808557;
+struct MapLight {
+    TagHash source;                    // the SShadowingLight / SLightCollection tag
+    TagHash technique;                 // lighting_apply technique (deferred light into the light buffers)
+    std::array<float, 16> node{};      // light local -> world (node / collection transform)
+    std::array<float, 16> light_space{};  // unit cube (NDC) -> light local, projective
+    std::array<float, 20> params{};    // SLight +0x00..+0x4F: two clip planes, two more, plane exponents
+    std::array<float, 3> lo{}, hi{};   // world bounds of the light volume
+    bool shadowing = false;
+};
+std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map);
+// The lights whose volume comes within `radius` of `center`.
+std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& lights, std::array<float, 3> center, float radius);
 
 }  // namespace nim
