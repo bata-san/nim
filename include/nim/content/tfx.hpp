@@ -1,8 +1,10 @@
 #pragma once
 #include "nim/core/package_manager.hpp"
 #include "nim/core/tag_hash.hpp"
+#include "nim/content/tfx_vm.hpp"
 
 #include <array>
+#include <map>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -42,6 +44,11 @@ struct TechniqueStage {
 struct Technique {
     TagHash tag;
     uint32_t bind_mode = 0;  // 1 = VS+PS, 2 = VS only, 6 = CS ...
+    uint64_t used_scopes = 0;
+    // Fixed-function state selection (goriath): bytes blend / depth-stencil / rasterizer / depth
+    // bias, each an index into the engine's state table with bit 7 = set.
+    uint32_t states = 0;
+    int blend_state() const { return (states & 0x80) ? int(states & 0x7F) : -1; }
     std::array<TechniqueStage, size_t(ShaderStage::Count)> stages;
     const TechniqueStage& stage(ShaderStage s) const { return stages[size_t(s)]; }
 };
@@ -114,6 +121,7 @@ struct DynamicModelMaterials {
     std::vector<TagHash> techniques;
     uint32_t permutation_count = 1;
     uint32_t default_permutation = 0;  // goriath: the last permutation when there are more than two
+    std::map<uint32_t, std::array<float, 4>> object_defaults;  // entity channel expressions' initial constants
     TagHash technique(uint16_t variant, uint32_t permutation) const;
 };
 // Model tag -> materials, from one pass over every component tag (a few seconds).
@@ -132,6 +140,9 @@ struct Texture {
     std::vector<uint8_t> data;  // full mip chain, D3D subresource order
 };
 Texture load_texture(PackageManager& pm, TagHash header);
+// Same, without the mips larger than max_dim (2D textures; others load in full). Reads only the
+// small data entry when its tail mips already cover the request.
+Texture load_texture(PackageManager& pm, TagHash header, uint32_t max_dim);
 
 // ---- Vertex input layouts (from the game's render globals) ---------------------------------
 struct InputElement {
@@ -171,6 +182,18 @@ struct Scope {
 };
 Scope load_scope(PackageManager& pm, TagHash tag);
 
+// Resource inheritance follows the technique's used_scopes bits, then its own stage.
+// The mapping records sources; it never manufactures a missing texture or sampler.
+struct StageResourceSources {
+    std::map<uint32_t, TagHash> textures, samplers;
+    std::map<uint32_t, TfxExternTexture> extern_textures, extern_uavs;
+    std::map<uint32_t, TagHash> cbuffer_scopes;
+};
+std::vector<Scope> load_technique_scopes(PackageManager& pm, const RenderGlobals& globals, const Technique& technique);
+ScopeStage scope_stage(ShaderStage stage);
+StageResourceSources resolve_stage_resources(const Technique& technique, ShaderStage stage,
+                                             std::span<const Scope* const> scopes);
+
 // ---- Shader bindings (DXBC PSV0 part) ---------------------------------------------------------
 // What a compiled shader binds, read from the pipeline-state-validation part dxc embeds. Lets nim
 // build a root signature for a game shader without reflection DLLs.
@@ -189,6 +212,8 @@ std::vector<ShaderBinding> shader_bindings(std::span<const uint8_t> dxbc);
 // whose input layout lacks any of them, even unused ones.
 struct ShaderInput { std::string semantic; uint32_t index = 0, reg = 0; };
 std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> dxbc);
+// Output attachments must match the original PS signature, including non-contiguous targets.
+std::vector<ShaderInput> shader_outputs(std::span<const uint8_t> dxbc);
 
 // Sampler tag -> the raw D3D12_SAMPLER_DESC it references (same layout).
 struct SamplerDesc {

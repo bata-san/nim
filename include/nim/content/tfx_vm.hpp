@@ -10,13 +10,13 @@ namespace nim {
 
 using float4 = std::array<float, 4>;
 
-// Inputs the TFX expression bytecode may read. Anything left unset evaluates to the defaults
-// the engine would use for an object with no animation state (ONE for channels, ZERO for externs).
+// Inputs the TFX expression bytecode may read. Missing inputs and unimplemented operations fail explicitly.
 struct TfxEnvironment {
     std::function<float4(uint8_t extern_id, uint8_t offset)> extern_vec4;  // offset in vec4 units
     std::function<float(uint8_t extern_id, uint8_t offset)> extern_float;  // offset in float units
     std::function<float4(uint8_t channel)> global_channel;
     std::function<float4(uint32_t hash)> object_channel;
+    std::function<float4(uint8_t texture)> texture_tiling;  // push_tex_tiling (streaming state)
 };
 
 struct TfxExternTexture {
@@ -32,15 +32,25 @@ struct TfxSampler {
 
 struct TfxResult {
     std::vector<TfxExternTexture> extern_textures;
+    std::vector<TfxExternTexture> extern_uavs;
     std::vector<TfxSampler> samplers;
     std::vector<std::string> unsupported;  // opcodes that were stubbed, for diagnostics
     size_t instructions = 0;
+    bool live_inputs = false;  // extern state or editable per-object channels
 };
+
+// Inspect texture/sampler assignments without evaluating numeric expressions.
+TfxResult inspect_tfx_bindings(std::span<const uint8_t> bytecode);
 
 // Runs a TFX expression program. `constants` are the stage's bytecode constants; `out` is the
 // cbuffer (pre-filled with the stage's initial cbuffer contents) the program writes into.
 TfxResult run_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants, std::span<float4> out,
                   const TfxEnvironment& env = {}, std::string* trace = nullptr);
+
+// Evaluate a material for a new frame from its original constants, never the previous frame's
+// outputs. Untouched registers and opaque uint/float bit patterns retain their original values.
+TfxResult evaluate_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants,
+                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env = {});
 
 // One instruction per line, for `nimcli technique`.
 std::string disassemble_tfx(std::span<const uint8_t> bytecode);

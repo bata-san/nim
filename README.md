@@ -1,5 +1,11 @@
 # nim
 
+**Renderer status:** the complete game renderer port is unfinished. Approximate lighting,
+placeholder textures and silent fallback have been removed. Missing original frame inputs
+now stop rendering, so lit previews and many thumbnails are currently unavailable. See
+[rendering status](docs/RENDERING.md) and [original game resources](docs/GAME_RESOURCES.md). The separate current build is `build-strict/Release/nim.exe`.
+
+
 A fast, faithful asset viewer for Bungie's *Marathon* (2026, Tiger engine).
 Goal: every line of text and dialogue, every model, map, texture and sound — rendered with the game's own shaders.
 
@@ -38,6 +44,13 @@ Noto Sans JP/KR/SC/TC), read from your install at startup; nothing is bundled.
 Camera: left drag orbits, middle drag pans, wheel zooms, right drag flies (WASD/QE, Shift
 faster, Ctrl slower, wheel = speed), F frames, Ctrl+S saves a PNG to `captures/` next to the exe.
 
+Material animation is evaluated every frame in both vertex and pixel shaders, using a shared
+clock and the installed global-channel defaults. The inspector provides play/pause, time,
+speed, and live object-channel controls; changing a channel does not reload the model.
+Entity channel initial constants and large material-variant tables are also read.
+Rendering changes, validation commands, and remaining special-shader limitations:
+[docs/RENDERING.md](docs/RENDERING.md).
+
 ## Command line
 
 The Steam install is detected automatically; otherwise pass `--install <Marathon dir>`.
@@ -67,14 +80,14 @@ build/Release/nimcli fonts out/fonts   # the game's UI fonts (for your own inspe
 
 ```
 build/Release/nimshade 80A878C8 out/shade --size 1600x1000
+build/Release/nimshade 80A48549 out/animated --game --time 2
+build/Release/nimshade 80A48549 out/benchmark --game --benchmark 480
 ```
 
-Renders a static mesh or dynamic model with the game's own compiled shaders, run unmodified on
-D3D12: the G-buffer vertex and pixel shaders (DXIL), with material constants computed by nim's TFX
-bytecode VM and the game's BC textures. It writes the G-buffer targets the pixel shader outputs
-(`gbuffer0_albedo.png`, `gbuffer1_normal.png`, `gbuffer2.png`) and `composite.png` (nim's GGX
-lighting). `--game` adds `composite_game.png`: the game's own deferred shading and film curve;
-`--fog 12` adds `composite_game_fog.png` with the game shader's height fog at 12 per km.
+The renderer loads original game DXIL and assets. It currently rejects lit rendering when
+required engine inputs or passes are missing; it does not write a substitute composite.
+`--game` remains accepted, but all Lit rendering now requires original game processing.
+G-buffer diagnostic visualizations are separate from game-fidelity validation.
 Requires a D3D12 GPU with Shader Model 6.6, or pass `--warp`.
 
 GPU faults: set `NIM_D3D_DEBUG=1` before starting any of the tools to enable the D3D12 debug layer

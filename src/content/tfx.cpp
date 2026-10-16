@@ -49,12 +49,13 @@ TechniqueStage read_core(PackageManager& pm, const TagReader& r, size_t core) {
     // A stage may keep its cbuffer contents in a separate buffer (header 32/7 -> data 40/7)
     // instead of inline; the inline array then holds a single placeholder register.
     if (!st.cbuffer.is_none()) {
-        if (const Entry* e = pm.entry(st.cbuffer); e && e->type == 32) {
-            auto data = pm.read(TagHash(e->reference));
-            std::vector<std::array<float, 4>> regs(data.size() / 16);
-            std::memcpy(regs.data(), data.data(), regs.size() * 16);
-            if (regs.size() > st.cbuffer_init.size()) st.cbuffer_init = std::move(regs);
-        }
+        const auto* entry = pm.entry(st.cbuffer);
+        if (!entry) throw std::runtime_error("Missing original constant-buffer header " + st.cbuffer.str());
+        const auto data = pm.read(TagHash(entry->reference));
+        if (data.size() % sizeof(float4)) throw std::runtime_error("Invalid original constant-buffer byte size");
+        // A referenced buffer takes precedence, even when it is shorter than the inline array.
+        st.cbuffer_init.resize(data.size() / sizeof(float4));
+        if (!data.empty()) std::memcpy(st.cbuffer_init.data(), data.data(), data.size());
     }
     return st;
 }
@@ -95,6 +96,8 @@ Technique load_technique(PackageManager& pm, TagHash tag) {
     Technique t;
     t.tag = tag;
     t.bind_mode = r.u32_at(0x08);
+    t.used_scopes = r.u64_at(0x20);
+    t.states = r.u32_at(0x30);
     for (size_t s = 0; s < size_t(ShaderStage::Count); ++s) t.stages[s] = read_stage(pm, r, 0x58 + s * 0x88);
     return t;
 }
@@ -197,13 +200,19 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
     // techniques 0x418. The struct sits somewhere inside the component tag, so find it by its
     // model tag and validate the vectors around it.
     std::unordered_map<uint32_t, bool> models;
+    std::vector<TagHash> entities;
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
-        for (uint32_t i = 0; i < p.entries().size(); ++i)
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
             if (p.entries()[i].type == 8 && p.entries()[i].reference == kClassDynamicModel)
                 models[TagHash::make(info.pkg_id, uint16_t(i)).value] = true;
+            if (p.entries()[i].type == 8 && p.entries()[i].reference == 0x8080BAAD)
+                entities.push_back(TagHash::make(info.pkg_id, uint16_t(i)));
+        }
     }
     std::unordered_map<uint32_t, DynamicModelMaterials> out;
+    using Defaults = std::map<uint32_t, std::array<float, 4>>;
+    std::unordered_map<uint32_t, Defaults> channel_components;
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
         for (uint32_t i = 0; i < p.entries().size(); ++i) {
@@ -217,16 +226,38 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                 continue;
             }
             TagReader r(bytes);
+            try {
+                const size_t definition = r.pointer_at(0x18);
+                if (definition >= 4 && definition < bytes.size() && r.u32_at(definition - 4) == 0x8080AF75) {
+                    auto channels = r.vec_at(definition + 0x120);
+                    if (channels.count && channels.element_class == 0x8080AF86) {
+                        Defaults defaults;
+                        for (uint64_t c = 0; c < channels.count; ++c) {
+                            const size_t at = channels.data + size_t(c) * 0x70;
+                            const auto constants = r.vec_at(at + 0x18);  // SExpression at +8, constants at +0x10
+                            if (!constants.count) continue;
+                            std::array<float, 4> value{};
+                            for (int k = 0; k < 4; ++k) value[k] = r.f32_at(constants.data + k * 4);
+                            defaults[r.u32_at(at)] = value;
+                        }
+                        channel_components.emplace(tag.value, std::move(defaults));
+                    }
+                    continue;
+                }
+            } catch (...) {
+            }
             for (size_t o = 0x234; o + 4 <= bytes.size(); o += 4) {
                 uint32_t v;
                 std::memcpy(&v, bytes.data() + o, 4);
                 if (!models.count(v) || out.count(v)) continue;
                 const size_t base = o - 0x234;
-                if (base + 0x428 > bytes.size()) continue;
+                if (base < 4 || base + 0x428 > bytes.size() || r.u32_at(base - 4) != 0x80808678) continue;
                 try {
                     auto map = r.vec_at(base + 0x3D8);
                     auto techs = r.vec_at(base + 0x418);
-                    if (map.count == 0 || map.element_class != 0x80808681 || techs.count == 0 || techs.count > 4096) continue;
+                    if ((map.count && map.element_class != 0x80808681) ||
+                        map.data > bytes.size() || map.count > (bytes.size() - map.data) / 12 ||
+                        techs.data > bytes.size() || techs.count > (bytes.size() - techs.data) / 4) continue;
                     DynamicModelMaterials m;
                     m.component = tag;
                     for (uint64_t k = 0; k < map.count; ++k) {
@@ -234,6 +265,9 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                         m.technique_map.push_back({r.u32_at(q), r.u32_at(q + 4), r.u32_at(q + 8)});
                     }
                     for (uint64_t k = 0; k < techs.count; ++k) m.techniques.push_back(r.tag_at(techs.data + size_t(k) * 4));
+                    if (std::any_of(m.technique_map.begin(), m.technique_map.end(), [&](const auto& rg) {
+                            return uint64_t(rg.start) + rg.count > m.techniques.size();
+                        })) continue;
                     for (const auto& rg : m.technique_map)
                         if (rg.unk8 == 0) {
                             m.permutation_count = std::max(1u, rg.count);
@@ -244,6 +278,29 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                 } catch (...) {
                 }
             }
+        }
+    }
+    // A model with inline techniques still needs its component: sibling channel components
+    // contain the scales, positions, visibility and effect states its VS/PS programs read.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> models_of;
+    for (const auto& [model, material] : out) models_of[material.component.value].push_back(model);
+    for (TagHash entity : entities) {
+        try {
+            auto bytes = pm.read(entity);
+            TagReader r(bytes);
+            auto components = r.vec_at(0x08);
+            Defaults defaults;
+            std::vector<uint32_t> placed;
+            for (uint64_t c = 0; c < components.count; ++c) {
+                const uint32_t component = r.u32_at(components.data + size_t(c) * 12);
+                if (auto f = channel_components.find(component); f != channel_components.end())
+                    defaults.insert(f->second.begin(), f->second.end());
+                if (auto f = models_of.find(component); f != models_of.end())
+                    placed.insert(placed.end(), f->second.begin(), f->second.end());
+            }
+            for (uint32_t model : placed)
+                if (defaults.size() > out[model].object_defaults.size()) out[model].object_defaults = defaults;
+        } catch (...) {
         }
     }
     return out;
@@ -302,6 +359,66 @@ Texture load_texture(PackageManager& pm, TagHash header) {
         covered++;
     }
     t.mip_count = std::max<uint16_t>(1, covered);
+    return t;
+}
+
+Texture load_texture(PackageManager& pm, TagHash header, uint32_t max_dim) {
+    auto h = pm.read(header);
+    BinaryReader r(h);
+    const uint16_t w0 = r.u16_at(0x22), h0 = r.u16_at(0x24), depth = r.u16_at(0x26), arr = r.u16_at(0x28);
+    if (!max_dim || std::max(w0, h0) <= max_dim || depth > 1 || arr > 1 || r.u16_at(0x20) != 0xCAFE)
+        return load_texture(pm, header);
+    Texture t;
+    t.dxgi_format = r.u32_at(0x04);
+    const uint16_t mips_hint = r.u8_at(0x2D);
+    uint16_t smallest = std::min(w0, h0), full = 1;
+    while ((1u << full) <= smallest) ++full;
+    const uint16_t mips = std::max<uint16_t>(1, std::min<uint16_t>(full, mips_hint ? mips_hint : 1));
+    const size_t bpp = bits_per_pixel(t.dxgi_format);
+    auto mip_size = [&](uint16_t m) {
+        size_t w = std::max(1, w0 >> m), hh = std::max(1, h0 >> m);
+        return is_block_compressed(t.dxgi_format) ? ((w + 3) / 4) * ((hh + 3) / 4) * bpp * 2 : w * hh * bpp / 8;
+    };
+    uint16_t skip = 0;
+    while (skip + 1 < mips && std::max(w0 >> skip, h0 >> skip) > int(max_dim)) ++skip;
+
+    // The data entry holds the chain from some mip down (all of it when there is no large buffer).
+    std::vector<uint8_t> small = pm.read(TagHash(pm.entry(header)->reference));
+    size_t tail = 0;
+    int small_first = -1;
+    for (int m = mips - 1; m >= 0; --m) {
+        tail += mip_size(uint16_t(m));
+        if (tail == small.size()) small_first = m;
+    }
+    std::vector<uint8_t> data;
+    uint16_t first = 0;
+    const TagHash large(r.u32_at(0x3C));
+    if (small_first >= 0 && small_first <= skip) {
+        data = std::move(small);
+        first = uint16_t(small_first);
+    } else if (!large.is_none() && pm.entry(large)) {
+        data = pm.read(large);
+    } else {
+        data = std::move(small);
+    }
+    size_t off = 0;
+    for (uint16_t m = first; m < skip; ++m) off += mip_size(m);
+    if (off >= data.size()) return load_texture(pm, header);
+    t.width = uint16_t(std::max(1, w0 >> skip));
+    t.height = uint16_t(std::max(1, h0 >> skip));
+    size_t total = 0;
+    uint16_t covered = 0;
+    for (uint16_t m = skip; m < mips; ++m) {
+        const size_t sz = mip_size(m);
+        if (off + total + sz > data.size()) break;
+        total += sz;
+        covered++;
+    }
+    if (!covered) return load_texture(pm, header);
+    // Block-compressed textures need the top mip in whole blocks.
+    if (is_block_compressed(t.dxgi_format) && ((t.width & 3) || (t.height & 3))) return load_texture(pm, header);
+    t.mip_count = covered;
+    t.data.assign(data.begin() + off, data.begin() + off + total);
     return t;
 }
 
@@ -372,6 +489,61 @@ Scope load_scope(PackageManager& pm, TagHash tag) {
     s.name = c_string_at(r, r.pointer_at(0x08));
     for (size_t i = 0; i < size_t(ScopeStage::Count); ++i) s.stages[i] = read_core(pm, r, 0x48 + i * 0x80);
     return s;
+}
+
+ScopeStage scope_stage(ShaderStage stage) {
+    switch (stage) {
+    case ShaderStage::Vertex: return ScopeStage::Vertex;
+    case ShaderStage::Pixel: return ScopeStage::Pixel;
+    case ShaderStage::Geometry: return ScopeStage::Geometry;
+    case ShaderStage::Hull: return ScopeStage::Hull;
+    case ShaderStage::Domain: return ScopeStage::Domain;
+    case ShaderStage::Compute: return ScopeStage::Compute;
+    default: throw std::invalid_argument("Invalid shader stage");
+    }
+}
+
+std::vector<Scope> load_technique_scopes(PackageManager& pm, const RenderGlobals& globals, const Technique& technique) {
+    std::vector<Scope> scopes;
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+        if (!(technique.used_scopes & (uint64_t{1} << bit))) continue;
+        if (bit >= globals.scopes.size())
+            throw std::runtime_error(std::format("{}: unknown shared scope bit {}", technique.tag.str(), bit));
+        const auto& [name, tag] = globals.scopes[bit];
+        auto scope = load_scope(pm, tag);
+        if (scope.name != name) throw std::runtime_error("Render globals scope name/order mismatch");
+        scopes.push_back(std::move(scope));
+    }
+    return scopes;
+}
+
+StageResourceSources resolve_stage_resources(const Technique& technique, ShaderStage stage,
+                                             std::span<const Scope* const> scopes) {
+    StageResourceSources result;
+    auto apply = [&](const TechniqueStage& core, TagHash owner) {
+        const auto assignments = inspect_tfx_bindings(core.bytecode);
+        for (const auto& texture : core.textures) {
+            result.textures[texture.slot] = texture.texture;
+            result.extern_textures.erase(texture.slot);
+        }
+        for (const auto& texture : assignments.extern_textures) {
+            result.extern_textures[texture.slot] = texture;
+            result.textures.erase(texture.slot);
+        }
+        for (const auto& texture : assignments.extern_uavs) result.extern_uavs[texture.slot] = texture;
+        for (const auto& sampler : assignments.samplers) {
+            if (sampler.index >= core.samplers.size()) throw std::runtime_error("Shared sampler index out of bounds");
+            result.samplers[sampler.slot] = core.samplers[sampler.index];
+        }
+        if (!owner.is_none() && core.cbuffer_slot > 0 && (!core.cbuffer_init.empty() || !core.bytecode.empty()))
+            result.cbuffer_scopes[uint32_t(core.cbuffer_slot)] = owner;
+    };
+    for (const auto* scope : scopes) {
+        if (!scope) throw std::invalid_argument("Null original scope");
+        apply(scope->stages[size_t(scope_stage(stage))], scope->tag);
+    }
+    apply(technique.stage(stage), TagHash());
+    return result;
 }
 
 std::vector<std::vector<InputElement>> load_input_layouts(PackageManager& pm) {
@@ -445,6 +617,35 @@ std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> bc) {
         for (uint32_t k = 0; k < count; ++k, o += 32) {  // stream, name, index, sysvalue, type, reg, mask, min precision
             const uint32_t name = u32(o + 4), sysvalue = u32(o + 12);
             if (sysvalue != 0) continue;
+            ShaderInput in;
+            for (size_t c = base + name; c < bc.size() && bc[c]; ++c) in.semantic += char(bc[c]);
+            in.index = u32(o + 8);
+            in.reg = u32(o + 20);
+            out.push_back(std::move(in));
+        }
+    }
+    return out;
+}
+
+std::vector<ShaderInput> shader_outputs(std::span<const uint8_t> bc) {
+    auto u32 = [&](size_t o) {
+        if (o + 4 > bc.size()) throw std::runtime_error("DXBC truncated");
+        uint32_t v;
+        std::memcpy(&v, bc.data() + o, 4);
+        return v;
+    };
+    if (bc.size() < 32 || std::memcmp(bc.data(), "DXBC", 4) != 0) throw std::runtime_error("not DXBC");
+    std::vector<ShaderInput> out;
+    const uint32_t parts = u32(28);
+    for (uint32_t i = 0; i < parts; ++i) {
+        const size_t part = u32(32 + size_t(i) * 4);
+        if (std::memcmp(bc.data() + part, "OSG1", 4) != 0) continue;
+        const size_t base = part + 8;
+        const uint32_t count = u32(base);
+        size_t o = base + u32(base + 4);
+        for (uint32_t k = 0; k < count; ++k, o += 32) {  // stream, name, index, sysvalue, type, reg, mask, min precision
+            const uint32_t name = u32(o + 4), sysvalue = u32(o + 12);
+            (void)sysvalue;
             ShaderInput in;
             for (size_t c = base + name; c < bc.size() && bc[c]; ++c) in.semantic += char(bc[c]);
             in.index = u32(o + 8);

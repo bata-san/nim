@@ -1,5 +1,10 @@
 # nim — Marathon アセットビューワー 設計書
 
+> Rendering sections below contain historical descriptions of the approximate renderer.
+> Those substitutions have been removed. Current behavior, missing producers and limitations
+> are documented in [RENDERING.md](RENDERING.md). Complete game reproduction remains unfinished.
+
+
 対象: Bungie『Marathon』(2026, PC/Steam 版, Tiger エンジン系。tiger-pkg 内のコード名は "Goliath")
 言語/基盤: C++23 / MSVC / CMake / Direct3D 12 / Dear ImGui(予定)
 

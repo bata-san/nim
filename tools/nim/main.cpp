@@ -10,6 +10,7 @@
 #include "nim/content/strings.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
+#include "nim/content/object_channels.hpp"
 #include "nim/render/scene.hpp"
 
 #include "imgui.h"
@@ -452,11 +453,12 @@ public:
         thumbs_.clear();
         results_.clear();
     }
-    void request_live(TagHash t, int permutation = -1) {
+    void request_live(TagHash t, int permutation = -1, ChannelValues channels = {}) {
         {
             std::lock_guard lk(m_);
             live_ = t;
             live_permutation_ = permutation;
+            live_channels_ = std::move(channels);
         }
         cv_.notify_all();
     }
@@ -496,6 +498,7 @@ private:
             TagHash tag;
             bool thumb = false;
             int permutation = -1;
+            ChannelValues channels;
             {
                 std::unique_lock lk(m_);
                 cv_.wait(lk, [&] { return quit_ || live_ || !thumbs_.empty(); });
@@ -503,6 +506,8 @@ private:
                 if (live_) {
                     tag = *live_;
                     permutation = live_permutation_;
+                    channels = std::move(live_channels_);
+                    live_channels_.clear();
                     live_.reset();
                     working_live_ = true;
                 } else {
@@ -532,10 +537,11 @@ private:
                     // The entity components hold the materials; index them once.
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
                     auto it = materials_->find(tag.value);
-                    r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation);
+                    r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation,
+                                                   channels.empty() ? nullptr : &channels);
                     if (!thumb) find_animation(*pm, r);
                 } else {
-                    r.mesh = prepare_static_mesh(*pm, tag);
+                    r.mesh = prepare_static_mesh(*pm, tag, channels.empty() ? nullptr : &channels);
                 }
             } catch (const std::exception& ex) {
                 r.error = ex.what();
@@ -574,6 +580,7 @@ private:
     bool quit_ = false, working_live_ = false;
     std::optional<TagHash> live_;
     int live_permutation_ = -1;
+    ChannelValues live_channels_;
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
     std::optional<std::unordered_map<uint32_t, ModelRig>> rigs_;
     std::optional<std::vector<ClipInfo>> clips_;
@@ -674,7 +681,7 @@ struct Camera {
     float fly_speed = 1;
 };
 
-enum class Engine : int { Game, Nim };
+enum class Engine : int { Game };
 
 enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabText, TabDialogue, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; const char* title; const char* id; bool closable; };
@@ -711,6 +718,7 @@ public:
     GameLighting game_lighting;
     bool game_ready = false;
     Engine engine = Engine::Game;
+    std::string render_error;
     LightingParams light;
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
@@ -719,8 +727,11 @@ public:
     bool capture_requested = false;
     bool show_fps = true;
     TagHash scene_component;
+    ChannelValues channel_overrides;  // object channels the user set for the live mesh
     uint32_t scene_permutation = 0, scene_permutation_count = 0;
     bool keep_camera = false;
+    float material_time = 0, material_speed = 1;
+    bool material_playing = true;
 
     // Skeletal animation of the live model (clips are sampled at 30 fps).
     struct Animation {
@@ -818,8 +829,7 @@ public:
             for (const auto& n : game_lighting.notes()) info("  " + n);
         } catch (const std::exception& ex) {
             game_ready = false;
-            engine = Engine::Nim;
-            error(std::format("ゲームのライティングを使えません (nim のライティングで表示): {}", ex.what()));
+            error(std::format("ゲームのライティングを使えません (代替描画は無効): {}", ex.what()));
         }
         try {
             thumb_lighting.release(gpu);
@@ -830,8 +840,61 @@ public:
         }
     }
 
+    // Object channels: the per-object state values the materials read (frozen, in a heat cascade,
+    // damage, dissolve ...). Editing one re-evaluates the materials' TFX with the new value.
+    void channels_panel() {
+        const auto& used = scene.channels();
+        if (used.empty()) return;
+        ImGui::Spacing();
+        if (!ImGui::CollapsingHeader(std::format("オブジェクトの状態 (チャネル {})###channels", used.size()).c_str(),
+                                     ImGuiTreeNodeFlags_DefaultOpen))
+            return;
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("マテリアルが読む値 (氷結・ヒートカスケード・ダメージ・ディゾルブなど)。名前が不明なものはハッシュ表示");
+        ImGui::PopTextWrapPos();
+        bool changed = false;
+        if (ImGui::BeginTable("##channels", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("チャネル", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("段", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("値", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableHeadersRow();
+            for (const auto& [hash, use] : used) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                const char* name = object_channel_name(hash);
+                const bool overridden = channel_overrides.count(hash) != 0;
+                if (overridden) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.8f, 0.3f, 1});
+                ImGui::TextUnformatted(name ? name : std::format("{:08X}", hash).c_str());
+                if (overridden) ImGui::PopStyleColor();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s%s", use.vs ? "VS" : "", use.ps ? (use.vs ? "+PS" : "PS") : "");
+                ImGui::TableNextColumn();
+                float4 v = overridden ? channel_overrides[hash] : use.value;
+                ImGui::PushID(int(hash));
+                const ImGuiStyle& st = ImGui::GetStyle();
+                ImGui::SetNextItemWidth(-(ImGui::CalcTextSize("01").x + st.FramePadding.x * 4 + st.ItemSpacing.x * 2));
+                if (ImGui::DragFloat4("##v", v.data(), 0.01f, -10.0f, 10.0f, "%.2f")) {
+                    channel_overrides[hash] = v;
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0")) { channel_overrides[hash] = {0, 0, 0, 0}; changed = true; }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("1")) { channel_overrides[hash] = {1, 1, 1, 1}; changed = true; }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (!channel_overrides.empty() && ImGui::SmallButton("既定値に戻す")) {
+            channel_overrides.clear();
+            changed = true;
+        }
+        if (changed) scene.set_channels(channel_overrides);
+    }
+
     void request_load(TagHash tag) {
         if (loading && *loading == tag) return;
+        channel_overrides.clear();
         loading = tag;
         worker.request_live(tag);
     }
@@ -861,7 +924,10 @@ public:
                         anim->dirty = true;  // same model reloaded (variant / channels): pose it again
                     }
                     keep_camera = prev == scene.tag();
-                    if (!keep_camera) frame_scene();
+                    if (!keep_camera) {
+                        frame_scene();
+                        material_time = 0;
+                    }
                     double up = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     size_t stubbed = 0;
                     for (const auto& gi : scene.groups()) stubbed += gi.stubbed_ops.size();
@@ -898,8 +964,12 @@ public:
             thumb_scene.render_gbuffer(g, cl, thumb_gb, vm);
             LightingParams lp = light;
             lp.mode = ViewMode::Lit;
-            if (thumb_game_ready) thumb_lighting.render(g, cl, thumb_gb, vm, lp);
-            else lighting.render(g, cl, thumb_gb, vm, lp);
+            lp.time = lp.delta_time = 0;
+            if (thumb_game_ready)
+                thumb_lighting.render(g, cl, thumb_gb, vm, lp, [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+                    thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm);
+                });
+            else throw std::runtime_error("Original game lighting is unavailable; thumbnail rendering stopped");
             if (!t.tex) {
                 t.tex = g.texture2d(kThumbSize, kThumbSize, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
@@ -1036,12 +1106,33 @@ public:
     void record(ID3D12GraphicsCommandList* cl) {
         if (!gb.lit) return;
         update_animation(ImGui::GetIO().DeltaTime);
+        const float material_dt = material_playing ? ImGui::GetIO().DeltaTime * material_speed : 0;
+        material_time += material_dt;
+        scene.set_material_frame(material_time, material_dt);
+        light.time = material_time;
+        light.delta_time = material_dt;
         ViewMatrices vm = make_view(current_view());
-        scene.render_gbuffer(gpu, cl, gb, vm);
-        if (engine == Engine::Game && game_ready && light.mode == ViewMode::Lit)
-            game_lighting.render(gpu, cl, gb, vm, light);
-        else
-            lighting.render(gpu, cl, gb, vm, light);
+        try {
+            scene.render_gbuffer(gpu, cl, gb, vm);
+            if (light.mode == ViewMode::Lit) {
+                if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
+                GameLighting::TransparentFn transparents;
+                if (scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+                    scene.render_transparent(gpu, c, gb, hdr, vm);
+                };
+                game_lighting.render(gpu, cl, gb, vm, light, transparents);
+            } else lighting.render(gpu, cl, gb, vm, light);
+            render_error.clear();
+        } catch (const std::exception& ex) {
+            if (render_error != ex.what()) error(std::format("描画停止 (代替なし): {}", ex.what()));
+            render_error = ex.what();
+            capture_requested = false;
+            // This is an explicit error surface, never a replacement material or lit scene.
+            Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const float clear[4] = {0, 0, 0, 1};
+            cl->ClearRenderTargetView(gb.lit_rtv, clear, 0, nullptr);
+            Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
     }
 
     void after_frame() {
@@ -1054,7 +1145,7 @@ public:
             fs::path dir = exe_dir() / "captures";
             fs::create_directories(dir);
             auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
-            const char* kind = light.mode != ViewMode::Lit ? "debug" : engine == Engine::Game ? "game" : "nim";
+            const char* kind = light.mode != ViewMode::Lit ? "debug" : "game";
             fs::path file = dir / std::format("{}_{}_{}.png", scene.loaded() ? scene.tag().str() : "empty", kind, stamp);
             write_png(file, gb.width(), gb.height(), px);
             info("保存しました: " + to_utf8(file.wstring()));
@@ -1212,12 +1303,7 @@ public:
         if (ImGui::Button("フォルダを選択…"))
             if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
         ImGui::SeparatorText("表示");
-        int e = int(engine);
-        ImGui::TextUnformatted("ライティング");
-        ImGui::RadioButton("ゲームのシェーダ (global_lighting_and_shading)", &e, int(Engine::Game));
-        ImGui::RadioButton("nim (GGX)", &e, int(Engine::Nim));
-        if (e == int(Engine::Game) && !game_ready) e = int(Engine::Nim);
-        engine = Engine(e);
+        ImGui::TextUnformatted("ゲームのシェーダのみ (代替描画なし)");
         ImGui::Checkbox("3D サムネイルを生成", &thumbnails_enabled);
         ImGui::Checkbox("FPS / VRAM を表示", &show_fps);
         if (ImGui::BeginCombo("第 2 言語", std::string(language_code(TextLanguage(language))).c_str())) {
@@ -1483,14 +1569,7 @@ public:
         }
         ImGui::SameLine(0, 4 * sc);
         ImGui::SetNextItemWidth(220 * sc);
-        const char* engines[] = {"GAME SHADING", "NIM GGX"};
-        if (ImGui::BeginCombo("##engine", (icon(ico::Light) + "  " + engines[int(engine)]).c_str())) {
-            if (ImGui::Selectable("GAME SHADING", engine == Engine::Game) && game_ready) engine = Engine::Game;
-            ImGui::SetItemTooltip("ゲーム自身の global_lighting_and_shading で陰影付け");
-            if (ImGui::Selectable("NIM GGX", engine == Engine::Nim)) engine = Engine::Nim;
-            ImGui::SetItemTooltip("nim の簡易 GGX ライティング");
-            ImGui::EndCombo();
-        }
+        ImGui::TextUnformatted("GAME SHADING / STRICT");
         ImGui::SameLine(0, 4 * sc);
         if (ImGui::Button(icon(ico::Frame).c_str())) frame_scene();
         ImGui::SetItemTooltip("全体を表示 (F)");
@@ -1508,12 +1587,17 @@ public:
             hud_text(dl, {origin.x + size.x - fs2.x - 10 * sc, origin.y + bar_h + 6 * sc + fs1.y}, IM_COL32(200, 200, 200, 255),
                      vram.c_str());
         }
+        if (!render_error.empty()) {
+            hud_text(dl, {origin.x + 12 * sc, origin.y + bar_h + 12 * sc}, IM_COL32(255, 100, 100, 255),
+                     "描画停止: ゲーム由来の入力が不足しています (代替描画なし)");
+            ImGui::TextWrapped("%s", render_error.c_str());
+        }
         // bottom-left HUD / messages
         if (scene.loaded()) {
             std::string hud = std::format("{}   LOD {}   r {:.2f}   {} groups{}", scene.tag().str(), scene.lod(),
                                           scene.radius(), scene.groups().size(),
                                           light.mode == ViewMode::Lit
-                                              ? (engine == Engine::Game ? "   GAME SHADING" : "   NIM GGX")
+                                              ? "   GAME SHADING"
                                               : "");
             hud_text(dl, {origin.x + 10 * sc, origin.y + size.y - ImGui::GetTextLineHeight() - 8 * sc},
                      IM_COL32(235, 235, 235, 230), hud.c_str());
@@ -1600,7 +1684,7 @@ public:
                     if (ImGui::SliderInt("マテリアル バリアント", &perm, 0, int(scene_permutation_count) - 1) &&
                         perm != int(scene_permutation)) {
                         loading = scene.tag();
-                        worker.request_live(scene.tag(), perm);
+                        worker.request_live(scene.tag(), perm, channel_overrides);
                         scene_permutation = uint32_t(perm);
                     }
                 }
@@ -1608,6 +1692,16 @@ public:
             for (const auto& n : scene.notes()) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "%s", n.c_str());
         }
         animation_panel();
+        if (ImGui::CollapsingHeader("マテリアルのアニメーション", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("再生##material", &material_playing);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("先頭に戻す##material")) material_time = 0;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::DragFloat("##material_time", &material_time, 0.01f, 0, 86400, "時刻 %.2f 秒")) material_playing = false;
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, "速度 %.2fx");
+        }
+        channels_panel();
         if (engine == Engine::Game && game_ready)
             ImGui::TextDisabled("シェーディング: %s (ゲームの global_lighting_and_shading)",
                                 game_lighting.shading_technique().str().c_str());

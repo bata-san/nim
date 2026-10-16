@@ -27,6 +27,8 @@ add_library(nim_core STATIC
   src/content/dialogue.cpp
   src/content/tfx.cpp
   src/content/tfx_vm.cpp
+  src/content/object_channels.cpp
+  src/content/map.cpp
   src/content/fonts.cpp
   src/content/animation.cpp
 )

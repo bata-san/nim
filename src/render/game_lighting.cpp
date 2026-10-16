@@ -2,6 +2,7 @@
 
 #include <d3dcompiler.h>
 
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -19,69 +20,73 @@ uint32_t fnv1(std::string_view s) {
 
 uint64_t tex_key(uint8_t id, uint32_t off) { return uint64_t(id) << 32 | off; }
 
-// What an engine texture nobody rendered should read as.
-float4 filler_value(uint8_t id, uint32_t byte_offset) {
-    switch (id) {
-    case ext::ShadowMask: return {1, 1, 1, 1};  // unshadowed, unoccluded
-    case ext::Atmosphere:
-        // 0x108: the froxel volume (x = transmittance, y = sky visibility, z = in-scatter amount):
-        // clear air. Everything else: black, opaque.
-        if (byte_offset == 0x108) return {1, 1, 0, 1};
-        if (byte_offset == 0x80) return {1, 1, 1, 1};  // fog density noise: none
-        return {0, 0, 0, 1};
-    case ext::Transparent: return byte_offset == 0x50 ? float4{1, 1, 1, 1} : float4{0, 0, 0, 0};
-    default: return {0, 0, 0, 0};
-    }
-}
-
 bool kind_is_texture(BindingKind k) {
     return k == BindingKind::Texture2D || k == BindingKind::Texture3D || k == BindingKind::TextureCube ||
-           k == BindingKind::Texture2DArray || k == BindingKind::TextureCubeArray || k == BindingKind::Texture1D;
+           k == BindingKind::Texture2DArray || k == BindingKind::TextureCubeArray || k == BindingKind::Texture1D ||
+           k == BindingKind::Texture1DArray || k == BindingKind::Texture2DMS || k == BindingKind::Texture2DMSArray;
 }
 
 bool resource_fits(ID3D12Resource* r, BindingKind k) {
     D3D12_RESOURCE_DESC d = r->GetDesc();
     switch (k) {
+    case BindingKind::Texture1D: case BindingKind::Texture1DArray:
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    case BindingKind::Texture2DMS: case BindingKind::Texture2DMSArray:
+        return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count > 1;
     case BindingKind::Texture3D: return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     case BindingKind::TextureCube:
     case BindingKind::TextureCubeArray:
         return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize % 6 == 0;
     case BindingKind::Texture2D:
-    case BindingKind::Texture2DArray: return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    case BindingKind::Texture2DArray: return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1;
     default: return false;
     }
 }
 
-void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKind k, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKind k, D3D12_CPU_DESCRIPTOR_HANDLE h, uint32_t stride = 0, uint32_t elements = 0, uint64_t first = 0) {
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (!r) {  // null descriptor: reads return zero
-        sd.Format = DXGI_FORMAT_R32_FLOAT;
-        switch (k) {
-        case BindingKind::Texture3D: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; sd.Texture3D.MipLevels = 1; break;
-        case BindingKind::TextureCube: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; sd.TextureCube.MipLevels = 1; break;
-        case BindingKind::Texture2DArray:
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-            sd.Texture2DArray.MipLevels = 1;
-            sd.Texture2DArray.ArraySize = 1;
-            break;
-        case BindingKind::TextureCubeArray:
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-            sd.TextureCubeArray.MipLevels = 1;
-            sd.TextureCubeArray.NumCubes = 1;
-            break;
-        case BindingKind::TypedBuffer: case BindingKind::RawBuffer: case BindingKind::StructuredBuffer:
-            sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            sd.Buffer.NumElements = 1;
-            break;
-        default: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1; break;
-        }
-        dev->CreateShaderResourceView(nullptr, &sd, h);
-        return;
-    }
+    if (!r) throw std::runtime_error("Missing game texture (null resource)");
     D3D12_RESOURCE_DESC d = r->GetDesc();
     sd.Format = fmt != DXGI_FORMAT_UNKNOWN ? fmt : d.Format;
     switch (k) {
+    case BindingKind::RawBuffer:
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        sd.Buffer.FirstElement = first;
+        sd.Buffer.NumElements = elements ? elements : UINT(d.Width / 4 - first);
+        break;
+    case BindingKind::StructuredBuffer:
+        if (!stride) throw std::runtime_error("Original structured SRV stride is required");
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.StructureByteStride = stride;
+        sd.Buffer.FirstElement = first;
+        sd.Buffer.NumElements = elements ? elements : UINT(d.Width / stride - first);
+        break;
+    case BindingKind::TypedBuffer:
+        if (fmt == DXGI_FORMAT_UNKNOWN || !elements) throw std::runtime_error("Original typed SRV format/element count is required");
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.FirstElement = first;
+        sd.Buffer.NumElements = elements;
+        break;
+    case BindingKind::Texture1D:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+        sd.Texture1D.MipLevels = UINT(-1);
+        break;
+    case BindingKind::Texture1DArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+        sd.Texture1DArray.MipLevels = UINT(-1);
+        sd.Texture1DArray.ArraySize = d.DepthOrArraySize;
+        break;
+    case BindingKind::Texture2DMS:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        break;
+    case BindingKind::Texture2DMSArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        sd.Texture2DMSArray.ArraySize = d.DepthOrArraySize;
+        break;
     case BindingKind::Texture3D:
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         sd.Texture3D.MipLevels = UINT(-1);
@@ -108,47 +113,79 @@ void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKin
     dev->CreateShaderResourceView(r, &sd, h);
 }
 
+void validate_resource_view(const ExternStore::Tex& view, BindingKind kind, bool uav) {
+    if (!view.resource) throw std::runtime_error("Missing original resource view");
+    const auto desc = view.resource->GetDesc();
+    if (kind == BindingKind::StructuredBuffer && (!view.stride || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER))
+        throw std::runtime_error("Original structured-buffer stride is required");
+    if (kind == BindingKind::TypedBuffer && (view.format == DXGI_FORMAT_UNKNOWN || !view.elements || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER))
+        throw std::runtime_error("Original typed-buffer format and element count are required");
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const uint32_t stride = kind == BindingKind::RawBuffer ? 4 : view.stride;
+        if (stride && (view.first_element > desc.Width / stride || uint64_t(view.elements) > desc.Width / stride - view.first_element))
+            throw std::runtime_error("Original buffer view is outside the resource");
+    }
+    if (kind == BindingKind::RawBuffer && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        throw std::runtime_error("Raw view requires an original buffer resource");
+    if (kind_is_texture(kind) && !resource_fits(view.resource, kind)) throw std::runtime_error("Original resource dimension mismatch");
+    if (uav && (kind == BindingKind::TextureCube || kind == BindingKind::TextureCubeArray || kind == BindingKind::Texture2DMS || kind == BindingKind::Texture2DMSArray))
+        throw std::runtime_error("Cube UAV requires the original array view");
+}
+
+void write_uav(ID3D12Device* dev, const ExternStore::Tex& view, BindingKind kind, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    validate_resource_view(view, kind, true);
+    const auto resource = view.resource->GetDesc();
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+    desc.Format = view.format == DXGI_FORMAT_UNKNOWN ? resource.Format : view.format;
+    if (kind == BindingKind::Texture1D) desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+    else if (kind == BindingKind::Texture1DArray) {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+        desc.Texture1DArray.ArraySize = resource.DepthOrArraySize;
+    } else if (kind == BindingKind::Texture2D) desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    else if (kind == BindingKind::Texture3D) {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        desc.Texture3D.WSize = resource.DepthOrArraySize;
+    } else if (kind == BindingKind::Texture2DArray) {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        desc.Texture2DArray.ArraySize = resource.DepthOrArraySize;
+    } else if (kind == BindingKind::RawBuffer || kind == BindingKind::StructuredBuffer || kind == BindingKind::TypedBuffer) {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        desc.Buffer.FirstElement = view.first_element;
+        if (kind == BindingKind::RawBuffer) {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            desc.Buffer.NumElements = view.elements ? view.elements : UINT(resource.Width / 4 - view.first_element);
+        } else if (kind == BindingKind::StructuredBuffer) {
+            desc.Format = DXGI_FORMAT_UNKNOWN;
+            desc.Buffer.StructureByteStride = view.stride;
+            desc.Buffer.NumElements = view.elements ? view.elements : UINT(resource.Width / view.stride - view.first_element);
+        } else desc.Buffer.NumElements = view.elements;
+    } else throw std::runtime_error("Unsupported original UAV view dimension");
+    dev->CreateUnorderedAccessView(view.resource, nullptr, &desc, handle);
+}
+
 D3D12_STATIC_SAMPLER_DESC static_sampler(const SamplerDesc& s, uint32_t reg, D3D12_SHADER_VISIBILITY vis) {
     D3D12_STATIC_SAMPLER_DESC d{};
     d.Filter = D3D12_FILTER(s.filter);
-    d.AddressU = D3D12_TEXTURE_ADDRESS_MODE(std::clamp<uint32_t>(s.address_u, 1, 5));
-    d.AddressV = D3D12_TEXTURE_ADDRESS_MODE(std::clamp<uint32_t>(s.address_v, 1, 5));
-    d.AddressW = D3D12_TEXTURE_ADDRESS_MODE(std::clamp<uint32_t>(s.address_w, 1, 5));
-    d.MipLODBias = std::min(s.mip_lod_bias, 0.0f);
-    d.MaxAnisotropy = std::clamp<uint32_t>(s.max_anisotropy, 1, 16);
-    d.ComparisonFunc = D3D12_COMPARISON_FUNC(std::clamp<uint32_t>(s.comparison_func, 1, 8));
-    d.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    if (s.address_u < 1 || s.address_u > 5 || s.address_v < 1 || s.address_v > 5 || s.address_w < 1 || s.address_w > 5 ||
+        s.max_anisotropy > 16 || s.comparison_func < 1 || s.comparison_func > 8)
+        throw std::runtime_error("Invalid original sampler state");
+    d.AddressU = D3D12_TEXTURE_ADDRESS_MODE(s.address_u);
+    d.AddressV = D3D12_TEXTURE_ADDRESS_MODE(s.address_v);
+    d.AddressW = D3D12_TEXTURE_ADDRESS_MODE(s.address_w);
+    d.MipLODBias = s.mip_lod_bias;
+    d.MaxAnisotropy = s.max_anisotropy;
+    d.ComparisonFunc = D3D12_COMPARISON_FUNC(s.comparison_func);
+    const std::array<float, 4> border{s.border_color[0], s.border_color[1], s.border_color[2], s.border_color[3]};
+    if (border == float4{0, 0, 0, 0}) d.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    else if (border == float4{0, 0, 0, 1}) d.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    else if (border == float4{1, 1, 1, 1}) d.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    else throw std::runtime_error("Original sampler requires a dynamic border-color sampler");
     d.MinLOD = s.min_lod;
     d.MaxLOD = s.max_lod;
     d.ShaderRegister = reg;
     d.ShaderVisibility = vis;
     return d;
-}
-
-SamplerDesc linear_clamp() {
-    SamplerDesc s;
-    s.filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    s.address_u = s.address_v = s.address_w = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    return s;
-}
-
-ScopeStage scope_stage(ShaderStage s) {
-    switch (s) {
-    case ShaderStage::Vertex: return ScopeStage::Vertex;
-    case ShaderStage::Geometry: return ScopeStage::Geometry;
-    case ShaderStage::Hull: return ScopeStage::Hull;
-    case ShaderStage::Domain: return ScopeStage::Domain;
-    case ShaderStage::Compute: return ScopeStage::Compute;
-    default: return ScopeStage::Pixel;
-    }
-}
-
-void sanitize(std::vector<float4>& cb) {
-    for (auto& v : cb)
-        for (auto& c : v) {
-            if (std::isnan(c)) c = 0;
-            else if (std::isinf(c)) c = std::copysign(3.0e38f, c);
-        }
 }
 
 ComPtr<ID3D12RootSignature> serialize(ID3D12Device* dev, const D3D12_ROOT_SIGNATURE_DESC& rsd, const char* what) {
@@ -163,54 +200,161 @@ ComPtr<ID3D12RootSignature> serialize(ID3D12Device* dev, const D3D12_ROOT_SIGNAT
 
 } // namespace
 
+void write_null_srv(ID3D12Device* device, BindingKind kind, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    switch (kind) {
+    case BindingKind::RawBuffer:
+        sd.Format = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        sd.Buffer.NumElements = 1;
+        break;
+    case BindingKind::StructuredBuffer:
+        sd.Format = DXGI_FORMAT_UNKNOWN;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.StructureByteStride = 16;
+        sd.Buffer.NumElements = 1;
+        break;
+    case BindingKind::TypedBuffer:
+        sd.Format = DXGI_FORMAT_R32_UINT;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.NumElements = 1;
+        break;
+    case BindingKind::Texture1D: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D; sd.Texture1D.MipLevels = 1; break;
+    case BindingKind::Texture1DArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY; sd.Texture1DArray.MipLevels = 1; sd.Texture1DArray.ArraySize = 1;
+        break;
+    case BindingKind::Texture2DMS: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS; break;
+    case BindingKind::Texture2DMSArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY; sd.Texture2DMSArray.ArraySize = 1;
+        break;
+    case BindingKind::Texture3D: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; sd.Texture3D.MipLevels = 1; break;
+    case BindingKind::TextureCube: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; sd.TextureCube.MipLevels = 1; break;
+    case BindingKind::TextureCubeArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY; sd.TextureCubeArray.MipLevels = 1; sd.TextureCubeArray.NumCubes = 1;
+        break;
+    case BindingKind::Texture2DArray:
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; sd.Texture2DArray.MipLevels = 1; sd.Texture2DArray.ArraySize = 1;
+        break;
+    default: sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1; break;
+    }
+    device->CreateShaderResourceView(nullptr, &sd, handle);
+}
+
+void write_game_srv(ID3D12Device* device, const ExternStore::Tex& view, BindingKind kind,
+                    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    validate_resource_view(view, kind, false);
+    write_srv(device, view.resource, view.format, kind, handle, view.stride, view.elements, view.first_element);
+}
+
 // ---- ExternStore ------------------------------------------------------------------------------
-ExternStore::ExternStore() : data_(size_t(kBlockSize) * kBlocks, 0) {
-    // Engine defaults (cross-checked with goriath's extern definitions).
-    set(ext::Frame, 0x18, 1.0f / 60.0f);  // exposure_time
-    set(ext::Frame, 0x1C, 1.0f);          // exposure_scale
-    set(ext::Frame, 0x28, 1.0f);          // exposure_illum_relative
-    set(ext::Frame, 0x70, 0.5f);
-    set(ext::Frame, 0x160, float4{0.1f, 0.1f, 0.1f, 1.0f});  // wind
-    set(ext::Frame, 0x180, float4{0.1f, 0.1f, 0.1f, 0.0f});
-    set(ext::Frame, 0x1B0, float4{0, 0, 0, 1});
-    set(ext::Frame, 0x1C0, float4{0, 0, 1, 0});
-    set(ext::Frame, 0x250, float4{1, 0, 1, 0});
-    set(ext::Frame, 0x280, float4{1, 1, 1, 1});
-    set(ext::View, 0x40, float4{-1, -1, -1, -1});
-    set(ext::Deferred, 0x00, float4{1.0f / 50000.0f, 1.0f / 0.02f, 0, 0});
-    set(ext::Deferred, 0x40, float4{1920, 1080, 0, 0});
-    for (uint32_t o = 0x100; o <= 0x130; o += 0x10) set(ext::DeferredLight, o, float4{0, 0, 0, 1});
-    set(ext::DeferredLight, 0x154, 7500.0f);
-    set(ext::RigidModel, 0x40, float4{1, 1, 1, 1});
-    set(ext::RigidModel, 0x60, float4{1, 1, 0, 0});
-    set(ext::GlobalLighting, 0x30, float4{0, 0, -1, 0});
+ExternStore::ExternStore() : data_(size_t(kBlockSize) * kBlocks, 0), present_(data_.size(), 0) {}
+
+void ExternStore::require(uint8_t id, uint32_t off, uint32_t size) const {
+    if (id >= kBlocks || off > kBlockSize || size > kBlockSize - off)
+        throw std::out_of_range("extern offset");
+    const size_t base = size_t(id) * kBlockSize + off;
+    if (!std::all_of(present_.begin() + base, present_.begin() + base + size, [](uint8_t v) { return v != 0; })) {
+        if (auto it = zero_policy_.find(id); it != zero_policy_.end()) {  // data_ is zero there
+            note_estimate(std::format("extern {} +0x{:X} = 0 ({} bytes)", id, off, size), it->second);
+            return;
+        }
+        throw std::runtime_error(std::format("Missing game extern {} at byte 0x{:X} ({} bytes); no replacement is permitted", id, off, size));
+    }
+}
+
+bool ExternStore::has(uint8_t id, uint32_t off, uint32_t size) const {
+    if (id >= kBlocks || off > kBlockSize || size > kBlockSize - off) return false;
+    const size_t base = size_t(id) * kBlockSize + off;
+    return std::all_of(present_.begin() + base, present_.begin() + base + size, [](uint8_t v) { return v != 0; });
+}
+
+void ExternStore::note_estimate(std::string what, std::string_view why) const { estimates_.try_emplace(std::move(what), why); }
+
+bool ExternStore::estimate_null_texture(uint8_t id, uint32_t off) const {
+    auto it = zero_policy_.find(id);
+    if (it == zero_policy_.end()) return false;
+    note_estimate(std::format("extern {} +0x{:X} texture (null view)", id, off), it->second);
+    return true;
+}
+
+void ExternStore::estimate(uint8_t id, uint32_t off, float4 v, std::string_view why) {
+    set(id, off, v);
+    note_estimate(std::format("extern {} +0x{:X} = ({:g}, {:g}, {:g}, {:g})", id, off, v[0], v[1], v[2], v[3]), why);
+}
+
+void ExternStore::estimate(uint8_t id, uint32_t off, const M4& m, std::string_view why) {
+    set(id, off, m);
+    note_estimate(std::format("extern {} +0x{:X} mat4", id, off), why);
+}
+
+void ExternStore::estimate_texture(uint8_t id, uint32_t off, ID3D12Resource* r, std::string_view why) {
+    set_texture(id, off, r);
+    note_estimate(std::format("extern {} +0x{:X} texture", id, off), why);
+}
+
+void ExternStore::estimate_frame_constants(const std::array<float4, 16>& constants, std::string_view why) {
+    set_frame_constants(constants);
+    note_estimate("frame cb13 (exposure, temporal seeds)", why);
+}
+
+const std::array<float4, 16>& ExternStore::frame_constants() const {
+    if (!has_frame_) throw std::runtime_error("Missing engine-produced frame scope cb13 (exposure / temporal state)");
+    return frame_;
+}
+
+void ExternStore::set_scope_constants(uint32_t reg, std::span<const float4> values) {
+    if (values.empty()) throw std::invalid_argument("Empty engine scope");
+    std::vector<float4> constants(values.begin(), values.end());
+    scopes_[reg] = std::move(constants);
+}
+
+const std::vector<float4>& ExternStore::scope_constants(uint32_t reg) const {
+    const auto it = scopes_.find(reg);
+    if (it == scopes_.end()) throw std::runtime_error(std::format("Missing engine-produced shared scope b{}", reg));
+    return it->second;
+}
+
+void ExternStore::set_scope_constants(ShaderStage stage, uint32_t reg, std::span<const float4> values) {
+    if (values.empty()) throw std::invalid_argument("Empty engine scope");
+    std::vector<float4> constants(values.begin(), values.end());
+    stage_scopes_[{stage, reg}] = std::move(constants);
+}
+
+const std::vector<float4>& ExternStore::scope_constants(ShaderStage stage, uint32_t reg) const {
+    if (auto it = stage_scopes_.find({stage, reg}); it != stage_scopes_.end()) return it->second;
+    return scope_constants(reg);
 }
 
 void ExternStore::set(uint8_t id, uint32_t off, float v) {
     if (id >= kBlocks || off + 4 > kBlockSize) throw std::out_of_range("extern offset");
     std::memcpy(data_.data() + size_t(id) * kBlockSize + off, &v, 4);
+    std::fill_n(present_.begin() + size_t(id) * kBlockSize + off, 4, uint8_t{1});
 }
 void ExternStore::set(uint8_t id, uint32_t off, float4 v) {
     if (id >= kBlocks || off + 16 > kBlockSize) throw std::out_of_range("extern offset");
     std::memcpy(data_.data() + size_t(id) * kBlockSize + off, v.data(), 16);
+    std::fill_n(present_.begin() + size_t(id) * kBlockSize + off, 16, uint8_t{1});
 }
 void ExternStore::set(uint8_t id, uint32_t off, const M4& m) {
     for (int c = 0; c < 4; ++c) set(id, off + uint32_t(c) * 16, m.c[c]);
 }
 float ExternStore::get_f(uint8_t id, uint32_t off) const {
-    if (id >= kBlocks || off + 4 > kBlockSize) return 0;
+    require(id, off, 4);
     float v;
     std::memcpy(&v, data_.data() + size_t(id) * kBlockSize + off, 4);
     return v;
 }
 float4 ExternStore::get_v(uint8_t id, uint32_t off) const {
-    if (id >= kBlocks || off + 16 > kBlockSize) return {};
+    require(id, off, 16);
     float4 v;
     std::memcpy(v.data(), data_.data() + size_t(id) * kBlockSize + off, 16);
     return v;
 }
-void ExternStore::set_texture(uint8_t id, uint32_t off, ID3D12Resource* r, DXGI_FORMAT f) {
-    if (r) textures_[tex_key(id, off)] = {r, f};
+void ExternStore::set_texture(uint8_t id, uint32_t off, ID3D12Resource* r, DXGI_FORMAT f, uint32_t stride, uint32_t elements, uint64_t first_element) {
+    if (r) textures_[tex_key(id, off)] = {r, f, stride, elements, first_element};
     else textures_.erase(tex_key(id, off));
 }
 ExternStore::Tex ExternStore::texture(uint8_t id, uint32_t off) const {
@@ -226,35 +370,16 @@ TfxEnvironment ExternStore::environment() const {
     TfxEnvironment env;
     env.extern_vec4 = [this](uint8_t id, uint8_t off) { return get_v(id, uint32_t(off) * 16); };
     env.extern_float = [this](uint8_t id, uint8_t off) { return get_f(id, uint32_t(off) * 4); };
-    env.global_channel = [this](uint8_t ch) { return ch < channels.size() ? channels[ch] : float4{1, 1, 1, 1}; };
+    env.global_channel = [this](uint8_t ch) {
+        if (ch >= channels.size()) throw std::runtime_error(std::format("Missing game global channel {}", ch));
+        return channels[ch];
+    };
+    // nim loads every mip of a texture: the streaming state is "fully resident" (min mip 0).
+    env.texture_tiling = [this](uint8_t texture) {
+        note_estimate(std::format("texture {} tiling params = 0", texture), "nim loads all mips: fully resident (min resident mip 0)");
+        return float4{0, 0, 0, 0};
+    };
     return env;
-}
-
-// ---- FillerTextures -----------------------------------------------------------------------------
-ID3D12Resource* FillerTextures::get(Gpu& gpu, BindingKind kind, float4 v) {
-    const int k = kind == BindingKind::Texture3D ? 3
-                  : (kind == BindingKind::TextureCube || kind == BindingKind::TextureCubeArray) ? 6
-                  : kind == BindingKind::Texture2DArray ? 1 : 2;
-    auto key = std::make_pair(k, v);
-    auto it = cache_.find(key);
-    if (it != cache_.end()) return it->second.Get();
-    Texture t;
-    t.dxgi_format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    t.width = t.height = 1;
-    t.depth = k == 3 ? 1 : 1;
-    t.array_size = k == 6 ? 6 : 1;
-    const int texels = k == 6 ? 6 : 1;
-    t.data.resize(size_t(texels) * 16);
-    for (int i = 0; i < texels; ++i) std::memcpy(t.data.data() + i * 16, v.data(), 16);
-    ComPtr<ID3D12Resource> r;
-    if (k == 3) {  // Gpu::texture makes a 3D resource for depth > 1 only; build the 1x1x1 volume here
-        t.depth = 2;
-        t.data.resize(32);
-        std::memcpy(t.data.data() + 16, v.data(), 16);
-    }
-    r = gpu.texture(t);
-    cache_[key] = r;
-    return r.Get();
 }
 
 // ---- GamePipeline -----------------------------------------------------------------------------------
@@ -273,15 +398,22 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     release(gpu);
     tag_ = technique;
     Technique t = load_technique(pm, technique);
+    compute_ = t.bind_mode == 6;
+    if (!compute_ && t.bind_mode != 1) throw std::runtime_error("Unsupported original pipeline bind mode");
+    auto authored_scopes = load_technique_scopes(pm, load_render_globals(pm), t);
+    std::vector<const Scope*> scope_ptrs;
+    for (const auto& scope : authored_scopes) scope_ptrs.push_back(&scope);
+    scopes = scope_ptrs;
     ID3D12Device* dev = gpu.device();
 
     std::vector<D3D12_ROOT_PARAMETER> params;
     std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
     ranges.reserve(8);
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
-    std::vector<uint8_t> vs_code, ps_code;
+    std::vector<uint8_t> vs_code, ps_code, cs_code;
+    const std::vector<ShaderStage> active_stages = compute_ ? std::vector{ShaderStage::Compute} : std::vector{ShaderStage::Vertex, ShaderStage::Pixel};
 
-    for (ShaderStage which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+    for (ShaderStage which : active_stages) {
         const auto& ts = t.stage(which);
         if (ts.shader.is_none()) throw std::runtime_error(std::format("{}: missing {} shader", technique.str(),
                                                                       which == ShaderStage::Vertex ? "vertex" : "pixel"));
@@ -290,35 +422,17 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
         st.tfx = ts;
         auto code = load_shader_bytecode(pm, ts.shader);
         st.bindings = shader_bindings(code);
-        (which == ShaderStage::Vertex ? vs_code : ps_code) = std::move(code);
-        const auto vis = which == ShaderStage::Vertex ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+        (which == ShaderStage::Vertex ? vs_code : which == ShaderStage::Compute ? cs_code : ps_code) = std::move(code);
+        const auto vis = which == ShaderStage::Vertex ? D3D12_SHADER_VISIBILITY_VERTEX : which == ShaderStage::Compute ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL;
 
-        // Dry run for the texture / sampler assignments the bytecode makes.
-        TfxResult dry;
-        if (!ts.bytecode.empty()) {
-            std::vector<float4> cb(ts.cbuffer_init.begin(), ts.cbuffer_init.end());
-            cb.resize(std::max<size_t>(cb.size(), 256));
-            dry = run_tfx(ts.bytecode, ts.constants, cb, ExternStore().environment());
-        }
-        st.extern_textures = dry.extern_textures;
-        for (const auto& u : dry.unsupported) notes.push_back(std::format("{}: stubbed TFX op {}", ts.shader.str(), u));
-
-        std::map<uint32_t, TagHash> sampler_tags;
-        for (const Scope* sc : scopes) {
-            const auto& ss = sc->stages[size_t(scope_stage(which))];
-            if (ss.bytecode.empty()) continue;
-            std::vector<float4> cb(256);
-            TfxResult r = run_tfx(ss.bytecode, ss.constants, cb, ExternStore().environment());
-            for (const auto& s : r.samplers)
-                if (s.index < ss.samplers.size()) sampler_tags[s.slot] = ss.samplers[s.index];
-        }
-        for (const auto& s : dry.samplers)
-            if (s.index < ts.samplers.size()) sampler_tags[s.slot] = ts.samplers[s.index];
+        st.sources = resolve_stage_resources(t, which, scopes);
+        for (const auto& [slot, source] : st.sources.extern_textures) st.extern_textures.push_back(source);
+        for (const auto& [slot, source] : st.sources.extern_uavs) st.extern_uavs.push_back(source);
+        const auto& sampler_tags = st.sources.samplers;
 
         for (const auto& b : st.bindings) {
             if (b.space != 0) {
-                notes.push_back(std::format("{}: binding in space {} ignored", ts.shader.str(), b.space));
-                continue;
+                throw std::runtime_error(std::format("{}: unsupported register space {}", ts.shader.str(), b.space));
             }
             switch (b.type) {
             case BindingType::Cbv: {
@@ -338,22 +452,19 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
                 break;
             case BindingType::Sampler:
                 for (uint32_t r = b.lower; r <= std::min(b.upper, 15u); ++r) {
-                    SamplerDesc sd = linear_clamp();
-                    auto it = sampler_tags.find(r);
-                    if (it != sampler_tags.end()) {
-                        try {
-                            sd = load_sampler(pm, it->second);
-                        } catch (const std::exception& ex) {
-                            notes.push_back(std::format("s{}: {}", r, ex.what()));
-                        }
-                    } else {
-                        notes.push_back(std::format("{}: s{} has no sampler tag (linear clamp)", ts.shader.str(), r));
-                    }
+                    const auto it = sampler_tags.find(r);
+                    if (it == sampler_tags.end())
+                        throw std::runtime_error(std::format("{}: missing authored sampler s{}", ts.shader.str(), r));
+                    const auto sd = load_sampler(pm, it->second);
                     samplers.push_back(static_sampler(sd, r, vis));
                 }
                 break;
             case BindingType::Uav:
-                notes.push_back(std::format("{}: UAV u{} not supported", ts.shader.str(), b.lower));
+                if (b.upper >= 64) throw std::runtime_error("UAV range exceeds original pipeline descriptor capacity");
+                for (uint32_t reg = b.lower; reg <= b.upper; ++reg) {
+                    st.uav_kinds[reg] = b.kind;
+                    st.uav_count = std::max(st.uav_count, reg + 1);
+                }
                 break;
             default: break;
             }
@@ -368,14 +479,17 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
             params.push_back(p);
         }
 
-        // Textures the technique itself carries.
-        for (const auto& tb : ts.textures) {
-            try {
-                st.static_textures[tb.slot] = gpu.texture(load_texture(pm, tb.texture));
-            } catch (const std::exception& ex) {
-                notes.push_back(std::format("t{} {}: {}", tb.slot, tb.texture.str(), ex.what()));
-            }
+        if (st.uav_count) {
+            ranges.push_back({D3D12_DESCRIPTOR_RANGE_TYPE_UAV, st.uav_count, 0, 0, 0});
+            D3D12_ROOT_PARAMETER param{};
+            param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            param.DescriptorTable = {1, &ranges.back()};
+            param.ShaderVisibility = vis;
+            st.uav_table_param = int(params.size());
+            params.push_back(param);
         }
+        for (const auto& [slot, tag] : st.sources.textures)
+            st.static_textures[slot] = gpu.texture(load_texture(pm, tag));
         stages_.push_back(std::move(st));
     }
 
@@ -383,6 +497,12 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
                                   D3D12_ROOT_SIGNATURE_FLAG_NONE};
     root_sig_ = serialize(dev, rsd, "game pipeline root signature");
 
+    if (compute_) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = root_sig_.Get();
+        desc.CS = {cs_code.data(), cs_code.size()};
+        check_hr(dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso_)), "Original game compute pipeline");
+    } else {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root_sig_.Get();
     pd.VS = {vs_code.data(), vs_code.size()};
@@ -401,89 +521,166 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = FALSE;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
+    pd.NumRenderTargets = UINT(1 + opt.additional_rtv_formats.size());
+    if (pd.NumRenderTargets > 8) throw std::runtime_error("Too many original render targets");
     pd.RTVFormats[0] = opt.rtv_format;
+    for (size_t i = 0; i < opt.additional_rtv_formats.size(); ++i) pd.RTVFormats[i + 1] = opt.additional_rtv_formats[i];
+    for (const auto& output : shader_outputs(ps_code))
+        if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
+            throw std::runtime_error(std::format("{}: original PS requires SV_Target{}; attachment missing", technique.str(), output.index));
     pd.SampleDesc.Count = 1;
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
 
-    for (const auto& st : stages_) srv_total_ += st.srv_count;
+    }
+    for (const auto& st : stages_) srv_total_ += st.srv_count + st.uav_count;
     if (srv_total_) srv_first_ = gpu.srv().alloc(srv_total_ * kRing);
 }
 
 void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                        FillerTextures& fillers) {
+                        bool validated) {
+    if (compute_) throw std::runtime_error("Compute pipeline requires original dispatch dimensions");
+    execute(gpu, cl, ext, scopes, validated, 0, 0, 0);
+}
+
+void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                            uint32_t x, uint32_t y, uint32_t z) {
+    if (!compute_ || !x || !y || !z || x > 65535 || y > 65535 || z > 65535)
+        throw std::invalid_argument("Invalid original compute dispatch");
+    execute(gpu, cl, ext, scopes, false, x, y, z);
+}
+
+void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                           bool validated, uint32_t x, uint32_t y, uint32_t z) {
+    if (!validated) validate(ext, scopes);
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
     const TfxEnvironment env = ext.environment();
     const uint32_t base = srv_first_ + ring_ * srv_total_;
     ring_ = (ring_ + 1) % kRing;
 
-    cl->SetGraphicsRootSignature(root_sig_.Get());
+    if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
+    else cl->SetGraphicsRootSignature(root_sig_.Get());
     cl->SetPipelineState(pso_.Get());
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
     cl->SetDescriptorHeaps(1, heaps);
-    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    if (!compute_) cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-    DynamicAlloc zero = gpu.dynamic(4096);
-    std::memset(zero.cpu, 0, 4096);
     uint32_t off = 0;
     for (auto& st : stages_) {
-        std::vector<float4> cb(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
+        auto& cb = st.constants;
+        cb.assign(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
         cb.resize(std::max<size_t>(cb.size(), 256));
         std::vector<TfxExternTexture> textures = st.extern_textures;
-        if (!st.tfx.bytecode.empty()) {
-            try {
-                textures = run_tfx(st.tfx.bytecode, st.tfx.constants, cb, env).extern_textures;
-            } catch (const std::exception& ex) {
-                notes.push_back(std::format("{}: TFX error {}", st.tfx.shader.str(), ex.what()));
-            }
-        }
-        if (st.which == ShaderStage::Pixel)
-            for (auto [reg, v] : ps_overrides) {
-                if (reg >= cb.size()) cb.resize(reg + 1);
-                cb[reg] = v;
-            }
-        sanitize(cb);
+        if (!st.tfx.bytecode.empty()) run_tfx(st.tfx.bytecode, st.tfx.constants, cb, env);
         DynamicAlloc a = gpu.dynamic(cb.size() * sizeof(float4));
         std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
         for (auto [reg, param] : st.cbvs) {
-            D3D12_GPU_VIRTUAL_ADDRESS va = reg == 0 ? a.gpu : scopes ? scopes(st.which, reg) : 0;
-            cl->SetGraphicsRootConstantBufferView(param, va ? va : zero.gpu);
+            D3D12_GPU_VIRTUAL_ADDRESS va = int32_t(reg) == st.tfx.cbuffer_slot ? a.gpu : scopes ? scopes(st.which, reg) : 0;
+            if (compute_) cl->SetComputeRootConstantBufferView(param, va);
+            else cl->SetGraphicsRootConstantBufferView(param, va);
         }
-        for (uint32_t s = 0; s < st.srv_count; ++s) {
-            auto kit = st.srv_kinds.find(s);
-            const BindingKind kind = kit == st.srv_kinds.end() ? BindingKind::Texture2D : kit->second;
+        auto& cached = st.bound_views[(ring_ + kRing - 1) % kRing];
+        cached.resize(st.srv_count);
+        for (const auto& [s, kind] : st.srv_kinds) {
             ID3D12Resource* r = nullptr;
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+            uint32_t stride = 0, elements = 0;
+            uint64_t first_element = 0;
             if (auto it = st.static_textures.find(s); it != st.static_textures.end()) r = it->second.Get();
-            float4 fill{0, 0, 0, 0};
             for (const auto& et : textures) {
                 if (et.slot != s) continue;
                 const uint32_t bo = uint32_t(et.offset) * 8;
                 auto t = ext.texture(et.extern_id, bo);
                 r = t.resource;
                 fmt = t.format;
-                fill = filler_value(et.extern_id, bo);
+                stride = t.stride;
+                elements = t.elements;
+                first_element = t.first_element;
             }
             if (r && kind_is_texture(kind) && !resource_fits(r, kind)) r = nullptr, fmt = DXGI_FORMAT_UNKNOWN;
-            if (!r && kind_is_texture(kind)) r = fillers.get(gpu, kind, fill);
-            write_srv(dev, r, fmt, kind, gpu.srv().cpu(base + off + s));
+            bool null_view = false;
+            if (!r)
+                for (const auto& et : textures)
+                    if (et.slot == s && ext.estimate_null_texture(et.extern_id, uint32_t(et.offset) * 8)) null_view = true;
+            if (null_view) {
+                write_null_srv(dev, kind, gpu.srv().cpu(base + off + s));
+                cached[s].valid = false;
+                continue;
+            }
+            auto& previous = cached[s];
+            if (!cache_bindings || !previous.valid || previous.resource.Get() != r || previous.format != fmt || previous.stride != stride || previous.elements != elements || previous.first_element != first_element) {
+                write_game_srv(dev, {r, fmt, stride, elements, first_element}, kind, gpu.srv().cpu(base + off + s));
+                previous.resource = r;
+                previous.format = fmt;
+                previous.stride = stride;
+                previous.elements = elements;
+                previous.first_element = first_element;
+                previous.valid = true;
+            }
         }
-        if (st.table_param >= 0) cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
-        off += st.srv_count;
+        if (st.table_param >= 0) {
+            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
+            else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
+        }
+        for (const auto& [slot, kind] : st.uav_kinds) {
+            const auto& source = st.sources.extern_uavs.at(slot);
+            auto view = ext.texture(source.extern_id, uint32_t(source.offset) * 8);
+            write_uav(dev, view, kind, gpu.srv().cpu(base + off + st.srv_count + slot));
+        }
+        if (st.uav_table_param >= 0) {
+            const auto handle = gpu.srv().gpu(base + off + st.srv_count);
+            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.uav_table_param), handle);
+            else cl->SetGraphicsRootDescriptorTable(UINT(st.uav_table_param), handle);
+        }
+        off += st.srv_count + st.uav_count;
     }
-    cl->DrawInstanced(4, 1, 0, 0);
+    if (compute_) cl->Dispatch(x, y, z);
+    else cl->DrawInstanced(4, 1, 0, 0);
 }
 
-void GamePipeline::prewarm(Gpu& gpu, FillerTextures& fillers) {
-    for (const auto& st : stages_)
-        for (const auto& [slot, kind] : st.srv_kinds) {
-            if (!kind_is_texture(kind) || st.static_textures.count(slot)) continue;
-            float4 fill{0, 0, 0, 0};
-            for (const auto& et : st.extern_textures)
-                if (et.slot == slot) fill = filler_value(et.extern_id, uint32_t(et.offset) * 8);
-            fillers.get(gpu, kind, fill);
+void GamePipeline::validate(const ExternStore& ext, const ScopeBufferFn& scopes) const {
+    if (!loaded()) throw std::runtime_error("Game pipeline is not loaded");
+    for (const auto& st : stages_) {
+        std::vector<float4> cb(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
+        cb.resize(std::max<size_t>(cb.size(), 256));
+        auto textures = st.extern_textures;
+        if (!st.tfx.bytecode.empty()) run_tfx(st.tfx.bytecode, st.tfx.constants, cb, ext.environment());
+        for (auto [reg, param] : st.cbvs)
+            if (int32_t(reg) != st.tfx.cbuffer_slot && (!scopes || !scopes(st.which, reg)))
+                throw std::runtime_error(std::format("{}: missing shared cbuffer b{}", st.tfx.shader.str(), reg));
+        for (const auto& [slot, kind] : st.uav_kinds) {
+            const auto it = st.sources.extern_uavs.find(slot);
+            if (it == st.sources.extern_uavs.end()) throw std::runtime_error(std::format("{}: missing original UAV source u{}", st.tfx.shader.str(), slot));
+            const auto view = ext.texture(it->second.extern_id, uint32_t(it->second.offset) * 8);
+            if (!view.resource || !(view.resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                throw std::runtime_error(std::format("{}: missing/incompatible original UAV u{}", st.tfx.shader.str(), slot));
+            validate_resource_view(view, kind, true);
         }
+        for (const auto& [slot, kind] : st.srv_kinds) {
+            ID3D12Resource* resource = nullptr;
+            if (auto it = st.static_textures.find(slot); it != st.static_textures.end()) resource = it->second.Get();
+            uint32_t stride = 0, elements = 0;
+            uint64_t first_element = 0;
+            DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+            std::string source;
+            bool null_view = false;
+            for (const auto& et : textures) if (et.slot == slot) {
+                const auto offset = uint32_t(et.offset) * 8;
+                const auto view = ext.texture(et.extern_id, offset);
+                resource = view.resource;
+                stride = view.stride;
+                elements = view.elements;
+                first_element = view.first_element;
+                format = view.format;
+                source = std::format(" extern {} byte 0x{:X}", et.extern_id, offset);
+                null_view = !resource && ext.estimate_null_texture(et.extern_id, offset);
+            }
+            if (null_view) continue;
+            if (!resource || (kind_is_texture(kind) && !resource_fits(resource, kind)))
+                throw std::runtime_error(std::format("{}: missing/incompatible t{}{}; no replacement is permitted", st.tfx.shader.str(), slot, source));
+            validate_resource_view({resource, format, stride, elements, first_element}, kind, false);
+        }
+    }
 }
 
 std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const ExternStore& ext) {
@@ -491,18 +688,21 @@ std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const E
     std::vector<float4> cb(ss.cbuffer_init.begin(), ss.cbuffer_init.end());
     cb.resize(std::max<size_t>(cb.size(), 64));
     if (!ss.bytecode.empty()) run_tfx(ss.bytecode, ss.constants, cb, ext.environment());
-    sanitize(cb);
     return cb;
 }
 
-// ---- GameLighting ---------------------------------------------------------------------------------
+// ---- GameLighting -----------------------------------------------------------------------------
 namespace {
+float4 v4(V3 v, float w) { return {v.x, v.y, v.z, w}; }
+}
 
-// nim's own helpers around the game pass: a sky reflection for light_specular_ibl (the game fills
-// it from cubemap volumes we do not render yet) and the tonemap to the 8-bit view target.
-constexpr const char* kUtilHlsl = R"(
+// ---- Viewer environment ------------------------------------------------------------------------
+// Not game data: a map's reflection probes / sky are not loaded, so nim draws its own sky into the
+// shading pass's specular-IBL light buffer and behind the model (the user asked for a readable
+// environment here). Everything is reported as an estimate.
+namespace {
+constexpr const char* kViewerEnvHlsl = R"(
 cbuffer P : register(b0) {
-    float3 eye;         float exposure;
     float3 fwd;         float fx;
     float3 right;       float fy;
     float3 up;          float inv_w;
@@ -511,13 +711,9 @@ cbuffer P : register(b0) {
     float3 ground;      float pad0;
     float3 bg_top;      float pad1;
     float3 bg_bottom;   float pad2;
-    float3 fog_color;   float fog_on;
-    float3 sun_dir;     float sun_glow;
-    float3 sun_col;     float pad3;
 };
-Texture2D<float4> hdr : register(t0);
-Texture2D<float>  depth : register(t1);
-Texture2D<float4> g1 : register(t2);
+Texture2D<float>  depth : register(t0);
+Texture2D<float4> g1 : register(t1);
 
 float4 vs_main(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -528,60 +724,30 @@ float3 sky(float3 d) {
     float3 c = t > 0 ? lerp(sky_horizon, sky_top, pow(saturate(t), 0.6)) : lerp(sky_horizon, ground, saturate(-t * 4));
     return c * sky_intensity;
 }
-float3 aces(float3 x) { return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)); }
-float3 srgb(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055; }
-
-float4 ps_ibl(float4 pos : SV_Position) : SV_Target {
-    int3 p = int3(pos.xy, 0);
-    if (depth.Load(p) <= 0) return 0;
-    float2 ndc = float2(pos.x * inv_w * 2 - 1, 1 - pos.y * inv_h * 2);
-    float3 ray = normalize(fwd + right * (ndc.x / fx) + up * (ndc.y / fy));
-    float3 v = g1.Load(p).rgb * 2 - 1;
-    float len = length(v);
-    float3 n = len > 0 ? v / len : float3(0, 0, 1);
-    float smooth = saturate(len * 4 - 3);
-    float3 r = reflect(ray, n);
-    float3 blurred = lerp(sky(-n) * 0.25 + ground * 0.25, sky(n), saturate(n.z * 0.5 + 0.5));
-    return float4(lerp(blurred, sky(r), smooth * smooth), 1);
-}
 float3 view_ray(float4 pos) {
     float2 ndc = float2(pos.x * inv_w * 2 - 1, 1 - pos.y * inv_h * 2);
     return normalize(fwd + right * (ndc.x / fx) + up * (ndc.y / fy));
 }
-// What the game's sky lookups would hold along this ray: the fog colour, brighter toward the sun.
-float3 inscatter(float3 r) {
-    float mu = saturate(dot(r, sun_dir));
-    return fog_color * sky_intensity + sun_col * (sun_glow * pow(mu, 8) * 0.25);
-}
-float4 ps_fog(float4 pos : SV_Position) : SV_Target { return float4(inscatter(view_ray(pos)), 1); }
-// Exposed linear HDR for final_combine; the background where nothing was drawn.
-float4 ps_post(float4 pos : SV_Position) : SV_Target {
+// Sky reflection along the G-buffer normal, blurred toward the hemisphere average when rough.
+float4 ps_ibl(float4 pos : SV_Position) : SV_Target {
     int3 p = int3(pos.xy, 0);
-    if (depth.Load(p) <= 0) {
-        if (fog_on > 0) return float4(inscatter(view_ray(pos)) * exposure, 1);
-        return float4(lerp(bg_top, bg_bottom, pos.y * inv_h), 1);
-    }
-    return float4(max(hdr.Load(p).rgb, 0) * exposure, 1);
+    if (depth.Load(p) <= 0) return 0;
+    float3 v = g1.Load(p).rgb * 2 - 1;
+    float len = length(v);
+    float3 n = len > 0 ? v / len : float3(0, 0, 1);
+    float smooth = saturate(len * 4 - 3);
+    float3 r = reflect(view_ray(pos), n);
+    float3 blurred = lerp(sky(-n) * 0.25 + ground * 0.25, sky(n), saturate(n.z * 0.5 + 0.5));
+    return float4(lerp(blurred, sky(r), smooth * smooth), 1);
 }
-float4 ps_tonemap(float4 pos : SV_Position) : SV_Target {
-    int3 p = int3(pos.xy, 0);
-    if (depth.Load(p) <= 0) return float4(srgb(lerp(bg_top, bg_bottom, pos.y * inv_h)), 1);
-    return float4(srgb(aces(max(hdr.Load(p).rgb, 0) * exposure)), 1);
+// Background where nothing was drawn (linear, before the game's final_combine).
+float4 ps_background(float4 pos : SV_Position) : SV_Target {
+    if (depth.Load(int3(pos.xy, 0)) > 0) discard;
+    return float4(lerp(bg_top, bg_bottom, pos.y * inv_h), 1);
 }
 )";
 
-ComPtr<ID3DBlob> compile_util(const char* entry, const char* target) {
-    ComPtr<ID3DBlob> code, err;
-    HRESULT hr = D3DCompile(kUtilHlsl, std::strlen(kUtilHlsl), "nim_game_util.hlsl", nullptr, nullptr, entry, target,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
-    if (FAILED(hr))
-        throw std::runtime_error(std::format("game util shader: {}",
-                                             err ? static_cast<const char*>(err->GetBufferPointer()) : "compile failed"));
-    return code;
-}
-
-struct UtilConstants {
-    V3 eye; float exposure;
+struct ViewerEnvConstants {
     V3 fwd; float fx;
     V3 right; float fy;
     V3 up; float inv_w;
@@ -590,32 +756,27 @@ struct UtilConstants {
     V3 ground; float pad0;
     V3 bg_top; float pad1;
     V3 bg_bottom; float pad2;
-    V3 fog_color; float fog_on;
-    V3 sun_dir; float sun_glow;
-    V3 sun_col; float pad3;
 };
 
-ComPtr<ID3D12Resource> load_lookup(PackageManager& pm, Gpu& gpu, TagHash tag, std::vector<std::string>& notes) {
-    if (tag.is_none()) return nullptr;
-    try {
-        return gpu.texture(load_texture(pm, tag));
-    } catch (const std::exception& ex) {
-        notes.push_back(std::format("lookup texture {}: {}", tag.str(), ex.what()));
-        return nullptr;
-    }
+ComPtr<ID3DBlob> compile_viewer_env(const char* entry, const char* target) {
+    ComPtr<ID3DBlob> code, err;
+    HRESULT hr = D3DCompile(kViewerEnvHlsl, std::strlen(kViewerEnvHlsl), "nim_viewer_env.hlsl", nullptr, nullptr, entry,
+                            target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    if (FAILED(hr))
+        throw std::runtime_error(std::format("viewer environment shader: {}",
+                                             err ? static_cast<const char*>(err->GetBufferPointer()) : "compile failed"));
+    return code;
 }
-
-float4 v4(V3 v, float w) { return {v.x, v.y, v.z, w}; }
-
 } // namespace
 
 void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
     final_combine_.release(gpu);
-    fillers_.release();
-    for (auto& t : targets_) t.Reset();
-    if (srv_first_ != UINT32_MAX) gpu.srv().free(srv_first_, 3);
-    srv_first_ = UINT32_MAX;
+    if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 2);
+    env_srv_ = UINT32_MAX;
+    env_.Reset();
+    hdr_.Reset();
+    rtv_heap_.Reset();
     w_ = h_ = 0;
 }
 
@@ -624,80 +785,128 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     frame_scope_ = load_scope(pm, globals_.scope("frame"));
     view_scope_ = load_scope(pm, globals_.scope("view"));
     ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
-    ext_.channels.resize(256, float4{1, 1, 1, 1});
     ext_.channel_ids = globals_.channel_ids;
-
     const Scope* scopes[] = {&frame_scope_, &view_scope_};
-    const TagHash shading = globals_.pipeline("global_lighting_and_shading");
-    if (shading.is_none()) throw std::runtime_error("render globals have no global_lighting_and_shading pipeline");
+    const auto shading = globals_.pipeline("global_lighting_and_shading");
+    const auto final = globals_.pipeline("final_combine");
+    if (shading.is_none() || final.is_none()) throw std::runtime_error("Missing required game shading/final_combine pipeline");
     shading_.load(pm, gpu, shading, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
-    shading_.prewarm(gpu, fillers_);
-    if (TagHash fc = globals_.pipeline("final_combine"); !fc.is_none()) {
-        try {
-            final_combine_.load(pm, gpu, fc, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
-            final_combine_.prewarm(gpu, fillers_);
-        } catch (const std::exception& ex) {
-            shading_.notes.push_back(std::format("final_combine: {} (nim tonemap used)", ex.what()));
+    final_combine_.load(pm, gpu, final, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+    auto lookup = [&](TagHash tag) {
+        if (tag.is_none()) throw std::runtime_error("Missing render_globals BRDF lookup");
+        return gpu.texture(load_texture(pm, tag));
+    };
+    tint_lookup_ = lookup(globals_.specular_tint_lookup);
+    lobe_lookup_ = lookup(globals_.specular_lobe_lookup);
+    lobe3d_lookup_ = lookup(globals_.specular_lobe_3d_lookup);
+    iridescence_lookup_ = lookup(globals_.iridescence_lookup);
+    {
+        Texture white;
+        white.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        white.width = white.height = 1;
+        white.data = {255, 255, 255, 255};
+        unshadowed_ = gpu.texture(white);
+        // The shading pass multiplies the lit colour by the atmosphere volume's .x (transmittance)
+        // and .y (fog transmittance) and adds .z-weighted in-scatter: (1, 1, 0) is "no atmosphere".
+        Texture clear;
+        clear.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        clear.width = clear.height = 1;
+        clear.depth = 2;
+        clear.data = {255, 255, 0, 0, 255, 255, 0, 0};
+        no_atmosphere_ = gpu.texture(clear);
+    }
+    {
+        ID3D12Device* dev = gpu.device();
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor = {0, 0};
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {1, &range};
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        env_rs_ = serialize(dev, rsd, "viewer environment root signature");
+        auto vs = compile_viewer_env("vs_main", "vs_5_0");
+        for (auto [entry, pso] : {std::pair{"ps_ibl", &env_ibl_pso_}, std::pair{"ps_background", &env_bg_pso_}}) {
+            auto ps = compile_viewer_env(entry, "ps_5_0");
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = env_rs_.Get();
+            pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+            pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+            pd.SampleMask = UINT_MAX;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pd.NumRenderTargets = 1;
+            pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            pd.SampleDesc.Count = 1;
+            check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso)), "viewer environment PSO");
         }
     }
-    tint_lookup_ = load_lookup(pm, gpu, globals_.specular_tint_lookup, shading_.notes);
-    lobe_lookup_ = load_lookup(pm, gpu, globals_.specular_lobe_lookup, shading_.notes);
-    lobe3d_lookup_ = load_lookup(pm, gpu, globals_.specular_lobe_3d_lookup, shading_.notes);
-    iridescence_lookup_ = load_lookup(pm, gpu, globals_.iridescence_lookup, shading_.notes);
-
-    ID3D12Device* dev = gpu.device();
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0};
-    D3D12_ROOT_PARAMETER params[2]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor = {0, 0};
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {1, &range};
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    util_rs_ = serialize(dev, rsd, "game util root signature");
-    auto vs = compile_util("vs_main", "vs_5_0");
-    for (auto [entry, pso, fmt] : {std::tuple{"ps_ibl", &ibl_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
-                                   std::tuple{"ps_fog", &fog_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
-                                   std::tuple{"ps_post", &post_pso_, DXGI_FORMAT_R16G16B16A16_FLOAT},
-                                   std::tuple{"ps_tonemap", &tonemap_pso_, DXGI_FORMAT_R8G8B8A8_UNORM}}) {
-        auto ps = compile_util(entry, "ps_5_0");
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = util_rs_.Get();
-        pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-        pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
-        pd.SampleMask = UINT_MAX;
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = fmt;
-        pd.SampleDesc.Count = 1;
-        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso)), "game util PSO");
-    }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kTargets};
-    check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game lighting rtv heap");
-    gpu.flush();  // lookup / filler / static texture uploads
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
+    gpu.flush();
 }
 
 void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
-    ID3D12Device* dev = gpu.device();
+    D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
+    hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    gpu.device()->CreateRenderTargetView(hdr_.Get(), nullptr, rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+    env_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    gpu.device()->CreateRenderTargetView(env_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + inc});
+    if (env_srv_ == UINT32_MAX) env_srv_ = gpu.srv().alloc(2);
     w_ = w;
     h_ = h;
-    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    for (int i = 0; i < kTargets; ++i) {
-        D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
-        targets_[i] = gpu.texture2d(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
-        dev->CreateRenderTargetView(targets_[i].Get(), nullptr,
-                                    {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(i) * inc});
-    }
-    if (srv_first_ == UINT32_MAX) srv_first_ = gpu.srv().alloc(3);
 }
 
-void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p) {
-    const float w = float(gb.width()), h = float(gb.height());
+std::array<float4, 16> frame_constants(float, float, const ExternStore& ext) {
+    return ext.frame_constants();
+}
+
+void estimate_engine_frame(ExternStore& ext, float t, float dt) {
+    constexpr std::string_view why = "engine run-time state (exposure, wind); goriath FrameScope default";
+    auto est = [&](uint32_t off, float4 v) {
+        if (!ext.has(ext::Frame, off, 16)) ext.estimate(ext::Frame, off, v, why);
+    };
+    auto est1 = [&](uint32_t off, float v) {
+        if (!ext.has(ext::Frame, off, 4)) {
+            ext.set(ext::Frame, off, v);
+            ext.note_estimate(std::format("extern 1 +0x{:X} = {:g}", off, v), why);
+        }
+    };
+    est1(0x18, 1.0f / 60.0f);  // exposure_time
+    est1(0x1C, 1.0f);          // exposure_scale
+    est1(0x28, 1.0f);          // exposure_illum_relative
+    est1(0x70, 0.5f);
+    est(0x160, {0.1f, 0.1f, 0.1f, 1.0f});  // wind
+    est(0x180, {0.1f, 0.1f, 0.1f, 0.0f});
+    est(0x1B0, {0, 0, 0, 1});
+    est(0x1C0, {0, 0, 1, 0});
+    est(0x1E0, {0, 0, 0, 0});
+    est(0x250, {1, 0, 1, 0});
+    est(0x280, {1, 1, 1, 1});
+    est(0x1F0, {0, 0, 1, 0});  // .z scales light_specular_ibl
+    if (!ext.zero_policy(ext::Frame)) ext.zero_when_missing(ext::Frame, "engine frame value with no known meaning: zero");
+    if (ext.has_frame_constants()) return;
+    std::array<float4, 16> f{};
+    const float es = ext.get_f(ext::Frame, 0x1C), ir = ext.get_f(ext::Frame, 0x28);
+    f[0] = {t, t, dt > 0 ? dt : 1.0f / 60.0f, ext.get_f(ext::Frame, 0x18)};
+    f[1] = {es, ir * 16.0f, es, ir};
+    f[2] = {(t * 60 + 33.75f) * 1.258699f, (t * 60 + 60) * 0.9583125f, (t * 60 + 60) * 8.789123f, (t * 60 + 33.75f) * 2.311535f};
+    f[3] = {0.5f, 0.5f, 0, 0};
+    f[4] = {1, 1, 0, 1};
+    f[5] = {0, 0, 512, 0};
+    f[6] = {1, 1, 1, 1};
+    ext.estimate_frame_constants(f, why);
+}
+
+void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm) {
+    const float w = float(width), h = float(height);
     const float near_z = vm.vp_rel.c[3][2];
 
     // View, in nim's camera space (x right, y up, z forward). The lighting VS reconstructs a
@@ -727,53 +936,81 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     pixel_to_ray.c[1] = {0, -2 / (h * vm.fy), 0, 0};
     pixel_to_ray.c[2] = {0, 0, 0, 0};
     pixel_to_ray.c[3] = {-1 / vm.fx, 1 / vm.fy, 1, 0};
-    ext_.set(ext::View, 0x00, w);
-    ext_.set(ext::View, 0x04, h);
-    ext_.set(ext::View, 0x10, float4{0, 0, 0, 0});
-    ext_.set(ext::View, 0x20, v4(vm.eye, 1));
-    ext_.set(ext::View, 0x60, world_to_cam);
-    ext_.set(ext::View, 0xA0, cam_to_proj);
-    ext_.set(ext::View, 0xE0, cam_to_world);
-    ext_.set(ext::View, 0x120, pixel_to_ray);
-    ext_.set(ext::View, 0x160, proj_to_ray);
-    ext_.set(ext::View, 0x1A0, vm.vp_abs);
+    ext.set(ext::View, 0x00, w);
+    ext.set(ext::View, 0x04, h);
+    ext.set(ext::View, 0x10, float4{0, 0, 0, 0});
+    ext.set(ext::View, 0x20, v4(vm.eye, 1));
+    ext.set(ext::View, 0x40, v4(vm.eye * -1.0f, 0));
+    // Engine view state with no known meaning yet (goriath leaves these zero as well).
+    constexpr std::string_view unknown_view = "unknown engine view value; zero as in goriath";
+    ext.estimate(ext::View, 0x30, float4{0, 0, 0, 0}, unknown_view);  // view_miscellaneous
+    ext.estimate(ext::View, 0x50, float4{0, 0, 0, 0}, unknown_view);
+    ext.estimate(ext::View, 0x260, M4{}, unknown_view);
+    ext.estimate(ext::View, 0x420, M4{}, unknown_view);
+    ext.estimate(ext::View, 0x460, float4{0, 0, 0, 0}, unknown_view);
+    if (!ext.zero_policy(ext::View)) ext.zero_when_missing(ext::View, std::string(unknown_view));
+    ext.set(ext::View, 0x60, world_to_cam);
+    ext.set(ext::View, 0xA0, cam_to_proj);
+    ext.set(ext::View, 0xE0, cam_to_world);
+    ext.set(ext::View, 0x120, pixel_to_ray);
+    ext.set(ext::View, 0x160, proj_to_ray);
+    ext.set(ext::View, 0x1A0, vm.vp_abs);
+    ext.set(ext::View, 0x3E0, vm.vp_abs);
 
-    // Deferred: the G-buffer the game's material shaders wrote, and nim's light buffers.
-    ext_.set(ext::Deferred, 0x00, float4{0, 1 / near_z, 0, 0});  // reversed infinite Z: 1/z = d / near
-    ext_.set(ext::Deferred, 0x30, float4{0, 0, 0, 0});           // light buffers at full resolution
-    ext_.set(ext::Deferred, 0x40, float4{w, h, 0, 0});
+}
+
+void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p) {
+    fill_view_externs(ext_, gb.width(), gb.height(), vm);
+    ext_.set(ext::Deferred, 0x00, float4{0, 1 / vm.vp_rel.c[3][2], 0, 0});
+    ext_.set(ext::Deferred, 0x40, float4{float(gb.width()), float(gb.height()), 0, 0});
     ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
     ext_.set_texture(ext::Deferred, 0xA8, gb.rt[0].Get());
     ext_.set_texture(ext::Deferred, 0xB0, gb.rt[1].Get());
     ext_.set_texture(ext::Deferred, 0xB8, gb.rt[2].Get());
-    ext_.set_texture(ext::Deferred, 0xC0, targets_[0].Get());
-    ext_.set_texture(ext::Deferred, 0xC8, targets_[1].Get());
-    ext_.set_texture(ext::Deferred, 0xD0, targets_[2].Get());
-
-    // Frame: time and the BRDF lookups from the render globals.
-    ext_.set(ext::Frame, 0x00, time_);
-    ext_.set(ext::Frame, 0x04, time_);
+    ext_.set(ext::Frame, 0x00, p.time);
+    ext_.set(ext::Frame, 0x04, p.time);
+    ext_.set(ext::Frame, 0x14, p.delta_time);
+    estimate_engine_frame(ext_, p.time, p.delta_time);
+    if (!ext_.texture(ext::Atmosphere, 0x108).resource)
+        ext_.estimate_texture(ext::Atmosphere, 0x108, no_atmosphere_.Get(),
+                              "no map atmosphere: transmittance 1, in-scatter 0 (clear air)");
+    for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
+        if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
+    if (!ext_.texture(ext::Deferred, 0xD0).resource)
+        ext_.estimate_texture(ext::Deferred, 0xD0, env_.Get(), "viewer environment: nim sky reflection (no map reflection probes)");
+    if (!ext_.zero_policy(ext::Deferred)) ext_.zero_when_missing(ext::Deferred, "deferred-pass value with no known meaning: zero");
+    // No shadow pass yet: the shadow / occlusion masks say "unshadowed" (white), full strength.
+    constexpr std::string_view unshadowed = "no shadow pass yet: unshadowed (white) mask";
+    for (uint32_t off : {0x00u, 0x08u, 0x10u})
+        if (!ext_.texture(ext::ShadowMask, off).resource) ext_.estimate_texture(ext::ShadowMask, off, unshadowed_.Get(), unshadowed);
+    if (!ext_.has(ext::ShadowMask, 0x30, 4)) {
+        ext_.set(ext::ShadowMask, 0x30, 1.0f);
+        ext_.set(ext::ShadowMask, 0x34, 0.0f);
+        ext_.note_estimate("extern 43 +0x30 = 1, +0x34 = 0 (shadow strength / filter)", unshadowed);
+    }
+    if (!ext_.zero_policy(ext::ShadowMask)) ext_.zero_when_missing(ext::ShadowMask, "no shadow pass yet (sun shadow mask not rendered): zero");
+    if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "no volumetric fog pass yet: zero");
     ext_.set_texture(ext::Frame, 0xC0, lobe_lookup_.Get());
     ext_.set_texture(ext::Frame, 0xC8, lobe3d_lookup_.Get());
     ext_.set_texture(ext::Frame, 0xD0, tint_lookup_.Get());
     ext_.set_texture(ext::Frame, 0xD8, iridescence_lookup_.Get());
-    ext_.set(ext::Frame, 0x1F0, float4{0, 0, 1, 0});  // .z scales light_specular_ibl
 
-    // GlobalLighting: the map's sun and hemisphere ambient. The shading multiplies the sun by
-    // 1/(4 pi) and the ambient by 1/4 (and the hemisphere weight), so scale nim's values to match.
+    // GlobalLighting: a map's sun and hemisphere ambient. Without a map it is nim's light set-up
+    // (the panel's sun / sky), laid out as the shading reads it: the sun is multiplied by
+    // 1/(4 pi) and the ambient by 1/4 there, so nim's values are scaled to match.
+    constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
     const V3 sun_dir = normalize(V3{std::cos(p.sun_azimuth) * std::cos(p.sun_elevation),
                                     std::sin(p.sun_azimuth) * std::cos(p.sun_elevation), std::sin(p.sun_elevation)});
     const V3 sun = p.sun_color * (p.sun_intensity * 4.0f);
     const float ka = 4.0f * p.sky_intensity;
-    ext_.set(ext::GlobalLighting, 0x10, v4(sun, 0));
-    ext_.set(ext::GlobalLighting, 0x30, v4(sun_dir, 0));
-    ext_.set(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0});
-    ext_.set(ext::GlobalLighting, 0x70, v4(p.sky_top * ka, 0));
-    ext_.set(ext::GlobalLighting, 0x80, v4(p.ground * ka, 0));
-    ext_.set(ext::GlobalLighting, 0x90, 0.35f);  // up / down hemisphere sharpness
-    ext_.set(ext::GlobalLighting, 0x94, 0.35f);
-    ext_.set(ext::GlobalLighting, 0xD0, 1.0f);   // light-buffer occlusion strength
-    ext_.set(ext::GlobalLighting, 0xD4, 1.0f);
+    ext_.estimate(ext::GlobalLighting, 0x10, v4(sun, 0), viewer_light);
+    ext_.estimate(ext::GlobalLighting, 0x30, v4(sun_dir, 0), viewer_light);
+    ext_.estimate(ext::GlobalLighting, 0x70, v4(p.sky_top * ka, 0), viewer_light);
+    ext_.estimate(ext::GlobalLighting, 0x80, v4(p.ground * ka, 0), viewer_light);
+    constexpr std::string_view chosen = "meaning reverse-engineered, value chosen (v0.3.1)";
+    ext_.estimate(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0}, chosen);  // hemisphere axis
+    ext_.estimate(ext::GlobalLighting, 0x90, float4{0.35f, 0.35f, 0, 0}, chosen);  // up / down sharpness
+    ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, 1, 0, 0}, chosen);  // light-buffer occlusion
     ext_.set_channel("skybox_sun_color", v4(p.sun_color, 1));
     ext_.set_channel("skybox_sun_intensity", float4{p.sun_intensity * 4.0f, 0, 0, 0});
     ext_.set_channel("sun_atmosphere_direction", v4(sun_dir, 0));
@@ -781,149 +1018,108 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set_channel("skybox_up_ambient_intensity", float4{ka, 0, 0, 0});
     ext_.set_channel("skybox_down_ambient_color", v4(p.ground, 1));
     ext_.set_channel("skybox_down_ambient_intensity", float4{ka, 0, 0, 0});
-    if (ext_.channels.size() > 130) ext_.channels[130] = {1, 0, 0, 0};  // near-field ambient strength
-
-    // Atmosphere: the near / far sky in-scatter lookups the fog blends between (nim's stand-in).
-    ext_.set_texture(ext::Atmosphere, 0xE0, targets_[4].Get());
-    ext_.set_texture(ext::Atmosphere, 0xF0, targets_[4].Get());
-
-    // ShadowMask: no sun shadow / AO rendered yet (fillers are white); full strength, simple filter.
-    ext_.set(ext::ShadowMask, 0x30, 1.0f);
-    ext_.set(ext::ShadowMask, 0x34, 0.0f);
+    ext_.note_estimate("global channels skybox_sun_* / skybox_*_ambient_*", viewer_light);
+    if (ext_.channels.size() > 130) {
+        ext_.channels[130] = {1, 0, 0, 0};  // scales the hemisphere ambient (cb0 60 / 62) in the shading pass
+        ext_.note_estimate("global channel 130 = 1 (near-field ambient strength)", chosen);
+    }
+    if (!ext_.zero_policy(ext::GlobalLighting))
+        ext_.zero_when_missing(ext::GlobalLighting, "global lighting value with no known meaning: zero");
 }
 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                          const LightingParams& p) {
-    if (!ready()) return;
-    ID3D12Device* dev = gpu.device();
+                          const LightingParams& p, const TransparentFn& transparents) {
+    if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
-    time_ += 1.0f / 60.0f;
     fill_externs(gb, vm, p);
-
-    for (auto& r : gb.rt)
-        Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Gpu::barrier(cl, gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    for (auto& t : targets_)
-        Gpu::barrier(cl, t.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    auto rtv = [&](int i) { return D3D12_CPU_DESCRIPTOR_HANDLE{rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(i) * inc}; };
-    const float zero[4] = {0, 0, 0, 0};
-    cl->ClearRenderTargetView(rtv(0), zero, 0, nullptr);
-    cl->ClearRenderTargetView(rtv(1), zero, 0, nullptr);
-    cl->ClearRenderTargetView(rtv(3), zero, 0, nullptr);
+    // Validate every dependency before recording any render-target transitions.
+    const auto frame = ext_.frame_constants();
+    auto upload = [&](const auto& values) {
+        auto a = gpu.dynamic(values.size() * sizeof(float4));
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
+        return a.gpu;
+    };
+    const auto cb13 = upload(frame);
+    const auto cb12_vs = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
+    const auto cb12_ps = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
+    ScopeBufferFn scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        if (reg == 13) return cb13;
+        if (reg == 12) return stage == ShaderStage::Vertex ? cb12_vs : cb12_ps;
+        return 0;
+    };
+    ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
+    shading_.validate(ext_, scopes);
+    final_combine_.validate(ext_, scopes);
+    // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal
+    // histories) is not yet decoded. Its outputs must be supplied by their real producers.
+    // Transparent parts are left out (not substituted): the original pass's shared inputs and MRT
+    // attachments are not reconstructed yet.
+    if (transparents)
+        ext_.note_estimate("transparent parts are NOT drawn", "original transparent pass inputs / MRTs not reconstructed");
+    for (auto& rt : gb.rt)
+        Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    Gpu::barrier(cl, gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, depth_read);
+    Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_VIEWPORT vp{0, 0, float(w_), float(h_), 0, 1};
     D3D12_RECT sc{0, 0, LONG(w_), LONG(h_)};
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
+    const auto hdr = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const float clear[4]{};
+    cl->ClearRenderTargetView(hdr, clear, 0, nullptr);
 
-    // nim helper SRVs: hdr, depth, rt1.
-    write_srv(dev, targets_[3].Get(), DXGI_FORMAT_UNKNOWN, BindingKind::Texture2D, gpu.srv().cpu(srv_first_));
-    write_srv(dev, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT, BindingKind::Texture2D, gpu.srv().cpu(srv_first_ + 1));
-    write_srv(dev, gb.rt[1].Get(), DXGI_FORMAT_UNKNOWN, BindingKind::Texture2D, gpu.srv().cpu(srv_first_ + 2));
-    UtilConstants uc{};
-    uc.eye = vm.eye; uc.exposure = p.exposure;
-    uc.fwd = vm.fwd; uc.fx = vm.fx;
-    uc.right = vm.right; uc.fy = vm.fy;
-    uc.up = vm.up; uc.inv_w = 1.0f / float(w_);
-    uc.sky_top = p.sky_top; uc.inv_h = 1.0f / float(h_);
-    uc.sky_horizon = p.sky_horizon; uc.sky_intensity = p.sky_intensity;
-    uc.ground = p.ground;
-    uc.bg_top = p.background_top;
-    uc.bg_bottom = p.background_bottom;
-    uc.fog_color = p.fog_color;
-    uc.fog_on = p.fog ? 1.0f : 0.0f;
-    uc.sun_dir = normalize(V3{std::cos(p.sun_azimuth) * std::cos(p.sun_elevation),
-                              std::sin(p.sun_azimuth) * std::cos(p.sun_elevation), std::sin(p.sun_elevation)});
-    uc.sun_glow = p.fog_sun_glow;
-    uc.sun_col = p.sun_color * p.sun_intensity;
-    DynamicAlloc ucb = gpu.dynamic(sizeof(uc));
-    std::memcpy(ucb.cpu, &uc, sizeof(uc));
-    auto util_pass = [&](ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE target) {
+    // Viewer environment (estimate): sky reflection into the IBL buffer, background after shading.
+    const bool own_env = ext_.texture(ext::Deferred, 0xD0).resource == env_.Get();
+    const D3D12_CPU_DESCRIPTOR_HANDLE env_rtv{hdr.ptr + gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    gpu.device()->CreateShaderResourceView(gb.depth.Get(), &sd, gpu.srv().cpu(env_srv_));
+    sd.Format = gb.rt[1]->GetDesc().Format;
+    gpu.device()->CreateShaderResourceView(gb.rt[1].Get(), &sd, gpu.srv().cpu(env_srv_ + 1));
+    ViewerEnvConstants ec{};
+    ec.fwd = vm.fwd; ec.fx = vm.fx;
+    ec.right = vm.right; ec.fy = vm.fy;
+    ec.up = vm.up; ec.inv_w = 1.0f / float(w_);
+    ec.sky_top = p.sky_top; ec.inv_h = 1.0f / float(h_);
+    ec.sky_horizon = p.sky_horizon; ec.sky_intensity = p.sky_intensity;
+    ec.ground = p.ground;
+    ec.bg_top = p.background_top;
+    ec.bg_bottom = p.background_bottom;
+    const auto ecb = gpu.dynamic(sizeof(ec));
+    std::memcpy(ecb.cpu, &ec, sizeof(ec));
+    auto env_pass = [&](ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE target) {
         cl->OMSetRenderTargets(1, &target, FALSE, nullptr);
-        cl->SetGraphicsRootSignature(util_rs_.Get());
+        cl->SetGraphicsRootSignature(env_rs_.Get());
         cl->SetPipelineState(pso);
         ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
         cl->SetDescriptorHeaps(1, heaps);
-        cl->SetGraphicsRootConstantBufferView(0, ucb.gpu);
-        cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(srv_first_));
+        cl->SetGraphicsRootConstantBufferView(0, ecb.gpu);
+        cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(env_srv_));
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cl->DrawInstanced(3, 1, 0, 0);
     };
-    util_pass(ibl_pso_.Get(), rtv(2));
-    util_pass(fog_pso_.Get(), rtv(4));
-    Gpu::barrier(cl, targets_[4].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    for (int i = 0; i < 3; ++i)
-        Gpu::barrier(cl, targets_[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    // Shared cbuffers: cb13 frame (engine-filled, layout per goriath's FrameScope), cb12 view (the
-    // view scope's own bytecode over the View extern).
-    const float t = time_;
-    float4 frame[16]{};
-    frame[0] = {t, t, 1.0f / 60.0f, ext_.get_f(ext::Frame, 0x18)};
-    const float es = ext_.get_f(ext::Frame, 0x1C), ir = ext_.get_f(ext::Frame, 0x28);
-    frame[1] = {es, ir * 16.0f, es, ir};
-    frame[2] = {(t * 60 + 33.75f) * 1.258699f, (t * 60 + 60) * 0.9583125f, (t * 60 + 60) * 8.789123f,
-                (t * 60 + 33.75f) * 2.311535f};
-    frame[3] = {0.5f, 0.5f, 0, 0};
-    frame[4] = {1, 1, 0, 1};
-    frame[5] = {0, 0, 512, 0};
-    frame[6] = {1, 1, 1, 1};
-    DynamicAlloc cb13 = gpu.dynamic(sizeof(frame));
-    std::memcpy(cb13.cpu, frame, sizeof(frame));
-    auto upload = [&](const std::vector<float4>& v) {
-        DynamicAlloc a = gpu.dynamic(v.size() * sizeof(float4));
-        std::memcpy(a.cpu, v.data(), v.size() * sizeof(float4));
-        return a.gpu;
-    };
-    const D3D12_GPU_VIRTUAL_ADDRESS cb12_ps = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
-    const D3D12_GPU_VIRTUAL_ADDRESS cb12_vs = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
-    ScopeBufferFn scopes = [&](ShaderStage s, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
-        if (reg == 13) return cb13.gpu;
-        if (reg == 12) return s == ShaderStage::Vertex ? cb12_vs : cb12_ps;
-        return 0;
-    };
-
-    // Height fog, evaluated by the shading pass itself (two exponential layers over world height,
-    // optical depth = 0.001 * distance * density). In game these registers come from the map's
-    // atmosphere settings; nim drives them from LightingParams.
-    auto& ov = shading_.ps_overrides;
-    ov[8] = {1, 0, 0, 0};                              // in-scatter intensity
-    ov[13] = {p.fog_height, 0, 0, 0};                  // layer 0 base height
-    ov[18] = {p.fog_height, 0, 0, 0};                  // layer 1 base height
-    ov[40] = {p.fog_falloff, p.fog_falloff, 0, 0};     // per-km height falloff
-    ov[41] = {p.fog ? p.fog_density : 0.0f, 0, 0, 0};  // per-km density
-    ov[42] = {0, 0, 0.5f, 0.5f};                       // density noise uv (constant)
-    ov[45] = {0, 1, 0, 0};                             // near/far lookup blend: near
-    ov[104] = ov[105] = ov[107] = ov[108] = {0, 0, 0, 0};  // no sky-visibility / froxel terms
-    ov[106] = {0, 0, 0, 0};                            // surface fully attenuated
-    {
-        float4 r109 = ext_.get_v(ext::Atmosphere, 0x130);
-        r109[1] = p.fog_start;
-        ov[109] = r109;
+    if (own_env) {
+        Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        env_pass(env_ibl_pso_.Get(), env_rtv);
+        Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE hdr = rtv(3);
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
-    shading_.draw(gpu, cl, ext_, scopes, fillers_);
-    Gpu::barrier(cl, targets_[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    // The game's own film curve (final_combine) over the exposed HDR.
+    shading_.draw(gpu, cl, ext_, scopes, true);
+    env_pass(env_bg_pso_.Get(), hdr);
+    ext_.note_estimate("background gradient", "viewer environment (no map sky)");
+    Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    if (final_combine_.loaded()) {
-        util_pass(post_pso_.Get(), rtv(5));
-        Gpu::barrier(cl, targets_[5].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        ext_.set_texture(ext::Postprocess, 0x00, targets_[5].Get());
-        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
-        final_combine_.draw(gpu, cl, ext_, scopes, fillers_);
-    } else {
-        util_pass(tonemap_pso_.Get(), gb.lit_rtv);
-    }
+    cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+    final_combine_.draw(gpu, cl, ext_, scopes, true);
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-    for (auto& r : gb.rt)
-        Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Gpu::barrier(cl, gb.depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    for (auto& rt : gb.rt)
+        Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 }
 
 } // namespace nim

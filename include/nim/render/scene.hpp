@@ -6,10 +6,14 @@
 
 #include <array>
 #include <map>
+#include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
 namespace nim {
+
+class ExternStore;
 
 // ---- small math (column vectors; M4 stores 4 columns) -----------------------------------------
 struct V3 { float x = 0, y = 0, z = 0; };
@@ -49,7 +53,7 @@ public:
     uint32_t height() const { return h_; }
 
     ComPtr<ID3D12Resource> rt[4], depth, lit;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, dsv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
     uint32_t srv_first = UINT32_MAX;  // 6 SRVs: rt0..3, depth, lit
     static constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -72,6 +76,14 @@ struct SceneGroupInfo {
 
 // Everything a StaticMeshScene needs, read and evaluated on the CPU (safe on a worker thread with
 // its own PackageManager); StaticMeshScene::upload() then only creates GPU objects.
+// Object channel values to evaluate a mesh's materials with (hash -> value), and what the
+// materials read: the value used and from which stage.
+using ChannelValues = std::map<uint32_t, float4>;
+struct ChannelUse {
+    float4 value{};
+    bool vs = false, ps = false;
+};
+
 struct PreparedMesh {
     struct Buffers {
         IndexBuffer ib;
@@ -89,7 +101,16 @@ struct PreparedMesh {
         SceneGroupInfo info;
         std::vector<uint8_t> vs, ps;
         std::vector<float4> cb0;
-        std::map<uint32_t, Texture> textures;
+        std::map<uint32_t, std::shared_ptr<const Texture>> textures;
+        uint8_t stage = 0;  // render stage: 0 = G-buffer, 8 = transparents
+        int blend = -1;     // engine blend state index (transparents)
+        std::vector<float4> vs_cb0;                // the VS stage's own cb0
+        std::map<uint32_t, std::shared_ptr<const Texture>> vs_textures;
+        TechniqueStage vs_material, ps_material;  // original TFX, retained for frame updates
+        std::vector<Scope> scopes;
+        StageResourceSources vs_sources, ps_sources;
+        bool vs_live = false, ps_live = false;
+        std::map<uint32_t, SamplerDesc> vs_samplers, ps_samplers;
     };
     TagHash tag;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
@@ -102,22 +123,30 @@ struct PreparedMesh {
     float radius = 1;
     uint8_t lod = 0;
     std::vector<std::string> notes;  // parts that could not be drawn, and why
+    std::map<uint32_t, ChannelUse> channels;  // object channels the materials read
+    ChannelValues channel_overrides;
+    ChannelValues channel_defaults;
+    std::vector<float4> global_channels;
+    std::vector<Scope> scopes;
     TagHash component;               // dynamic models: the component the materials came from
     uint32_t permutation = 0, permutation_count = 0;
 };
 // Throws on failure.
-PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh);
+PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
 // material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_pose.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
-                                   int permutation = -1);
+                                   int permutation = -1, const ChannelValues* channels = nullptr);
 // Either of the above, by the tag's class.
-PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr);
+PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr,
+                          const ChannelValues* channels = nullptr);
 
 class StaticMeshScene {
 public:
+    StaticMeshScene();
+    ~StaticMeshScene();
     void load(PackageManager& pm, Gpu& gpu, TagHash mesh, const std::vector<std::vector<InputElement>>& layouts) {
         upload(gpu, prepare_mesh(pm, mesh), layouts);
     }
@@ -127,10 +156,20 @@ public:
 
     // Clears the G-buffer and draws every G-buffer group. Leaves targets in RENDER_TARGET.
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
+    // Transparent parts (render stage 8), blended into the HDR target `rtv` (R16G16B16A16_FLOAT)
+    // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
+    void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                            const ViewMatrices& vm);
+    bool has_transparent() const { return transparent_count_ > 0; }
     // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
     // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
     bool skinned() const { return skinned_; }
     void set_skin_pose(std::vector<BoneTransform> bones);
+    size_t transparent_count() const { return transparent_count_; }
+    // One clock for both shader stages and all passes; channel edits update constants in place.
+    void set_material_frame(float seconds, float delta_seconds = 0);
+    void set_render_inputs(const ExternStore& inputs);
+    void set_channels(const ChannelValues& values) { channel_overrides_ = values; }
 
     TagHash tag() const { return tag_; }
     V3 center() const { return center_; }
@@ -138,24 +177,52 @@ public:
     uint8_t lod() const { return lod_; }
     bool dynamic() const { return dynamic_; }
     const std::vector<SceneGroupInfo>& groups() const { return info_; }
+    const std::map<uint32_t, ChannelUse>& channels() const { return channels_; }
     const std::vector<std::string>& notes() const { return notes_; }
+    // Engine inputs the materials read that were estimated (what -> why); see ExternStore.
+    const std::map<std::string, std::string>& estimates() const;
 
 private:
     struct Item {
         StaticMeshPart part;
         uint32_t buffers = 0;
+        uint8_t stage = 0;
         ComPtr<ID3D12PipelineState> pso;
-        ComPtr<ID3D12Resource> cb0;
-        uint32_t srv_first = 0;
-        std::map<uint32_t, ComPtr<ID3D12Resource>> textures;
+        ComPtr<ID3D12RootSignature> root_sig;
+        ComPtr<ID3D12Resource> cb0, vs_cb0;
+        TechniqueStage vs_material, ps_material;
+        std::vector<Scope> scopes;
+        StageResourceSources vs_sources, ps_sources;
+        std::map<uint32_t, BindingKind> vs_kinds, ps_kinds;
+        std::vector<uint32_t> vs_cbvs, ps_cbvs;
+        std::map<std::pair<ShaderStage, uint32_t>, D3D12_GPU_VIRTUAL_ADDRESS> scope_addresses;
+        std::vector<float4> vs_constants, ps_constants;
+        D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
+        TagHash technique;
+        bool vs_live = false, ps_live = false;
+        uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
+        std::map<uint32_t, ComPtr<ID3D12Resource>> textures, vs_textures;
     };
+    static constexpr uint32_t kPsSrvs = 32, kVsSrvs = 32, kItemSrvs = kPsSrvs + kVsSrvs;
+    static constexpr uint32_t kSrvCopies = Gpu::kFramesInFlight + 1;
+    uint32_t srv_frame_ = 0;
+    void bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices& vm,
+                     ID3D12RootSignature* root = nullptr);
+    void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm);
+    void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm);
+    std::unique_ptr<ExternStore> material_externs_;
+    ChannelValues channel_overrides_;
+    ChannelValues channel_defaults_;
+    float material_time_ = 0, material_delta_ = 0;
+    std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
+    size_t transparent_count_ = 0;
+    std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
     std::vector<SceneGroupInfo> info_;
     ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
     struct BufferSet {
         ComPtr<ID3D12Resource> ib, vb0, vb1, skin_pos, skin_normal, color;
-        uint32_t srv_first = UINT32_MAX;  // VS t0-t4 (dynamic models): color, -, skin streams
         D3D12_INDEX_BUFFER_VIEW ibv{};
         D3D12_VERTEX_BUFFER_VIEW vbv[4]{};
         // CPU skinning: bind-pose vertices and weights; each frame's streams go through its own
@@ -168,7 +235,7 @@ private:
     void update_skin(ID3D12GraphicsCommandList* cl);
     std::vector<BufferSet> sets_;
     std::vector<std::string> notes_;
-    ComPtr<ID3D12Resource> inst_vb_, zero_vb_, t2_, fallback_;
+    ComPtr<ID3D12Resource> inst_vb_, t2_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;
     bool skinned_ = false, skin_dirty_ = false;
@@ -188,6 +255,8 @@ const char* view_mode_name(ViewMode m);
 
 struct LightingParams {
     ViewMode mode = ViewMode::Lit;
+    float time = 0, delta_time = 0;  // seconds, shared with the model's material clock
+    bool optimize = true;  // reference path for pixel comparisons / timestamp benchmarks
     float exposure = 1.0f;
     float sun_azimuth = 0.9f, sun_elevation = 0.75f;  // radians
     float sun_intensity = 3.2f;

@@ -12,6 +12,7 @@
 //   nimcli [--install DIR] xref-tags T/S|class:HASH    which tag classes reference tags of that kind
 //   nimcli [--install DIR] static TAG                  static mesh: groups, techniques, shaders, layouts
 //   nimcli [--install DIR] shader TAG [OUT.asm]         disassemble a shader header's DXBC
+//   nimcli [--install DIR] render-resources [TAG]      original pipeline/scope resource sources (TSV)
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
@@ -30,6 +31,7 @@
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
+#include "nim/content/map.hpp"
 #include "nim/content/strings.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
@@ -461,6 +463,91 @@ int cmd_dialogue(PackageManager& pm, const char* out_path) {
     return 0;
 }
 
+// Breadth-first walk of the tags a tag references (u32 TagHashes at 4-byte alignment, u64 hash64s
+// at 8-byte alignment), skipping leaf asset classes. For reverse-engineering map structures.
+int cmd_crawl(PackageManager& pm, TagHash root, int max_depth, uint32_t target = 0) {
+    pm.build_hash64_index();
+    const std::set<uint32_t> leaves = {kClassStaticMesh};
+    std::map<uint32_t, std::pair<int, size_t>> seen;  // tag -> depth, order
+    std::map<uint32_t, uint32_t> parent;
+    std::vector<std::pair<TagHash, int>> queue{{root, 0}};
+    std::map<uint32_t, size_t> hist;
+    seen[root.value] = {0, 0};
+    for (size_t qi = 0; qi < queue.size() && queue.size() < 200000; ++qi) {
+        auto [t, d] = queue[qi];
+        const Entry* e = pm.entry(t);
+        if (!e) continue;
+        hist[e->reference]++;
+        if (!target && d <= 3) std::println("{:{}}{} class {:08X} size {}", "", d * 2, t.str(), e->reference, e->file_size);
+        if (target && e->reference == target) {
+            std::string chain;
+            for (uint32_t c = t.value; ; c = parent[c]) {
+                const Entry* ce = pm.entry(TagHash(c));
+                chain = std::format("{}({:08X}) ", TagHash(c).str(), ce ? ce->reference : 0) + chain;
+                if (!parent.count(c)) break;
+            }
+            std::println("{}", chain);
+        }
+        if (d >= max_depth || (e->type != 8 && e->type != 16) || leaves.count(e->reference)) continue;
+        std::vector<uint8_t> data;
+        try { data = pm.read(t); } catch (...) { continue; }
+        auto visit = [&](TagHash c) {
+            const Entry* ce = pm.entry(c);
+            if (!ce || (ce->type != 8 && ce->type != 16) || seen.count(c.value)) return;
+            seen[c.value] = {d + 1, queue.size()};
+            parent[c.value] = t.value;
+            queue.push_back({c, d + 1});
+        };
+        for (size_t o = 8; o + 4 <= data.size(); o += 4) {
+            uint32_t v; std::memcpy(&v, data.data() + o, 4);
+            if (v >= 0x80800000u && v != 0xFFFFFFFFu) visit(TagHash(v));
+            if ((o & 7) == 0 && o + 8 <= data.size()) {
+                uint64_t w; std::memcpy(&w, data.data() + o, 8);
+                if (w >> 63) if (auto r = pm.resolve64(w)) visit(*r);
+            }
+        }
+    }
+    std::println("{} tags reached", queue.size());
+    for (auto& [c, n] : hist) std::println("  class {:08X}  {}", c, n);
+    return 0;
+}
+
+int cmd_maps(PackageManager& pm) {
+    for (const auto& m : list_maps(pm)) {
+        auto l = load_map_layout(pm, m.bubble);
+        std::println("{}  {:<32} statics {:>6}  instances {:>7}  bounds ({:.0f} {:.0f} {:.0f})-({:.0f} {:.0f} {:.0f})", m.bubble.str(),
+                     m.package, l.statics.size(), l.instances, l.lo[0], l.lo[1], l.lo[2], l.hi[0], l.hi[1], l.hi[2]);
+    }
+    return 0;
+}
+
+// Tags that name `tag` by one of its hash64s.
+int cmd_refs64(PackageManager& pm, TagHash tag) {
+    std::set<uint64_t> wanted;
+    for (const auto& info : pm.packages())
+        for (const auto& h : pm.open(info).hash64s())
+            if (h.hash32 == tag) wanted.insert(h.hash64);
+    for (uint64_t w : wanted) std::println("hash64 {:016X}", w);
+    size_t n = 0;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 && e.type != 16) continue;
+            std::vector<uint8_t> d;
+            try { d = p.read_entry(i); } catch (...) { continue; }
+            for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+                uint64_t v; std::memcpy(&v, d.data() + o, 8);
+                if (!wanted.count(v)) continue;
+                std::println("{}  class {:08X}  +0x{:X}  size {}  {}", TagHash::make(info.pkg_id, uint16_t(i)).str(), e.reference, o, d.size(), info.name);
+                n++;
+            }
+        }
+    }
+    std::println("{} references", n);
+    return 0;
+}
+
 int cmd_find(PackageManager& pm, uint32_t cls) {
     size_t n = 0;
     for (const auto& info : pm.packages()) {
@@ -851,6 +938,76 @@ int cmd_fonts(PackageManager& pm, const char* out_dir) {
     return 0;
 }
 
+int cmd_render_resources(PackageManager& pm, std::optional<TagHash> requested) {
+    pm.build_hash64_index();
+    const auto globals = load_render_globals(pm);
+    const auto pipelines = requested ? std::vector<std::pair<std::string, TagHash>>{{"requested", *requested}} : globals.pipelines;
+    std::map<uint32_t, std::vector<ShaderBinding>> binding_cache;
+    std::map<uint32_t, std::vector<ShaderInput>> output_cache;
+    size_t failures = 0;
+    std::println("pipeline\ttechnique\tstage\tshader\tkind\tslot\tsource");
+    for (const auto& [name, tag] : pipelines) {
+        try {
+            if (tag.is_none()) {
+                std::println("{}\t{}\t-\t-\tunassigned\t-\tNo technique assigned by this game build", name, tag.str());
+                continue;
+            }
+            const auto technique = load_technique(pm, tag);
+            auto scopes = load_technique_scopes(pm, globals, technique);
+            std::vector<const Scope*> scope_ptrs;
+            for (const auto& scope : scopes) scope_ptrs.push_back(&scope);
+            for (size_t i = 0; i < size_t(ShaderStage::Count); ++i) {
+                const auto stage = ShaderStage(i);
+                const auto& core = technique.stage(stage);
+                if (core.shader.is_none()) continue;
+                auto row = [&](std::string_view kind, uint32_t slot, const std::string& source) {
+                    std::println("{}\t{}\t{}\t{}\t{}\t{}\t{}", name, tag.str(), "VHDGPC"[i], core.shader.str(), kind, slot, source);
+                };
+                const auto resources = resolve_stage_resources(technique, stage, scope_ptrs);
+                if (!binding_cache.contains(core.shader.value)) {
+                    const auto code = load_shader_bytecode(pm, core.shader);
+                    binding_cache[core.shader.value] = shader_bindings(code);
+                    output_cache[core.shader.value] = shader_outputs(code);
+                }
+                for (const auto& binding : binding_cache.at(core.shader.value)) {
+                    if (binding.upper - binding.lower > 4096) throw std::runtime_error("Unbounded shader binding range requires explicit handling");
+                    for (uint32_t slot = binding.lower; slot <= binding.upper; ++slot) {
+                        std::string source = "unresolved";
+                        switch (binding.type) {
+                        case BindingType::Sampler:
+                            if (auto it = resources.samplers.find(slot); it != resources.samplers.end()) source = "tag:" + it->second.str();
+                            row("sampler", slot, source);
+                            break;
+                        case BindingType::Cbv:
+                            if (int32_t(slot) == core.cbuffer_slot) source = "material:" + tag.str();
+                            else if (auto it = resources.cbuffer_scopes.find(slot); it != resources.cbuffer_scopes.end()) source = "scope:" + it->second.str();
+                            row("cbuffer", slot, source);
+                            break;
+                        case BindingType::Srv: case BindingType::Uav: {
+                            const auto& external = binding.type == BindingType::Srv ? resources.extern_textures : resources.extern_uavs;
+                            if (binding.type == BindingType::Srv)
+                                if (auto it = resources.textures.find(slot); it != resources.textures.end()) source = "tag:" + it->second.str();
+                            if (auto it = external.find(slot); it != external.end())
+                                source = std::format("extern:{}:0x{:X}:kind{}", it->second.extern_id, uint32_t(it->second.offset) * 8, int(binding.kind));
+                            row(binding.type == BindingType::Srv ? "srv" : "uav", slot, source);
+                            break;
+                        }
+                        default: break;
+                        }
+                    }
+                }
+                for (const auto& output : output_cache.at(core.shader.value)) row("output", output.index, output.semantic);
+            }
+        } catch (const std::exception& ex) {
+            ++failures;
+            std::println("{}\t{}\t-\t-\terror\t-\t{}", name, tag.str(), ex.what());
+        }
+    }
+    std::println(stderr, "Original game resource index: {} techniques, {} shaders, {} errors. Extern producers and execution order are not inferred.",
+                 pipelines.size(), binding_cache.size(), failures);
+    return failures ? 1 : 0;
+}
+
 int cmd_scope(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     Scope s = load_scope(pm, tag);
@@ -860,6 +1017,12 @@ int cmd_scope(PackageManager& pm, TagHash tag) {
         if (st.cbuffer_slot < 0 && st.bytecode.empty() && st.textures.empty()) continue;
         std::println(" stage {} cbuffer slot {} regs {} constants {} textures {} samplers {}", "PVGHCD"[i],
                      st.cbuffer_slot, st.cbuffer_init.size(), st.constants.size(), st.textures.size(), st.samplers.size());
+        for (size_t reg = 0; reg < st.cbuffer_init.size(); ++reg) {
+            const auto& v = st.cbuffer_init[reg];
+            std::println("   init[{}] = ({:.9g}, {:.9g}, {:.9g}, {:.9g})", reg, v[0], v[1], v[2], v[3]);
+        }
+        for (const auto& tex : st.textures) std::println("   texture t{} {}", tex.slot, tex.texture.str());
+        for (size_t n = 0; n < st.samplers.size(); ++n) std::println("   sampler[{}] {}", n, st.samplers[n].str());
         std::print("{}", disassemble_tfx(st.bytecode));
     }
     return 0;
@@ -868,7 +1031,7 @@ int cmd_scope(PackageManager& pm, TagHash tag) {
 int cmd_technique(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     Technique t = load_technique(pm, tag);
-    std::println("technique {} bind mode {}", t.tag.str(), t.bind_mode);
+    std::println("technique {} bind mode {} scopes {:016X} states {:08X}", t.tag.str(), t.bind_mode, t.used_scopes, t.states);
     for (size_t s = 0; s < 6; ++s) {
         const auto& st = t.stages[s];
         if (st.shader.is_none()) continue;
@@ -956,6 +1119,7 @@ int main(int argc, char** argv) {
             return cmd_extract(pm, uint16_t(parse_hex(args[1])), std::stoi(args[2]), args[3]);
         if (cmd == "globals") return cmd_globals(pm);
         if (cmd == "fonts") return cmd_fonts(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
+        if (cmd == "render-resources") return cmd_render_resources(pm, args.size() >= 2 ? std::optional{TagHash(parse_hex(args[1]))} : std::nullopt);
         if (cmd == "scope" && args.size() >= 2) return cmd_scope(pm, TagHash(parse_hex(args[1])));
         if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skeleton" && args.size() >= 2) return cmd_skeleton(pm, TagHash(parse_hex(args[1])));
@@ -966,6 +1130,10 @@ int main(int argc, char** argv) {
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
         if (cmd == "components") return cmd_components(pm, args.size() >= 2 ? parse_hex(args[1]) : 0);
+        if (cmd == "crawl" && args.size() >= 2)
+            return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
+        if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});
         if (cmd == "h64") return cmd_h64(pm, {args.begin() + 1, args.end()});

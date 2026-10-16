@@ -44,7 +44,7 @@ OpInfo op_info(uint8_t op) {
     case 0x53: return {"pop_output", 2}; case 0x54: return {"pop_output_unk", 2};
     case 0x55: return {"pop_output_mat4", 2};
     case 0x57: return {"push_temp", 2};  case 0x58: return {"pop_temp", 2};
-    case 0x59: return {"pop_texview", 2}; case 0x5A: return {"unk5a", 2};
+    case 0x59: return {"pop_texview", 2}; case 0x5B: return {"pop_srv_view", 2}; case 0x5A: return {"unk5a", 2};
     case 0x5D: return {"pop_sampler", 2}; case 0x5E: return {"pop_uav", 2};
     case 0x5F: return {"unk5f", 2};
     case 0x61: return {"push_sampler", 2}; case 0x62: return {"push_object_channel", 5};
@@ -188,16 +188,38 @@ std::string disassemble_tfx(std::span<const uint8_t> bc) {
     return s;
 }
 
+TfxResult inspect_tfx_bindings(std::span<const uint8_t> bc) {
+    TfxResult result;
+    uint8_t id = 0, offset = 0, sampler = 0;
+    for (size_t ip = 0; ip < bc.size();) {
+        auto [name, size] = op_info(bc[ip]);
+        if (!name || ip + size > bc.size()) throw std::runtime_error(std::format("TFX: invalid binding opcode {:02X} at 0x{:X}", bc[ip], ip));
+        const auto op = bc[ip];
+        if (op == 0x80) break;
+        if (op == 0x4D || op == 0x4F) { id = bc[ip + 1]; offset = bc[ip + 2]; }
+        if (op == 0x59 || op == 0x5B) result.extern_textures.push_back({uint32_t(bc[ip + 1] & 31), id, offset});
+        if (op == 0x5E) result.extern_uavs.push_back({uint32_t(bc[ip + 1] & 31), id, offset});
+        if (op == 0x61) sampler = bc[ip + 1];
+        if (op == 0x5D) result.samplers.push_back({uint32_t(bc[ip + 1] & 31), sampler});
+        result.live_inputs |= (op >= 0x4A && op <= 0x4F) || op == 0x62 || op == 0x63 || op == 0x64 || op == 0x69;
+        ++result.instructions;
+        ip += size;
+    }
+    return result;
+}
+
 TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants, std::span<float4> out,
                   const TfxEnvironment& env, std::string* trace) {
+    auto missing = [](const char* kind) -> float4 {
+        throw std::runtime_error(std::format("TFX: missing {} input", kind));
+    };
     TfxResult res;
     Vm vm(constants, out, env);
     std::vector<int> pending_textures;  // stack depth bookkeeping for texture views
     uint8_t last_extern_id = 0, last_extern_offset = 0, last_sampler = 0;
 
     auto note = [&](const char* name) {
-        if (std::find(res.unsupported.begin(), res.unsupported.end(), name) == res.unsupported.end())
-            res.unsupported.push_back(name);
+        throw std::runtime_error(std::format("TFX: unimplemented opcode {} (substitution is disabled)", name));
     };
 
     for (size_t ip = 0; ip < bc.size();) {
@@ -207,6 +229,7 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         if (ip + size > bc.size()) throw std::runtime_error("TFX: truncated instruction");
         const uint8_t a1 = size > 1 ? bc[ip + 1] : 0, a2 = size > 2 ? bc[ip + 2] : 0;
         res.instructions++;
+        if ((op >= 0x4A && op <= 0x4F) || op == 0x62 || op == 0x69) res.live_inputs = true;
         if (op == 0x80) break;
 
         switch (op) {
@@ -347,11 +370,11 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             vm.top() = t;
             break;
         }
-        case 0x4A: vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : 0.0f)); break;
-        case 0x4B: vm.push(env.extern_vec4 ? env.extern_vec4(a1, a2) : float4{}); break;
+        case 0x4A: vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : missing("extern scalar")[0])); break;
+        case 0x4B: vm.push(env.extern_vec4 ? env.extern_vec4(a1, a2) : missing("extern vector")); break;
         case 0x4C:
             for (uint8_t r = 0; r < 4; ++r)
-                vm.push(env.extern_vec4 ? env.extern_vec4(a1, uint8_t(a2 + r)) : float4{});
+                vm.push(env.extern_vec4 ? env.extern_vec4(a1, uint8_t(a2 + r)) : missing("extern matrix"));
             break;
         case 0x4D: case 0x4F:  // texture / UAV handles: keep the stack shape, remember the source
             last_extern_id = a1;
@@ -359,11 +382,11 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             vm.push(float4{});
             break;
         case 0x4E: case 0x69:  // raw u32 bits, splatted (reading the bytes as a float keeps them)
-            vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : 0.0f));
+            vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : missing("extern scalar")[0]));
             break;
         case 0x51: vm.push(vm.output(a1)); break;
         case 0x53: vm.output(a1) = vm.pop(); break;
-        case 0x54: vm.pop(); note(name); break;
+        case 0x54: note(name); break;
         case 0x55: {
             float4 w = vm.pop(), z = vm.pop(), y = vm.pop(), x = vm.pop();
             vm.output(a1) = x; vm.output(a1 + 1u) = y; vm.output(a1 + 2u) = z; vm.output(a1 + 3u) = w;
@@ -371,7 +394,7 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         }
         case 0x57: if (a1 >= 16) throw std::runtime_error("TFX temp slot"); vm.push(vm.temp[a1]); break;
         case 0x58: if (a1 >= 16) throw std::runtime_error("TFX temp slot"); vm.temp[a1] = vm.pop(); break;
-        case 0x59:
+        case 0x59: case 0x5B:
             res.extern_textures.push_back({uint32_t(a1 & 0x1F), last_extern_id, last_extern_offset});
             vm.pop();
             break;
@@ -379,23 +402,30 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             res.samplers.push_back({uint32_t(a1 & 0x1F), last_sampler});
             vm.pop();
             break;
-        case 0x5E: vm.pop(); break;                     // UAV bind
+        case 0x5E:
+            res.extern_uavs.push_back({uint32_t(a1 & 31), last_extern_id, last_extern_offset});
+            vm.pop();
+            break;                     // UAV bind
         case 0x61: last_sampler = a1; vm.push(float4{}); break;  // sampler handle
         case 0x62: {
             uint32_t h = uint32_t(bc[ip + 1]) << 24 | uint32_t(bc[ip + 2]) << 16 | uint32_t(bc[ip + 3]) << 8 | bc[ip + 4];
-            vm.push(env.object_channel ? env.object_channel(h) : splat(1.0f));
+            vm.push(env.object_channel ? env.object_channel(h) : missing("object channel"));
             break;
         }
-        case 0x63: case 0x64: vm.push(env.global_channel ? env.global_channel(a1) : splat(1.0f)); break;
-        case 0x66: case 0x67: case 0x68: {
-            const float4 v = {0.25f, 0.25f, 0.25f, 0.0625f};
-            vm.push({v[(a1 >> 6) & 3], v[(a1 >> 4) & 3], v[(a1 >> 2) & 3], v[a1 & 3]});
-            note(name);
+        case 0x63: case 0x64: vm.push(env.global_channel ? env.global_channel(a1) : missing("global channel")); break;
+        case 0x67: {
+            // Texture streaming / tiling parameters of texture a1; the shaders seen use .w as the
+            // minimum resident mip (an LOD clamp). Supplied by the environment, never invented here.
+            if (!env.texture_tiling) missing("texture tiling");
+            const float4 v = env.texture_tiling(a1);
+            vm.push({v[(a2 >> 6) & 3], v[(a2 >> 4) & 3], v[(a2 >> 2) & 3], v[a2 & 3]});
             break;
         }
-        case 0x3D: { float4 v1 = vm.at(-1); vm.push(v1); vm.sp -= 2; note("unk3d"); break; }
+        case 0x66: case 0x68:
+            throw std::runtime_error(std::format("TFX: unimplemented opcode {} {:02X} {:02X} at {:04X}", name, a1, a2, ip));
+        case 0x3D: note("unk3d"); break;
         default:
-            // Unimplemented ops leave the stack shape as-is; record them so callers can tell.
+            // Never continue with an invented result for an unknown instruction.
             note(name);
             break;
         }
@@ -411,6 +441,14 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         ip += size;
     }
     return res;
+}
+
+TfxResult evaluate_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants,
+                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env) {
+    out.assign(initial.begin(), initial.end());
+    out.resize(std::max<size_t>(out.size(), 128));
+    TfxResult result = run_tfx(bytecode, constants, out, env);
+    return result;
 }
 
 } // namespace nim

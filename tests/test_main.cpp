@@ -5,6 +5,7 @@
 #include "nim/core/tag_reader.hpp"
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -77,6 +78,44 @@ int main() {
         CHECK((out[2] == float4{10, 40, 90, 160}));
         CHECK((out[3] == float4{3, 17, 55, 129}));
         CHECK((out[4] == float4{0, 0, 0, 0}));
+    }
+
+    // Material frame evaluation: time-driven UVs, edited object state, real global defaults and
+    // an output that reads its initial value. Rewinding must reproduce the original frame.
+    {
+        const float4 initial[] = {{5, 5, 5, 5}, {7, 8, 9, 10}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+        const float4 constants[] = {{0.04f, 0.04f, 0.04f, 0.04f}};
+        const uint8_t program[] = {
+            0x51, 0x00, 0x4A, 0x01, 0x00, 0x01, 0x53, 0x00, // initial[0] + frame.time
+            0x4A, 0x01, 0x00, 0x42, 0x00, 0x03, 0x1D, 0x53, 0x02, // frac(time * .04)
+            0x62, 0xEA, 0xA8, 0xE3, 0xCF, 0x63, 0xCA, 0x03, 0x53, 0x03,
+        };
+        float time = 0, gate = 1;
+        TfxEnvironment env;
+        env.extern_float = [&](uint8_t id, uint8_t off) { return id == 1 && off == 0 ? time : 0; };
+        env.object_channel = [&](uint32_t h) { CHECK(h == 0xEAA8E3CF); return float4{gate, gate, gate, gate}; };
+        env.global_channel = [&](uint8_t ch) { CHECK(ch == 202); return float4{0, 16, 16, 0.5f}; };
+        std::vector<float4> out;
+        const auto result = evaluate_tfx(program, constants, initial, out, env);
+        CHECK(result.unsupported.empty());
+        CHECK(result.live_inputs);
+        CHECK(out[0] == initial[0]);
+        CHECK(out[1] == initial[1]);
+        CHECK((out[3] == float4{0, 16, 16, 0.5f}));
+        const auto first = out;
+        time = 2.5f;
+        gate = 0;
+        evaluate_tfx(program, constants, initial, out, env);
+        CHECK((out[0] == float4{7.5f, 7.5f, 7.5f, 7.5f}));
+        CHECK(std::fabs(out[2][0] - 0.1f) < 1e-6f);
+        CHECK(out[1] == initial[1]);
+        CHECK((out[3] == float4{}));
+        time = 0;
+        gate = 1;
+        evaluate_tfx(program, constants, initial, out, env);
+        CHECK(out == first);
+        const uint8_t globals_only[] = {0x63, 0xCA, 0x53, 0x00};
+        CHECK(!evaluate_tfx(globals_only, {}, initial, out, env).live_inputs);
     }
 
     if (g_failures) return 1;

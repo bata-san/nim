@@ -111,7 +111,7 @@ void Gpu::init(bool warp) {
              "CreateCommandList");
     check_hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    srv_.init(device_.Get(), 16384);
+    srv_.init(device_.Get(), 500000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
 
     dynamic_ = buffer(kDynamicPerFrame * kFramesInFlight, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     check_hr(dynamic_->Map(0, nullptr, reinterpret_cast<void**>(&dynamic_cpu_)), "Map(dynamic)");
