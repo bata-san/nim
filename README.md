@@ -25,6 +25,8 @@ build/Release/nimcli ls 120            # entries of package 0x120
 build/Release/nimcli types             # entry type/class histogram
 build/Release/nimcli read 80A4001D     # hex preview of a tag
 build/Release/nimcli verify            # decrypt + decompress every block
+build/Release/nimcli strings out.csv   # every localized string, 13 languages
+build/Release/nimcli dialogue out.csv  # every spoken line: speaker, text, audio event, WEM streams
 ```
 
 nim only reads installed files. It never touches the running game, and it ships no game data or Oodle binaries.

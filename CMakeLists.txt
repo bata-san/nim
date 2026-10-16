@@ -21,6 +21,8 @@ add_library(nim_core STATIC
   src/core/crypto.cpp
   src/core/package.cpp
   src/core/package_manager.cpp
+  src/content/strings.cpp
+  src/content/dialogue.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)

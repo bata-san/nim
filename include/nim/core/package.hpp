@@ -83,8 +83,10 @@ public:
     const std::vector<Hash64Entry>& hash64s() const { return hash64s_; }
     const std::string& name() const { return name_; }  // e.g. "w64_sr_globals_0120"
 
-    // Reads one decrypted, decompressed block. Thread-safe.
+    // Reads one decrypted, decompressed block (bypasses the cache). Thread-safe.
     std::vector<uint8_t> read_block(uint32_t index) const;
+    // Same, through a small LRU of recently decoded blocks. Thread-safe.
+    std::shared_ptr<const std::vector<uint8_t>> cached_block(uint32_t index) const;
     // Reads one entry's bytes. Thread-safe.
     std::vector<uint8_t> read_entry(uint32_t index) const;
 
@@ -100,6 +102,10 @@ private:
     std::vector<NamedTag> named_tags_;
     std::vector<Hash64Entry> hash64s_;
     std::unique_ptr<PackageCipher> cipher_;
+
+    static constexpr size_t kCacheSlots = 8;
+    mutable std::mutex cache_mutex_;
+    mutable std::vector<std::pair<uint32_t, std::shared_ptr<const std::vector<uint8_t>>>> cache_;
 
     mutable std::mutex files_mutex_;
     mutable std::map<uint16_t, std::unique_ptr<MappedFile>> files_;

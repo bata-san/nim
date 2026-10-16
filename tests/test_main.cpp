@@ -1,8 +1,10 @@
 // Unit tests that do not need a game install.
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
+#include "nim/core/tag_reader.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace nim;
@@ -33,6 +35,27 @@ int main() {
     CHECK(r.cstr_at(8) == "hi");
     bool threw = false;
     try { r.u64_at(8); } catch (const std::out_of_range&) { threw = true; }
+    CHECK(threw);
+
+    // Vec layout taken from string container 80A40282: count at 0x08, rel offset at 0x10 -> header at 0x60.
+    std::vector<uint8_t> tag(0x80, 0);
+    auto put32 = [&](size_t o, uint32_t v) { std::memcpy(tag.data() + o, &v, 4); };
+    auto put64 = [&](size_t o, uint64_t v) { std::memcpy(tag.data() + o, &v, 8); };
+    put64(0x08, 2);
+    put64(0x10, 0x50);
+    put64(0x60, 2);
+    put32(0x68, 0x80800070);
+    put32(0x70, 0xAAAA);
+    put32(0x74, 0xBBBB);
+    TagReader tr(tag);
+    auto v = tr.vec_at(0x08);
+    CHECK(v.count == 2);
+    CHECK(v.data == 0x70);
+    CHECK(v.element_class == 0x80800070);
+    CHECK(tr.u32_at(v.data + 4) == 0xBBBB);
+    put64(0x60, 3);  // header count mismatch must be rejected
+    threw = false;
+    try { tr.vec_at(0x08); } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
 
     if (g_failures) return 1;

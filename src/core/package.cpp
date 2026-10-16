@@ -124,6 +124,25 @@ std::vector<uint8_t> Package::read_block(uint32_t index) const {
     return out;
 }
 
+std::shared_ptr<const std::vector<uint8_t>> Package::cached_block(uint32_t index) const {
+    {
+        std::lock_guard lock(cache_mutex_);
+        for (size_t i = 0; i < cache_.size(); ++i) {
+            if (cache_[i].first == index) {
+                auto hit = cache_[i];
+                cache_.erase(cache_.begin() + i);
+                cache_.insert(cache_.begin(), hit);
+                return hit.second;
+            }
+        }
+    }
+    auto data = std::make_shared<const std::vector<uint8_t>>(read_block(index));
+    std::lock_guard lock(cache_mutex_);
+    cache_.insert(cache_.begin(), {index, data});
+    if (cache_.size() > kCacheSlots) cache_.pop_back();
+    return data;
+}
+
 std::vector<uint8_t> Package::read_entry(uint32_t index) const {
     const Entry& e = entries_.at(index);
     std::vector<uint8_t> out;
@@ -131,7 +150,8 @@ std::vector<uint8_t> Package::read_entry(uint32_t index) const {
     uint32_t block = e.starting_block;
     size_t offset = e.starting_block_offset;
     while (out.size() < e.file_size) {
-        auto data = read_block(block++);
+        auto block_data = cached_block(block++);
+        const auto& data = *block_data;
         if (offset >= data.size()) throw std::runtime_error("entry offset beyond block");
         size_t n = std::min(data.size() - offset, size_t(e.file_size) - out.size());
         out.insert(out.end(), data.begin() + offset, data.begin() + offset + n);
