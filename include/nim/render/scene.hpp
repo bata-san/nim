@@ -6,6 +6,8 @@
 
 #include <array>
 #include <map>
+#include <mutex>
+#include <span>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -35,12 +37,34 @@ struct View {
 };
 struct ViewMatrices {
     M4 vp_abs, vp_rel;  // absolute / camera-relative world -> clip
+    M4 proj;            // camera space (x right, y up, z forward) -> clip
     V3 eye, fwd, right, up;
     float fx = 1, fy = 1;
+    float ortho = 0;  // > 0: orthographic, half the view's extent (the sun's shadow view)
 };
 ViewMatrices make_view(const View& v);
 // A view that frames a sphere from a pleasant three-quarter angle.
 View frame_sphere(V3 center, float radius, uint32_t w, uint32_t h, float yaw = -0.93f, float pitch = 0.41f);
+
+// ---- sun shadow map ------------------------------------------------------------------------------
+// Not an engine pass (the game's shadow cascades are not decoded): nim draws the scene's own
+// G-buffer pipelines from the sun into one orthographic depth map, which GameLighting turns into
+// the shading pass's sun shadow mask. Reported as an estimate.
+struct SunShadow {
+    ComPtr<ID3D12Resource> depth;  // R32 typeless; DEPTH_WRITE outside GameLighting::render
+    ComPtr<ID3D12DescriptorHeap> dsv_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+    uint32_t size = 0;
+    ViewMatrices vm;
+    float half = 1, range = 1;  // ortho half extent, depth range (m)
+    bool valid = false;         // rendered this frame
+    void resize(Gpu& gpu, uint32_t size);
+    // Covers the sphere (center, radius) seen from the sun (sun_dir points toward the sun),
+    // snapped to whole texels so the map does not shimmer as the camera moves.
+    void fit(V3 sun_dir, V3 center, float radius);
+    // A small scene whole; a large one (a map) around the camera's focus, sized by its distance.
+    void fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius);
+};
 
 // ---- G-buffer ---------------------------------------------------------------------------------
 // RT0 albedo, RT1 packed normal+smoothness, RT2 material params, RT3 motion; all RGBA16F as
@@ -103,6 +127,7 @@ struct PreparedMesh {
         std::vector<float4> cb0;
         std::map<uint32_t, std::shared_ptr<const Texture>> textures;
         uint8_t stage = 0;  // render stage: 0 = G-buffer, 8 = transparents
+        uint8_t lod_mask = 1;  // static mesh LOD levels this part belongs to (bit n = LOD n)
         int blend = -1;     // engine blend state index (transparents)
         std::vector<float4> vs_cb0;                // the VS stage's own cb0
         std::map<uint32_t, std::shared_ptr<const Texture>> vs_textures;
@@ -111,6 +136,9 @@ struct PreparedMesh {
         StageResourceSources vs_sources, ps_sources;
         bool vs_live = false, ps_live = false;
         std::map<uint32_t, SamplerDesc> vs_samplers, ps_samplers;
+        // Constant buffers the object supplies itself (terrain: VS b11 = position offset and
+        // texcoord transform), by (stage, register).
+        std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_cbuffers;
     };
     TagHash tag;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
@@ -122,6 +150,7 @@ struct PreparedMesh {
     V3 center;
     float radius = 1;
     uint8_t lod = 0;
+    uint8_t lod_levels = 1;  // static meshes prepared with all LODs: bit n = LOD n present
     std::vector<std::string> notes;  // parts that could not be drawn, and why
     std::map<uint32_t, ChannelUse> channels;  // object channels the materials read
     ChannelValues channel_overrides;
@@ -131,8 +160,27 @@ struct PreparedMesh {
     TagHash component;               // dynamic models: the component the materials came from
     uint32_t permutation = 0, permutation_count = 0;
 };
+// Shared across many prepare_static_mesh calls (maps): render globals / scopes read once,
+// textures shared by tag and capped at max_texture_dim (0 = full size), G-buffer parts only.
+struct PrepareCache {
+    uint32_t max_texture_dim = 0;
+    bool gbuffer_only = false;
+    bool all_lods = false;  // every LOD level (maps pick one per instance by screen size)
+    bool ready = false;
+    std::vector<float4> global_channels;
+    std::vector<Scope> scopes;
+    std::unordered_map<uint32_t, std::shared_ptr<const Texture>> textures;
+    // Shared by the threads preparing a map's meshes in parallel (each with its own PackageManager).
+    std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
+};
 // Throws on failure.
-PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr);
+PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr,
+                                 PrepareCache* cache = nullptr);
+struct Terrain;
+// A map's terrain patch (high detail parts) with its own techniques, dyemaps and VS constants;
+// `layouts` picks the game input layout matching its vertex streams. Throws on failure.
+PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
+                             PrepareCache* cache = nullptr);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
 // material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_pose.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
@@ -151,11 +199,22 @@ public:
         upload(gpu, prepare_mesh(pm, mesh), layouts);
     }
     void upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts);
+    // Many static meshes in one scene (a map): begin, add_mesh per mesh with its world placements
+    // (3x4 rows: rotation * scale | translation), then finish. Materials, scopes and textures are
+    // shared across meshes; each mesh is drawn instanced.
+    void begin(Gpu& gpu);
+    void add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
+                  std::span<const std::array<float, 12>> placements);
+    void finish(Gpu& gpu, TagHash tag, V3 center, float radius);
+    size_t mesh_count() const { return sets_.size(); }
+    size_t instance_count() const { return instance_total_; }
     void release(Gpu& gpu);  // caller must make sure the GPU is idle
     bool loaded() const { return !items_.empty(); }
 
     // Clears the G-buffer and draws every G-buffer group. Leaves targets in RENDER_TARGET.
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
+    // Depth of the G-buffer parts from the sun (shadow.fit first); sets shadow.valid.
+    void render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow);
     // Transparent parts (render stage 8), blended into the HDR target `rtv` (R16G16B16A16_FLOAT)
     // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
@@ -187,20 +246,31 @@ private:
         StaticMeshPart part;
         uint32_t buffers = 0;
         uint8_t stage = 0;
+        uint8_t lod_mask = 1;
+        ComPtr<ID3D12PipelineState> shadow_pso;  // same shaders, depth only, from the sun
         ComPtr<ID3D12PipelineState> pso;
         ComPtr<ID3D12RootSignature> root_sig;
-        ComPtr<ID3D12Resource> cb0, vs_cb0;
+        GpuBuffer cb0, vs_cb0;
         TechniqueStage vs_material, ps_material;
         std::vector<Scope> scopes;
         StageResourceSources vs_sources, ps_sources;
         std::map<uint32_t, BindingKind> vs_kinds, ps_kinds;
         std::vector<uint32_t> vs_cbvs, ps_cbvs;
-        std::map<std::pair<ShaderStage, uint32_t>, D3D12_GPU_VIRTUAL_ADDRESS> scope_addresses;
+        std::vector<std::pair<uint32_t, GpuBuffer>> own_cbvs;  // (root parameter, constants)
+        std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_regs;
+        std::vector<std::pair<uint32_t, uint32_t>> scope_slots;                   // (root parameter, scope_defs_ slot)
+        std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
         std::vector<float4> vs_constants, ps_constants;
         D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
         TagHash technique;
         bool vs_live = false, ps_live = false;
+        bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
         uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
+        uint32_t srv_copies = 1;          // kSrvCopies when engine textures are rebound per frame
+        bool owns_srv = true;             // false: a table shared with an item with the same views
+        // Single-copy tables: the engine views last written (resource, format) per table slot, so
+        // a slot is only rewritten when the view changes.
+        std::map<uint32_t, std::pair<const void*, uint32_t>> written;
         std::map<uint32_t, ComPtr<ID3D12Resource>> textures, vs_textures;
     };
     static constexpr uint32_t kPsSrvs = 32, kVsSrvs = 32, kItemSrvs = kPsSrvs + kVsSrvs;
@@ -208,7 +278,8 @@ private:
     uint32_t srv_frame_ = 0;
     void bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices& vm,
                      ID3D12RootSignature* root = nullptr);
-    void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm);
+    void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
+                    bool shadow = false);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm);
     std::unique_ptr<ExternStore> material_externs_;
     ChannelValues channel_overrides_;
@@ -222,7 +293,11 @@ private:
     std::vector<SceneGroupInfo> info_;
     ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
     struct BufferSet {
-        ComPtr<ID3D12Resource> ib, vb0, vb1, skin_pos, skin_normal, color;
+        GpuBuffer ib, vb0, vb1, color;
+        ComPtr<ID3D12Resource> skin_pos, skin_normal;
+        GpuBuffer t2, inst;  // static meshes: instance records + mesh block, instance index stream
+        uint32_t instances = 1;
+        uint32_t cull = UINT32_MAX;  // cull_groups_ index: this frame's visible instances
         D3D12_INDEX_BUFFER_VIEW ibv{};
         D3D12_VERTEX_BUFFER_VIEW vbv[4]{};
         // CPU skinning: bind-pose vertices and weights; each frame's streams go through its own
@@ -233,9 +308,34 @@ private:
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
+    void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
+                        std::span<const std::array<float, 12>> placements);
     std::vector<BufferSet> sets_;
     std::vector<std::string> notes_;
-    ComPtr<ID3D12Resource> inst_vb_, t2_;
+    size_t instance_total_ = 0;
+    // View culling of static instances (a viewer choice, not the game's visibility system):
+    // world bounding spheres, and per frame the indices that survive into the instance stream.
+    struct CullGroup {
+        std::vector<std::array<float, 4>> spheres;
+        uint8_t levels = 1;  // LOD levels the mesh has (bit n = LOD n)
+        D3D12_GPU_VIRTUAL_ADDRESS visible_address = 0;
+        uint32_t visible = 0;
+        std::array<uint32_t, 4> first{}, count{};  // visible instances per LOD level, in that order
+    };
+    std::array<std::vector<uint32_t>, 4> cull_scratch_;
+    std::vector<CullGroup> cull_groups_;
+    void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height);
+    uint32_t item_instances(const Item& it) const;  // this frame's, after cull()
+    struct ScopeDef { const Scope* scope; ShaderStage stage; uint32_t reg; };
+    std::vector<ScopeDef> scope_defs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scope_frame_;
+    bool scopes_resolved_ = false;
+    GpuBuffer white_color_;
+    BufferArena arena_;  // geometry and fixed constants of this scene  // 1 x RGBA8 white: VS colour stream of meshes without one
+    std::map<uint32_t, ComPtr<ID3D12Resource>> texture_cache_;
+    std::map<uint32_t, ComPtr<ID3D12RootSignature>> root_cache_;
+    std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
+    std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;
     bool skinned_ = false, skin_dirty_ = false;

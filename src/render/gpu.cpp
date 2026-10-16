@@ -111,7 +111,7 @@ void Gpu::init(bool warp) {
              "CreateCommandList");
     check_hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    srv_.init(device_.Get(), 500000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
+    srv_.init(device_.Get(), 1000000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
 
     dynamic_ = buffer(kDynamicPerFrame * kFramesInFlight, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     check_hr(dynamic_->Map(0, nullptr, reinterpret_cast<void**>(&dynamic_cpu_)), "Map(dynamic)");
@@ -136,6 +136,7 @@ void Gpu::flush() {
     wait(signal());
     check_device();
     keep_.clear();
+    staging_used_ = 0;
     check_hr(alloc_->Reset(), "allocator Reset");
     check_hr(list_->Reset(alloc_.Get(), nullptr), "list Reset");
 }
@@ -209,6 +210,40 @@ ComPtr<ID3D12Resource> Gpu::buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESO
              "CreateCommittedResource(buffer)");
     debug_name(r.Get(), heap == D3D12_HEAP_TYPE_UPLOAD ? "upload" : heap == D3D12_HEAP_TYPE_READBACK ? "readback" : "buffer", size, 0);
     return r;
+}
+
+void Gpu::stage_copy(ID3D12Resource* dst, uint64_t dst_offset, const void* data, size_t size) {
+    if (!size) return;
+    if (size > kStagingChunk) {
+        auto up = upload(data, size);
+        list_->CopyBufferRegion(dst, dst_offset, up.Get(), 0, size);
+        keep_.push_back(std::move(up));
+        return;
+    }
+    staging_used_ = (staging_used_ + 15) & ~size_t(15);
+    if (!staging_ || staging_used_ + size > kStagingChunk) {
+        if (staging_) keep_.push_back(staging_);  // still read by recorded copies
+        staging_ = buffer(kStagingChunk, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check_hr(staging_->Map(0, nullptr, reinterpret_cast<void**>(&staging_cpu_)), "Map(staging)");
+        staging_used_ = 0;
+    }
+    std::memcpy(staging_cpu_ + staging_used_, data, size);
+    list_->CopyBufferRegion(dst, dst_offset, staging_.Get(), staging_used_, size);
+    staging_used_ += size;
+}
+
+GpuBuffer BufferArena::upload(Gpu& gpu, const void* data, size_t size, size_t align) {
+    constexpr uint64_t kChunk = 64ull << 20;
+    const uint64_t bytes = std::max<uint64_t>(size, 4);
+    uint64_t at = (used_ + align - 1) / align * align;
+    if (!chunk_ || at + bytes > capacity_) {
+        capacity_ = std::max(kChunk, (bytes + 0xFFFF) & ~0xFFFFull);
+        chunk_ = gpu.buffer(size_t(capacity_), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        at = 0;
+    }
+    used_ = at + bytes;
+    gpu.stage_copy(chunk_.Get(), at, data, size);
+    return {chunk_, at, bytes, chunk_->GetGPUVirtualAddress() + at};
 }
 
 ComPtr<ID3D12Resource> Gpu::upload(const void* data, size_t size) {

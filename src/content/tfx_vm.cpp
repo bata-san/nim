@@ -421,7 +421,14 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             vm.push({v[(a2 >> 6) & 3], v[(a2 >> 4) & 3], v[(a2 >> 2) & 3], v[a2 & 3]});
             break;
         }
-        case 0x66: case 0x68:
+        case 0x68: {
+            // Layer count of texture a1 (tiled / array textures), swizzled like push_tex_tiling.
+            if (!env.texture_layer_count) missing("texture layer count");
+            const float4 v = env.texture_layer_count(a1);
+            vm.push({v[(a2 >> 6) & 3], v[(a2 >> 4) & 3], v[(a2 >> 2) & 3], v[a2 & 3]});
+            break;
+        }
+        case 0x66:
             throw std::runtime_error(std::format("TFX: unimplemented opcode {} {:02X} {:02X} at {:04X}", name, a1, a2, ip));
         case 0x3D: note("unk3d"); break;
         default:

@@ -1,10 +1,12 @@
 #include "nim/render/scene.hpp"
+#include "nim/content/map.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/object_channels.hpp"
 
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -49,6 +51,7 @@ ViewMatrices make_view(const View& v) {
     proj.c[1] = {0, m.fy, 0, 0};
     proj.c[2] = {0, 0, 0, 1};
     proj.c[3] = {0, 0, v.near_z, 0};
+    m.proj = proj;
     m.vp_rel = mul(proj, rot);
     M4 tr;
     tr.c[0] = {1, 0, 0, 0};
@@ -57,6 +60,78 @@ ViewMatrices make_view(const View& v) {
     tr.c[3] = {-v.eye.x, -v.eye.y, -v.eye.z, 1};
     m.vp_abs = mul(m.vp_rel, tr);
     return m;
+}
+
+void SunShadow::resize(Gpu& gpu, uint32_t n) {
+    if (n == size && depth) return;
+    size = n;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rd.Height = n;
+    rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R32_TYPELESS;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv{DXGI_FORMAT_D32_FLOAT};
+    cv.DepthStencil.Depth = 0;
+    depth.Reset();
+    check_hr(gpu.device()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                                   IID_PPV_ARGS(&depth)),
+             "sun shadow map");
+    if (!dsv_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+        check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap)), "sun shadow DSV heap");
+    }
+    dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd{};
+    dd.Format = DXGI_FORMAT_D32_FLOAT;
+    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    gpu.device()->CreateDepthStencilView(depth.Get(), &dd, dsv);
+}
+
+void SunShadow::fit(V3 sun_dir, V3 center, float radius) {
+    vm = {};
+    vm.fwd = normalize(V3{-sun_dir.x, -sun_dir.y, -sun_dir.z});
+    V3 world_up{0, 0, 1};
+    if (std::fabs(dot(vm.fwd, world_up)) > 0.999f) world_up = {0, 1, 0};
+    vm.right = normalize(cross(vm.fwd, world_up));
+    vm.up = cross(vm.right, vm.fwd);
+    half = std::max(0.05f, radius);
+    // Casters well outside the covered sphere (towers, overhangs) still reach it.
+    const float back = radius + std::max(50.0f, radius * 4);
+    range = back + radius;
+    const float texel = 2 * half / float(std::max(1u, size));
+    const float u = std::floor(dot(center, vm.right) / texel) * texel, v = std::floor(dot(center, vm.up) / texel) * texel;
+    const float w = dot(center, vm.fwd);
+    vm.eye = vm.right * u + vm.up * v + vm.fwd * (w - back);
+    vm.ortho = half;
+    vm.fx = vm.fy = 1 / half;
+    M4 rot;
+    rot.c[0] = {vm.right.x, vm.up.x, vm.fwd.x, 0};
+    rot.c[1] = {vm.right.y, vm.up.y, vm.fwd.y, 0};
+    rot.c[2] = {vm.right.z, vm.up.z, vm.fwd.z, 0};
+    rot.c[3] = {0, 0, 0, 1};
+    M4 proj;  // reversed depth: 1 at the sun's eye, 0 at `range`
+    proj.c[0] = {1 / half, 0, 0, 0};
+    proj.c[1] = {0, 1 / half, 0, 0};
+    proj.c[2] = {0, 0, -1 / range, 0};
+    proj.c[3] = {0, 0, 1, 1};
+    vm.proj = proj;
+    vm.vp_rel = mul(proj, rot);
+    M4 tr;
+    tr.c[0] = {1, 0, 0, 0};
+    tr.c[1] = {0, 1, 0, 0};
+    tr.c[2] = {0, 0, 1, 0};
+    tr.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    vm.vp_abs = mul(vm.vp_rel, tr);
+}
+
+void SunShadow::fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius) {
+    const V3 d = focus - eye;
+    const float reach = std::clamp(std::sqrt(dot(d, d)) * 0.9f, 40.0f, 300.0f);
+    if (scene_radius <= reach) fit(sun_dir, scene_center, scene_radius * 1.05f);
+    else fit(sun_dir, focus, reach);
 }
 
 View frame_sphere(V3 center, float radius, uint32_t w, uint32_t h, float yaw, float pitch) {
@@ -281,13 +356,19 @@ std::map<uint32_t, BindingKind> srv_kinds(std::span<const uint8_t> code) {
     return out;
 }
 
-void create_buffer_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, UINT elements, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+void create_buffer_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, UINT elements, D3D12_CPU_DESCRIPTOR_HANDLE h,
+                       uint64_t first_element = 0) {
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = fmt;
     sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Buffer.FirstElement = first_element;
     sd.Buffer.NumElements = std::max<UINT>(1, elements);
     dev->CreateShaderResourceView(r, &sd, h);
+}
+// An RGBA8 / R32 typed view of an arena range (offsets are 256-aligned, so element-aligned).
+void create_buffer_srv(ID3D12Device* dev, const GpuBuffer& b, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    create_buffer_srv(dev, b.resource.Get(), fmt, UINT(b.size / 4), h, b.offset / 4);
 }
 
 
@@ -320,8 +401,17 @@ void StaticMeshScene::release(Gpu& gpu) {
         } catch (...) {
         }
     }
-    for (auto& it : items_) gpu.srv().free(it.srv_first, kItemSrvs * kSrvCopies);
+    for (auto& it : items_)
+        if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
     items_.clear();
+    table_cache_.clear();
+    scopes_resolved_ = false;
+    scope_defs_.clear();
+    cull_groups_.clear();
+    instance_total_ = 0;
+    texture_cache_.clear();
+    root_cache_.clear();
+    pipeline_cache_.clear();
     info_.clear();
     transparent_count_ = 0;
     channels_.clear();
@@ -329,10 +419,11 @@ void StaticMeshScene::release(Gpu& gpu) {
     channel_defaults_.clear();
     material_addresses_.clear();
     material_time_ = material_delta_ = 0;
+    white_color_ = {};
+    arena_.reset();
     material_externs_.reset();
     sets_.clear();
     notes_.clear();
-    inst_vb_.Reset(); t2_.Reset();
     dynamic_ = false;
     skinned_ = skin_dirty_ = false;
     skin_pose_.clear();
@@ -385,12 +476,20 @@ void prepare_material_inputs(PackageManager& pm, PreparedMesh& mesh, const Chann
 
 }
 
-using TextureCache = std::unordered_map<uint32_t, std::shared_ptr<const Texture>>;
+struct TextureCache {
+    std::unordered_map<uint32_t, std::shared_ptr<const Texture>> local;
+    PrepareCache* shared = nullptr;
+};
 std::shared_ptr<const Texture> cached_texture(PackageManager& pm, TagHash tag, TextureCache& cache) {
-    if (auto it = cache.find(tag.value); it != cache.end()) return it->second;
-    auto texture = std::make_shared<const Texture>(load_texture(pm, tag));
-    cache.emplace(tag.value, texture);
-    return texture;
+    auto& map = cache.shared ? cache.shared->textures : cache.local;
+    std::mutex unshared;
+    std::unique_lock lk(cache.shared ? *cache.shared->mutex : unshared);
+    if (auto it = map.find(tag.value); it != map.end()) return it->second;
+    lk.unlock();  // decoded outside the lock; a texture two threads load at once is kept once
+    const uint32_t cap = cache.shared ? cache.shared->max_texture_dim : 0;
+    auto texture = std::make_shared<const Texture>(cap ? load_texture(pm, tag, cap) : load_texture(pm, tag));
+    lk.lock();
+    return map.emplace(tag.value, texture).first->second;
 }
 
 PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const StaticMeshPart& part,
@@ -673,30 +772,53 @@ PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMat
     return prepare_static_mesh(pm, tag, channels);
 }
 
-PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelValues* channels) {
+PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelValues* channels, PrepareCache* cache) {
     PreparedMesh out;
-    prepare_material_inputs(pm, out, channels);
+    if (cache) {
+        std::lock_guard lk(*cache->mutex);
+        if (!cache->ready) {
+            PreparedMesh first;
+            prepare_material_inputs(pm, first, nullptr);
+            cache->global_channels = std::move(first.global_channels);
+            cache->scopes = std::move(first.scopes);
+            cache->ready = true;
+        }
+        if (channels) out.channel_overrides = *channels;
+        out.global_channels = cache->global_channels;
+        out.scopes = cache->scopes;
+    } else {
+        prepare_material_inputs(pm, out, channels);
+    }
     out.tag = tag;
     StaticMesh mesh = load_static_mesh(pm, tag);
     TextureCache texture_cache;
+    texture_cache.shared = cache;
 
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
-    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent; };
+    const bool gbuffer_only = cache && cache->gbuffer_only;
+    auto drawn = [gbuffer_only](uint8_t st) { return st == 0 || (!gbuffer_only && st == kStageTransparent); };
     std::vector<Pending> pending;
     uint8_t lod = 0xFF;
     for (const auto& g : mesh.groups)
         if (drawn(g.render_stage)) lod = std::min(lod, mesh.parts.at(g.part_index).lod_category);
+    // lod_category is a mask of LOD levels (1 = LOD0, 2 = LOD1, 4 = LOD2 ...). Every level shares
+    // the mesh's buffers; with all_lods each part keeps its mask.
+    const bool all_lods = cache && cache->all_lods;
+    int buffer = -1;
     for (size_t g = 0; g < mesh.groups.size(); ++g) {
         const auto& gr = mesh.groups[g];
         if (!drawn(gr.render_stage) || g >= mesh.techniques.size()) continue;
         const auto& part = mesh.parts.at(gr.part_index);
-        if (part.lod_category != lod) continue;
+        if (all_lods ? (part.lod_category & 0x0F) == 0 : part.lod_category != lod) continue;
+        if (buffer >= 0 && part.buffer_index != buffer) continue;
         Technique t = load_technique(pm, mesh.techniques[g]);
         if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
+        buffer = part.buffer_index;
         pending.push_back({gr, part, std::move(t)});
     }
     if (pending.empty()) throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
     out.lod = lod;
+    if (all_lods) out.lod_levels = 0;
 
     const auto& bufs = mesh.buffers.at(pending[0].part.buffer_index);
     out.buffers.emplace_back();
@@ -704,12 +826,19 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     set.ib = load_index_buffer(pm, bufs.index);
     set.vb0 = load_vertex_buffer(pm, bufs.vertex0);
     if (!bufs.vertex1.is_none()) set.vb1 = load_vertex_buffer(pm, bufs.vertex1);
+    if (!bufs.color.is_none()) set.color = load_vertex_buffer(pm, bufs.color).data;  // per-vertex RGBA8 (VS t0)
     const IndexBuffer& ib = set.ib;
     const VertexBuffer& vb0 = set.vb0;
 
     // Bounds of the drawn geometry, in the space the VS produces (pos * scale + offset).
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    const uint8_t detail = all_lods ? uint8_t(pending[0].part.lod_category & 0x0F) : 0;
+    uint8_t lowest = 0x0F;
+    for (const auto& it : pending) lowest = std::min<uint8_t>(lowest, it.part.lod_category & 0x0F);
+    const uint8_t lowest_bit = uint8_t(lowest & (~lowest + 1));
+    (void)detail;
     for (const auto& it : pending)
+        if (!all_lods || (it.part.lod_category & lowest_bit))
         for (uint32_t i = 0; i < it.part.index_count; ++i) {
             size_t ii = it.part.index_start + i;
             if ((ii + 1) * (ib.is_32bit ? 4 : 2) > ib.data.size()) break;
@@ -740,46 +869,212 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     for (auto& p : pending) {
         out.groups.push_back(build_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes));
         out.groups.back().stage = p.group.render_stage;
+        out.groups.back().lod_mask = all_lods ? uint8_t(p.part.lod_category & 0x0F) : 1;
+        if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
     }
     return out;
 }
 
+PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
+                             PrepareCache* cache) {
+    PreparedMesh out;
+    if (cache) {
+        std::lock_guard lk(*cache->mutex);
+        if (!cache->ready) {
+            PreparedMesh first;
+            prepare_material_inputs(pm, first, nullptr);
+            cache->global_channels = std::move(first.global_channels);
+            cache->scopes = std::move(first.scopes);
+            cache->ready = true;
+        }
+        out.global_channels = cache->global_channels;
+        out.scopes = cache->scopes;
+    } else {
+        prepare_material_inputs(pm, out, nullptr);
+    }
+    out.tag = terrain.tag;
+    out.buffers.emplace_back();
+    auto& set = out.buffers.back();
+    set.ib = load_index_buffer(pm, terrain.index);
+    set.vb0 = load_vertex_buffer(pm, terrain.vertex0);
+    set.vb1 = load_vertex_buffer(pm, terrain.vertex1);
+    // The game layout whose streams have exactly these strides (int16x4 position; normal + uv).
+    int layout = -1;
+    for (size_t l = 0; l < layouts.size() && layout < 0; ++l) {
+        uint32_t stride[4]{};
+        bool position = false;
+        for (const auto& e : layouts[l]) {
+            if (e.buffer < 4) stride[e.buffer] += e.size;
+            position |= _stricmp(e.semantic, "POSITION") == 0 && e.buffer == 0;
+            if (e.instanced) stride[3] += 1000;
+        }
+        if (position && stride[0] == set.vb0.stride && stride[1] == set.vb1.stride && !stride[2] && !stride[3] &&
+            layouts[l].size() == 3)
+            layout = int(l);
+    }
+    if (layout < 0) throw std::runtime_error(std::format("terrain {}: no game input layout for strides {}/{}", terrain.tag.str(),
+                                                         set.vb0.stride, set.vb1.stride));
+    TextureCache texture_cache;
+    texture_cache.shared = cache;
+    for (size_t i = 0; i < terrain.parts.size(); ++i) {
+        const auto& tp = terrain.parts[i];
+        if (tp.detail != 0 || tp.group >= terrain.groups.size() || tp.technique.is_none()) continue;
+        Technique t = load_technique(pm, tp.technique);
+        if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
+        StaticMeshPart part{tp.index_start, tp.index_count, 0, 1, 5};  // strips
+        out.groups.push_back(build_group(pm, t, part, uint16_t(i), uint8_t(layout), texture_cache, out.scopes));
+        auto& g = out.groups.back();
+        const auto& group = terrain.groups[tp.group];
+        // PS t14: the group's dyemap (goriath binds it there; the PS declares t14).
+        if (!group.dyemap.is_none()) {
+            g.textures[14] = cached_texture(pm, group.dyemap, texture_cache);
+            g.ps_sources.textures[14] = group.dyemap;
+        }
+        g.own_cbuffers[{ShaderStage::Vertex, 11}] = {
+            float4{terrain.offset[0], terrain.offset[1], terrain.offset[2], terrain.offset[3]},
+            float4{group.texcoord[0], group.texcoord[1], group.texcoord[2], group.texcoord[3]}, float4{}, float4{}};
+    }
+    if (out.groups.empty()) throw std::runtime_error(std::format("terrain {}: no high-detail parts with shaders", terrain.tag.str()));
+    // The VS: world = ((pos.xy + offset.xy) / 64, (pos.z + offset.z + (pos.w + offset.w) * 65536) / 8192).
+    out.center = {(terrain.lo[0] + terrain.hi[0]) * 0.5f, (terrain.lo[1] + terrain.hi[1]) * 0.5f, (terrain.lo[2] + terrain.hi[2]) * 0.5f};
+    const V3 ext{terrain.hi[0] - terrain.lo[0], terrain.hi[1] - terrain.lo[1], terrain.hi[2] - terrain.lo[2]};
+    out.radius = std::max(0.01f, std::sqrt(dot(ext, ext)) * 0.5f);
+    out.instance.assign(128, 0);
+    const float rows[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(out.instance.data(), rows, sizeof(rows));
+    const uint32_t block = 80;
+    std::memcpy(out.instance.data() + 60, &block, 4);
+    return out;
+}
+
 void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts) {
+    begin(gpu);
+    const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    const TagHash tag = mesh.tag;
+    const V3 center = mesh.center;
+    const float radius = mesh.radius;
+    add_mesh(gpu, std::move(mesh), layouts, std::span(&identity, 1));
+    finish(gpu, tag, center, radius);
+}
+
+void StaticMeshScene::begin(Gpu& gpu) {
     release(gpu);
     ID3D12Device* dev = gpu.device();
     if (!root_sig_) root_sig_ = make_gbuffer_root_signature(dev);
     if (!root_sig_dynamic_) root_sig_dynamic_ = make_gbuffer_root_signature(dev, true);
-    center_ = mesh.center;
-    radius_ = mesh.radius;
-    lod_ = mesh.lod;
-    dynamic_ = mesh.dynamic;
-    model_cb_ = mesh.model_cb;
-    skin_scale_ = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
-    skin_offset_ = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
-    skin_range_ = mesh.model_cb[13][3] > 1e-8f ? mesh.model_cb[13][3] : 1.0f;
-    notes_ = mesh.notes;
-    channels_ = mesh.channels;
-    channel_overrides_ = mesh.channel_overrides;
-    channel_defaults_ = std::move(mesh.channel_defaults);
-    material_externs_ = std::make_unique<ExternStore>();
-    material_externs_->channels = std::move(mesh.global_channels);
+}
 
-    const uint32_t instance_index = 0;
-    inst_vb_ = gpu.upload(&instance_index, 4);
-    if (!mesh.dynamic) {
-        if (mesh.instance.empty()) throw std::runtime_error("Missing original mesh instance data");
-        t2_ = gpu.upload(mesh.instance.data(), mesh.instance.size());
+void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
+    gpu.flush();  // texture uploads
+    tag_ = tag;
+    center_ = center;
+    radius_ = radius;
+}
+
+void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
+                               std::span<const std::array<float, 12>> placements) {
+    scopes_resolved_ = false;
+    // All or nothing: a mesh that fails validation leaves no partial parts behind.
+    const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count_;
+    const size_t instances = instance_total_, culls = cull_groups_.size();
+    try {
+        add_mesh_parts(gpu, std::move(mesh), layouts, placements);
+    } catch (...) {
+        try { gpu.flush(); } catch (...) {}
+        for (size_t k = items; k < items_.size(); ++k) {
+            if (!items_[k].owns_srv) continue;
+            gpu.srv().free(items_[k].srv_first, kItemSrvs * items_[k].srv_copies);
+            std::erase_if(table_cache_, [&](const auto& e) { return e.second == items_[k].srv_first; });
+        }
+        items_.resize(items);
+        sets_.resize(sets);
+        info_.resize(infos);
+        transparent_count_ = transparent;
+        instance_total_ = instances;
+        cull_groups_.resize(culls);
+        throw;
     }
+}
+
+void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
+                                     std::span<const std::array<float, 12>> placements) {
+    ID3D12Device* dev = gpu.device();
+    const bool first_mesh = sets_.empty();
+    if (mesh.dynamic && (!first_mesh || placements.size() != 1))
+        throw std::runtime_error("dynamic models are drawn alone, once");
+    if (placements.empty()) throw std::runtime_error("mesh has no placements");
+    const uint32_t set_base = uint32_t(sets_.size());
+    if (first_mesh) {
+        center_ = mesh.center;
+        radius_ = mesh.radius;
+        lod_ = mesh.lod;
+        dynamic_ = mesh.dynamic;
+        model_cb_ = mesh.model_cb;
+        skin_scale_ = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
+        skin_offset_ = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
+        skin_range_ = mesh.model_cb[13][3] > 1e-8f ? mesh.model_cb[13][3] : 1.0f;
+        notes_ = mesh.notes;
+        channels_ = mesh.channels;
+        channel_overrides_ = mesh.channel_overrides;
+        channel_defaults_ = std::move(mesh.channel_defaults);
+        material_externs_ = std::make_unique<ExternStore>();
+        material_externs_->channels = std::move(mesh.global_channels);
+    } else {
+        for (const auto& n : mesh.notes) notes_.push_back(n);
+        for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
+        for (auto& [h, u] : mesh.channels) channels_.emplace(h, u);
+    }
+
+    // Instance index stream (0..n-1) and t2: n 80-byte records (3x4 rows, translation in w;
+    // +60 = byte offset of the mesh block), then the mesh block from the prepared single record.
+    const uint32_t n = uint32_t(placements.size());
+    std::vector<uint32_t> iota(n);
+    for (uint32_t i = 0; i < n; ++i) iota[i] = i;
+    const GpuBuffer inst = arena_.upload(gpu, iota.data(), iota.size() * 4);
+    GpuBuffer t2;
+    if (!mesh.dynamic) {
+        if (mesh.instance.size() < 112) throw std::runtime_error("Missing original mesh instance data");
+        std::vector<uint8_t> data(size_t(n) * 80 + 48, 0);
+        const uint32_t block = n * 80;
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(data.data() + size_t(i) * 80, placements[i].data(), 48);
+            std::memcpy(data.data() + size_t(i) * 80 + 60, &block, 4);
+        }
+        std::memcpy(data.data() + block, mesh.instance.data() + 80, 32);
+        t2 = arena_.upload(gpu, data.data(), data.size());
+    }
+    uint32_t cull = UINT32_MAX;
+    if (!mesh.dynamic) {
+        CullGroup group;
+        group.spheres.reserve(n);
+        for (const auto& m : placements) {
+            const V3 c = mesh.center;
+            const float scale = std::sqrt(std::max({m[0] * m[0] + m[1] * m[1] + m[2] * m[2], m[4] * m[4] + m[5] * m[5] + m[6] * m[6],
+                                                    m[8] * m[8] + m[9] * m[9] + m[10] * m[10]}));
+            group.spheres.push_back({m[0] * c.x + m[1] * c.y + m[2] * c.z + m[3], m[4] * c.x + m[5] * c.y + m[6] * c.z + m[7],
+                                     m[8] * c.x + m[9] * c.y + m[10] * c.z + m[11], mesh.radius * scale});
+        }
+        group.levels = mesh.lod_levels ? mesh.lod_levels : 1;
+        if (std::popcount(group.levels) > 1 && material_externs_)
+            material_externs_->note_estimate("static mesh LOD per instance by screen radius (LOD1 < 160 px, LOD2 < 64 px, LOD3 < 24 px)",
+                                             "engine LOD distances not decoded");
+        cull = uint32_t(cull_groups_.size());
+        cull_groups_.push_back(std::move(group));
+    }
+    instance_total_ += n;
     for (const auto& b : mesh.buffers) {
         BufferSet set;
-        set.ib = gpu.upload(b.ib.data.data(), b.ib.data.size());
-        set.vb0 = gpu.upload(b.vb0.data.data(), b.vb0.data.size());
-        if (!b.vb1.data.empty()) set.vb1 = gpu.upload(b.vb1.data.data(), b.vb1.data.size());
-        set.ibv = {set.ib->GetGPUVirtualAddress(), UINT(b.ib.data.size()),
-                   b.ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
-        set.vbv[0] = {set.vb0->GetGPUVirtualAddress(), UINT(b.vb0.data.size()), b.vb0.stride};
-        if (set.vb1) set.vbv[1] = {set.vb1->GetGPUVirtualAddress(), UINT(b.vb1.data.size()), b.vb1.stride};
-        set.vbv[2] = {inst_vb_->GetGPUVirtualAddress(), 4, 4};
+        set.ib = arena_.upload(gpu, b.ib.data.data(), b.ib.data.size());
+        set.vb0 = arena_.upload(gpu, b.vb0.data.data(), b.vb0.data.size());
+        if (!b.vb1.data.empty()) set.vb1 = arena_.upload(gpu, b.vb1.data.data(), b.vb1.data.size());
+        set.ibv = {set.ib.gpu, UINT(b.ib.data.size()), b.ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        set.vbv[0] = {set.vb0.gpu, UINT(b.vb0.data.size()), b.vb0.stride};
+        if (set.vb1) set.vbv[1] = {set.vb1.gpu, UINT(b.vb1.data.size()), b.vb1.stride};
+        set.inst = inst;
+        set.t2 = t2;
+        set.instances = n;
+        set.cull = cull;
+        set.vbv[2] = {inst.gpu, n * 4, 4};
         if (mesh.dynamic) {
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
                 return v.empty() ? ComPtr<ID3D12Resource>{} : gpu.upload(v.data(), v.size() * 4);
@@ -797,14 +1092,14 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
                 set.skin_pos = up(b.skin_pos);
                 set.skin_normal = up(b.skin_normal);
             }
-            if (b.color.size() >= 4) set.color = gpu.upload(b.color.data(), b.color.size() & ~size_t(3));
         }
+        if (b.color.size() >= 4) set.color = arena_.upload(gpu, b.color.data(), b.color.size() & ~size_t(3));
         sets_.push_back(std::move(set));
     }
 
-    std::map<uint32_t, ComPtr<ID3D12Resource>> shared_textures;
-    std::map<uint32_t, ComPtr<ID3D12RootSignature>> shared_roots;
-    std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> shared_pipelines;
+    auto& shared_textures = texture_cache_;
+    auto& shared_roots = root_cache_;
+    auto& shared_pipelines = pipeline_cache_;
     auto upload_textures = [&](const auto& source, const StageResourceSources& sources, auto& destination) {
         for (const auto& [slot, tx] : source) {
             const TagHash tag = sources.textures.at(slot);
@@ -826,13 +1121,17 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
             ~FlushFailedUpload() {
                 if (committed) return;
                 try { gpu.flush(); } catch (...) {}
-                if (item.srv_first != UINT32_MAX) gpu.srv().free(item.srv_first, kItemSrvs * kSrvCopies);
+                if (item.srv_first != UINT32_MAX && item.owns_srv) gpu.srv().free(item.srv_first, kItemSrvs * item.srv_copies);
             }
         } upload_guard{gpu, item};
         item.part = g.part;
-        item.buffers = g.buffers;
-        item.cb0 = gpu.upload(g.cb0.data(), g.cb0.size() * sizeof(float4));
-        item.vs_cb0 = gpu.upload(g.vs_cb0.data(), g.vs_cb0.size() * sizeof(float4));
+        item.buffers = set_base + g.buffers;
+        for (const auto& [key, values] : g.own_cbuffers)
+            item.own_cbvs.emplace_back(scope_root_parameter(key.first, key.second),
+                                       arena_.upload(gpu, values.data(), values.size() * sizeof(float4)));
+        item.own_regs = g.own_cbuffers;
+        item.cb0 = arena_.upload(gpu, g.cb0.data(), g.cb0.size() * sizeof(float4));
+        item.vs_cb0 = arena_.upload(gpu, g.vs_cb0.data(), g.vs_cb0.size() * sizeof(float4));
         item.vs_material = std::move(g.vs_material);
         item.ps_material = std::move(g.ps_material);
         item.vs_live = g.vs_live;
@@ -865,17 +1164,49 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
         for (const auto& [slot, kind] : ps_kinds)
             if (!item.textures.contains(slot) && !item.ps_sources.extern_textures.contains(slot))
                 throw std::runtime_error(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), slot));
-        const auto& source_buffers = sets_.at(g.buffers);
+        const auto& source_buffers = sets_.at(item.buffers);
         for (const auto& [slot, kind] : vs_kinds) {
-            const bool color = mesh.dynamic && (slot == 0 || slot == 1) && source_buffers.color;
+            const bool color = (slot == 0 || slot == 1) && (source_buffers.color || !mesh.dynamic);
             const bool skin = mesh.dynamic && slot >= 2 && slot <= 4 && source_buffers.skin_pos;
             const bool instance_data = !mesh.dynamic && slot == 2;  // the mesh's own t2, a root SRV
             if (!item.vs_textures.contains(slot) && !item.vs_sources.extern_textures.contains(slot) && !color && !skin &&
                 !instance_data)
                 throw std::runtime_error(std::format("{}: missing original VS resource t{}", item.technique.str(), slot));
         }
-        item.srv_first = gpu.srv().alloc(kItemSrvs * kSrvCopies);
-        for (uint32_t copy = 0; copy < kSrvCopies; ++copy) {
+        // Descriptor copies per frame in flight only where engine textures are rebound each frame.
+        const bool rebinds = std::any_of(item.ps_sources.extern_textures.begin(), item.ps_sources.extern_textures.end(),
+                                         [&](const auto& e) { return ps_kinds.contains(e.first); }) ||
+                             std::any_of(item.vs_sources.extern_textures.begin(), item.vs_sources.extern_textures.end(),
+                                         [&](const auto& e) { return vs_kinds.contains(e.first); });
+        // Static parts: engine views rarely change, so one table rewritten on change is enough.
+        item.srv_copies = rebinds && mesh.dynamic ? kSrvCopies : 1;
+        // Static parts whose views are all fixed share one table per distinct set of views.
+        std::vector<uint64_t> table_key;
+        if (!mesh.dynamic) {
+            for (const auto* src : {&item.ps_sources.extern_textures, &item.vs_sources.extern_textures}) {
+                table_key.push_back(0xFFFFFFFFull);
+                for (const auto& [slot, e] : *src) table_key.push_back(uint64_t(slot) << 16 | uint64_t(e.extern_id) << 8 | e.offset);
+            }
+            for (UINT s = 0; s < kPsSrvs; ++s) {
+                auto f = item.textures.find(s);
+                table_key.push_back(uint64_t(reinterpret_cast<uintptr_t>(f != item.textures.end() ? f->second.Get() : nullptr)));
+                table_key.push_back(uint64_t(kind_of(ps_kinds, s)));
+            }
+            for (UINT s = 0; s < kVsSrvs; ++s) {
+                auto f = item.vs_textures.find(s);
+                table_key.push_back(uint64_t(reinterpret_cast<uintptr_t>(f != item.vs_textures.end() ? f->second.Get() : nullptr)));
+                table_key.push_back(uint64_t(kind_of(vs_kinds, s)));
+            }
+            if (auto shared = table_cache_.find(table_key); shared != table_cache_.end()) {
+                item.srv_first = shared->second;
+                item.owns_srv = false;
+            }
+        }
+        if (item.owns_srv) {
+            item.srv_first = gpu.srv().alloc(kItemSrvs * item.srv_copies);
+            if (!table_key.empty()) table_cache_.emplace(table_key, item.srv_first);
+        }
+        for (uint32_t copy = 0; item.owns_srv && copy < item.srv_copies; ++copy) {
             const uint32_t srv_first = item.srv_first + copy * kItemSrvs;
             for (UINT s = 0; s < kPsSrvs; ++s) {
                 auto f = item.textures.find(s);
@@ -886,14 +1217,25 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
             }
             // VS t0-t15: the stage's own textures, else (dynamic models) t0 vertex colour and t2-t4 the
             // skinning streams. Undeclared table holes have null descriptors.
-            const BufferSet& bs = sets_.at(g.buffers);
+            const BufferSet& bs = sets_.at(item.buffers);
             for (UINT s = 0; s < kVsSrvs; ++s) {
                 const auto h = gpu.srv().cpu(srv_first + kPsSrvs + s);
                 const BindingKind k = kind_of(vs_kinds, s);
                 if (auto f = item.vs_textures.find(s); f != item.vs_textures.end()) {
                     create_texture_srv(dev, f->second.Get(), k, h);
-                } else if (mesh.dynamic && (s == 0 || s == 1) && bs.color) {
-                    create_buffer_srv(dev, bs.color.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, UINT(bs.color->GetDesc().Width / 4), h);
+                } else if ((s == 0 || s == 1) && bs.color) {
+                    create_buffer_srv(dev, bs.color, DXGI_FORMAT_R8G8B8A8_UNORM, h);
+                } else if ((s == 0 || s == 1) && !mesh.dynamic && vs_kinds.contains(s) && !item.vs_sources.extern_textures.contains(s)) {
+                    // The VS reads a colour stream this mesh does not have (its colour comes from
+                    // map-baked per-instance data not decoded yet): white.
+                    if (!white_color_) {
+                        const uint32_t white = 0xFFFFFFFFu;
+                        white_color_ = arena_.upload(gpu, &white, 4);
+                    }
+                    create_buffer_srv(dev, white_color_.resource.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1, h, white_color_.offset / 4);
+                    if (material_externs_)
+                        material_externs_->note_estimate(std::format("{} VS t{} vertex colour = white", item.technique.str(), s),
+                                                         "mesh has no colour stream (map-baked per-instance colour not decoded)");
                 } else if (mesh.dynamic && s >= 2 && s <= 4 && bs.skin_pos) {
                     ID3D12Resource* r = s == 3 ? bs.skin_normal.Get() : bs.skin_pos.Get();
                     create_buffer_srv(dev, r, DXGI_FORMAT_R32_UINT, UINT(r->GetDesc().Width / 4), h);
@@ -911,7 +1253,7 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
         std::vector<D3D12_INPUT_ELEMENT_DESC> ied;
         for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
-            if (e.buffer >= 4 || sets_.at(g.buffers).vbv[e.buffer].BufferLocation == 0)
+            if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0)
                 throw std::runtime_error(std::format("{}: missing original vertex stream {}", item.technique.str(), e.buffer));
             d.SemanticName = e.semantic;
             d.SemanticIndex = e.semantic_index;
@@ -930,6 +1272,7 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
                 item.technique.str(), g.input_layout, input.semantic, input.index));
         }
         item.stage = g.stage;
+        item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = item.root_sig.Get();
@@ -981,13 +1324,29 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
                                                  uint32_t(hr), vs_in, g.input_layout, layout));
         }
 
+        if (!transparent) {
+            // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
+            // and a slope bias against acne (reversed depth: toward 0).
+            const auto shadow_key = std::tuple{g.info.technique.value, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
+                                               mesh.buffers.at(g.buffers).ib.is_32bit};
+            if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
+            else {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = pd;
+                sd.NumRenderTargets = 0;
+                for (auto& f : sd.RTVFormats) f = DXGI_FORMAT_UNKNOWN;
+                sd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+                sd.RasterizerState.DepthBias = -16;
+                sd.RasterizerState.SlopeScaledDepthBias = -2.0f;
+                sd.RasterizerState.DepthBiasClamp = -0.01f;
+                if (SUCCEEDED(dev->CreateGraphicsPipelineState(&sd, IID_PPV_ARGS(&item.shadow_pso))))
+                    shared_pipelines.emplace(shadow_key, item.shadow_pso);
+            }
+        }
         transparent_count_ += transparent;
         items_.push_back(std::move(item));
         upload_guard.committed = true;
         info_.push_back(std::move(g.info));
     }
-    gpu.flush();  // texture uploads
-    tag_ = mesh.tag;
 }
 
 void StaticMeshScene::bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices&,
@@ -999,7 +1358,6 @@ void StaticMeshScene::bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint3
     cl->SetGraphicsRootSignature(root ? root : dynamic_ ? root_sig_dynamic_.Get() : root_sig_.Get());
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
     cl->SetDescriptorHeaps(1, heaps);
-    if (!dynamic_) cl->SetGraphicsRootShaderResourceView(2, t2_->GetGPUVirtualAddress());
 }
 
 void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm) {
@@ -1013,6 +1371,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // A single model has no map around it: no atmosphere, no overhead visibility map.
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext.zero_policy(id)) ext.zero_when_missing(id, "world state from a map (not loaded): zero");
+    // PatternBlending (97): an engine-produced pattern texture whose producer is not decoded.
+    if (!ext.zero_policy(97)) ext.zero_when_missing(97, "pattern-blending engine input (producer not decoded): zero");
     ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
     if (dynamic_) {
         // RigidModel (goriath layout): local_to_world, position scale / offset, texcoord0
@@ -1025,51 +1385,79 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     auto base = ext.environment();
     const ChannelContext cc{&channel_overrides_, &channels_, &channel_defaults_, &ext};
     material_addresses_.clear();
-    std::map<std::pair<uint32_t, ShaderStage>, D3D12_GPU_VIRTUAL_ADDRESS> scope_cache;
-    for (auto& it : items_) {
-        it.scope_addresses.clear();
-        auto bind_scopes = [&](ShaderStage stage, const StageResourceSources& sources, const auto& required) {
-            for (const auto reg : required) {
-                if (reg == 0) continue;
-                const auto source = sources.cbuffer_scopes.find(reg);
-                if (source == sources.cbuffer_scopes.end()) throw std::runtime_error(std::format("{}: no original shared scope b{}", it.technique.str(), reg));
-                const auto key = std::pair{source->second.value, stage};
-                auto cached = scope_cache.find(key);
-                if (cached == scope_cache.end()) {
-                    const auto scope = std::find_if(it.scopes.begin(), it.scopes.end(), [&](const Scope& value) { return value.tag == source->second; });
-                    if (scope == it.scopes.end()) throw std::runtime_error("Original shared scope was not loaded");
-                    std::vector<float4> constants;
-                    if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
-                    else if (dynamic_ && (scope->name == "rigid_model" || scope->name == "skinning")) {
-                        // The object's own constants: local_to_world, position / texcoord packing, skinning.
-                        constants.assign(model_cb_.begin(), model_cb_.end());
-                    } else if (scope->name == "frame") {
-                        const auto& frame = ext.frame_constants();
-                        constants.assign(frame.begin(), frame.end());
-                    } else {
-                        const auto& core = scope->stages[size_t(scope_stage(stage))];
-                        const auto disassembly = disassemble_tfx(core.bytecode);
-                        const bool writes = disassembly.find("pop_output") != std::string::npos;
-                        if (!writes && std::all_of(core.cbuffer_init.begin(), core.cbuffer_init.end(), [](const float4& value) { return value == float4{}; })) {
-                            if (!ext.has_scope_constants(stage, reg))
-                                throw std::runtime_error(std::format("Missing engine-produced scope \"{}\" (b{})", scope->name, reg));
-                            constants = ext.scope_constants(stage, reg);
-                        }
-                        else constants = evaluate_scope(*scope, scope_stage(stage), ext);
+    // Shared scope bindings are fixed per item: resolved once to slots of scope_defs_, whose
+    // constants are produced at most once per frame.
+    if (!scopes_resolved_) {
+        scope_defs_.clear();
+        std::map<std::tuple<uint32_t, ShaderStage, uint32_t>, uint32_t> slots;
+        for (auto& it : items_) {
+            it.scope_slots.clear();
+            for (auto [stage, sources, required] : {std::tuple{ShaderStage::Vertex, &it.vs_sources, &it.vs_cbvs},
+                                                    std::tuple{ShaderStage::Pixel, &it.ps_sources, &it.ps_cbvs}})
+                for (const auto reg : *required) {
+                    if (reg == 0 || it.own_regs.contains({stage, reg})) continue;
+                    const auto source = sources->cbuffer_scopes.find(reg);
+                    if (source == sources->cbuffer_scopes.end())
+                        throw std::runtime_error(std::format("{}: no original shared scope b{}", it.technique.str(), reg));
+                    const auto key = std::tuple{source->second.value, stage, reg};
+                    auto slot = slots.find(key);
+                    if (slot == slots.end()) {
+                        const auto scope = std::find_if(it.scopes.begin(), it.scopes.end(), [&](const Scope& value) { return value.tag == source->second; });
+                        if (scope == it.scopes.end()) throw std::runtime_error("Original shared scope was not loaded");
+                        slot = slots.emplace(key, uint32_t(scope_defs_.size())).first;
+                        scope_defs_.push_back({&*scope, stage, reg});
                     }
-                    const auto upload = gpu.dynamic(constants.size() * sizeof(float4));
-                    std::memcpy(upload.cpu, constants.data(), constants.size() * sizeof(float4));
-                    cached = scope_cache.emplace(key, upload.gpu).first;
+                    it.scope_slots.emplace_back(scope_root_parameter(stage, reg), slot->second);
                 }
-                it.scope_addresses[{stage, reg}] = cached->second;
+        }
+        scopes_resolved_ = true;
+    }
+    scope_frame_.assign(scope_defs_.size(), 0);
+    auto scope_address = [&](uint32_t slot) {
+        if (scope_frame_[slot]) return scope_frame_[slot];
+        const auto& def = scope_defs_[slot];
+        const Scope* scope = def.scope;
+        const ShaderStage stage = def.stage;
+        const uint32_t reg = def.reg;
+        std::vector<float4> constants;
+        if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
+        else if (dynamic_ && (scope->name == "rigid_model" || scope->name == "skinning")) {
+            // The object's own constants: local_to_world, position / texcoord packing, skinning.
+            constants.assign(model_cb_.begin(), model_cb_.end());
+        } else if (scope->name == "frame") {
+            const auto& frame = ext.frame_constants();
+            constants.assign(frame.begin(), frame.end());
+        } else {
+            const auto& core = scope->stages[size_t(scope_stage(stage))];
+            const auto disassembly = disassemble_tfx(core.bytecode);
+            const bool writes = disassembly.find("pop_output") != std::string::npos;
+            if (!writes && std::all_of(core.cbuffer_init.begin(), core.cbuffer_init.end(), [](const float4& value) { return value == float4{}; })) {
+                if (!ext.has_scope_constants(stage, reg))
+                    throw std::runtime_error(std::format("Missing engine-produced scope \"{}\" (b{})", scope->name, reg));
+                constants = ext.scope_constants(stage, reg);
             }
-        };
-        bind_scopes(ShaderStage::Vertex, it.vs_sources, it.vs_cbvs);
-        bind_scopes(ShaderStage::Pixel, it.ps_sources, it.ps_cbvs);
-        auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, ID3D12Resource* fixed, bool vs) {
+            else {
+                try {
+                    constants = evaluate_scope(*scope, scope_stage(stage), ext);
+                } catch (const std::exception& ex) {
+                    throw std::runtime_error(std::format("scope \"{}\" (b{}): {}", scope->name, reg, ex.what()));
+                }
+            }
+        }
+        const auto upload = gpu.dynamic(constants.size() * sizeof(float4));
+        std::memcpy(upload.cpu, constants.data(), constants.size() * sizeof(float4));
+        return scope_frame_[slot] = upload.gpu;
+    };
+    for (auto& it : items_) {
+        if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
+      try {
+        it.scope_addresses.resize(it.scope_slots.size());
+        for (size_t k = 0; k < it.scope_slots.size(); ++k)
+            it.scope_addresses[k] = {it.scope_slots[k].first, scope_address(it.scope_slots[k].second)};
+        auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
             const uint64_t key = (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
-            if (!(vs ? it.vs_live : it.ps_live)) return fixed->GetGPUVirtualAddress();
+            if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
             evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, cc, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
@@ -1081,49 +1469,92 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                 const auto kind = kinds.find(slot);
                 if (kind == kinds.end()) continue;
                 const auto view = ext.texture(source.extern_id, uint32_t(source.offset) * 8);
+                const uint32_t table_slot = (vs ? kPsSrvs : 0) + slot;
+                if (it.srv_copies == 1) {
+                    const std::pair<const void*, uint32_t> now{view.resource ? static_cast<const void*>(view.resource) : &it, uint32_t(view.format)};
+                    auto& last = it.written[table_slot];
+                    if (last == now) continue;  // unchanged since it was written (and reported)
+                    last = now;
+                }
                 if (!view.resource && ext.estimate_null_texture(source.extern_id, uint32_t(source.offset) * 8)) {
                     create_texture_srv(gpu.device(), nullptr, kind->second,
-                        gpu.srv().cpu(it.srv_first + srv_frame_ * kItemSrvs + (vs ? kPsSrvs : 0) + slot));
+                        gpu.srv().cpu(it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs + (vs ? kPsSrvs : 0) + slot));
                     continue;
                 }
                 if (!view.resource) throw std::runtime_error(std::format("{}: missing game {} t{} from extern {} byte 0x{:X}",
                     it.technique.str(), vs ? "VS" : "PS", slot, source.extern_id, uint32_t(source.offset) * 8));
                 write_game_srv(gpu.device(), view, kind->second,
-                    gpu.srv().cpu(it.srv_first + srv_frame_ * kItemSrvs + (vs ? kPsSrvs : 0) + slot));
+                    gpu.srv().cpu(it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs + (vs ? kPsSrvs : 0) + slot));
             }
         };
         bind_shared(it.vs_sources, it.vs_kinds, true);
         bind_shared(it.ps_sources, it.ps_kinds, false);
-        it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0.Get(), true);
-        it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0.Get(), false);
+        it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0, true);
+        it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
+      } catch (const std::exception& ex) {
+        // One part without its game inputs is left out (never drawn with invented values);
+        // the rest of the scene still draws.
+        it.failed = true;
+        notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), ex.what()));
+      }
     }
 }
 
-void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm) {
+void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
+                                 bool shadow) {
     uint32_t bound = UINT32_MAX;
     ID3D12RootSignature* bound_root = nullptr;
+    bool bound_root_changed = false;
+    // Redundant root arguments are skipped (maps issue tens of thousands of draws).
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 31> bound_cbv{};
+    ID3D12PipelineState* bound_pso = nullptr;
+    uint32_t bound_table = UINT32_MAX;
+    D3D_PRIMITIVE_TOPOLOGY bound_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    auto set_cbv = [&](uint32_t param, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        if (bound_cbv[param] == address) return;
+        bound_cbv[param] = address;
+        cl->SetGraphicsRootConstantBufferView(param, address);
+    };
     for (const auto& it : items_) {
         if (it.stage != stage) continue;
+        if (shadow && !it.shadow_pso) continue;
         if (bound_root != it.root_sig.Get()) {
             bind_common(gpu, cl, w, h, vm, it.root_sig.Get());
             bound_root = it.root_sig.Get();
+            bound_root_changed = true;
+            bound_cbv = {};
+            bound_table = UINT32_MAX;
         }
-        if (it.buffers != bound) {
+        const auto& set = sets_[it.buffers];
+        const CullGroup* cg = set.cull == UINT32_MAX ? nullptr : &cull_groups_[set.cull];
+        const uint32_t instances = item_instances(it);
+        if (!instances) continue;
+        if (it.buffers != bound || bound_root_changed) {
             bound = it.buffers;
             cl->IASetIndexBuffer(&sets_[bound].ibv);
             cl->IASetVertexBuffers(0, 4, sets_[bound].vbv);
+            if (!dynamic_) cl->SetGraphicsRootShaderResourceView(2, sets_[bound].t2.gpu);
         }
-        cl->SetPipelineState(it.pso.Get());
-        cl->SetGraphicsRootConstantBufferView(0, it.ps_address);
-        cl->SetGraphicsRootConstantBufferView(6, it.vs_address);
-        for (const auto& [key, address] : it.scope_addresses)
-            cl->SetGraphicsRootConstantBufferView(scope_root_parameter(key.first, key.second), address);
-        const uint32_t first = it.srv_first + srv_frame_ * kItemSrvs;
-        cl->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
-        cl->SetGraphicsRootDescriptorTable(dynamic_ ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
-        cl->IASetPrimitiveTopology(it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
-                                                               : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
+        bound_root_changed = false;
+        ID3D12PipelineState* pso = shadow ? it.shadow_pso.Get() : it.pso.Get();
+        if (bound_pso != pso) cl->SetPipelineState(bound_pso = pso);
+        set_cbv(0, it.ps_address);
+        set_cbv(6, it.vs_address);
+        for (const auto& [param, address] : it.scope_addresses) set_cbv(param, address);
+        for (const auto& [param, buffer] : it.own_cbvs) set_cbv(param, buffer.gpu);
+        const uint32_t first = it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs;
+        if (bound_table != first) {
+            bound_table = first;
+            cl->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
+            cl->SetGraphicsRootDescriptorTable(dynamic_ ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
+        }
+        const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        if (bound_topology != topology) cl->IASetPrimitiveTopology(bound_topology = topology);
+        if (!cg) cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, 0);
+        else
+            for (int l = 0; l < 4; ++l)
+                if (((it.lod_mask >> l) & 1) && cg->count[size_t(l)])
+                    cl->DrawIndexedInstanced(it.part.index_count, cg->count[size_t(l)], it.part.index_start, 0, cg->first[size_t(l)]);
     }
 }
 
@@ -1195,8 +1626,74 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     }
 }
 
+uint32_t StaticMeshScene::item_instances(const Item& it) const {
+    if (it.failed) return 0;
+    const auto& set = sets_[it.buffers];
+    if (set.cull == UINT32_MAX) return set.instances;
+    uint32_t n = 0;
+    for (size_t l = 0; l < 4; ++l)
+        if ((it.lod_mask >> l) & 1) n += cull_groups_[set.cull].count[l];
+    return n;
+}
+
+void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height) {
+    // Frustum side planes from the projection scales (x' = x * fx / z), plus a size cut: an
+    // instance smaller than about a pixel on screen is skipped.
+    const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
+    const float pixel = 2.0f / (vm.fy * float(std::max(1u, height)));
+    const float half_h = 0.5f * float(std::max(1u, height)) * vm.fy;
+    for (auto& group : cull_groups_) {
+        const auto upload = gpu.dynamic(group.spheres.size() * 4);
+        auto* out = static_cast<uint32_t*>(static_cast<void*>(upload.cpu));
+        const bool lods = group.levels != 1;
+        if (lods)
+            for (auto& v : cull_scratch_) v.clear();
+        uint32_t visible = 0;
+        for (uint32_t i = 0; i < group.spheres.size(); ++i) {
+            const auto& sp = group.spheres[i];
+            const V3 d{sp[0] - vm.eye.x, sp[1] - vm.eye.y, sp[2] - vm.eye.z};
+            const float z = dot(d, vm.fwd), r = sp[3];
+            const float x = dot(d, vm.right), y = dot(d, vm.up);
+            float px;  // projected radius in pixels
+            if (vm.ortho > 0) {
+                if (std::abs(x) - r > vm.ortho || std::abs(y) - r > vm.ortho || z < -r) continue;
+                px = r / vm.ortho * 0.5f * float(std::max(1u, height));
+                if (px < 0.5f) continue;
+            } else {
+                if (z < -r) continue;
+                if (std::abs(x) * vm.fx - z > r * kx || std::abs(y) * vm.fy - z > r * ky) continue;
+                if (z > r && r < z * pixel) continue;
+                px = z > r ? r * half_h / z : 1e9f;
+            }
+            if (!lods) {
+                out[visible++] = i;
+                continue;
+            }
+            int level = px >= 160 ? 0 : px >= 64 ? 1 : px >= 24 ? 2 : 3;
+            while (level > 0 && !((group.levels >> level) & 1)) --level;
+            while (level < 3 && !((group.levels >> level) & 1)) ++level;
+            cull_scratch_[size_t(level)].push_back(i);
+        }
+        group.first = {};
+        group.count = {};
+        if (lods)
+            for (size_t l = 0; l < 4; ++l) {
+                group.first[l] = visible;
+                group.count[l] = uint32_t(cull_scratch_[l].size());
+                if (!cull_scratch_[l].empty()) std::memcpy(out + visible, cull_scratch_[l].data(), cull_scratch_[l].size() * 4);
+                visible += group.count[l];
+            }
+        else group.count[0] = visible;
+        group.visible = visible;
+        group.visible_address = upload.gpu;
+    }
+    for (auto& set : sets_)
+        if (set.cull != UINT32_MAX) set.vbv[2] = {cull_groups_[set.cull].visible_address, std::max(4u, cull_groups_[set.cull].visible * 4), 4};
+}
+
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
     srv_frame_ = (srv_frame_ + 1) % kSrvCopies;
+    cull(gpu, vm, gb.height());
     update_materials(gpu, gb.width(), gb.height(), vm);
     if (skin_dirty_) update_skin(cl);
     const float clear[4] = {0, 0, 0, 0};
@@ -1205,6 +1702,17 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     if (items_.size() == transparent_count_) return;
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
     draw_items(gpu, cl, 0, gb.width(), gb.height(), vm);
+}
+
+void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {
+    shadow.valid = false;
+    if (!shadow.depth || items_.size() == transparent_count_) return;
+    cull(gpu, shadow.vm, shadow.size);
+    update_materials(gpu, shadow.size, shadow.size, shadow.vm);
+    cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+    cl->OMSetRenderTargets(0, nullptr, FALSE, &shadow.dsv);
+    draw_items(gpu, cl, 0, shadow.size, shadow.size, shadow.vm, true);
+    shadow.valid = true;
 }
 
 void StaticMeshScene::render_transparent(Gpu&, ID3D12GraphicsCommandList*, GBuffer&, D3D12_CPU_DESCRIPTOR_HANDLE,

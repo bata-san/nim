@@ -379,6 +379,11 @@ TfxEnvironment ExternStore::environment() const {
         note_estimate(std::format("texture {} tiling params = 0", texture), "nim loads all mips: fully resident (min resident mip 0)");
         return float4{0, 0, 0, 0};
     };
+    // nim binds every texture as a plain (single-layer, untiled) resource.
+    env.texture_layer_count = [this](uint8_t texture) {
+        note_estimate(std::format("texture {} layer count = 1", texture), "nim binds textures untiled with a single layer");
+        return float4{1, 1, 1, 1};
+    };
     return env;
 }
 
@@ -747,6 +752,61 @@ float4 ps_background(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
+// Sun shadow resolve (viewer estimate): each pixel's world position from the depth buffer,
+// compared with nim's sun shadow map (5x5 PCF), faded out at the map's edge.
+constexpr const char* kSunShadowHlsl = R"(
+cbuffer P : register(b0) {
+    float3 fwd;     float fx;
+    float3 right;   float fy;
+    float3 up;      float near_z;
+    float3 eye;     float inv_w;
+    float3 s_eye;   float inv_h;
+    float3 s_right; float s_half;
+    float3 s_up;    float s_range;
+    float3 s_fwd;   float s_texel;
+    float bias;     float3 pad;
+};
+Texture2D<float> depth : register(t0);
+Texture2D<float> smap : register(t1);
+SamplerComparisonState cmp : register(s0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float ps_main(float4 pos : SV_Position) : SV_Target {
+    float d = depth.Load(int3(pos.xy, 0));
+    if (d <= 0) return 1;
+    float z = near_z / d;
+    float2 ndc = float2(pos.x * inv_w * 2 - 1, 1 - pos.y * inv_h * 2);
+    float3 w = eye + fwd * z + right * (ndc.x * z / fx) + up * (ndc.y * z / fy);
+    float3 rel = w - s_eye;
+    float2 suv = float2(dot(rel, s_right), dot(rel, s_up)) / s_half;
+    float sz = dot(rel, s_fwd);
+    float edge = max(abs(suv.x), abs(suv.y));
+    if (edge >= 1 || sz <= 0 || sz >= s_range) return 1;
+    // Depth bias grows with distance from the camera (the depth buffer's precision).
+    float ref = 1 - sz / s_range + bias * (1 + z * 0.02);
+    float2 tc = suv * float2(0.5, -0.5) + 0.5;
+    float sum = 0;
+    [unroll] for (int y = -2; y <= 2; ++y)
+        [unroll] for (int x = -2; x <= 2; ++x)
+            sum += smap.SampleCmpLevelZero(cmp, tc + float2(x, y) * s_texel, ref);
+    return lerp(sum / 25, 1, saturate((edge - 0.85) / 0.14));
+}
+)";
+
+struct SunShadowConstants {
+    V3 fwd; float fx;
+    V3 right; float fy;
+    V3 up; float near_z;
+    V3 eye; float inv_w;
+    V3 s_eye; float inv_h;
+    V3 s_right; float s_half;
+    V3 s_up; float s_range;
+    V3 s_fwd; float s_texel;
+    float bias; float pad[3];
+};
+
 struct ViewerEnvConstants {
     V3 fwd; float fx;
     V3 right; float fy;
@@ -758,9 +818,9 @@ struct ViewerEnvConstants {
     V3 bg_bottom; float pad2;
 };
 
-ComPtr<ID3DBlob> compile_viewer_env(const char* entry, const char* target) {
+ComPtr<ID3DBlob> compile_viewer_env(const char* entry, const char* target, const char* source = kViewerEnvHlsl) {
     ComPtr<ID3DBlob> code, err;
-    HRESULT hr = D3DCompile(kViewerEnvHlsl, std::strlen(kViewerEnvHlsl), "nim_viewer_env.hlsl", nullptr, nullptr, entry,
+    HRESULT hr = D3DCompile(source, std::strlen(source), "nim_viewer_env.hlsl", nullptr, nullptr, entry,
                             target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (FAILED(hr))
         throw std::runtime_error(std::format("viewer environment shader: {}",
@@ -772,9 +832,10 @@ ComPtr<ID3DBlob> compile_viewer_env(const char* entry, const char* target) {
 void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
     final_combine_.release(gpu);
-    if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 2);
+    if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
+    shadow_mask_.Reset();
     hdr_.Reset();
     rtv_heap_.Reset();
     w_ = h_ = 0;
@@ -844,8 +905,32 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
             pd.SampleDesc.Count = 1;
             check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso)), "viewer environment PSO");
         }
+        // Sun shadow resolve: b0, (scene depth, shadow map), a comparison sampler.
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.ComparisonFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC srsd{2, params, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        shadow_rs_ = serialize(dev, srsd, "sun shadow resolve root signature");
+        auto svs = compile_viewer_env("vs_main", "vs_5_0", kSunShadowHlsl);
+        auto sps = compile_viewer_env("ps_main", "ps_5_0", kSunShadowHlsl);
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = shadow_rs_.Get();
+        pd.VS = {svs->GetBufferPointer(), svs->GetBufferSize()};
+        pd.PS = {sps->GetBufferPointer(), sps->GetBufferSize()};
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+        pd.SampleDesc.Count = 1;
+        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow_pso_)), "sun shadow resolve PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     gpu.flush();
 }
@@ -859,7 +944,11 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     gpu.device()->CreateRenderTargetView(env_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + inc});
-    if (env_srv_ == UINT32_MAX) env_srv_ = gpu.srv().alloc(2);
+    D3D12_CLEAR_VALUE mv{DXGI_FORMAT_R8_UNORM, {1, 1, 1, 1}};
+    shadow_mask_ = gpu.texture2d(w, h, mv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &mv);
+    gpu.device()->CreateRenderTargetView(shadow_mask_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 2 * inc});
+    if (env_srv_ == UINT32_MAX) env_srv_ = gpu.srv().alloc(4);  // env: depth, rt1; shadow: depth, map
     w_ = w;
     h_ = h;
 }
@@ -907,7 +996,6 @@ void estimate_engine_frame(ExternStore& ext, float t, float dt) {
 
 void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm) {
     const float w = float(width), h = float(height);
-    const float near_z = vm.vp_rel.c[3][2];
 
     // View, in nim's camera space (x right, y up, z forward). The lighting VS reconstructs a
     // per-pixel ray at unit depth from 0x160 and moves it to world space with 0xE0.
@@ -921,11 +1009,7 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     world_to_cam.c[1] = {vm.right.y, vm.up.y, vm.fwd.y, 0};
     world_to_cam.c[2] = {vm.right.z, vm.up.z, vm.fwd.z, 0};
     world_to_cam.c[3] = {-dot(vm.right, vm.eye), -dot(vm.up, vm.eye), -dot(vm.fwd, vm.eye), 1};
-    M4 cam_to_proj;
-    cam_to_proj.c[0] = {vm.fx, 0, 0, 0};
-    cam_to_proj.c[1] = {0, vm.fy, 0, 0};
-    cam_to_proj.c[2] = {0, 0, 0, 1};
-    cam_to_proj.c[3] = {0, 0, near_z, 0};
+    const M4 cam_to_proj = vm.proj;  // perspective, or the sun's orthographic shadow view
     M4 proj_to_ray;  // (ndc.x, ndc.y, any, 1) -> camera-space ray with z = 1, w = 0
     proj_to_ray.c[0] = {1 / vm.fx, 0, 0, 0};
     proj_to_ray.c[1] = {0, 1 / vm.fy, 0, 0};
@@ -959,7 +1043,12 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
 
 }
 
-void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p) {
+V3 sun_direction(const LightingParams& p) {
+    return normalize(V3{std::cos(p.sun_azimuth) * std::cos(p.sun_elevation), std::sin(p.sun_azimuth) * std::cos(p.sun_elevation),
+                        std::sin(p.sun_elevation)});
+}
+
+void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p, bool shadowed) {
     fill_view_externs(ext_, gb.width(), gb.height(), vm);
     ext_.set(ext::Deferred, 0x00, float4{0, 1 / vm.vp_rel.c[3][2], 0, 0});
     ext_.set(ext::Deferred, 0x40, float4{float(gb.width()), float(gb.height()), 0, 0});
@@ -981,6 +1070,12 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     if (!ext_.zero_policy(ext::Deferred)) ext_.zero_when_missing(ext::Deferred, "deferred-pass value with no known meaning: zero");
     // No shadow pass yet: the shadow / occlusion masks say "unshadowed" (white), full strength.
     constexpr std::string_view unshadowed = "no shadow pass yet: unshadowed (white) mask";
+    // t7 is the sun shadow (the PS reads .r at the pixel while +0x34 = 0, its upsampling filter off).
+    if (shadowed)
+        ext_.estimate_texture(ext::ShadowMask, 0x00, shadow_mask_.Get(),
+                              "nim sun shadow map: the scene's own pipelines drawn from the sun, 5x5 PCF (engine cascades not decoded)");
+    else if (ext_.texture(ext::ShadowMask, 0x00).resource == shadow_mask_.Get())
+        ext_.estimate_texture(ext::ShadowMask, 0x00, unshadowed_.Get(), unshadowed);
     for (uint32_t off : {0x00u, 0x08u, 0x10u})
         if (!ext_.texture(ext::ShadowMask, off).resource) ext_.estimate_texture(ext::ShadowMask, off, unshadowed_.Get(), unshadowed);
     if (!ext_.has(ext::ShadowMask, 0x30, 4)) {
@@ -999,8 +1094,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     // (the panel's sun / sky), laid out as the shading reads it: the sun is multiplied by
     // 1/(4 pi) and the ambient by 1/4 there, so nim's values are scaled to match.
     constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
-    const V3 sun_dir = normalize(V3{std::cos(p.sun_azimuth) * std::cos(p.sun_elevation),
-                                    std::sin(p.sun_azimuth) * std::cos(p.sun_elevation), std::sin(p.sun_elevation)});
+    const V3 sun_dir = sun_direction(p);
     const V3 sun = p.sun_color * (p.sun_intensity * 4.0f);
     const float ka = 4.0f * p.sky_intensity;
     ext_.estimate(ext::GlobalLighting, 0x10, v4(sun, 0), viewer_light);
@@ -1028,10 +1122,11 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
 }
 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                          const LightingParams& p, const TransparentFn& transparents) {
+                          const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
-    fill_externs(gb, vm, p);
+    const bool shadowed = shadow && shadow->valid && shadow->depth;
+    fill_externs(gb, vm, p, shadowed);
     // Validate every dependency before recording any render-target transitions.
     const auto frame = ext_.frame_constants();
     auto upload = [&](const auto& values) {
@@ -1102,6 +1197,41 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cl->DrawInstanced(3, 1, 0, 0);
     };
+    if (shadowed) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC dsd{};
+        dsd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        dsd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        dsd.Texture2D.MipLevels = 1;
+        dsd.Format = DXGI_FORMAT_R32_FLOAT;
+        gpu.device()->CreateShaderResourceView(gb.depth.Get(), &dsd, gpu.srv().cpu(env_srv_ + 2));
+        gpu.device()->CreateShaderResourceView(shadow->depth.Get(), &dsd, gpu.srv().cpu(env_srv_ + 3));
+        SunShadowConstants sc{};
+        sc.fwd = vm.fwd; sc.fx = vm.fx;
+        sc.right = vm.right; sc.fy = vm.fy;
+        sc.up = vm.up; sc.near_z = vm.vp_rel.c[3][2];
+        sc.eye = vm.eye; sc.inv_w = 1.0f / float(w_);
+        sc.s_eye = shadow->vm.eye; sc.inv_h = 1.0f / float(h_);
+        sc.s_right = shadow->vm.right; sc.s_half = shadow->half;
+        sc.s_up = shadow->vm.up; sc.s_range = shadow->range;
+        sc.s_fwd = shadow->vm.fwd; sc.s_texel = 1.0f / float(std::max(1u, shadow->size));
+        sc.bias = 0.03f / shadow->range;
+        const auto scb = gpu.dynamic(sizeof(sc));
+        std::memcpy(scb.cpu, &sc, sizeof(sc));
+        Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const D3D12_CPU_DESCRIPTOR_HANDLE mask_rtv{hdr.ptr + 2 * gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
+        cl->OMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
+        cl->SetGraphicsRootSignature(shadow_rs_.Get());
+        cl->SetPipelineState(shadow_pso_.Get());
+        ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetGraphicsRootConstantBufferView(0, scb.gpu);
+        cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(env_srv_ + 2));
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cl->DrawInstanced(3, 1, 0, 0);
+        Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    }
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         env_pass(env_ibl_pso_.Get(), env_rtv);

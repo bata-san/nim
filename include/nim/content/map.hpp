@@ -19,6 +19,33 @@ namespace nim {
 
 inline constexpr uint32_t kClassBubbleParent = 0x8080AB27;
 inline constexpr uint32_t kClassStaticInstances = 0x8080A7F1;
+inline constexpr uint32_t kClassTerrain = 0x80808567;
+
+// STerrain 80808567 (layout as goriath's, verified on Marathon data): 0x10 bounds min, 0x20 max,
+// 0x30 the position offset its VS adds (cb11[0]), 0x50 Vec<group, 0x60 bytes: +0x20 texcoord
+// transform (cb11[1]), +0x50 dyemap texture>, 0x60 vertex0 (int16x4 position), 0x64 vertex1
+// (snorm16x4 normal, half2 texcoord), 0x68 index buffer (strips), 0x6C shadow / 0x70 depth-only
+// techniques, 0x78 Vec<part, 12 bytes: technique, index start u32, count u16, group u8, detail
+// u8 (0 = high ... 3 = thumbnail)>.
+struct Terrain {
+    TagHash tag;
+    std::array<float, 3> lo{}, hi{};
+    std::array<float, 4> offset{};
+    struct Group {
+        std::array<float, 4> texcoord{};
+        TagHash dyemap;
+    };
+    std::vector<Group> groups;
+    TagHash vertex0, vertex1, index, technique_shadow, technique_depth;
+    struct Part {
+        TagHash technique;
+        uint32_t index_start = 0;
+        uint16_t index_count = 0;
+        uint8_t group = 0, detail = 0;
+    };
+    std::vector<Part> parts;
+};
+Terrain load_terrain(PackageManager& pm, TagHash tag);
 
 struct MapEntry {
     TagHash bubble;
@@ -37,9 +64,18 @@ struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
     std::vector<MapStatic> statics;      // one per distinct mesh
+    std::vector<Terrain> terrains;       // terrain patches
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble);
+
+// Where the geometry is: the per-axis median of the instance origins (bounds are stretched by
+// far-off outliers such as skyboxes).
+std::array<float, 3> map_focus(const MapLayout& map);
+// The instances whose origin lies within `radius` of `center`, grouped by mesh, nearest meshes first.
+std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> center, float radius);
+// The terrain patches whose bounds come within `radius` of `center`, nearest first.
+std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius);
 
 }  // namespace nim

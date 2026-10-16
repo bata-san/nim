@@ -43,7 +43,12 @@ public:
     // Builds the global hash64 table by opening every package (header + tables only).
     void build_hash64_index();
 
+    // Another manager over the same install for a worker thread: the package list and hash64
+    // index are copied (no directory scan, no reopening every package); open packages are its own.
+    std::unique_ptr<PackageManager> fork() const;
+
 private:
+    PackageManager() = default;
     std::filesystem::path pkg_dir_;
     std::vector<PackageInfo> infos_;
     std::unordered_map<uint16_t, std::vector<size_t>> by_id_;

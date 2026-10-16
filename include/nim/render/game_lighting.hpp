@@ -153,6 +153,9 @@ std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const E
 
 // Original game DXIL only. Engine-owned inputs must be supplied through externs();
 // missing producers are reported instead of being approximated.
+// The sun direction (toward the sun) of nim's light set-up.
+V3 sun_direction(const LightingParams& p);
+
 class GameLighting {
 public:
     void init(PackageManager& pm, Gpu& gpu);
@@ -160,17 +163,20 @@ public:
     // `transparents` runs after the shading pass with the HDR target's RTV (the G-buffer depth is
     // then in DEPTH_READ, bound through gb.dsv_ro).
     using TransparentFn = std::function<void(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE hdr)>;
+    // `shadow`: a sun shadow map rendered this frame (StaticMeshScene::render_shadow), resolved
+    // into the shading pass's sun shadow mask; without one the mask is white (unshadowed).
     void render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const LightingParams& p,
-                const TransparentFn& transparents = {});
+                const TransparentFn& transparents = {}, SunShadow* shadow = nullptr);
     void release(Gpu& gpu);
 
     ExternStore& externs() { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
+    ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
 
 private:
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
-    void fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p);
+    void fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p, bool shadowed);
 
     RenderGlobals globals_;
     Scope frame_scope_, view_scope_;
@@ -184,6 +190,9 @@ private:
     ComPtr<ID3D12Resource> env_;
     ComPtr<ID3D12RootSignature> env_rs_;
     ComPtr<ID3D12PipelineState> env_ibl_pso_, env_bg_pso_;
+    ComPtr<ID3D12RootSignature> shadow_rs_;
+    ComPtr<ID3D12PipelineState> shadow_pso_;
+    ComPtr<ID3D12Resource> shadow_mask_;  // R8: the resolved sun shadow (viewer estimate)
     uint32_t env_srv_ = UINT32_MAX;
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     uint32_t w_ = 0, h_ = 0;

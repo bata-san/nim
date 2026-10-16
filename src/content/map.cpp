@@ -29,7 +29,7 @@ bool structural(uint32_t cls) {
     }
 }
 
-std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble) {
+std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr) {
     pm.build_hash64_index();
     std::vector<TagHash> queue{bubble}, found;
     std::set<uint32_t> seen{bubble.value};
@@ -50,7 +50,13 @@ std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble) {
         auto visit = [&](TagHash c) {
             if (seen.count(c.value)) return;
             const Entry* ce = pm.entry(c);
-            if (!ce || (ce->type != 8 && ce->type != 16) || !structural(ce->reference)) return;
+            if (!ce || (ce->type != 8 && ce->type != 16)) return;
+            if (ce->reference == kClassTerrain) {
+                seen.insert(c.value);
+                if (terrains) terrains->push_back(c);
+                return;
+            }
+            if (!structural(ce->reference)) return;
             seen.insert(c.value);
             queue.push_back(c);
         };
@@ -78,10 +84,70 @@ std::string package_of(PackageManager& pm, TagHash t) {
 
 }  // namespace
 
+Terrain load_terrain(PackageManager& pm, TagHash tag) {
+    auto bytes = pm.read(tag);
+    TagReader r(bytes);
+    Terrain t;
+    t.tag = tag;
+    for (int a = 0; a < 3; ++a) {
+        t.lo[size_t(a)] = r.f32_at(0x10 + size_t(a) * 4);
+        t.hi[size_t(a)] = r.f32_at(0x20 + size_t(a) * 4);
+    }
+    for (int a = 0; a < 4; ++a) t.offset[size_t(a)] = r.f32_at(0x30 + size_t(a) * 4);
+    const auto groups = r.vec_at(0x50);
+    for (uint64_t g = 0; g < groups.count; ++g) {
+        const size_t e = groups.data + size_t(g) * 0x60;
+        Terrain::Group group;
+        for (int a = 0; a < 4; ++a) group.texcoord[size_t(a)] = r.f32_at(e + 0x20 + size_t(a) * 4);
+        group.dyemap = r.tag_at(e + 0x50);
+        t.groups.push_back(group);
+    }
+    t.vertex0 = r.tag_at(0x60);
+    t.vertex1 = r.tag_at(0x64);
+    t.index = r.tag_at(0x68);
+    t.technique_shadow = r.tag_at(0x6C);
+    t.technique_depth = r.tag_at(0x70);
+    const auto parts = r.vec_at(0x78);
+    for (uint64_t i = 0; i < parts.count; ++i) {
+        const size_t e = parts.data + size_t(i) * 12;
+        Terrain::Part part;
+        part.technique = r.tag_at(e);
+        part.index_start = r.u32_at(e + 4);
+        part.index_count = uint16_t(r.u32_at(e + 8) & 0xFFFF);
+        part.group = uint8_t((r.u32_at(e + 8) >> 16) & 0xFF);
+        part.detail = uint8_t(r.u32_at(e + 8) >> 24);
+        t.parts.push_back(part);
+    }
+    return t;
+}
+
+std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius) {
+    std::vector<std::pair<float, const Terrain*>> found;
+    for (const auto& t : map.terrains) {
+        float d2 = 0;  // distance from the centre to the patch's box
+        for (int a = 0; a < 3; ++a) {
+            const float c = center[size_t(a)], d = c < t.lo[size_t(a)] ? t.lo[size_t(a)] - c : c > t.hi[size_t(a)] ? c - t.hi[size_t(a)] : 0;
+            d2 += d * d;
+        }
+        if (d2 <= radius * radius) found.emplace_back(d2, &t);
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<const Terrain*> out;
+    for (const auto& f : found) out.push_back(f.second);
+    return out;
+}
+
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble) {
     MapLayout out;
     out.bubble = bubble;
-    out.instance_tags = find_instance_tags(pm, bubble);
+    std::vector<TagHash> terrain_tags;
+    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags);
+    for (TagHash t : terrain_tags) {
+        try {
+            out.terrains.push_back(load_terrain(pm, t));
+        } catch (...) {
+        }
+    }
     std::unordered_map<uint32_t, size_t> index;  // mesh -> statics slot
     out.lo = {1e30f, 1e30f, 1e30f};
     out.hi = {-1e30f, -1e30f, -1e30f};
@@ -141,6 +207,42 @@ std::vector<MapEntry> list_maps(PackageManager& pm) {
             out.push_back(std::move(m));
         }
     }
+    return out;
+}
+
+std::array<float, 3> map_focus(const MapLayout& map) {
+    std::array<float, 3> out{};
+    for (int a = 0; a < 3; ++a) {
+        std::vector<float> v;
+        v.reserve(map.instances);
+        for (const auto& st : map.statics)
+            for (const auto& r : st.rows) v.push_back(r[size_t(a) * 4 + 3]);
+        if (v.empty()) continue;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        out[size_t(a)] = v[v.size() / 2];
+    }
+    return out;
+}
+
+std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> center, float radius) {
+    std::vector<std::pair<float, MapStatic>> found;
+    const float r2 = radius * radius;
+    for (const auto& st : map.statics) {
+        MapStatic m{st.mesh, {}};
+        float nearest = 1e30f;
+        for (const auto& r : st.rows) {
+            const float dx = r[3] - center[0], dy = r[7] - center[1], dz = r[11] - center[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > r2) continue;
+            m.rows.push_back(r);
+            nearest = std::min(nearest, d2);
+        }
+        if (!m.rows.empty()) found.emplace_back(nearest, std::move(m));
+    }
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<MapStatic> out;
+    out.reserve(found.size());
+    for (auto& f : found) out.push_back(std::move(f.second));
     return out;
 }
 

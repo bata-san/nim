@@ -124,6 +124,16 @@ void PackageManager::build_hash64_index() {
         for (const auto& e : open(i).hash64s()) h64_.emplace(e.hash64, e.hash32);
 }
 
+std::unique_ptr<PackageManager> PackageManager::fork() const {
+    std::unique_ptr<PackageManager> m(new PackageManager());
+    m->pkg_dir_ = pkg_dir_;
+    m->infos_ = infos_;
+    m->by_id_ = by_id_;
+    m->language_ = language_;
+    m->h64_ = h64_;
+    return m;
+}
+
 std::optional<TagHash> PackageManager::resolve64(uint64_t hash64) {
     auto it = h64_.find(hash64);
     if (it == h64_.end()) return std::nullopt;

@@ -7,6 +7,7 @@
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
+#include "nim/content/map.hpp"
 #include "nim/content/strings.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
@@ -92,7 +93,7 @@ std::string icon(uint32_t cp) {
 namespace ico {
 constexpr uint32_t Home = 0xE80F, Settings = 0xE713, Statics = 0xE7B8, Text = 0xE8D2, Dialogue = 0xE8BD,
                    Packages = 0xE8B7, Log = 0xE9D9, Tune = 0xE9E9, Frame = 0xE740, Save = 0xE74E, Light = 0xE706,
-                   Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890;
+                   Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890, Maps = 0xE774;
 }
 std::string format_bytes(uint64_t b) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -588,6 +589,227 @@ private:
     std::deque<Result> results_;
 };
 
+// Maps: lists the bubbles once, then streams the static meshes of a region (prepared on this
+// thread, nearest first) to the UI, which adds a time-boxed batch per frame. A newer request
+// abandons the current one.
+class MapWorker {
+public:
+    struct Piece {
+        uint64_t generation = 0;
+        PreparedMesh mesh;
+        std::vector<std::array<float, 12>> rows;
+    };
+    struct Progress {
+        uint64_t generation = 0;
+        size_t total = 0, prepared = 0, failed = 0;
+        bool done = false;
+        std::array<float, 3> center{};
+        std::map<std::string, size_t> failures;  // reason -> count
+    };
+
+    void start(const fs::path& install) {
+        stop();
+        quit_ = false;
+        thread_ = std::thread([this, install] { run(install); });
+    }
+    void stop() {
+        {
+            std::lock_guard lk(m_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+        pieces_.clear();
+        request_.reset();
+        listed_ = false;
+        list_requested_ = false;
+        maps_.clear();
+    }
+    void request_list() {
+        {
+            std::lock_guard lk(m_);
+            if (list_requested_) return;
+            list_requested_ = true;
+        }
+        cv_.notify_all();
+    }
+    bool listed() {
+        std::lock_guard lk(m_);
+        return listed_;
+    }
+    const std::vector<MapEntry>& maps() const { return maps_; }  // valid once listed()
+    std::string list_error() {
+        std::lock_guard lk(m_);
+        return list_error_;
+    }
+    // center: nullopt = where the map's geometry is (map_focus).
+    uint64_t request(TagHash bubble, std::optional<std::array<float, 3>> center, float radius, uint32_t texture_cap) {
+        std::lock_guard lk(m_);
+        request_ = Request{++generation_, bubble, center, radius, texture_cap};
+        pieces_.clear();
+        progress_ = Progress{generation_};
+        cv_.notify_all();
+        return generation_;
+    }
+    void cancel() {
+        std::lock_guard lk(m_);
+        ++generation_;
+        request_.reset();
+        pieces_.clear();
+        cv_.notify_all();
+    }
+    std::optional<Piece> take(uint64_t generation) {
+        std::lock_guard lk(m_);
+        while (!pieces_.empty() && pieces_.front().generation != generation) pieces_.pop_front();
+        if (pieces_.empty()) return std::nullopt;
+        Piece p = std::move(pieces_.front());
+        pieces_.pop_front();
+        cv_.notify_all();
+        return p;
+    }
+    Progress progress() {
+        std::lock_guard lk(m_);
+        return progress_;
+    }
+    ~MapWorker() { stop(); }
+
+private:
+    struct Request {
+        uint64_t generation;
+        TagHash bubble;
+        std::optional<std::array<float, 3>> center;
+        float radius;
+        uint32_t texture_cap;
+    };
+    void run(fs::path install) {
+        std::unique_ptr<PackageManager> pm;
+        try {
+            pm = std::make_unique<PackageManager>(install);
+            pm->build_hash64_index();
+        } catch (const std::exception& ex) {
+            std::lock_guard lk(m_);
+            list_error_ = ex.what();
+            listed_ = true;
+            return;
+        }
+        std::optional<MapLayout> layout;
+        std::optional<PrepareCache> cache;
+        const auto layouts = load_input_layouts(*pm);
+        std::vector<std::unique_ptr<PackageManager>> helpers;
+        for (;;) {
+            Request req;
+            bool list = false;
+            {
+                std::unique_lock lk(m_);
+                cv_.wait(lk, [&] { return quit_ || request_ || (list_requested_ && !listed_); });
+                if (quit_) return;
+                if (list_requested_ && !listed_) list = true;
+                else {
+                    req = *request_;
+                    request_.reset();
+                }
+            }
+            if (list) {
+                std::vector<MapEntry> maps;
+                std::string err;
+                try {
+                    maps = list_maps(*pm);
+                } catch (const std::exception& ex) {
+                    err = ex.what();
+                }
+                std::lock_guard lk(m_);
+                maps_ = std::move(maps);
+                list_error_ = err;
+                listed_ = true;
+                continue;
+            }
+            auto stale = [&] {
+                std::lock_guard lk(m_);
+                return quit_ || generation_ != req.generation;
+            };
+            try {
+                if (!layout || layout->bubble != req.bubble) layout = load_map_layout(*pm, req.bubble);
+                if (!cache || cache->max_texture_dim != req.texture_cap) {
+                    cache.emplace();
+                    cache->max_texture_dim = req.texture_cap;
+                    cache->gbuffer_only = true;
+                    cache->all_lods = true;
+                }
+                const auto center = req.center ? *req.center : map_focus(*layout);
+                auto region = map_region(*layout, center, req.radius);
+                const auto terrain = map_terrain_region(*layout, center, req.radius);
+                {
+                    std::lock_guard lk(m_);
+                    if (generation_ != req.generation) continue;
+                    progress_.total = region.size() + terrain.size();
+                    progress_.center = center;
+                }
+                // Prepared in parallel (one PackageManager per thread), terrain first, then the
+                // statics nearest first; pieces arrive roughly in that order.
+                // Every core but the UI thread's.
+                if (helpers.empty()) {
+                    const unsigned n = std::max(std::thread::hardware_concurrency(), 2u) - 2;
+                    for (unsigned i = 0; i < n; ++i) helpers.push_back(pm->fork());
+                }
+                std::atomic<size_t> next{0};
+                const size_t jobs = terrain.size() + region.size();
+                auto work = [&](PackageManager& wpm) {
+                    for (;;) {
+                        const size_t j = next.fetch_add(1);
+                        if (j >= jobs || stale()) return;
+                        Piece piece{req.generation};
+                        std::string failure;
+                        try {
+                            if (j < terrain.size()) {
+                                piece.mesh = prepare_terrain(wpm, *terrain[j], layouts, &*cache);
+                                piece.rows = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}};
+                            } else {
+                                auto& st = region[j - terrain.size()];
+                                piece.mesh = prepare_static_mesh(wpm, st.mesh, nullptr, &*cache);
+                                piece.rows = std::move(st.rows);
+                            }
+                        } catch (const std::exception& ex) {
+                            failure = (j < terrain.size() ? "terrain: " : "") + std::string(ex.what()).substr(0, 110);
+                        }
+                        std::unique_lock lk(m_);
+                        // Back-pressure: the UI adds a few meshes per frame.
+                        cv_.wait(lk, [&] { return quit_ || generation_ != req.generation || pieces_.size() < 64; });
+                        if (quit_ || generation_ != req.generation) return;
+                        ++progress_.prepared;
+                        if (!failure.empty()) {
+                            ++progress_.failed;
+                            ++progress_.failures[failure];
+                        } else pieces_.push_back(std::move(piece));
+                    }
+                };
+                std::vector<std::thread> threads;
+                for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
+                work(*pm);
+                for (auto& t : threads) t.join();
+            } catch (const std::exception& ex) {
+                std::lock_guard lk(m_);
+                if (generation_ == req.generation) {
+                    ++progress_.failed;
+                    ++progress_.failures[std::string(ex.what()).substr(0, 120)];
+                }
+            }
+            std::lock_guard lk(m_);
+            if (generation_ == req.generation) progress_.done = true;
+        }
+    }
+
+    std::thread thread_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool quit_ = false, list_requested_ = false, listed_ = false;
+    std::vector<MapEntry> maps_;
+    std::string list_error_;
+    uint64_t generation_ = 0;
+    std::optional<Request> request_;
+    std::deque<Piece> pieces_;
+    Progress progress_;
+};
+
 // ---- window / swapchain -----------------------------------------------------------------------------
 struct Window {
     HWND hwnd = nullptr;
@@ -683,11 +905,12 @@ struct Camera {
 
 enum class Engine : int { Game };
 
-enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabText, TabDialogue, TabPackages, TabLog, TabCount };
+enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; const char* title; const char* id; bool closable; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, "HOME", "home", false},         {ico::Settings, "", "settings", false},
     {ico::Statics, "STATICS", "statics", true}, {ico::Entities, "ENTITIES", "entities", true},
+    {ico::Maps, "MAPS", "maps", true},
     {ico::Text, "TEXT", "text", true},
     {ico::Dialogue, "DIALOGUE", "dialogue", true}, {ico::Packages, "PACKAGES", "packages", true},
     {ico::Log, "LOG", "log", true},
@@ -710,6 +933,24 @@ public:
     std::unique_ptr<Catalog> catalog;
     std::thread loader;
     MeshWorker worker;
+    MapWorker map_worker;
+
+    // The loaded map region (the live scene holds its meshes).
+    struct MapView {
+        char filter[64] = "";
+        int selected = -1;     // index into map_worker.maps()
+        float radius = 250;    // m around the region centre
+        int texture_cap = 3;   // kMapTextureCaps index (full resolution)
+        uint64_t generation = 0;
+        bool streaming = false, framed = false;
+        TagHash bubble;
+        std::string name;
+        std::array<float, 3> center{};
+    };
+    MapView map;
+    bool map_scene = false;  // the live scene is a map region
+    std::optional<TagHash> pending_map;  // from the command line, loaded once the maps are listed
+    static constexpr uint32_t kMapTextureCaps[] = {256, 512, 1024, 0};
 
     // live view
     StaticMeshScene scene;
@@ -730,6 +971,8 @@ public:
     ChannelValues channel_overrides;  // object channels the user set for the live mesh
     uint32_t scene_permutation = 0, scene_permutation_count = 0;
     bool keep_camera = false;
+    bool shadows = true;   // nim's sun shadow map (viewer estimate)
+    SunShadow sun_shadow;
     float material_time = 0, material_speed = 1;
     bool material_playing = true;
 
@@ -759,7 +1002,7 @@ public:
 
     std::deque<LogLine> log;
     int language = 1;  // second column language (ja by default)
-    bool tab_open[TabCount] = {true, true, true, true, true, true, true, false};
+    bool tab_open[TabCount] = {true, true, true, true, true, true, true, true, false};
     int focus_tab = -1, focus_frames = 0;
 
     // statics browser
@@ -810,6 +1053,9 @@ public:
             catalog = std::make_unique<Catalog>();
             loader = std::thread(load_catalog, dir, catalog.get());
             worker.start(dir);
+            map_worker.start(dir);
+            map = MapView{};
+            map_scene = false;
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -842,6 +1088,27 @@ public:
 
     // Object channels: the per-object state values the materials read (frozen, in a heat cascade,
     // damage, dissolve ...). Editing one re-evaluates the materials' TFX with the new value.
+    // Engine inputs with no game data behind them (no map loaded, run-time state): what nim used
+    // instead and why. Collapsed by default; the header count is the summary.
+    void estimates_panel() {
+        std::map<std::string, std::string> all = scene.estimates();
+        if (engine == Engine::Game && game_ready)
+            for (const auto& [what, why] : game_lighting.externs().estimates()) all.emplace(what, why);
+        if (all.empty()) return;
+        ImGui::Spacing();
+        if (!ImGui::CollapsingHeader(std::format("推定値 ({})###estimates", all.size()).c_str())) return;
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("ゲームデータが無い入力 (マップ未読込・実行時の状態) に nim が入れた値");
+        std::map<std::string, std::vector<const std::string*>> by_reason;
+        for (const auto& [what, why] : all) by_reason[why].push_back(&what);
+        for (const auto& [why, items] : by_reason) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted(why.c_str());
+            for (const auto* w : items) ImGui::TextDisabled("  %s", w->c_str());
+        }
+        ImGui::PopTextWrapPos();
+    }
+
     void channels_panel() {
         const auto& used = scene.channels();
         if (used.empty()) return;
@@ -894,6 +1161,7 @@ public:
 
     void request_load(TagHash tag) {
         if (loading && *loading == tag) return;
+        stop_map();
         channel_overrides.clear();
         loading = tag;
         worker.request_live(tag);
@@ -906,7 +1174,9 @@ public:
             gb.resize(g, view_w, view_h);
         }
         if (auto r = worker.take(false)) {
-            if (loading && *loading == r->tag) loading.reset();
+            const bool expected = loading && *loading == r->tag;
+            if (expected) loading.reset();
+            if (map_scene && !expected) return;  // requested before a map replaced the live scene
             g.wait_idle();
             if (r->mesh) {
                 try {
@@ -914,7 +1184,9 @@ public:
                     scene_component = r->mesh->component;
                     scene_permutation = r->mesh->permutation;
                     scene_permutation_count = r->mesh->permutation_count;
-                    const TagHash prev = scene.tag();
+                    const TagHash prev = map_scene ? TagHash{} : scene.tag();
+                    stop_map();
+                    map_scene = false;
                     scene.upload(g, std::move(*r->mesh), layouts);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
@@ -943,6 +1215,219 @@ public:
             }
         }
         make_thumbnail(g);
+        stream_map(g);
+    }
+
+    // ---- maps ----
+    void stop_map() {
+        if (!map.streaming) return;
+        map_worker.cancel();
+        map.streaming = false;
+    }
+    void load_map(int index, std::optional<std::array<float, 3>> center) {
+        const auto& maps = map_worker.maps();
+        if (index < 0 || index >= int(maps.size())) return;
+        const auto& m = maps[size_t(index)];
+        loading.reset();  // a live mesh still being prepared is discarded when it arrives
+        map_add_failures.clear();
+        gpu.wait_idle();
+        scene.begin(gpu);
+        anim.reset();
+        channel_overrides.clear();
+        const bool same = map_scene && map.bubble == m.bubble;
+        map.framed = same && center.has_value();  // reloading around the camera keeps the view
+        map.bubble = m.bubble;
+        map.name = m.package;
+        map.selected = index;
+        map.streaming = true;
+        map_scene = true;
+        map.generation = map_worker.request(m.bubble, center, map.radius, kMapTextureCaps[map.texture_cap]);
+        info(std::format("マップ {} ({}) を読込: 半径 {:.0f} m", m.package, m.bubble.str(), map.radius));
+    }
+    void stream_map(Gpu& g) {
+        if (!map.streaming) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        bool added = false;
+        // Only new GPU objects are created (nothing the frame in flight uses), so no GPU wait.
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(24)) {
+            auto piece = map_worker.take(map.generation);
+            if (!piece) break;
+            added = true;
+            try {
+                scene.add_mesh(g, std::move(piece->mesh), layouts, piece->rows);
+            } catch (const std::exception& ex) {
+                // add_mesh rolled the mesh back; counted with the worker's failures below.
+                ++map_add_failures[std::string(ex.what()).substr(0, 120)];
+            }
+        }
+        const auto pr = map_worker.progress();
+        if (pr.generation != map.generation) return;
+        map.center = pr.center;
+        if (added) {
+            scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, map.radius * 0.6f);
+            if (!map.framed && scene.loaded()) {
+                frame_scene();
+                map.framed = true;
+            }
+        }
+        if (pr.done && !added && !map_worker.take(map.generation)) {
+            map.streaming = false;
+            info(std::format("マップ {}: {} メッシュ / {} インスタンス{}", map.name, scene.mesh_count(), scene.instance_count(),
+                             pr.failed ? std::format(" ({} スキップ)", pr.failed) : ""));
+        }
+    }
+    std::map<std::string, size_t> map_add_failures;
+
+    void maps_tab() {
+        if (!pm) return;
+        map_worker.request_list();
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        if (!map_worker.listed()) {
+            ImGui::SetCursorPos({20 * sc, 20 * sc});
+            spinner(ImGui::GetWindowDrawList(), {ImGui::GetCursorScreenPos().x + 8 * sc, ImGui::GetCursorScreenPos().y + 8 * sc},
+                    7 * sc, kGreen);
+            ImGui::SetCursorPos({44 * sc, 20 * sc});
+            ImGui::TextDisabled("マップを列挙中…");
+            return;
+        }
+        if (const auto err = map_worker.list_error(); !err.empty()) {
+            ImGui::SetCursorPos({20 * sc, 20 * sc});
+            ImGui::TextColored({1, 0.45f, 0.45f, 1}, "マップを列挙できません: %s", err.c_str());
+            return;
+        }
+        const auto& maps = map_worker.maps();
+        if (pending_map) {
+            for (size_t i = 0; i < maps.size(); ++i)
+                if (maps[i].bubble == *pending_map) load_map(int(i), std::nullopt);
+            pending_map.reset();
+        }
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float left_w = 300 * sc, pad = 10 * sc;
+        const auto grey = IM_COL32(150, 150, 156, 255);
+
+        // left: maps, then the region controls
+        ImGui::BeginChild("maps", {left_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        ImGui::SetCursorPos({pad, pad});
+        ImGui::SetNextItemWidth(left_w - 2 * pad);
+        ImGui::InputTextWithHint("##mfilter", (icon(ico::Search) + "  マップ / タグ").c_str(), map.filter, sizeof(map.filter));
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 3 + ImGui::GetTextLineHeightWithSpacing() * 2 + pad * 2;
+        ImGui::SetCursorPosX(0);
+        ImGui::BeginChild("maplist", {0, -footer}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        const std::string f = lower_ascii(map.filter);
+        for (size_t i = 0; i < maps.size(); ++i) {
+            const auto& m = maps[i];
+            if (!f.empty() && !contains_ci(m.package, f) && !contains_ci(m.bubble.str(), f)) continue;
+            ImGui::PushID(int(i));
+            const ImVec2 pos = ImGui::GetCursorScreenPos();
+            const bool live = map_scene && map.bubble == m.bubble;
+            if (ImGui::Selectable("##m", int(i) == map.selected, 0, {0, ImGui::GetTextLineHeight() * 2 + 4 * sc})) {
+                map.selected = int(i);
+                load_map(int(i), std::nullopt);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            auto* dl = ImGui::GetWindowDrawList();
+            const float lh = ImGui::GetTextLineHeight();
+            if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, kGreen);
+            dl->AddText({pos.x + pad, pos.y + 2 * sc}, IM_COL32_WHITE, m.package.c_str());
+            dl->AddText({pos.x + pad, pos.y + 2 * sc + lh}, grey,
+                        std::format("{}   {} メッシュ · {} 配置", m.bubble.str(), m.statics, m.instances).c_str());
+            ImGui::PopID();
+        }
+        if (maps.empty()) {
+            ImGui::SetCursorPosX(pad);
+            ImGui::TextDisabled("静的ジオメトリを持つマップがありません");
+        }
+        ImGui::EndChild();
+
+        // region controls
+        ImGui::SetCursorPos({pad, ImGui::GetCursorPosY() + pad});
+        ImGui::BeginGroup();
+        const float w = left_w - 2 * pad;
+        ImGui::SetNextItemWidth(w);
+        ImGui::SliderFloat("##radius", &map.radius, 50, 2000, "範囲  %.0f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("領域の中心からこの距離にある配置を読み込みます");
+        ImGui::SetNextItemWidth(w);
+        const char* caps[] = {"テクスチャ  256", "テクスチャ  512", "テクスチャ  1024", "テクスチャ  原寸"};
+        ImGui::Combo("##texcap", &map.texture_cap, caps, 4);
+        ImGui::SetItemTooltip("テクスチャの最大辺 (VRAM と読込時間の節約。原寸 = ゲームのデータそのまま)");
+        ImGui::BeginDisabled(map.selected < 0);
+        if (dbutton("カメラの位置で読込", w)) {
+            const bool here = map_scene && map.selected >= 0 && maps[size_t(map.selected)].bubble == map.bubble;
+            load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("いまのカメラの注視点を中心に、範囲内を読み込み直します");
+        if (map_scene) {
+            const auto pr = map_worker.progress();
+            if (map.streaming && pr.generation == map.generation)
+                ImGui::TextDisabled("読込中  %zu / %zu", pr.prepared, pr.total);
+            else
+                ImGui::TextDisabled("%zu メッシュ · %zu 配置", scene.mesh_count(), scene.instance_count());
+            ImGui::TextDisabled("中心 (%.0f, %.0f, %.0f)", map.center[0], map.center[1], map.center[2]);
+        }
+        ImGui::EndGroup();
+        ImGui::EndChild();
+
+        // right: the live view, map details below
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("mapscene", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        if (details_h <= 0) details_h = 220 * sc;
+        const float view_h_px = std::max(120 * sc, ImGui::GetContentRegionAvail().y - details_h - 6 * sc);
+        const ImVec2 view_origin = ImGui::GetCursorScreenPos();
+        const float view_w_px = ImGui::GetContentRegionAvail().x;
+        viewport_ui({view_w_px, view_h_px});
+        if (map.streaming) {
+            const auto pr = map_worker.progress();
+            const float t = pr.total ? float(pr.prepared) / float(pr.total) : 0.0f;
+            const float y = view_origin.y + view_h_px - 2 * sc;
+            auto* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled({view_origin.x, y}, {view_origin.x + view_w_px, y + 2 * sc}, IM_COL32(255, 255, 255, 30));
+            dl->AddRectFilled({view_origin.x, y}, {view_origin.x + view_w_px * t, y + 2 * sc}, kGreen);
+        }
+        ImGui::InvisibleButton("##mhsplit", {ImGui::GetContentRegionAvail().x, 6 * sc});
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (ImGui::IsItemActive()) details_h = std::max(40 * sc, details_h - ImGui::GetIO().MouseDelta.y);
+        ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                                  ImGui::IsItemActive() ? kGreen : IM_COL32(4, 4, 4, 255));
+        ImGui::BeginChild("mapdetails", {0, 0}, ImGuiChildFlags_None);
+        map_details_ui();
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    void map_details_ui() {
+        if (!map_scene) {
+            ImGui::TextDisabled("マップを選ぶと、周辺の静的ジオメトリをゲームのシェーダで描画します");
+            ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
+            return;
+        }
+        ImGui::PushFont(g_fonts.bold, 0);
+        ImGui::TextUnformatted(map.name.c_str());
+        ImGui::PopFont();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", map.bubble.str().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(map.bubble.str().c_str());
+        ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
+        const auto pr = map_worker.progress();
+        std::map<std::string, size_t> skipped = map_add_failures;
+        if (pr.generation == map.generation)
+            for (const auto& [why, n] : pr.failures) skipped[why] += n;
+        size_t total = 0;
+        for (const auto& [why, n] : skipped) total += n;
+        if (total) {
+            ImGui::Spacing();
+            if (ImGui::CollapsingHeader(std::format("スキップしたメッシュ ({})###mapskipped", total).c_str())) {
+                ImGui::PushTextWrapPos(0);
+                for (const auto& [why, n] : skipped) ImGui::TextDisabled("%zu  %s", n, why.c_str());
+                ImGui::PopTextWrapPos();
+            }
+        }
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("未対応: 半透明パス・デカール・マップのライト / 大気 / 反射プローブ (ビューア環境で代用、推定値に記載)");
+        ImGui::PopTextWrapPos();
+        estimates_panel();
     }
 
     void make_thumbnail(Gpu& g) {
@@ -1014,7 +1499,8 @@ public:
         v.fov_y = 40.0f * 3.14159265f / 180.0f;
         V3 dir{std::cos(cam.yaw) * std::cos(cam.pitch), std::sin(cam.yaw) * std::cos(cam.pitch), std::sin(cam.pitch)};
         v.eye = cam.target + dir * cam.distance;
-        v.near_z = std::max(0.001f, cam.radius * 0.005f);
+        // Inside a map the camera walks among the geometry: a near plane at human scale.
+        v.near_z = map_scene ? 0.05f : std::max(0.001f, cam.radius * 0.005f);
         return v;
     }
 
@@ -1113,6 +1599,13 @@ public:
         light.delta_time = material_dt;
         ViewMatrices vm = make_view(current_view());
         try {
+            SunShadow* shadow = nullptr;
+            if (shadows && light.mode == ViewMode::Lit && game_ready) {
+                if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
+                sun_shadow.fit_view(sun_direction(light), vm.eye, cam.target, scene.center(), scene.radius());
+                scene.render_shadow(gpu, cl, sun_shadow);
+                shadow = &sun_shadow;
+            }
             scene.render_gbuffer(gpu, cl, gb, vm);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
@@ -1120,7 +1613,7 @@ public:
                 if (scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                     scene.render_transparent(gpu, c, gb, hdr, vm);
                 };
-                game_lighting.render(gpu, cl, gb, vm, light, transparents);
+                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow);
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {
@@ -1185,7 +1678,7 @@ public:
                 if (++focus_frames > 2) focus_tab = -1, focus_frames = 0;  // docking settles over a few frames
             }
             ImGui::SetNextWindowDockID(dock, ImGuiCond_FirstUseEver);
-            const bool pad0 = t == TabStatics || t == TabEntities;
+            const bool pad0 = t == TabStatics || t == TabEntities || t == TabMaps;
             if (pad0) ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
             bool visible = ImGui::Begin(tab_title(t).c_str(), kTabs[t].closable ? &tab_open[t] : nullptr,
                                         ImGuiWindowFlags_NoCollapse);
@@ -1196,6 +1689,7 @@ public:
                 case TabSettings: settings_tab(); break;
                 case TabStatics: statics_tab(false); break;
                 case TabEntities: statics_tab(true); break;
+                case TabMaps: maps_tab(); break;
                 case TabText: strings_tab(); break;
                 case TabDialogue: dialogue_tab(); break;
                 case TabPackages: packages_tab(); break;
@@ -1267,6 +1761,8 @@ public:
             ImGui::SetItemTooltip("静的メッシュをライブ 3D サムネイルで一覧し、ゲームのシェーダで表示");
             if (dbutton((icon(ico::Entities) + "  ENTITIES").c_str(), bw)) open_tab(TabEntities);
             ImGui::SetItemTooltip("エンティティのダイナミックモデル (剛体・スキン) をエンティティのマテリアルで表示");
+            if (dbutton((icon(ico::Maps) + "  MAPS").c_str(), bw)) open_tab(TabMaps);
+            ImGui::SetItemTooltip("マップの配置済み静的ジオメトリを読み込んで歩き回る");
             ImGui::TableNextColumn();
             heading("2D");
             ImGui::Dummy({0, 4 * sc});
@@ -1536,6 +2032,8 @@ public:
             ImGui::SliderAngle("太陽の方位", &light.sun_azimuth, -180, 180);
             ImGui::SliderAngle("太陽の高度", &light.sun_elevation, -10, 90);
             ImGui::SliderFloat("太陽の強さ", &light.sun_intensity, 0, 10);
+            ImGui::Checkbox("太陽の影", &shadows);
+            ImGui::SetItemTooltip("nim のシャドウマップ (ゲームのカスケードは未解読のため推定)");
             ImGui::ColorEdit3("太陽の色", &light.sun_color.x);
             ImGui::SliderFloat("空の強さ", &light.sky_intensity, 0, 4);
             ImGui::ColorEdit3("空 (天頂)", &light.sky_top.x);
@@ -1593,7 +2091,13 @@ public:
             ImGui::TextWrapped("%s", render_error.c_str());
         }
         // bottom-left HUD / messages
-        if (scene.loaded()) {
+        if (scene.loaded() && map_scene) {
+            const ViewMatrices vm = make_view(current_view());
+            std::string hud = std::format("{}   {} meshes   {} instances   ({:.0f}, {:.0f}, {:.0f})   GAME SHADING", map.name,
+                                          scene.mesh_count(), scene.instance_count(), vm.eye.x, vm.eye.y, vm.eye.z);
+            hud_text(dl, {origin.x + 10 * sc, origin.y + size.y - ImGui::GetTextLineHeight() - 8 * sc},
+                     IM_COL32(235, 235, 235, 230), hud.c_str());
+        } else if (scene.loaded()) {
             std::string hud = std::format("{}   LOD {}   r {:.2f}   {} groups{}", scene.tag().str(), scene.lod(),
                                           scene.radius(), scene.groups().size(),
                                           light.mode == ViewMode::Lit
@@ -1663,6 +2167,10 @@ public:
     }
 
     void details_ui() {
+        if (map_scene) {
+            map_details_ui();
+            return;
+        }
         if (!scene.loaded()) {
             ImGui::TextDisabled("メッシュ未選択");
             return;
@@ -1702,6 +2210,7 @@ public:
             ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, "速度 %.2fx");
         }
         channels_panel();
+        estimates_panel();
         if (engine == Engine::Game && game_ready)
             ImGui::TextDisabled("シェーディング: %s (ゲームの global_lighting_and_shading)",
                                 game_lighting.shading_technique().str().c_str());
@@ -1986,6 +2495,7 @@ public:
 
     void shutdown() {
         worker.stop();
+        map_worker.stop();
         gpu.wait_idle();
         for (auto& [k, t] : thumbs)
             if (t.srv != UINT32_MAX) gpu.srv().free(t.srv, 1);
@@ -2025,7 +2535,7 @@ int run(const std::wstring& cmdline) {
         return 1;
     }
 
-    // Command line: [INSTALL_DIR] [STATIC_MESH_TAG] in any order.
+    // Command line: [INSTALL_DIR] [STATIC_MESH / DYNAMIC_MODEL / MAP_BUBBLE_TAG] in any order.
     std::optional<fs::path> install_arg;
     std::optional<TagHash> tag_arg;
     {
@@ -2080,9 +2590,14 @@ int run(const std::wstring& cmdline) {
 
     app->info(std::format("nim {} — GPU: {}", kVersion, app->gpu.adapter_name()));
     if (tag_arg && app->pm) {
-        app->request_load(*tag_arg);
         const Entry* e = app->pm->entry(*tag_arg);
-        app->focus_tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
+        if (e && e->reference == kClassBubbleParent) {
+            app->pending_map = *tag_arg;
+            app->focus_tab = TabMaps;
+        } else {
+            app->request_load(*tag_arg);
+            app->focus_tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
+        }
     }
 
     uint64_t frame = 0;

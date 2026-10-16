@@ -38,6 +38,28 @@ private:
 // Per-frame constant data, from a persistently mapped upload buffer split into frame regions.
 struct DynamicAlloc { void* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu; };
 
+// A range of a shared default-heap buffer (BufferArena). Holding it keeps its chunk alive.
+struct GpuBuffer {
+    ComPtr<ID3D12Resource> resource;
+    uint64_t offset = 0, size = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    explicit operator bool() const { return resource != nullptr; }
+};
+class Gpu;
+// Sub-allocates read-only GPU buffers (geometry, constants) from 64 MB default-heap chunks: one
+// committed resource per buffer costs a kernel call and 64 KB alignment each, which dominated
+// map loading. Chunks stay in COMMON and are promoted implicitly (copy, then vertex / index / SRV
+// / CBV reads). Contents are copied on the immediate list: valid after Gpu::flush().
+class BufferArena {
+public:
+    GpuBuffer upload(Gpu& gpu, const void* data, size_t size, size_t align = 256);
+    void reset() { chunk_.Reset(); used_ = capacity_ = 0; }
+
+private:
+    ComPtr<ID3D12Resource> chunk_;
+    uint64_t used_ = 0, capacity_ = 0;
+};
+
 class Gpu {
 public:
     static constexpr uint32_t kFramesInFlight = 2;
@@ -67,6 +89,9 @@ public:
     ComPtr<ID3D12Resource> buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
     ComPtr<ID3D12Resource> upload(const void* data, size_t size);  // upload-heap buffer with contents
+    // Records a copy of `data` into dst at dst_offset on the immediate list (staged in a shared
+    // upload ring that is recycled by flush()).
+    void stage_copy(ID3D12Resource* dst, uint64_t dst_offset, const void* data, size_t size);
     ComPtr<ID3D12Resource> texture(const Texture& t);  // records the copy on the immediate list
     ComPtr<ID3D12Resource> texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
                                      D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear);
@@ -88,12 +113,16 @@ private:
     bool removed_ = false;
     HANDLE event_ = nullptr;
     std::vector<ComPtr<ID3D12Resource>> keep_;  // staging kept alive until the next flush
+    ComPtr<ID3D12Resource> staging_;
+    uint8_t* staging_cpu_ = nullptr;
+    size_t staging_used_ = 0;
+    static constexpr size_t kStagingChunk = 32 << 20;
     DescriptorAllocator srv_;
     ComPtr<ID3D12Resource> dynamic_;
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
     std::string adapter_;
-    static constexpr size_t kDynamicPerFrame = 4 << 20;
+    static constexpr size_t kDynamicPerFrame = 16 << 20;
 };
 
 } // namespace nim

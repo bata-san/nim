@@ -17,6 +17,7 @@ struct TfxEnvironment {
     std::function<float4(uint8_t channel)> global_channel;
     std::function<float4(uint32_t hash)> object_channel;
     std::function<float4(uint8_t texture)> texture_tiling;  // push_tex_tiling (streaming state)
+    std::function<float4(uint8_t texture)> texture_layer_count;  // push_tex_layer_count
 };
 
 struct TfxExternTexture {

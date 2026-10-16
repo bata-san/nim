@@ -13,6 +13,7 @@
 #include "nim/content/object_channels.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
+#include "nim/content/map.hpp"
 #include "nim/render/scene.hpp"
 
 #include <wincodec.h>
@@ -25,6 +26,8 @@
 #include <optional>
 #include <print>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -69,12 +72,16 @@ int run(int argc, char** argv) {
     ChannelValues channel_values;
     uint32_t benchmark_frames = 0;
     float camera_scale = 1;
+    float map_radius = 120;
+    bool shadows = true;
+    uint32_t map_texture_cap = 0;  // full resolution
     bool reference = false;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
         else if (args[i] == "--size" && i + 1 < args.size()) sscanf_s(args[++i].c_str(), "%ux%u", &width, &height);
         else if (args[i] == "--warp") warp = true;
+        else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--game") game = true;
         else if (args[i] == "--reference") reference = true;
         else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
@@ -83,6 +90,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
         else if (args[i] == "--benchmark" && i + 1 < args.size()) benchmark_frames = std::stoul(args[++i]);
         else if (args[i] == "--camera-scale" && i + 1 < args.size()) camera_scale = std::stof(args[++i]);
+        else if (args[i] == "--map-radius" && i + 1 < args.size()) map_radius = std::stof(args[++i]);
+        else if (args[i] == "--map-textures" && i + 1 < args.size()) map_texture_cap = std::stoul(args[++i]);
         else if (args[i] == "--channel" && i + 1 < args.size()) {
             const auto value = args[++i];
             const auto eq = value.find('=');
@@ -118,7 +127,74 @@ int run(int argc, char** argv) {
     std::println("adapter: {}", gpu.adapter_name());
 
     StaticMeshScene scene;
-    if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
+    if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
+        // A map: the static instances within --map-radius of where the geometry is.
+        auto t0 = std::chrono::steady_clock::now();
+        MapLayout map = load_map_layout(pm, mesh_tag);
+        const auto focus = map_focus(map);
+        auto region = map_region(map, focus, map_radius);
+        size_t in_region = 0;
+        for (const auto& st : region) in_region += st.rows.size();
+        std::println("map {}: {} statics / {} instances; {} statics / {} instances within {} m of ({:.1f}, {:.1f}, {:.1f})",
+                     mesh_tag.str(), map.statics.size(), map.instances, region.size(), in_region, map_radius,
+                     focus[0], focus[1], focus[2]);
+        PrepareCache cache;
+        cache.max_texture_dim = map_texture_cap;
+        cache.gbuffer_only = true;
+        cache.all_lods = true;
+        scene.begin(gpu);
+        std::map<std::string, size_t> failures;
+        double prep_s = 0, add_s = 0;
+        const auto terrain = map_terrain_region(map, focus, map_radius);
+        // Prepared on every core (one forked PackageManager per thread), then added in order.
+        const size_t jobs = terrain.size() + region.size();
+        std::vector<std::optional<PreparedMesh>> prepared(jobs);
+        std::vector<std::string> errors(jobs);
+        {
+            auto ta = std::chrono::steady_clock::now();
+            std::atomic<size_t> next{0};
+            auto work = [&](PackageManager& wpm) {
+                for (size_t j; (j = next.fetch_add(1)) < jobs;) {
+                    try {
+                        prepared[j] = j < terrain.size() ? prepare_terrain(wpm, *terrain[j], layouts, &cache)
+                                                         : prepare_static_mesh(wpm, region[j - terrain.size()].mesh, nullptr, &cache);
+                    } catch (const std::exception& ex) {
+                        errors[j] = ex.what();
+                    }
+                }
+            };
+            std::vector<std::unique_ptr<PackageManager>> helpers;
+            for (unsigned i = 1; i < std::max(std::thread::hardware_concurrency(), 1u); ++i) helpers.push_back(pm.fork());
+            std::vector<std::thread> threads;
+            for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
+            work(pm);
+            for (auto& t : threads) t.join();
+            prep_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
+        }
+        size_t terrain_ok = 0;
+        const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        auto tb = std::chrono::steady_clock::now();
+        for (size_t j = 0; j < jobs; ++j) {
+            const bool is_terrain = j < terrain.size();
+            const std::string what = is_terrain ? terrain[j]->tag.str() : region[j - terrain.size()].mesh.str();
+            try {
+                if (!prepared[j]) throw std::runtime_error(errors[j]);
+                if (is_terrain) scene.add_mesh(gpu, std::move(*prepared[j]), layouts, std::span(&identity, 1));
+                else scene.add_mesh(gpu, std::move(*prepared[j]), layouts, region[j - terrain.size()].rows);
+                prepared[j].reset();
+                terrain_ok += is_terrain;
+            } catch (const std::exception& ex) {
+                if (++failures[std::string(ex.what()).substr(0, 100)] == 1) std::println("  {}{}: {}", is_terrain ? "terrain " : "", what, ex.what());
+            }
+        }
+        add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
+        std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
+        scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, map_radius * 0.6f);
+        std::println("loaded {} meshes / {} instances in {:.1f}s", scene.mesh_count(), scene.instance_count(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        std::println("  prepare {:.1f}s, add {:.1f}s", prep_s, add_s);
+        for (const auto& [why, n] : failures) std::println("  skipped {}: {}", n, why);
+    } else if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
         auto it = mats.find(mesh_tag.value);
@@ -165,6 +241,14 @@ int run(int argc, char** argv) {
     auto* cl = gpu.immediate();
     scene.set_material_frame(material_time);
     if (!channel_values.empty()) scene.set_channels(channel_values);
+    SunShadow shadow;
+    if (shadows) shadow.resize(gpu, 4096);
+    auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
+        if (!shadows) return;
+        shadow.fit_view(sun_direction(p), vm.eye, scene.center(), scene.center(), scene.radius());
+        scene.render_shadow(gpu, list, shadow);
+    };
+    shadow_pass(cl, LightingParams{});
     scene.render_gbuffer(gpu, cl, gb, vm);
     for (const auto& [hash, channel] : scene.channels()) {
         const char* name = object_channel_name(hash);
@@ -191,20 +275,32 @@ int run(int argc, char** argv) {
         gl.init(pm, gpu);
         std::println("game shading: technique {}", gl.shading_technique().str());
         for (const auto& n : gl.notes()) std::println("  {}", n);
-        gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr);
+        gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
         std::println("estimated engine inputs (no game data for these):");
         for (const auto& [what, why] : scene.estimates()) std::println("  material  {}  [{}]", what, why);
         for (const auto& [what, why] : gl.externs().estimates()) std::println("  lighting  {}  [{}]", what, why);
         write_png(out_dir / "composite_game.png", width, height,
                   gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+        if (shadow.valid) {
+            auto d = gpu.read_texture(shadow.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
+            const float* f = reinterpret_cast<const float*>(d.data());
+            size_t n = d.size() / 4, covered = 0;
+            float lo = 1e9f, hi = -1e9f;
+            for (size_t i = 0; i < n; ++i) { lo = std::min(lo, f[i]); hi = std::max(hi, f[i]); covered += f[i] > 0; }
+            std::println("shadow map {}: depth {}..{}, covered {:.1f}%, half {:.1f} m, range {:.1f} m", shadow.size, lo, hi, 100.0 * covered / n, shadow.half, shadow.range);
+            auto mask = gpu.read_texture(gl.shadow_mask(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1);
+            std::vector<uint8_t> rgba(mask.size() * 4);
+            for (size_t i = 0; i < mask.size(); ++i) rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = mask[i], rgba[i * 4 + 3] = 255;
+            write_png(out_dir / "sun_shadow_mask.png", width, height, rgba);
+        }
         if (fog > 0) {
             LightingParams lp;
             lp.time = material_time;
             lp.optimize = !reference;
             lp.fog = true;
             lp.fog_density = fog;
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, transparents);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, transparents, &shadow);
             gpu.flush();
             write_png(out_dir / "composite_game_fog.png", width, height,
                       gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
@@ -229,8 +325,9 @@ int run(int argc, char** argv) {
             lp.delta_time = 1.0f / 60;
             scene.set_material_frame(lp.time, lp.delta_time);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            shadow_pass(list, lp);
             scene.render_gbuffer(gpu, list, gb, vm);
-            if (game) gl.render(gpu, list, gb, vm, lp, transparents);
+            if (game) gl.render(gpu, list, gb, vm, lp, transparents, &shadow);
             else lighting.render(gpu, list, gb, vm, lp);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
             list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.Get(), 0);
