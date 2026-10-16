@@ -5,3 +5,5 @@ out/
 extracted/
 keys.txt
 build-*/
+nim_layout.ini
+captures/

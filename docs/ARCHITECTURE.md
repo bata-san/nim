@@ -107,9 +107,9 @@ Tiger のタグ(8/0)は「先頭 u64 = サイズ、以降は固定レイアウ�
 
 検証方法: ゲームにはデバッガやキャプチャツールを接続できない(BattlEye)ので、同じ視点の **ゲーム内スクリーンショットとの比較** で詰める。
 
-### 3.6 nim_app — UI
+### 3.6 nim_app — UI【一部実装済み: `nim.exe`】
 
-Dear ImGui の docking を使う。
+Dear ImGui(docking ブランチ, `third_party/imgui`)を使う。実装済み: メッシュブラウザ(全静的メッシュ、クリックでゲームのシェーダで描画)、テキスト(英語 + 選択言語の並列表示・検索・コピー)、セリフ(話者・台詞・訳・音声イベント)、パッケージエクスプローラ(エントリ表 + hex)、インスペクタ(テクニック・シェーダ・cbuffer・TFX・テクスチャ)、ビュー切替(Lit / G-buffer 各チャネル)、ライト調整、PNG 保存。カタログ(メッシュ一覧・文字列・セリフ)は別スレッドで、専用の PackageManager を使って読む。今後:
 
 - パッケージ / クラス / 種別のツリー、全文検索(テキスト・ハッシュ・TagHash)
 - タグエクスプローラ(hex + スキーマ注釈 + 参照の行き来)
@@ -119,7 +119,7 @@ Dear ImGui の docking を使う。
 
 ### 3.7 nimcli【一部実装済み】
 
-`pkgs`, `ls`, `types`, `read`, `verify`, `strings`, `dialogue`, `static`, `technique`(TFX の逆アセンブルと VM 実行結果), `shader`(DXIL の取り出し)を実装済み。今後 `export`、`index` を追加する。UI と同じライブラリを使うので、回帰テスト(全ブロック復号、全文字列件数)にも使う。
+`pkgs`, `ls`, `types`, `read`, `verify`, `strings`, `dialogue`, `static`, `technique`(TFX の逆アセンブルと VM 実行結果), `shader`(DXIL の取り出し), `extract PKGID TYPE DIR`(種別ごとの一括書き出し)を実装済み。今後 `export`、`index` を追加する。UI と同じライブラリを使うので、回帰テスト(全ブロック復号、全文字列件数)にも使う。
 
 ## 4. ロードマップ
 
@@ -129,7 +129,7 @@ Dear ImGui の docking を使う。
 | P1 ✅ | テキスト / セリフ | `nimcli strings` / `nimcli dialogue`。下記「P1 の結果」 |
 | P2 | 音声 | BNK/HIRC 解析、WEM デコード、セリフ画面での再生 |
 | P3 | テクスチャ + 静的メッシュ + D3D12 基盤 + UI | モデルを汎用シェーダで表示、glTF 書き出し |
-| P4 🟡 | 元シェーダ実行 | DXIL PSO + TFX VM は動作(`nimshade`、6 章)。残りはスコープ再構築、ライティングパス、ゲームのスクショとの比較 |
+| P4 🟡 | 元シェーダ実行 | DXIL PSO + TFX VM は動作(`nimshade` / `nim`、6 章)。エンジンのライト用シェーダを特定(6 章)。残りはスコープ再構築、ライティングパス、ゲームのスクショとの比較 |
 | P5 | マップ | 1 マップ全体をインスタンシングで 60fps 表示 |
 | P6 | エンティティ / スケルトン / アイテム / 動画 | |
 
@@ -186,7 +186,11 @@ Dear ImGui の docking を使う。
 | 2 | マテリアルパラメータ(r = メタル系の値と推定、a = 1) |
 | 3 | xy = モーションベクタ(前フレームとのクリップ座標の差 × 0.5) |
 
-**未解決**: ライティングパス(ゲームの deferred lighting シェーダ)は未実行で、合成画像は nimshade 内の簡易ライティング。エンジンの extern / グローバルチャネルは既定値で埋めている。RT2 各チャネルの意味は未確定。
+**ライティング(nim_render の LightingPass)**: G-buffer を読み、太陽の GGX(Smith 可視項, Schlick フレネル)、半球の空の放射照度、環境スペキュラ(Karis の EnvBRDFApprox)、RT2.g の発光をデコードして加算し、ACES で tonemap する。ゲームのシェーダではなく nim の代替。
+
+**エンジンのライティングシェーダの調査(第一歩)**: ブートストラップパッケージ `013A`(`w64_client_bootstrap_patchable`)に 41/0(PS)521 個、41/6(CS)105 個のエンジン用シェーダがある(`nimcli extract 013A 41 DIR` → `dxc -dumpbin`)。入力が SV_Position だけのフルスクリーン PS のうち、`80A7432D` / `80A7433B` / `80A74326` は SV_Target を 2 枚(diffuse / specular の光の蓄積と推定)出し、t0/t1 を textureLoad、t3 に 3D LUT を持つ。cb12(view)に加えて cb0 を使い、reg23〜26 = 逆ビュー射影(画面 → ワールド)、reg27 = 光源位置、reg28 = 距離減衰(scale, bias)、reg32/34 = 方向・色、reg39 = 有効フラグで、ローカルライト(スポット/ポイント)の deferred シェーダとみられる。法線は `normalize(t1.rgb × 2 − 1)` と a > 0.5 のフラグで読んでおり、G-buffer RT1 そのものではなく、前段で作るライティング用の中間バッファを読んでいる可能性が高い。これらを実行するには、中間バッファを作るパスと cb0 の残りの意味の特定が必要。
+
+**未解決**: ゲームのライティングパスは未実行で、合成画像は上記の代替。エンジンの extern / グローバルチャネルは既定値で埋めている。RT2 各チャネルの意味は未確定。
 
 ## 7. リスク
 

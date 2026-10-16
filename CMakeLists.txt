@@ -35,9 +35,27 @@ target_link_libraries(nim_core PUBLIC bcrypt)
 add_executable(nimcli tools/nimcli/main.cpp)
 target_link_libraries(nimcli PRIVATE nim_core)
 
-# ---- nimshade: headless D3D12 render with the game's own shaders ------------
+# ---- nim_render: D3D12 renderer running the game's own shaders --------------
+add_library(nim_render STATIC
+  src/render/gpu.cpp
+  src/render/scene.cpp
+)
+target_link_libraries(nim_render PUBLIC nim_core d3d12 dxgi d3dcompiler)
+
+# ---- nimshade: headless shading test -----------------------------------------
 add_executable(nimshade tools/nimshade/main.cpp)
-target_link_libraries(nimshade PRIVATE nim_core d3d12 dxgi windowscodecs ole32)
+target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32)
+
+# ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
+set(IMGUI_DIR third_party/imgui)
+add_executable(nim WIN32 tools/nim/main.cpp
+    ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp)
+target_include_directories(nim PRIVATE ${IMGUI_DIR})
+file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
+set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
+target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi)
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()

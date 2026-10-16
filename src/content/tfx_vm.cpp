@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <stdexcept>
 
@@ -71,6 +72,65 @@ float4 sin_rot(float4 a) {  // engine's polynomial sin(2*pi*a) estimate
         float y = w * (-16.0f * std::fabs(w) + 8.0f);
         r[i] = y * (0.225f * std::fabs(y) + 0.775f);
     }
+    return r;
+}
+
+
+float hash_rand(float v0) {  // engine's 1/(prime/1e6) dot + Blum-Blum-Shub style scramble
+    float d = v0 * (1.0f / 1.043501f) + v0 * (1.0f / 0.794471f) + v0 * (1.0f / 0.113777f) + v0 * (1.0f / 0.015101f);
+    d -= std::floor(d);
+    d = d * d * 251.0f;
+    return d - std::floor(d);
+}
+float pseudo_sin(float a) {
+    float w = a - std::round(a);
+    return w * (-16.0f * std::fabs(w) + 8.0f);
+}
+// Piecewise cubic over 4 segments; lane i is active when thresholds[i] <= t < thresholds[i+1].
+float4 spline4(float4 t, const float4* c) {
+    bool m[4];
+    for (int i = 0; i < 4; ++i) m[i] = c[4][i] <= t[i];
+    uint32_t acc = 0;
+    for (int i = 0; i < 4; ++i) {
+        bool sel = m[i] != (i < 3 ? m[i + 1] : false);
+        float v = (t[i] * c[0][i] + c[1][i]) * (t[i] * t[i]) + (c[2][i] * t[i] + c[3][i]);
+        uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        if (sel) acc ^= bits;
+    }
+    float r;
+    std::memcpy(&r, &acc, 4);
+    return {r, r, r, r};
+}
+// 8-segment spline: two banks (c, d) of 4 cubic segments with their thresholds.
+float spline8_eval(float x, const float4* k, bool* c_first, bool* d_first) {
+    auto bank = [&](int base, int th, bool* first) {
+        float4 mask;
+        for (int i = 0; i < 4; ++i) mask[i] = x >= k[th][i] ? 1.0f : 0.0f;
+        float4 ch = {std::fmod(mask[0] + mask[1], 2.0f), std::fmod(mask[1] + mask[2], 2.0f),
+                     std::fmod(mask[2] + mask[3], 2.0f), mask[3]};
+        float sum = 0;
+        for (int i = 0; i < 4; ++i) {
+            float hi = k[base][i] * x + k[base + 1][i], lo = k[base + 2][i] * x + k[base + 3][i];
+            sum += (hi * x * x + lo) * ch[i];
+        }
+        *first = mask[0] > 0;
+        return sum;
+    };
+    float c = bank(0, 8, c_first), d = bank(4, 9, d_first);
+    return *d_first ? d : c;
+}
+float4 gradient4(float4 x, const float4* k) {  // base, r, g, b, a, thresholds
+    const float4& th = k[5];
+    float4 r = k[0];
+    float4 pct;
+    for (int i = 0; i < 4; ++i) {
+        float next = i < 3 ? th[i + 1] : 1.0f;
+        float off = x[i] - th[i], seg = next - th[i];
+        pct[i] = std::clamp(seg != 0 ? off / seg : (off > 0 ? 1.0f : 0.0f), 0.0f, 1.0f);
+    }
+    for (int ch = 0; ch < 4; ++ch)
+        for (int i = 0; i < 4; ++i) r[ch] += k[1 + ch][i] * pct[i];
     return r;
 }
 
@@ -224,6 +284,60 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             break;
         }
         case 0x42: vm.push(vm.konst(a1)); break;
+        case 0x2F: {  // jitter
+            float x = vm.top()[0];
+            const float m[4] = {4.67f, 2.99f, 1.08f, 1.35f}, o[4] = {0.52f, 0.37f, 0.16f, 0.79f};
+            float v = 0.5f;
+            for (int i = 0; i < 4; ++i) {
+                float a = x * m[i] + o[i];
+                a -= std::round(a);
+                v += (a * 0.25f) * (std::fabs(a) * -16.0f + 8.0f);
+            }
+            vm.top() = splat((3.0f - 2.0f * v) * v * v);
+            break;
+        }
+        case 0x30: {  // wander
+            float x = vm.top()[0];
+            const float m0[4] = {4.08f, 1.02f, 3.0f / 5.37f, 3.0f / 9.67f}, o0[4] = {0.92f, 0.33f, 0.26f, 0.54f};
+            const float m1[4] = {1.83f, 3.09f, 0.39f, 0.87f}, o1[4] = {0.12f, 0.37f, 0.16f, 0.79f};
+            const float w1[4] = {0.02f, 0.02f, 0.28f, 0.28f};
+            float v = 0.5f;
+            for (int i = 0; i < 4; ++i) v += pseudo_sin(x * m0[i] + o0[i]) * pseudo_sin(x * m1[i] + o1[i]) * w1[i];
+            vm.top() = splat(v);
+            break;
+        }
+        case 0x31: vm.top() = splat(hash_rand(std::floor(vm.top()[0]))); break;
+        case 0x32: {  // rand_smooth
+            float v = vm.top()[0], v0 = std::round(v), f = v - v0;
+            float a = hash_rand(v0), b = hash_rand(v0 + 1.0f), sf = (3.0f - 2.0f * f) * f * f;
+            vm.top() = splat(a + (b - a) * sf);
+            break;
+        }
+        case 0x45: {
+            float4 k[5];
+            for (int i = 0; i < 5; ++i) k[i] = vm.konst(a1 + size_t(i));
+            vm.top() = spline4(vm.top(), k);
+            break;
+        }
+        case 0x46: case 0x47: {
+            float4 k[10];
+            for (int i = 0; i < 10; ++i) k[i] = vm.konst(a1 + size_t(i));
+            float4 x = vm.pop();
+            float rec = 0;
+            if (op == 0x47) rec = vm.top()[0];
+            else vm.push(x);
+            bool c_first = false, d_first = false;
+            float r = spline8_eval(x[0], k, &c_first, &d_first);
+            if (op == 0x47 && !d_first && !c_first) r = rec;
+            vm.top() = splat(r);
+            break;
+        }
+        case 0x48: {
+            float4 k[6];
+            for (int i = 0; i < 6; ++i) k[i] = vm.konst(a1 + size_t(i));
+            vm.top() = gradient4(vm.top(), k);
+            break;
+        }
         case 0x43: case 0x44: {
             float4 a = vm.konst(a1), b = vm.konst(a1 + 1u), t = vm.top();
             for (int i = 0; i < 4; ++i) {

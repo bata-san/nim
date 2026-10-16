@@ -515,6 +515,24 @@ int cmd_shader(PackageManager& pm, TagHash header, const char* out) {
     return 0;
 }
 
+// Writes every entry of one type (e.g. 41 = shader bytecode) in a package to OUT_DIR/TAG.bin.
+int cmd_extract(PackageManager& pm, uint16_t pkg_id, int type, const std::string& out_dir) {
+    std::filesystem::create_directories(out_dir);
+    Package& p = pm.open(pkg_id);
+    size_t n = 0;
+    for (uint32_t i = 0; i < p.entries().size(); ++i) {
+        const Entry& e = p.entries()[i];
+        if (e.type != type) continue;
+        auto bytes = p.read_entry(i);
+        TagHash tag = TagHash::make(pkg_id, uint16_t(i));
+        std::ofstream(std::filesystem::path(out_dir) / std::format("{}_{}.bin", tag.str(), e.subtype), std::ios::binary)
+            .write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        ++n;
+    }
+    std::println("wrote {} entries of type {} to {}", n, type, out_dir);
+    return 0;
+}
+
 int cmd_technique(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     Technique t = load_technique(pm, tag);
@@ -595,6 +613,8 @@ int main(int argc, char** argv) {
         if (cmd == "static" && args.size() >= 2) return cmd_static(pm, TagHash(parse_hex(args[1])));
         if (cmd == "shader" && args.size() >= 2)
             return cmd_shader(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
+        if (cmd == "extract" && args.size() >= 4)
+            return cmd_extract(pm, uint16_t(parse_hex(args[1])), std::stoi(args[2]), args[3]);
         if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});

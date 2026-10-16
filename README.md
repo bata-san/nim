@@ -14,7 +14,20 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-## Use
+## Viewer (GUI)
+
+```
+build/Release/nim.exe                 # opens the Steam install automatically
+build/Release/nim.exe 80A878C8        # ...and shows this static mesh
+```
+
+Browse all 57k static meshes (click to render with the game's own shaders), every localized
+string side by side with a second language, all spoken lines, and raw packages (entry table +
+hex). The inspector lists each part's technique, shaders, cbuffer, TFX and textures. The
+viewport switches between lit and the G-buffer channels; left drag orbits, right drag pans,
+wheel zooms, F frames, Ctrl+S saves a PNG to `captures/` next to the exe.
+
+## Command line
 
 The Steam install is detected automatically; otherwise pass `--install <Marathon dir>`.
 Oodle is loaded from the game's own `bin/x64/oo2core_9_win64.dll`.
@@ -31,6 +44,7 @@ build/Release/nimcli find 80808635     # list static meshes
 build/Release/nimcli static 80A655FC   # mesh groups, LODs, techniques, vertex layouts
 build/Release/nimcli technique 80A655FB  # material: textures, TFX bytecode disassembly + VM result
 build/Release/nimcli shader 80A65559 ps.dxil  # extract a shader (DXIL); view with `dxc -dumpbin ps.dxil`
+build/Release/nimcli extract 13A 41 shaders   # every entry of one type in a package (41 = shader bytecode)
 ```
 
 ### Shading test
@@ -43,7 +57,7 @@ Renders a static mesh with the game's own compiled shaders, run unmodified on D3
 the G-buffer vertex and pixel shaders (DXIL), with material constants computed by nim's TFX
 bytecode VM and the game's BC textures. It writes the four G-buffer targets the pixel shader
 outputs (`gbuffer0_albedo.png`, `gbuffer1_normal.png`, `gbuffer2.png`) and `composite.png`, which
-adds simple lighting. The game's own lighting pass is not run yet. Requires a D3D12 GPU with
+adds nim's GGX sun + sky lighting with ACES tonemapping. The game's own lighting pass is not run yet. Requires a D3D12 GPU with
 Shader Model 6.6, or pass `--warp`.
 
 nim only reads installed files. It never touches the running game, and it ships no game data or Oodle binaries.
