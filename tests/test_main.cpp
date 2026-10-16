@@ -1,4 +1,5 @@
 // Unit tests that do not need a game install.
+#include "nim/content/tfx_vm.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
 #include "nim/core/tag_reader.hpp"
@@ -57,6 +58,26 @@ int main() {
     threw = false;
     try { tr.vec_at(0x08); } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
+
+    // TFX VM: operand order (a - b with b on top), outputs, temps, permute, cubic.
+    {
+        const float4 k[3] = {{1, 2, 3, 4}, {10, 20, 30, 40}, {2, 0, 0, 1}};  // cubic coeffs: 2x^3 + 1
+        std::vector<float4> out(8);
+        const uint8_t bc[] = {
+            0x42, 0x01, 0x42, 0x00, 0x02, 0x53, 0x00,  // out0 = k1 - k0
+            0x42, 0x00, 0x29, 0xE4, 0x53, 0x01,        // out1 = k0.wzyx (selectors 11 10 01 00)
+            0x42, 0x00, 0x58, 0x03, 0x57, 0x03, 0x42, 0x01, 0x03, 0x53, 0x02,  // temp3 = k0; out2 = temp3 * k1
+            0x42, 0x02, 0x42, 0x00, 0x0F, 0x53, 0x03,  // out3 = cubic(k2, k0)
+            0x80, 0x42, 0x00, 0x53, 0x04,              // return stops execution
+        };
+        auto res = run_tfx(bc, k, out);
+        CHECK(res.unsupported.empty());
+        CHECK((out[0] == float4{9, 18, 27, 36}));
+        CHECK((out[1] == float4{4, 3, 2, 1}));
+        CHECK((out[2] == float4{10, 40, 90, 160}));
+        CHECK((out[3] == float4{3, 17, 55, 129}));
+        CHECK((out[4] == float4{0, 0, 0, 0}));
+    }
 
     if (g_failures) return 1;
     std::puts("all tests passed");

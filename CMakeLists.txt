@@ -23,6 +23,8 @@ add_library(nim_core STATIC
   src/core/package_manager.cpp
   src/content/strings.cpp
   src/content/dialogue.cpp
+  src/content/tfx.cpp
+  src/content/tfx_vm.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)
@@ -30,6 +32,10 @@ target_link_libraries(nim_core PUBLIC bcrypt)
 # ---- nimcli: headless inspection / extraction --------------------------------
 add_executable(nimcli tools/nimcli/main.cpp)
 target_link_libraries(nimcli PRIVATE nim_core)
+
+# ---- nimshade: headless D3D12 render with the game's own shaders ------------
+add_executable(nimshade tools/nimshade/main.cpp)
+target_link_libraries(nimshade PRIVATE nim_core d3d12 dxgi windowscodecs ole32)
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()

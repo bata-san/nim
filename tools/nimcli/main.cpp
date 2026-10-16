@@ -10,16 +10,23 @@
 //   nimcli [--install DIR] dialogue [OUT.csv]         every spoken line: speaker, text (all languages), audio
 //   nimcli [--install DIR] xref-strings                which tag classes reference string hashes
 //   nimcli [--install DIR] xref-tags T/S|class:HASH    which tag classes reference tags of that kind
+//   nimcli [--install DIR] static TAG                  static mesh: groups, techniques, shaders, layouts
+//   nimcli [--install DIR] shader TAG [OUT.asm]         disassemble a shader header's DXBC
+//   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
+//   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/dialogue.hpp"
 #include "nim/content/strings.hpp"
+#include "nim/content/tfx.hpp"
+#include "nim/content/tfx_vm.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/package_manager.hpp"
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -443,6 +450,116 @@ int cmd_dialogue(PackageManager& pm, const char* out_path) {
     return 0;
 }
 
+int cmd_find(PackageManager& pm, uint32_t cls) {
+    size_t n = 0;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.reference != cls || (e.type != 8 && e.type != 16)) continue;
+            std::println("{}  type {:>3}/{}  size {:>8}  {}", TagHash::make(info.pkg_id, uint16_t(i)).str(), e.type,
+                         e.subtype, e.file_size, info.name);
+            n++;
+        }
+    }
+    std::println("{} tags", n);
+    return 0;
+}
+
+const char* kStageNames[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
+
+int cmd_static(PackageManager& pm, TagHash tag) {
+    pm.build_hash64_index();
+    StaticMesh m = load_static_mesh(pm, tag);
+    auto layouts = load_input_layouts(pm);
+    std::println("static {} data {} offset ({:.3f},{:.3f},{:.3f}) scale {:.3f} uv scale {:.3f} uv offset ({:.3f},{:.3f})",
+                 m.tag.str(), m.data_tag.str(), m.mesh_offset[0], m.mesh_offset[1], m.mesh_offset[2], m.mesh_scale,
+                 m.texcoord_scale, m.texcoord_offset[0], m.texcoord_offset[1]);
+    for (size_t b = 0; b < m.buffers.size(); ++b)
+        std::println("  buffers[{}] ib {} vb0 {} vb1 {} color {}", b, m.buffers[b].index.str(), m.buffers[b].vertex0.str(),
+                     m.buffers[b].vertex1.str(), m.buffers[b].color.str());
+    for (size_t g = 0; g < m.groups.size(); ++g) {
+        const auto& gr = m.groups[g];
+        const auto& part = m.parts.at(gr.part_index);
+        std::print("  group {:>2} part {:>2} stage {:>2} layout {:>3} idx [{}, +{}) prim {} lod {}", g, gr.part_index,
+                   gr.render_stage, gr.input_layout, part.index_start, part.index_count, part.primitive_type,
+                   part.lod_category);
+        if (g < m.techniques.size()) {
+            Technique t = load_technique(pm, m.techniques[g]);
+            std::print("  tech {} bind {}", t.tag.str(), t.bind_mode);
+            for (size_t s = 0; s < 6; ++s)
+                if (!t.stages[s].shader.is_none())
+                    std::print(" {}={} tex{} cb{}", kStageNames[s], t.stages[s].shader.str(), t.stages[s].textures.size(),
+                               t.stages[s].cbuffer_slot);
+        }
+        std::println("");
+    }
+    std::set<int> used;
+    for (const auto& g : m.groups) used.insert(g.input_layout);
+    for (int l : used) {
+        std::print("  layout {}:", l);
+        for (const auto& e : layouts[l])
+            std::print(" [{}]{}{} fmt{} ({}B){}", e.buffer, e.semantic, e.semantic_index, e.dxgi_format, e.size,
+                       e.instanced ? " inst" : "");
+        std::println("");
+    }
+    return 0;
+}
+
+int cmd_shader(PackageManager& pm, TagHash header, const char* out) {
+    // Marathon shaders are DXIL (SM6) inside a DXBC container; disassemble with `dxc -dumpbin OUT`.
+    auto bc = load_shader_bytecode(pm, header);
+    std::string path = out ? out : header.str() + ".dxil";
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bc.data()), std::streamsize(bc.size()));
+    std::println("wrote {} ({} bytes, DXIL in DXBC container; view with: dxc -dumpbin {})", path, bc.size(), path);
+    return 0;
+}
+
+int cmd_technique(PackageManager& pm, TagHash tag) {
+    pm.build_hash64_index();
+    Technique t = load_technique(pm, tag);
+    std::println("technique {} bind mode {}", t.tag.str(), t.bind_mode);
+    for (size_t s = 0; s < 6; ++s) {
+        const auto& st = t.stages[s];
+        if (st.shader.is_none()) continue;
+        std::println(" {} shader {}  bytecode {}B  constants {}  samplers {}  cbuffer slot {} tag {}", kStageNames[s],
+                     st.shader.str(), st.bytecode.size(), st.constants.size(), st.samplers.size(), st.cbuffer_slot,
+                     st.cbuffer.str());
+        for (const auto& tb : st.textures) {
+            try {
+                Texture tx = load_texture(pm, tb.texture);
+                std::println("   t{:<2} {} fmt {} {}x{} mips {} bytes {}", tb.slot, tb.texture.str(), tx.dxgi_format,
+                             tx.width, tx.height, tx.mip_count, tx.data.size());
+            } catch (const std::exception& ex) {
+                std::println("   t{:<2} {} ({})", tb.slot, tb.texture.str(), ex.what());
+            }
+        }
+        for (size_t k = 0; k < st.constants.size(); ++k)
+            std::println("   c{:<2} ({:.4f}, {:.4f}, {:.4f}, {:.4f})", k, st.constants[k][0], st.constants[k][1],
+                         st.constants[k][2], st.constants[k][3]);
+        if (!st.bytecode.empty()) {
+            std::print("{}", disassemble_tfx(st.bytecode));
+            std::vector<float4> cb(st.cbuffer_init.begin(), st.cbuffer_init.end());
+            if (cb.size() < 128) cb.resize(128);
+            auto before = cb;
+            try {
+                auto res = run_tfx(st.bytecode, st.constants, cb);
+                std::println("   vm: {} instructions, cbuffer {} regs", res.instructions, st.cbuffer_init.size());
+                for (size_t i = 0; i < cb.size(); ++i)
+                    if (cb[i] != before[i])
+                        std::println("   cb{}[{}] = ({:.4f}, {:.4f}, {:.4f}, {:.4f})", st.cbuffer_slot, i, cb[i][0],
+                                     cb[i][1], cb[i][2], cb[i][3]);
+                for (const auto& et : res.extern_textures)
+                    std::println("   extern texture -> t{} (extern {} offset {})", et.slot, et.extern_id, et.offset);
+                for (const auto& u : res.unsupported) std::println("   stubbed op: {}", u);
+            } catch (const std::exception& ex) {
+                std::println("   vm error: {}", ex.what());
+            }
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -475,6 +592,11 @@ int main(int argc, char** argv) {
                                args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
+        if (cmd == "static" && args.size() >= 2) return cmd_static(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "shader" && args.size() >= 2)
+            return cmd_shader(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
+        if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});
         if (cmd == "h64") return cmd_h64(pm, {args.begin() + 1, args.end()});
         if (cmd == "xref-tags" && args.size() >= 2) return cmd_xref_tags(pm, args[1]);
