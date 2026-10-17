@@ -103,6 +103,8 @@ D3D12_RENDER_TARGET_BLEND_DESC engine_blend_desc(int index, int rt = 0);
 // (RGBA8, sRGB-encoded values).
 class GBuffer {
 public:
+    static constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    static constexpr DXGI_FORMAT kDepthSrvFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
     void release(Gpu& gpu);
     uint32_t width() const { return w_; }

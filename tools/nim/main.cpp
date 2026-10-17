@@ -782,8 +782,7 @@ private:
                 }
                 auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
                 try {
-                    const auto all = load_map_cubemaps(*pm, *layout);
-                    for (const MapCubemap* c : map_cubemap_region(all, center, req.radius)) cubemaps->push_back(*c);
+                    *cubemaps = load_map_cubemaps(*pm, *layout);
                 } catch (const std::exception&) {
                     // likewise without cubemap volumes
                 }

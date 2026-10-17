@@ -355,24 +355,26 @@ ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
     return r;
 }
 
-std::vector<uint8_t> Gpu::read_texture(ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bpp) {
+std::vector<uint8_t> Gpu::read_texture(ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bpp, uint32_t subresource) {
     D3D12_RESOURCE_DESC rd = tex->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
-    device_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    device_->GetCopyableFootprints(&rd, subresource, 1, 0, &fp, nullptr, nullptr, &total);
     auto rb = buffer(size_t(total), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     barrier(list_.Get(), tex, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION dst{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     dst.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION src{tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    src.SubresourceIndex = subresource;
     list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     barrier(list_.Get(), tex, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     flush();
-    std::vector<uint8_t> out(size_t(rd.Width) * rd.Height * bpp);
+    const auto width = fp.Footprint.Width, height = fp.Footprint.Height;
+    std::vector<uint8_t> out(size_t(width) * height * bpp);
     uint8_t* p = nullptr;
     check_hr(rb->Map(0, nullptr, reinterpret_cast<void**>(&p)), "Map(readback)");
-    for (uint32_t y = 0; y < rd.Height; ++y)
-        std::memcpy(out.data() + size_t(y) * rd.Width * bpp, p + size_t(y) * fp.Footprint.RowPitch, size_t(rd.Width) * bpp);
+    for (uint32_t y = 0; y < height; ++y)
+        std::memcpy(out.data() + size_t(y) * width * bpp, p + size_t(y) * fp.Footprint.RowPitch, size_t(width) * bpp);
     rb->Unmap(0, nullptr);
     return out;
 }

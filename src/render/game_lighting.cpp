@@ -432,7 +432,8 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     ranges.reserve(8);
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
     std::vector<uint8_t> vs_code, ps_code, cs_code;
-    const std::vector<ShaderStage> active_stages = compute_ ? std::vector{ShaderStage::Compute} : std::vector{ShaderStage::Vertex, ShaderStage::Pixel};
+    const std::vector<ShaderStage> active_stages = compute_ ? std::vector{ShaderStage::Compute} :
+        opt.stencil_volume ? std::vector{ShaderStage::Vertex} : std::vector{ShaderStage::Vertex, ShaderStage::Pixel};
 
     for (ShaderStage which : active_stages) {
         const auto& ts = t.stage(which);
@@ -560,15 +561,34 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     if (pd.NumRenderTargets > 8) throw std::runtime_error("Too many original render targets");
     pd.RTVFormats[0] = opt.rtv_format;
     for (size_t i = 0; i < opt.additional_rtv_formats.size(); ++i) pd.RTVFormats[i + 1] = opt.additional_rtv_formats[i];
-    for (const auto& output : shader_outputs(ps_code))
+    for (const auto& output : opt.stencil_volume ? std::vector<ShaderInput>{} : shader_outputs(ps_code))
         if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !output.never_written &&
             !opt.drop_extra_targets)
             throw std::runtime_error(std::format("{}: original PS requires SV_Target{}; attachment missing", technique.str(), output.index));
-    if (opt.depth_func) {
-        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    if (opt.depth_func || opt.stencil_volume || opt.stencil_test) {
+        pd.DSVFormat = GBuffer::kDepthFormat;
+    }
+    if (opt.depth_func || opt.stencil_volume) {
         pd.DepthStencilState.DepthEnable = TRUE;
         pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-        pd.DepthStencilState.DepthFunc = opt.depth_func;
+        pd.DepthStencilState.DepthFunc = opt.stencil_volume ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : opt.depth_func;
+    }
+    if (opt.stencil_volume || opt.stencil_test) {
+        auto& ds = pd.DepthStencilState;
+        ds.StencilEnable = TRUE;
+        ds.StencilReadMask = 0xFF;
+        ds.StencilWriteMask = opt.stencil_volume ? 0xFF : 0;
+        ds.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                        opt.stencil_test ? D3D12_COMPARISON_FUNC_NOT_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS};
+        ds.BackFace = ds.FrontFace;
+        if (opt.stencil_volume) {
+            pd.PS = {};
+            pd.NumRenderTargets = 0;
+            for (auto& f : pd.RTVFormats) f = DXGI_FORMAT_UNKNOWN;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            ds.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_INCR;
+            ds.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_DECR;
+        }
     }
     pd.SampleDesc.Count = 1;
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
@@ -691,7 +711,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         off += st.srv_count + st.uav_count;
     }
     if (compute_) cl->Dispatch(x, y, z);
-    else if (geometry && geometry->vbv) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
+    else if (geometry && geometry->vbv && geometry->ibv && geometry->ibv->BufferLocation) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
+    else if (geometry && geometry->vbv) cl->DrawInstanced(geometry->indices, 1, 0, 0);
     else cl->DrawInstanced(4, 1, 0, 0);
 }
 
@@ -939,8 +960,11 @@ void GameLighting::release(Gpu& gpu) {
     cubemaps_.clear();
     for (auto& cp : cubemap_pipelines_) cp->release(gpu);
     cubemap_pipelines_.clear();
+    if (cubemap_stencil_) cubemap_stencil_->release(gpu);
+    cubemap_stencil_.reset();
     cubemap_variants_.clear();
     probe_textures_.clear();
+    probe_shapes_.clear();
     filtered_cubes_.clear();
     if (cube_filter_) cube_filter_->release(gpu);
     cube_filter_.reset();
@@ -1289,7 +1313,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     fill_view_externs(ext_, gb.width(), gb.height(), vm);
     ext_.set(ext::Deferred, 0x00, float4{0, 1 / vm.vp_rel.c[3][2], 0, 0});
     ext_.set(ext::Deferred, 0x40, float4{float(gb.width()), float(gb.height()), 0, 0});
-    ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
     ext_.set_texture(ext::Deferred, 0xA8, gb.rt[0].Get());
     ext_.set_texture(ext::Deferred, 0xB0, gb.rt[1].Get());
     ext_.set_texture(ext::Deferred, 0xB8, gb.rt[2].Get());
@@ -1494,7 +1518,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MipLevels = 1;
-    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.Format = GBuffer::kDepthSrvFormat;
     gpu.device()->CreateShaderResourceView(gb.depth.Get(), &sd, gpu.srv().cpu(env_srv_));
     sd.Format = gb.rt[1]->GetDesc().Format;
     gpu.device()->CreateShaderResourceView(gb.rt[1].Get(), &sd, gpu.srv().cpu(env_srv_ + 1));
@@ -1525,8 +1549,9 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         dsd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         dsd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         dsd.Texture2D.MipLevels = 1;
-        dsd.Format = DXGI_FORMAT_R32_FLOAT;
+        dsd.Format = GBuffer::kDepthSrvFormat;
         gpu.device()->CreateShaderResourceView(gb.depth.Get(), &dsd, gpu.srv().cpu(env_srv_ + 2));
+        dsd.Format = DXGI_FORMAT_R32_FLOAT;
         gpu.device()->CreateShaderResourceView(shadow->depth.Get(), &dsd, gpu.srv().cpu(env_srv_ + 3));
         SunShadowConstants sc{};
         sc.fwd = vm.fwd; sc.fx = vm.fx;
@@ -1604,7 +1629,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             sky_apply_.draw(gpu, cl, ext_, scopes);
         }
         if (!cubemaps_.empty() && own_env) {
-            draw_cubemaps(gpu, cl, vm, scopes);
+            draw_cubemaps(gpu, cl, gb, vm, scopes);
             ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
                                "engine pass order not in game data; the cubemap alpha replaces what is under it");
         }
@@ -1644,7 +1669,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (transparents) {
         ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
         transparents(cl, hdr);
-        ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+        ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
@@ -1848,7 +1873,7 @@ void GameLighting::render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, 
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
-        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        sd.Format = GBuffer::kDepthSrvFormat;
         gpu.device()->CreateShaderResourceView(gb.depth.Get(), &sd, gpu.srv().cpu(env_srv_));
         const float4 k{near_z, 0, 0, 0};
         const auto cb = gpu.dynamic(sizeof(k));
@@ -1875,7 +1900,7 @@ void GameLighting::render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     auto& e = hdao_ext_;
     constexpr uint8_t kHdao = 0x21;
     const float w = float(w_), h = float(h_);
-    e.set_texture(kHdao, 0x50, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);  // t0: device depth (cb0[3] = its size)
+    e.set_texture(kHdao, 0x50, gb.depth.Get(), GBuffer::kDepthSrvFormat);  // t0: device depth (cb0[3] = its size)
     e.set_texture(kHdao, 0x58, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);  // t1: view depth, gathered from R and G
     e.set(kHdao, 0x60, float4{0, 0, 1 / w, 1 / h});           // cb0[2].zw: t1 texel size
     e.set(kHdao, 0x70, float4{w, h, 0, 0});                    // cb0[3].xy: t0 size
@@ -2173,7 +2198,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 
     // 1. Quarter-resolution min / max view depth.
     constexpr uint8_t kDownsample = 0x23;
-    ext_.set_texture(kDownsample, 0x00, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set_texture(kDownsample, 0x00, gb.depth.Get(), GBuffer::kDepthSrvFormat);
     ext_.set(kDownsample, 0x10, float4{lw, lh, 1 / lw, 1 / lh});  // cb0[2]: target size
     ext_.set(kDownsample, 0x20, float4{w, h, 1 / w, 1 / h});      // cb0[3]: source size (x: 4 source texels per target texel)
     ext_.set(kDownsample, 0x30, float4{0, 1 / near_z, 0, 0});     // cb0[4]: 1 / view depth = x + y * device depth
@@ -2285,7 +2310,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 
     // Restore what the other passes read.
     ext_.set_texture(ext::Postprocess, 0x00, post.resource, post.format);
-    ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
 }
 
 // ---- Cubemap volumes ---------------------------------------------------------------------------
@@ -2301,6 +2326,15 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         if (!slot) slot = gpu.texture(load_texture(pm, t));
         return slot;
     };
+    if (!cubemap_stencil_) {
+        auto stencil = std::make_unique<GamePipeline>();
+        GamePipeline::Options opt;
+        opt.volume = true;
+        opt.stencil_volume = true;
+        opt.cbuffer_floor = 64;
+        stencil->load(pm, gpu, globals_.pipeline("cubemap_apply_cube_alpha_off_probes_on_relighting_off"), scopes, opt);
+        cubemap_stencil_ = std::move(stencil);
+    }
     {
         std::vector<uint32_t> wanted;
         for (const MapCubemap* m : cubemaps)
@@ -2327,6 +2361,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
                     auto gp = std::make_unique<GamePipeline>();
                     GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                     opt.volume = true;
+                    opt.stencil_test = true;
                     opt.cull_front = front;
                     opt.cbuffer_floor = 64;
                     opt.blend_state = 23;  // goriath CubemapRenderer: src + dst * src.a over both targets
@@ -2343,6 +2378,26 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;
             v.alpha = texture(m->alpha);
             v.diffuse = texture(m->diffuse);
+            if (!m->shape_vertices.is_none()) {
+                auto& shape = probe_shapes_[m->shape_vertices.value];
+                if (!shape) {
+                    const auto mesh = load_vertex_buffer(pm, m->shape_vertices);
+                    if (mesh.stride != 12 || mesh.data.empty() || mesh.data.size() % 36)
+                        throw std::runtime_error("invalid authored probe boundary triangle list");
+                    // The stored CSG is in +local coordinates; the original volume VS negates its
+                    // input. Convert that convention exactly, retaining every authored triangle.
+                    std::vector<float> vertices(mesh.data.size() / sizeof(float));
+                    std::memcpy(vertices.data(), mesh.data.data(), mesh.data.size());
+                    for (auto& f : vertices) {
+                        if (!std::isfinite(f)) throw std::runtime_error("non-finite probe boundary vertex");
+                        f = -f;
+                    }
+                    shape = gpu.upload(vertices.data(), mesh.data.size());
+                }
+                v.shape = shape;
+                v.shape_vbv = {shape->GetGPUVirtualAddress(), UINT(shape->GetDesc().Width), 12};
+                v.shape_vertices = v.shape_vbv.SizeInBytes / 12;
+            }
             if (!v.specular || (m->use_alpha() && !v.alpha) || (m->use_probes() && !v.diffuse))
                 throw std::runtime_error("volume without its cube / probe textures");
             const auto desc = raw->GetDesc();
@@ -2370,6 +2425,8 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         ext_.note_estimate("cubemaps: GGX filter roughness = mip / last mip, chain down to 4x4",
                            "cubemap_face_filter_ggx inputs (extern 84) are engine-set");
         ext_.note_estimate("cubemaps: draw order largest volume first", "engine sort order not decoded");
+        ext_.note_estimate("cubemaps: scene depth stencil winding mask from authored CSG boundary",
+                           "geometric membership uses the original mesh; engine stencil scheduling/state not decoded");
     }
 }
 
@@ -2505,11 +2562,21 @@ void GameLighting::filter_specular_cubes(PackageManager& pm, Gpu& gpu, std::span
     ext_.set_texture(kFilter, 0x108, nullptr);
 }
 
-void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + inc}};  // light diffuse, specular IBL
-    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    // Depth plane stays readable by the original PS. Only the separate stencil plane is
+    // written; the scene's reversed float depth is never changed by volume membership.
+    const auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    auto stencil_state = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {gb.depth.Get(), 1, before, after};
+        cl->ResourceBarrier(1, &b);
+    };
+    stencil_state(depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    cl->OMSetStencilRef(0);
     constexpr float kHardEdge = 1e-3f;  // a face with no blend: fades over the last 0.1% of its half extent
     auto upload = [&](std::span<const float4> values) {
         auto a = gpu.dynamic(values.size() * sizeof(float4));
@@ -2537,7 +2604,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         const float fade = m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
         if (fade <= 0) continue;
         std::array<float4, 4> vs{};
-        vs[0] = {m.center[0], m.center[1], m.center[2], 1};
+        vs[0] = {m.origin[0], m.origin[1], m.origin[2], 1};
         vs[1] = {m.rotation[0], m.rotation[1], m.rotation[2], m.rotation[3]};
         vs[2] = {m.extents[0], m.extents[1], m.extents[2], 0};
         std::array<float4, 32> ps{};
@@ -2575,12 +2642,23 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         if (cv.alpha) textures.push_back({1, cv.alpha.Get()});
         if (cv.diffuse) textures.push_back({2, cv.diffuse.Get()});
         try {
+            cl->OMSetRenderTargets(0, nullptr, FALSE, &gb.dsv_ro);
+            cl->ClearDepthStencilView(gb.dsv_ro, D3D12_CLEAR_FLAG_STENCIL, 0, 0, 0, nullptr);
+            if (cv.shape) {
+                const D3D12_INDEX_BUFFER_VIEW no_indices{};
+                cubemap_stencil_->draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cv.shape_vbv, no_indices, cv.shape_vertices);
+            } else {
+                cubemap_stencil_->draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36);
+            }
+            cl->OMSetRenderTargets(2, rtvs, FALSE, &gb.dsv_ro);
             gp.draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36, textures);
             ++cubemaps_drawn_;
         } catch (const std::exception& ex) {
             if (cubemap_notes_.size() < 32) cubemap_notes_.push_back(std::format("cubemap {}: {}", m.specular.str(), ex.what()));
         }
     }
+    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    stencil_state(D3D12_RESOURCE_STATE_DEPTH_WRITE, depth_read);
 }
 
 } // namespace nim

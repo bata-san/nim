@@ -119,6 +119,9 @@ public:
         bool drop_extra_targets = false;
         // Per-target write masks (D3D12_COLOR_WRITE_ENABLE_*), when not blending; empty = all.
         std::vector<uint8_t> write_masks;
+        // Original volume VS only, with winding counts behind the scene depth; or apply where
+        // that count is nonzero. No replacement pixel shader is used for the geometry mask.
+        bool stencil_volume = false, stencil_test = false;
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -138,7 +141,8 @@ public:
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
     // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
     // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
-    // (slots no TFX fills, e.g. a cubemap volume's cubes).
+    // (slots no TFX fills, e.g. a cubemap volume's cubes). With an empty ibv, `indices` is the
+    // vertex count of an authored non-indexed triangle list.
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                      const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
                      uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {});
@@ -345,11 +349,14 @@ private:
     D3D12_INDEX_BUFFER_VIEW cube_ibv_{};
     void make_cube(Gpu& gpu);
 
-    void draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    void draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     struct CubemapVolume {
         uint32_t pipeline = 0;  // index of the variant's pipeline pair (both windings)
         MapCubemap volume;
         ComPtr<ID3D12Resource> specular, alpha, diffuse;
+        ComPtr<ID3D12Resource> shape;
+        D3D12_VERTEX_BUFFER_VIEW shape_vbv{};
+        uint32_t shape_vertices = 0;
         float max_mip = 0;      // the specular cube's last mip
         bool squared = false;   // specular cube stored gamma-2 (UNORM): the PS squares its samples
     };
@@ -359,11 +366,13 @@ private:
     std::unique_ptr<GamePipeline> cube_filter_;
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> filtered_cubes_;  // by specular tag
     std::vector<std::unique_ptr<GamePipeline>> cubemap_pipelines_;
+    std::unique_ptr<GamePipeline> cubemap_stencil_;
     std::map<std::string, uint32_t> cubemap_variants_;  // pipeline name -> pipeline pair
     std::vector<CubemapVolume> cubemaps_;
     std::vector<std::string> cubemap_notes_;
     size_t cubemaps_drawn_ = 0;
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // by tag, kept across maps
+    std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_shapes_;    // keep in-flight boundary buffers alive across map changes
 
     // Post-processing (docs/PROGRESS.md 3.5, src/render/game_post.cpp): the bloom pyramid
     // (bloom_initial_downsample, downsample_block_2x2, gaussian_10 blurs, weighted_add), auto

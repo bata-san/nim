@@ -393,7 +393,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(kTaa, 0x48, taa_history_[taa_current_].Get());
         e.set_texture(kTaa, 0x50, gb.rt[3].Get());
         e.set_texture(kTaa, 0x58, post_ldr_.Get());
-        e.set_texture(kTaa, 0x60, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+        e.set_texture(kTaa, 0x60, gb.depth.Get(), GBuffer::kDepthSrvFormat);
         ext_.note_estimate("taa: history weight 0.92 (0.75 .. 0.5 by motion when the clip rejects it), luma rejection 0.1, Halton 2,3 jitter over 8 frames",
                            "engine TAA settings and jitter sequence not in game data");
         begin(taa_history_[cur].Get(), 3 * kBloomLevels + 3 + cur, w_, h_);

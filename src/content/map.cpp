@@ -272,6 +272,7 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
                     for (int a = 0; a < 3; ++a) {
                         m.extents[size_t(a)] = std::fabs(r.f32_at(c + 0x10 + size_t(a) * 4));
                         m.center[size_t(a)] = r.f32_at(c + 0x20 + size_t(a) * 4);
+                        m.origin[size_t(a)] = r.f32_at(c + 0x110 + size_t(a) * 4);
                     }
                     for (int k = 0; k < 4; ++k) {
                         m.rotation[size_t(k)] = r.f32_at(c + 0x100 + size_t(k) * 4);
@@ -293,6 +294,8 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
                     m.specular = r.tag_at(c + 0x1B8);
                     m.alpha = r.tag_at(c + 0x1BC);
                     m.diffuse = r.tag_at(c + 0x1C0);
+                    m.shape_vertices = r.tag_at(c + 0x1C4);
+                    m.shape_records = r.tag_at(c + 0x1B4);
                     // World bounds: the eight corners of the unit cube through local_to_world.
                     m.lo = {1e30f, 1e30f, 1e30f};
                     m.hi = {-1e30f, -1e30f, -1e30f};

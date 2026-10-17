@@ -109,7 +109,7 @@ public:
     ComPtr<ID3D12Resource> texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
                                      D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear);
     // Copies a 2D texture back to the CPU (tightly packed rows). Flushes.
-    std::vector<uint8_t> read_texture(ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bytes_per_pixel);
+    std::vector<uint8_t> read_texture(ID3D12Resource* tex, D3D12_RESOURCE_STATES state, uint32_t bytes_per_pixel, uint32_t subresource = 0);
 
     static void barrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D12_RESOURCE_STATES from,
                         D3D12_RESOURCE_STATES to);

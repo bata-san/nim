@@ -260,18 +260,18 @@ void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
         dev->CreateRenderTargetView(rt[i].Get(), nullptr, rtv[i]);
         dev->CreateShaderResourceView(rt[i].Get(), nullptr, gpu.srv().cpu(srv_first + i));
     }
-    D3D12_CLEAR_VALUE dc{DXGI_FORMAT_D32_FLOAT};
+    D3D12_CLEAR_VALUE dc{kDepthFormat};
     dc.DepthStencil = {0.0f, 0};
-    depth = gpu.texture2d(w, h, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    depth = gpu.texture2d(w, h, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                           D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc);
     dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
-    D3D12_DEPTH_STENCIL_VIEW_DESC dd{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D};
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd{kDepthFormat, D3D12_DSV_DIMENSION_TEXTURE2D};
     dev->CreateDepthStencilView(depth.Get(), &dd, dsv);
     dsv_ro = {dsv.ptr + dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
     dd.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
     dev->CreateDepthStencilView(depth.Get(), &dd, dsv_ro);
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.Format = kDepthSrvFormat;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.Texture2D.MipLevels = 1;
@@ -1539,7 +1539,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw std::runtime_error(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
-        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pd.DSVFormat = GBuffer::kDepthFormat;
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
                                              mesh.buffers.at(g.buffers).ib.is_32bit};
@@ -1574,6 +1574,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
             else {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = pd;
+                sd.DSVFormat = DXGI_FORMAT_D32_FLOAT;  // the sun's separate depth-only target
                 sd.NumRenderTargets = 0;
                 for (auto& f : sd.RTVFormats) f = DXGI_FORMAT_UNKNOWN;
                 sd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;

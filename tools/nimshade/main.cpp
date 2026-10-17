@@ -9,6 +9,7 @@
 //
 //   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]
 //            [--clip CLIP_TAG [--frame F]]   (skinned dynamic models: posed with an animation clip)
+//            [--probe-index N --dump-probe-mask] (original CSG/GPU membership verification)
 #include "nim/content/animation.hpp"
 #include "nim/content/object_channels.hpp"
 #include "nim/core/package_manager.hpp"
@@ -80,6 +81,8 @@ int run(int argc, char** argv) {
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false;
+    std::optional<size_t> probe_index;
+    bool dump_probe_mask = false;
     bool no_ssao = false, no_volumetrics = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
@@ -96,6 +99,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
+        else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
+        else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
@@ -201,7 +206,8 @@ int run(int argc, char** argv) {
             }
             for (const auto& [slot, v] : weather_channels) std::println("  global channel {} = {:.3g}", slot, v);
         }
-        const auto focus = map_focus(map);
+        const auto focus = look_arg ? std::array<float, 3>{look_arg->x, look_arg->y, look_arg->z} :
+                           eye_arg ? std::array<float, 3>{eye_arg->x, eye_arg->y, eye_arg->z} : map_focus(map);
         auto region = map_region(map, focus, map_radius);
         size_t in_region = 0;
         for (const auto& st : region) in_region += st.rows.size();
@@ -251,8 +257,11 @@ int run(int argc, char** argv) {
         }
         if (!no_cubemaps) {
             map_cubemaps = load_map_cubemaps(pm, map);
-            region_cubemaps = map_cubemap_region(map_cubemaps, focus, map_radius);
-            std::println("cubemap volumes: {} of {} within range", region_cubemaps.size(), map_cubemaps.size());
+            if (probe_index) {
+                if (*probe_index >= map_cubemaps.size()) throw std::runtime_error("probe index out of range");
+                region_cubemaps.push_back(&map_cubemaps[*probe_index]);
+            } else for (const auto& probe : map_cubemaps) region_cubemaps.push_back(&probe);
+            std::println("cubemap volumes: {} of {} authored volumes selected (view culling at draw time)", region_cubemaps.size(), map_cubemaps.size());
         }
         // Prepared on every core (one forked PackageManager per thread), then added in order.
         const size_t jobs = terrain.size() + region.size();
@@ -580,6 +589,25 @@ int run(int argc, char** argv) {
 
     // Coverage: depth > 0 where something was drawn (reversed-Z, cleared to 0).
     auto depth = gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
+    if (dump_probe_mask) {
+        if (!probe_index || region_cubemaps.size() != 1) throw std::runtime_error("--dump-probe-mask requires one --probe-index");
+        const auto& m = *region_cubemaps[0];
+        auto save = [&](const char* name, const auto& bytes) {
+            std::ofstream f(out_dir / name, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            if (!f) throw std::runtime_error("probe verification dump failed");
+        };
+        save("probe-depth.bin", depth);
+        save("probe-stencil.bin", gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 1, 1));
+        save("probe-shapes.bin", m.shape_records.is_none() ? std::vector<uint8_t>{} : pm.read(m.shape_records));
+        std::ofstream f(out_dir / "probe-mask.json");
+        f << std::format("{{\"width\":{},\"height\":{},\"index\":{},\"vp\":[", width, height, *probe_index);
+        for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) f << std::format("{}{:.9g}", c || r ? "," : "", vm.vp_abs.c[c][size_t(r)]);
+        f << "],\"local_to_world\":[";
+        for (size_t i = 0; i < 16; ++i) f << std::format("{}{:.9g}", i ? "," : "", m.local_to_world[i]);
+        f << "]}";
+        if (!f) throw std::runtime_error("probe verification metadata write failed");
+    }
     size_t covered = 0;
     for (size_t i = 0; i < depth.size(); i += 4) {
         float d;

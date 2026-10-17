@@ -47,6 +47,7 @@
 #include <set>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <unordered_set>
@@ -665,14 +666,15 @@ int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& outpu
     std::vector<ManifestRow> manifest_rows;
     std::map<uint32_t, std::vector<uint8_t>> auxiliary;
     size_t tables = 0, records = 0, collection_count = 0;
-    size_t grid_points = 0, texture_failures = 0, dimension_mismatches = 0;
+    size_t grid_points = 0, texture_failures = 0, dimension_mismatches = 0, empty_records = 0, mesh_count = 0;
+    float mesh_coordinate_max = 0;
     std::ofstream manifest;
     if (!output.empty()) {
         manifest.open(output);
         if (!manifest) throw std::runtime_error("cannot open probe manifest");
         manifest << "collection\tindex\tauthored_id\tinline_source\tcenter_x\tcenter_y\tcenter_z\tgrid_x\tgrid_y\tgrid_z\tspecular\talpha\tdiffuse\tdiffuse_width\tdiffuse_height\tdiffuse_depth\tauxiliary\tauxiliary_records\tvertex_buffer";
         for (int i = 0; i < 16; ++i) manifest << std::format("\tlocal_to_world_{}", i);
-        manifest << '\n';
+        manifest << "\torigin_x\torigin_y\torigin_z\tvertex_count\n";
     }
     auto key = [](const std::vector<uint8_t>& d, size_t c) {
         if (c > d.size() || d.size() - c < 0x1D0) throw std::runtime_error("truncated cubemap");
@@ -701,13 +703,17 @@ int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& outpu
                     origins.try_emplace(identity);
                     const uint32_t gx = r.u32_at(c + 0x160), gy = r.u32_at(c + 0x164), gz = r.u32_at(c + 0x168);
                     grid_points += size_t(gx) * gy * gz;
-                    const auto diffuse = r.tag_at(c + 0x1C0), aux = r.tag_at(c + 0x1B4);
+                    const auto diffuse = r.tag_at(c + 0x1C0), aux = r.tag_at(c + 0x1B4), specular = r.tag_at(c + 0x1B8);
+                    const bool empty = diffuse.is_none() && specular.is_none();
+                    empty_records += empty;
                     Texture tx;
                     try {
-                        tx = load_texture(pm, diffuse);
-                        if (tx.width != gx * 7 || tx.height != gy || tx.depth != gz) ++dimension_mismatches;
+                        if (!diffuse.is_none()) {
+                            tx = load_texture(pm, diffuse);
+                            if (tx.width != gx * 7 || tx.height != gy || tx.depth != gz) ++dimension_mismatches;
+                        } else if (!empty && uint64_t(gx) * gy * gz > 1) throw std::runtime_error("missing required diffuse texture");
                         // Validate the cube's complete original mip payload too.
-                        (void)load_texture(pm, r.tag_at(c + 0x1B8));
+                        if (!empty) (void)load_texture(pm, specular);
                         if (!r.tag_at(c + 0x1BC).is_none()) (void)load_texture(pm, r.tag_at(c + 0x1BC));
                     } catch (const std::exception& ex) {
                         ++texture_failures;
@@ -719,12 +725,27 @@ int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& outpu
                         if (fresh) it->second = pm.read(aux);
                         aux_count = TagReader(it->second).vec_at(8).count;
                     }
+                    size_t vertices = 0;
+                    if (!r.tag_at(c + 0x1C4).is_none()) {
+                        const auto vb = load_vertex_buffer(pm, r.tag_at(c + 0x1C4));
+                        if (vb.stride != 12 || vb.data.empty() || vb.data.size() % 36)
+                            throw std::runtime_error("invalid authored probe boundary");
+                        vertices = vb.data.size() / 12;
+                        for (size_t o = 0; o < vb.data.size(); o += 4) {
+                            float coordinate;
+                            std::memcpy(&coordinate, vb.data.data() + o, 4);
+                            if (!std::isfinite(coordinate)) throw std::runtime_error("non-finite authored probe boundary");
+                            mesh_coordinate_max = std::max(mesh_coordinate_max, std::fabs(coordinate));
+                        }
+                        ++mesh_count;
+                    }
                     if (manifest.is_open()) {
                         auto suffix = std::format("\t{:.9g}\t{:.9g}\t{:.9g}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                             r.f32_at(c + 0x20), r.f32_at(c + 0x24), r.f32_at(c + 0x28),
                             gx, gy, gz, r.tag_at(c + 0x1B8).str(), r.tag_at(c + 0x1BC).str(), diffuse.str(),
                             tx.width, tx.height, tx.depth, aux.str(), aux_count, r.tag_at(c + 0x1C4).str());
                         for (int j = 0; j < 16; ++j) suffix += std::format("\t{:.9g}", r.f32_at(c + 0xC0 + size_t(j) * 4));
+                        suffix += std::format("\t{:.9g}\t{:.9g}\t{:.9g}\t{}", r.f32_at(c + 0x110), r.f32_at(c + 0x114), r.f32_at(c + 0x118), vertices);
                         manifest_rows.push_back({identity, std::format("{}\t{}\t{:08X}\t", tag.str(), k, r.u32_at(c + 0x1C8)), std::move(suffix)});
                     }
                 }
@@ -761,15 +782,29 @@ int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& outpu
     std::println("authored grid slots {}; texture read failures {}; grid/texture dimension mismatches {}", grid_points, texture_failures, dimension_mismatches);
     const auto loaded = load_map_cubemaps(pm, map);
     std::println("runtime loader: {} volumes", loaded.size());
+    std::println("authored boundary meshes {}; records without any lighting texture {}", mesh_count, empty_records);
+    std::println("maximum absolute authored boundary coordinate: {}", mesh_coordinate_max);
     size_t auxiliary_records = 0;
-    for (const auto& [tag, data] : auxiliary) auxiliary_records += TagReader(data).vec_at(8).count;
-    std::println("auxiliary tags {}: {} records (semantics not decoded; not counted as extra probes)", auxiliary.size(), auxiliary_records);
+    std::map<uint32_t, size_t> operations;
+    for (const auto& [tag, data] : auxiliary) {
+        TagReader r(data);
+        const auto shapes = r.vec_at(8);
+        auxiliary_records += shapes.count;
+        if (shapes.count && shapes.element_class != 0x80807F57) throw std::runtime_error("unknown CSG collection class");
+        for (uint64_t k = 0; k < shapes.count; ++k) {
+            const size_t c = shapes.data + size_t(k) * 0xD0;
+            if (r.u64_at(c) != 0xD0 || c + 0xD0 > data.size()) throw std::runtime_error("invalid CSG record");
+            ++operations[r.u32_at(c + 0x10)];
+        }
+    }
+    std::println("auxiliary tags {}: {} CSG shape records (not extra probes)", auxiliary.size(), auxiliary_records);
+    for (const auto& [operation, count] : operations) std::println("  CSG operation {}: {} records", operation, count);
     if (manifest.is_open()) {
         for (const auto& row : manifest_rows) manifest << row.prefix << origins.at(row.key) << row.suffix << '\n';
         manifest.flush();
         if (!manifest) throw std::runtime_error("probe manifest write failed");
     }
-    return texture_failures || dimension_mismatches || loaded.size() != rooted.size() || missing(family_nodes, rooted) || missing(collections, rooted) || missing(rooted, collections) ? 1 : 0;
+    return texture_failures || dimension_mismatches || loaded.size() + empty_records != rooted.size() || missing(family_nodes, rooted) || missing(collections, rooted) || missing(rooted, collections) ? 1 : 0;
 }
 
 int cmd_weather(PackageManager& pm, TagHash bubble) {

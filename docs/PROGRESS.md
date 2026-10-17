@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (Outpost 全域の原プローブ一覧・全ノード・テクスチャの照合)
+最終更新: 2026-10-18 (原プローブの基準位置・CSG 境界の描画、外周 / 低温アーカイブ全域の照合)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -17,7 +17,7 @@
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
 | 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
-| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 不透明物の適用を実装。原データ全域照合済み、適用の完全一致は未検証 | §3.4, §3.4.1 | Outpost 313 領域 / 703,505 グリッド点分。付属データ・適用条件に未解明あり |
+| 5 | 拡散・反射プローブ (cubemap_apply / sky hemisphere) | 原位置・CSG 適用形状を描画に反映、3 マップの全域照合済み | §3.4〜3.4.2 | Outpost 313、外周 167 (空レコード含む原一覧169)、低温アーカイブ499。エンジンの順序等は未解明 |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
@@ -190,13 +190,61 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   非空のタグは 162 種、空の共通タグ 80A7995B は 151 領域で共有。
   レコードは 0xD0 バイト、class 80807F57。役割は未確定で、追加の拡散プローブとして数えない。
   162 領域は +0x1C4 の vertex buffer も参照する (例 80A7996E: stride12 / 3456B の float3 データ)。
-  現描画はこの付属データを使っていない。影響形状・適用条件の候補として原シェーダーと照合が必要。
+  この調査時には未使用だったが、後続の §3.4.2 で CSG 境界として描画に反映した。
 - ローダーの重複排除を「行列 + float に変換した specular hash」から原 payload の全バイト比較へ変更。
   float 変換による hash 下位ビットの消失と、同じ配置・反射 cube で異なる diffuse/flags を持つ領域の誤統合を防ぐ。
   Outpost は修正前後とも 313 領域で、これ自体による見た目の変化はない。
 - 検証: Release nimcli/nimshade/tests と別出力先 GUI をビルド、ctest 2/2、上記実データ監査を実行。
   発見済みのクラスの収録範囲を照合した結果であり、未解明の付属データやエンジン側の適用条件を含む
   「ゲーム内と完全一致」の証明ではない。次はこれらの適用条件・形状、sky ambient との合成を解析する。
+
+### 3.4.2 原位置・CSG 境界の適用と 3 マップの全域検証 (2026-10-18)
+
+- **+0x20 は境界中心、描画の基準位置は +0x110**。+0x110 は +0xC0 行列の translation および
+  +0x120 軸行列の translation と対応する。従来の VS cb11[0] が +0x20 を使っていた誤りを修正。
+  Outpost は 266/313 領域で両者が異なる。PS のグリッド解像度・テクスチャ・強度は原データのまま。
+- +0x1B4 の 80807F54 は +0x08 Vec<80807F57, stride 0xD0>。
+  レコード +0x10 は CSG operation (観測値 0 = 加算、1 = 減算)、+0x30 は unit box → world 行列、
+  +0x20 は half extents、+0x70 は軸、+0xB0 quaternion、+0xC0 origin。
+  +0x1C4 の float3 頂点列はその合成境界 (triangle list)。Outpost の例 80A7996E で
+  全96面の重心が原 CSG 境界面に一致 (local 誤差最大 3.81e-6)。追加プローブではなく適用形状。
+- 元の volume VS (80A74B13) は input を反転するので、原頂点の符号を反転して渡し、
+  原 CSG 座標をそのまま再現。形状バッファはタグ単位で保持し、マップを切り替えても描画中の GPU 参照を破棄しない。
+- **ステンシルの深度失敗時の winding count** でシーン表面が原境界内にあるかを求め、
+  count != 0 の画素だけ既存の原 cubemap_apply PS で描く。凹形状の裏面をそのまま重ねて多重合成しない。
+  マスクは原 VS のみ (PS なし)、元の色や照明値を置換するシェーダーは追加しない。
+  エンジン側の stencil state/スケジューリング自体は未解析なので `note_estimate` に明記。
+- GBuffer は浮動小数32bit深度を維持し stencil plane を持つ D32_FLOAT_S8X24_UINT へ。
+  depth SRV は R32_FLOAT_X8X24_TYPELESS。マスク時は stencil plane のみ WRITE に移し、depth plane は
+  READ + PS_RESOURCE のまま。影マップは従来の D32_FLOAT。空・透明物・SSAO・TAA の深度参照も更新。
+- GUI / nimshade は選択マップの **全プローブ**を準備して描画時に視野・距離で絞る。
+  nimshade の static/terrain/light の読み込み中心は指定 --look、次に --eye、未指定時のみ map_focus。
+  従来はカメラを移しても map_focus 周辺の形状しか読み込まれず、他区域の検証が空振りしていた。
+
+| マップ / bubble | 原一覧 | テーブル数 | 原領域数 / 描画可能数 | grid slots | 境界 mesh | 付属 CSG records |
+|---|---|---:|---:|---:|---:|---:|
+| Outpost 80AF9550 | 80AE8026 | 2,441 | 313 / 313 | 703,505 | 162 | 624 |
+| 外周 (Perimeter) 80A8FE73 | 80A653B0 | 3,017 | 169 / 167 | 367,463 | 109 | 414 |
+| 低温アーカイブ (w64_marathon_deck_001_) 80B385FA | 80B1FD04 | 4,061 | 499 / 499 | 2,888,259 | 176 | 659 |
+
+- 全マップとも原一覧と全ノードの payload 比較差分0、必要な texture の読込失敗0、grid寸法不一致0。
+  外周の原一覧 index77/78 は specular/diffuse が両方 FFFFFFFF の空レコードで、描画データを持たない。
+  外周 index53、低温 index50/400/403 は grid=0 / diffuseなしの **反射専用**。原 probes_off 技法で描く。
+  監査はこれらを読込失敗と誤判定しないよう修正。TSV に origin と vertex count も保存。
+  447 個の原境界 mesh の座標最大絶対値は 1.0000153、全 CSG operation は 0/1 のみ。
+- `nimshade ... --probe-index N --dump-probe-mask --no-taa` で、単一の実行時プローブの
+  stencil plane / scene depth / カメラ行列 / 原 CSG を **nim 自身の GPU 出力から** `out/` に保存できる。
+  N は実行時ローダー順であり原 collection index と同一とは限らない。
+  `python tools/re/verify_probe_mask.py OUT...` (NumPy) は、深度から復元したシーン位置と原 CSG を独立に照合。
+  境界の float 精度帯を除外し、内外の両方を通る検証画像群を要求。不一致があれば失敗する。
+  Outpost の室内・外側・切り欠き、外周、低温で計 **287,988 表面画素、不一致0**。
+- 検証: Release ビルド、ctest 2/2、3マップの全プローブ準備と headless 描画、D3D12 debug 警告/エラー0、
+  LUT と 657×371 → 640×360 リサイズ後の深度受け渡し・モーションも確認。
+  GUI ビルドは `out/probe-bin/nim.exe`。8秒の起動 smoke check と debug log 0件を確認。
+  既存の起動中ビューアは差し替えない。
+- 未解明: エンジンの領域の優先順位・描画順、Havok 空間検索、relighting の完全な実行時入力、
+  sky hemisphere の地面反射/霧/色調、既存のフェード等。ここまでの変更は原形状の適用を復元したもので、
+  ゲーム最終画像との完全一致の検証ではない。
 
 ### 3.5 ポストプロセス + アンチエイリアス (実装済み, `src/render/game_post.cpp`)
 - 自動露出: autoexposure_sample_columns (1/16 の bloom 段の列ごとの log 輝度和) を読み戻し、key 0.18、
