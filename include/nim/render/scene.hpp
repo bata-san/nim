@@ -217,7 +217,7 @@ PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const s
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
-                                   int permutation = -1, const ChannelValues* channels = nullptr);
+                                   int permutation = -1, const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
 // Either of the above, by the tag's class.
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr,
                           const ChannelValues* channels = nullptr);
@@ -305,6 +305,8 @@ private:
         bool vs_live = false, ps_live = false;
         bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items
         bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
+        bool dynamic = false;  // a dynamic model part: drawn once per placement with its object constants
+        std::vector<uint32_t> object_params;  // root parameters of its rigid_model / skinning scopes
         uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
         uint32_t srv_copies = 1;          // kSrvCopies when engine textures are rebound per frame
         bool owns_srv = true;             // false: a table shared with an item with the same views
@@ -349,6 +351,12 @@ private:
         SkinWeights skin;
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
+        // Dynamic models: the object constants (rigid_model / skinning scope, local_to_world in
+        // rows 0-3) and the placements; this frame's constants per placement.
+        bool dynamic = false;
+        std::array<float4, 20> model_cb{};
+        std::vector<std::array<float, 12>> placements;
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> object_cb;
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
@@ -380,7 +388,8 @@ private:
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
     std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
-    bool dynamic_ = false;
+    bool dynamic_ = false;          // the scene is one dynamic model (entity view)
+    bool dynamic_parts_ = false;    // dynamic models placed among static meshes (map entities)
     bool skinned_ = false, skin_dirty_ = false;
     std::vector<BoneTransform> skin_pose_;
     uint32_t skin_frame_ = 0;

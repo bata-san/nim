@@ -578,7 +578,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     material_externs_.reset();
     sets_.clear();
     notes_.clear();
-    dynamic_ = false;
+    dynamic_ = dynamic_parts_ = false;
     skinned_ = skin_dirty_ = false;
     skin_pose_.clear();
     tag_ = TagHash();
@@ -815,12 +815,27 @@ bool vs_reads_typed_buffers(const std::vector<uint8_t>& vs) {
 } // namespace
 
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials,
-                                   int permutation, const ChannelValues* channels) {
+                                   int permutation, const ChannelValues* channels, PrepareCache* cache) {
     PreparedMesh out;
-    prepare_material_inputs(pm, out, channels);
+    if (cache) {
+        std::lock_guard lk(*cache->mutex);
+        if (!cache->ready) {
+            PreparedMesh first;
+            prepare_material_inputs(pm, first, nullptr);
+            cache->global_channels = std::move(first.global_channels);
+            cache->scopes = std::move(first.scopes);
+            cache->ready = true;
+        }
+        if (channels) out.channel_overrides = *channels;
+        out.global_channels = cache->global_channels;
+        out.scopes = cache->scopes;
+    } else {
+        prepare_material_inputs(pm, out, channels);
+    }
     out.tag = tag;
     out.dynamic = true;
     TextureCache texture_cache;
+    texture_cache.shared = cache;
     uint32_t perm = 0;
     if (materials) {
         out.channel_defaults = materials->object_defaults;
@@ -1182,8 +1197,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     ProfileScope profile_total("add.mesh_parts.total");
     ID3D12Device* dev = gpu.device();
     const bool first_mesh = sets_.empty();
-    if (mesh.dynamic && (!first_mesh || placements.size() != 1))
-        throw std::runtime_error("dynamic models are drawn alone, once");
+    if (dynamic_ && !first_mesh) throw std::runtime_error("a dynamic model scene holds that model alone");
+    if (mesh.dynamic && first_mesh && placements.size() != 1) throw std::runtime_error("a dynamic model view places it once");
     if (placements.empty()) throw std::runtime_error("mesh has no placements");
     const uint32_t set_base = uint32_t(sets_.size());
     if (first_mesh) {
@@ -1203,6 +1218,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (mesh.global_channels) material_externs_->channels = *mesh.global_channels;
         global_base_ = material_externs_->channels;
     } else {
+        dynamic_parts_ |= mesh.dynamic;
         for (const auto& n : mesh.notes) notes_.push_back(n);
         for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
         for (auto& [h, u] : mesh.channels) channels_.emplace(h, u);
@@ -1259,11 +1275,16 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         set.instances = n;
         set.cull = cull;
         set.vbv[2] = {inst.gpu, n * 4, 4};
+        set.dynamic = mesh.dynamic;
+        if (mesh.dynamic) {
+            set.model_cb = mesh.model_cb;
+            set.placements.assign(placements.begin(), placements.end());
+        }
         if (mesh.dynamic) {
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
                 return v.empty() ? ComPtr<ID3D12Resource>{} : gpu.upload(v.data(), v.size() * 4);
             };
-            if (!b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
+            if (first_mesh && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
                 // Posed on the CPU (update_skin); the first render uploads the bind pose.
                 const size_t bytes = b.skin_pos.size() * 4;
                 set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1311,6 +1332,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
         } upload_guard{gpu, item};
         item.part = g.part;
+        item.dynamic = mesh.dynamic;
         item.buffers = set_base + g.buffers;
         for (const auto& [key, values] : g.own_cbuffers)
             item.own_cbvs.emplace_back(scope_root_parameter(key.first, key.second),
@@ -1327,7 +1349,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.vs_sources = std::move(g.vs_sources);
         item.ps_sources = std::move(g.ps_sources);
         ProfileScope profile_root("add.root_signature");
-        auto& root = shared_roots[g.info.technique.value];
+        // Keyed apart for dynamic parts (another root signature layout); tags never set bit 30.
+        const uint32_t root_key = g.info.technique.value ^ (mesh.dynamic ? 0x40000000u : 0u);
+        auto& root = shared_roots[root_key];
         if (!root) root = make_gbuffer_root_signature(dev, mesh.dynamic, g.vs_samplers, g.ps_samplers);
         item.root_sig = root;
         profile_root.stop();
@@ -1500,7 +1524,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                     item.technique.str(), output.index));
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         pd.SampleDesc.Count = 1;
-        const auto pipeline_key = std::tuple{g.info.technique.value, g.input_layout, g.stage, g.part.primitive_type,
+        const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
                                              mesh.buffers.at(g.buffers).ib.is_32bit};
         ProfileScope profile_pso("add.pso");
         HRESULT pipeline_hr = S_OK;
@@ -1528,7 +1552,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (!transparent) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
-            const auto shadow_key = std::tuple{g.info.technique.value, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
+            const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
                                                mesh.buffers.at(g.buffers).ib.is_32bit};
             if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
             else {
@@ -1587,6 +1611,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // PatternBlending (97): an engine-produced pattern texture whose producer is not decoded.
     if (!ext.zero_policy(97)) ext.zero_when_missing(97, "pattern-blending engine input (producer not decoded): zero");
     ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
+    if (dynamic_parts_ && !ext.zero_policy(ext::RigidModel))
+        ext.zero_when_missing(ext::RigidModel, "per-object engine value of a placed entity (object lighting / SH) not produced: zero");
     if (dynamic_) {
         // RigidModel (goriath layout): local_to_world, position scale / offset, texcoord0
         // scale-offset, all from the model itself. Beyond 0x70 (dynamic SH / AO, skinning
@@ -1612,11 +1638,16 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                     const auto source = sources->cbuffer_scopes.find(reg);
                     if (source == sources->cbuffer_scopes.end())
                         throw std::runtime_error(std::format("{}: no original shared scope b{}", it.technique.str(), reg));
+                    const auto scope = std::find_if(it.scopes->begin(), it.scopes->end(), [&](const Scope& value) { return value.tag == source->second; });
+                    if (scope == it.scopes->end()) throw std::runtime_error("Original shared scope was not loaded");
+                    // A dynamic model's object scopes carry its own constants, per placement.
+                    if (it.dynamic && (scope->name == "rigid_model" || scope->name == "skinning")) {
+                        it.object_params.push_back(scope_root_parameter(stage, reg));
+                        continue;
+                    }
                     const auto key = std::tuple{source->second.value, stage, reg};
                     auto slot = slots.find(key);
                     if (slot == slots.end()) {
-                        const auto scope = std::find_if(it.scopes->begin(), it.scopes->end(), [&](const Scope& value) { return value.tag == source->second; });
-                        if (scope == it.scopes->end()) throw std::runtime_error("Original shared scope was not loaded");
                         slot = slots.emplace(key, uint32_t(scope_defs_.size())).first;
                         scope_defs_.push_back({&*scope, stage, reg});
                     }
@@ -1634,10 +1665,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         const uint32_t reg = def.reg;
         std::vector<float4> constants;
         if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
-        else if (dynamic_ && (scope->name == "rigid_model" || scope->name == "skinning")) {
-            // The object's own constants: local_to_world, position / texcoord packing, skinning.
-            constants.assign(model_cb_.begin(), model_cb_.end());
-        } else if (scope->name == "frame") {
+        else if (scope->name == "frame") {
             const auto& frame = ext.frame_constants();
             constants.assign(frame.begin(), frame.end());
         } else {
@@ -1661,6 +1689,22 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         std::memcpy(upload.cpu, constants.data(), constants.size() * sizeof(float4));
         return scope_frame_[slot] = upload.gpu;
     };
+    // Dynamic models: the object constants of every placement (local_to_world = the placement).
+    for (auto& set : sets_) {
+        if (!set.dynamic) continue;
+        set.object_cb.clear();
+        for (const auto& p : set.placements) {
+            auto cb = set.model_cb;
+            // Column-major: the translation is the fourth row.
+            cb[0] = {p[0], p[4], p[8], 0};
+            cb[1] = {p[1], p[5], p[9], 0};
+            cb[2] = {p[2], p[6], p[10], 0};
+            cb[3] = {p[3], p[7], p[11], 1};
+            const auto upload = gpu.dynamic(cb.size() * sizeof(float4));
+            std::memcpy(upload.cpu, cb.data(), cb.size() * sizeof(float4));
+            set.object_cb.push_back(upload.gpu);
+        }
+    }
     for (auto& it : items_) {
         if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
       try {
@@ -1748,7 +1792,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             bound = it.buffers;
             cl->IASetIndexBuffer(&sets_[bound].ibv);
             cl->IASetVertexBuffers(0, 4, sets_[bound].vbv);
-            if (!dynamic_) cl->SetGraphicsRootShaderResourceView(2, sets_[bound].t2.gpu);
+            if (!it.dynamic) cl->SetGraphicsRootShaderResourceView(2, sets_[bound].t2.gpu);
         }
         bound_root_changed = false;
         ID3D12PipelineState* pso = shadow ? it.shadow_pso.Get() : it.pso.Get();
@@ -1761,11 +1805,16 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         if (bound_table != first) {
             bound_table = first;
             cl->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
-            cl->SetGraphicsRootDescriptorTable(dynamic_ ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
+            cl->SetGraphicsRootDescriptorTable(it.dynamic ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
         }
         const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         if (bound_topology != topology) cl->IASetPrimitiveTopology(bound_topology = topology);
-        if (!cg) cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, 0);
+        if (it.dynamic) {
+            for (size_t p = 0; p < set.object_cb.size(); ++p) {
+                for (uint32_t param : it.object_params) set_cbv(param, set.object_cb[p]);
+                cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
+            }
+        } else if (!cg) cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, 0);
         else
             for (int l = 0; l < 4; ++l)
                 if (((it.lod_mask >> l) & 1) && cg->count[size_t(l)])

@@ -76,7 +76,7 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
-    bool no_lights = false, no_cubemaps = false;
+    bool no_lights = false, no_cubemaps = false, no_entities = false;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -90,6 +90,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
+        else if (args[i] == "--no-entities") no_entities = true;
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
@@ -186,6 +187,21 @@ int run(int argc, char** argv) {
         std::println("map {}: {} statics / {} instances; {} statics / {} instances within {} m of ({:.1f}, {:.1f}, {:.1f})",
                      mesh_tag.str(), map.statics.size(), map.instances, region.size(), in_region, map_radius,
                      focus[0], focus[1], focus[2]);
+        // The placed entities' dynamic models, prepared after the statics.
+        const size_t static_count = region.size();
+        std::unordered_map<uint32_t, DynamicModelMaterials> entity_materials;
+        if (!no_entities) {
+            const auto te = std::chrono::steady_clock::now();
+            entity_materials = index_dynamic_model_materials(pm);
+            const MapEntities ents = load_map_entities(pm, mesh_tag, entity_materials);
+            auto er = map_region(ents.models, focus, map_radius);
+            size_t n = 0;
+            for (const auto& m : er) n += m.rows.size();
+            std::println("entities: {} placements of {} models ({} entities, {} node tables); {} models / {} placements in range ({:.1f}s)",
+                         ents.placements, ents.models.size(), ents.entities, ents.node_tables, er.size(), n,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - te).count());
+            for (auto& m : er) region.push_back(std::move(m));
+        }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;
         cache.gbuffer_only = true;
@@ -214,8 +230,15 @@ int run(int argc, char** argv) {
             auto work = [&](PackageManager& wpm) {
                 for (size_t j; (j = next.fetch_add(1)) < jobs;) {
                     try {
-                        prepared[j] = j < terrain.size() ? prepare_terrain(wpm, *terrain[j], layouts, &cache)
-                                                         : prepare_static_mesh(wpm, region[j - terrain.size()].mesh, nullptr, &cache);
+                        const size_t r = j - terrain.size();
+                        if (j < terrain.size()) prepared[j] = prepare_terrain(wpm, *terrain[j], layouts, &cache);
+                        else if (r < static_count) prepared[j] = prepare_static_mesh(wpm, region[r].mesh, nullptr, &cache);
+                        else {
+                            const auto mat = entity_materials.find(region[r].mesh.value);
+                            prepared[j] = prepare_dynamic_model(wpm, region[r].mesh, mat == entity_materials.end() ? nullptr : &mat->second, -1,
+                                                                nullptr, &cache);
+                            if (prepared[j]->no_drawable) prepared[j].reset(), errors[j] = "entity model with no drawable parts";
+                        }
                     } catch (const std::exception& ex) {
                         errors[j] = ex.what();
                     }

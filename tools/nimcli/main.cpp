@@ -656,6 +656,191 @@ int cmd_weather(PackageManager& pm, TagHash bubble) {
     return 0;
 }
 
+// Node-table components of a map: by component type, how many, their payload sizes and the
+// classes of the tags they reference (survey for entities / gimmicks).
+int cmd_map_components(PackageManager& pm, TagHash bubble, uint32_t detail_type) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    struct Stat { size_t n = 0; std::map<uint32_t, size_t> classes; std::vector<std::string> samples; };
+    std::map<uint32_t, Stat> types;
+    size_t nodes_total = 0;
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(t); } catch (...) { continue; }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        nodes_total += nodes.count;
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                const uint32_t type = r.u32_at(p - 4);
+                const uint64_t next = r.u64_at(p);
+                const size_t end = next ? std::min(data.size(), p + size_t(next)) : std::min(data.size(), p + 0x200);
+                Stat& s = types[type];
+                ++s.n;
+                std::set<uint32_t> seen;
+                for (size_t o = p + 0x10; o + 4 <= end; o += 4) {
+                    const TagHash h(r.u32_at(o));
+                    if (!h.is_pkg_ref() || !seen.insert(h.value).second) continue;
+                    if (const Entry* pe = pm.entry(h)) ++s.classes[pe->type == 8 ? pe->reference : 0xF0000000u | pe->type];
+                }
+                if (type == detail_type && s.samples.size() < 6) {
+                    std::string hex = std::format("{} node {} @{:X} pos ({:.1f} {:.1f} {:.1f}):", t.str(), i, p, r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18));
+                    for (size_t o = p + 0x10; o < end && o < p + 0x10 + 0x100; o += 4) hex += std::format("{}{:08X}", (o - p - 0x10) % 32 ? " " : "\n    ", r.u32_at(o));
+                    s.samples.push_back(hex);
+                }
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    std::println("{} node tables, {} nodes", map.node_tables.size(), nodes_total);
+    for (const auto& [type, s] : types) {
+        std::string cls;
+        for (const auto& [c, n] : s.classes) cls += std::format(" {:08X}x{}", c, n);
+        std::println("  type {:08X}  {:>6}{}", type, s.n, cls);
+        for (const auto& x : s.samples) std::println("    {}", x);
+    }
+    return 0;
+}
+
+// Script instances (8080BADB) of a map's package family: the classes they reference, and the
+// ones that place a dynamic model (survey for entities / gimmicks).
+int cmd_map_entities(PackageManager& pm, TagHash bubble) {
+    const PackageInfo* home = pm.info(bubble.pkg_id());
+    if (!home) return 1;
+    const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
+    std::map<uint32_t, size_t> classes;  // referenced class -> instances referencing it
+    std::map<uint32_t, size_t> scripts;  // referenced 80800000 tag -> instances
+    size_t total = 0, with_dyn = 0;
+    std::vector<std::string> lines;
+    for (const auto& info : pm.packages()) {
+        if (!info.name.starts_with(family)) continue;
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != 0x8080BADB) continue;
+            const TagHash self = TagHash::make(info.pkg_id, uint16_t(i));
+            std::vector<uint8_t> d;
+            try { d = p.read_entry(i); } catch (...) { continue; }
+            ++total;
+            std::set<uint32_t> cls, dyn, nodes, scr;
+            for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+                uint32_t v; std::memcpy(&v, d.data() + o, 4);
+                const TagHash h(v);
+                if (!h.is_pkg_ref() || h == self) continue;
+                const Entry* pe = pm.entry(h);
+                if (!pe || pe->type != 8) continue;
+                cls.insert(pe->reference);
+                if (pe->reference == 0x8080881C) dyn.insert(v);
+                if (pe->reference == 0x8080B1A7) nodes.insert(v);
+                if (pe->reference == 0x80800000) scr.insert(v);
+            }
+            for (uint32_t c : cls) ++classes[c];
+            for (uint32_t s : scr) ++scripts[s];
+            if (dyn.empty()) continue;
+            ++with_dyn;
+            std::string l = std::format("{} size {:>6} dyn", self.str(), d.size());
+            for (uint32_t v : dyn) l += " " + TagHash(v).str();
+            l += "  nodes";
+            for (uint32_t v : nodes) l += " " + TagHash(v).str();
+            l += "  scripts";
+            for (uint32_t v : scr) l += " " + TagHash(v).str();
+            lines.push_back(l);
+        }
+    }
+    std::println("{} script instances, {} with dynamic models", total, with_dyn);
+    for (const auto& [c, n] : classes) if (n >= 20) std::println("  class {:08X} in {}", c, n);
+    std::println("scripts:");
+    for (const auto& [s, n] : scripts) if (n >= 10) std::println("  {} in {}", TagHash(s).str(), n);
+    for (const auto& l : lines) std::println("{}", l);
+    return 0;
+}
+
+// Node placements of a map's package family: the entity each node names by hash64 (+0x30),
+// and the dynamic models those entities' components carry.
+int cmd_map_placements(PackageManager& pm, TagHash bubble) {
+    pm.build_hash64_index();
+    const PackageInfo* home = pm.info(bubble.pkg_id());
+    if (!home) return 1;
+    const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
+    auto tag_refs = [&](const std::vector<uint8_t>& d, uint32_t cls, TagHash self) {
+        std::set<uint32_t> out;
+        for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+            uint32_t v; std::memcpy(&v, d.data() + o, 4);
+            const TagHash h(v);
+            if (!h.is_pkg_ref() || h == self) continue;
+            if (const Entry* pe = pm.entry(h); pe && pe->type == 8 && pe->reference == cls) out.insert(v);
+        }
+        return out;
+    };
+    std::map<uint32_t, std::set<uint32_t>> entity_models;  // entity -> dynamic models
+    std::map<uint32_t, size_t> classes, model_uses;
+    size_t nodes = 0, tables = 0, placed = 0, unresolved = 0;
+    std::vector<std::string> samples;
+    for (const auto& info : pm.packages()) {
+        if (!info.name.starts_with(family)) continue;
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& en = p.entries()[i];
+            if (en.type != 8 || en.reference != 0x8080B1A7) continue;
+            std::vector<uint8_t> data;
+            try { data = p.read_entry(i); } catch (...) { continue; }
+            ++tables;
+            TagReader r(data);
+            const auto vec = r.vec_at(0x08);
+            for (uint64_t k = 0; k < vec.count; ++k) {
+                const size_t e = vec.data + size_t(k) * 0x90;
+                if (e + 0x90 > data.size()) break;
+                ++nodes;
+                const uint64_t h64 = r.u64_at(e + 0x30);
+                if (!h64 || h64 == ~0ull) continue;
+                const auto ent = pm.resolve64(h64);
+                if (!ent) { ++unresolved; continue; }
+                const Entry* ee = pm.entry(*ent);
+                if (!ee) continue;
+                ++classes[ee->type == 8 ? ee->reference : 0xF0000000u | ee->type];
+                if (ee->reference != 0x8080BAAD) continue;
+                auto it = entity_models.find(ent->value);
+                if (it == entity_models.end()) {
+                    std::set<uint32_t> models;
+                    try {
+                        const auto ed = pm.read(*ent);
+                        for (uint32_t c : tag_refs(ed, 0x8080BADB, *ent))
+                            for (uint32_t m : tag_refs(pm.read(TagHash(c)), 0x8080881C, TagHash(c))) models.insert(m);
+                    } catch (...) {}
+                    it = entity_models.emplace(ent->value, std::move(models)).first;
+                }
+                if (it->second.empty()) continue;
+                ++placed;
+                for (uint32_t m : it->second) ++model_uses[m];
+                if (samples.size() < 30)
+                    samples.push_back(std::format("{} node {} entity {} pos ({:.1f} {:.1f} {:.1f}) scale {:.2f} models {}", TagHash::make(info.pkg_id, uint16_t(i)).str(), k,
+                                                  ent->str(), r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C), it->second.size()));
+            }
+        }
+    }
+    size_t with_models = 0;
+    for (const auto& [e, m] : entity_models) with_models += !m.empty();
+    std::println("{} node tables, {} nodes, {} unresolved hash64", tables, nodes, unresolved);
+    for (const auto& [c, n] : classes) std::println("  entity class {:08X}: {}", c, n);
+    std::println("{} entities ({} with dynamic models), {} placements with models, {} distinct models", entity_models.size(), with_models, placed, model_uses.size());
+    for (const auto& s : samples) std::println("  {}", s);
+    for (const auto& [m, n] : model_uses) std::println("  model {} x{}", TagHash(m).str(), n);
+    return 0;
+}
+
+int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
+    pm.build_hash64_index();
+    const auto materials = index_dynamic_model_materials(pm);
+    const MapEntities me = load_map_entities(pm, bubble, materials);
+    std::println("{} node tables, {} nodes, {} entities, {} placements with a model, {} models", me.node_tables, me.nodes, me.entities,
+                 me.placements, me.models.size());
+    for (const auto& m : me.models) std::println("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
+    return 0;
+}
+
 int cmd_lights(PackageManager& pm, TagHash bubble) {
     const MapLayout map = load_map_layout(pm, bubble);
     const auto lights = load_map_lights(pm, map);
@@ -1293,6 +1478,11 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "map-components" && args.size() >= 2)
+            return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "weather" && args.size() >= 2) return cmd_weather(pm, TagHash(parse_hex(args[1])));
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));

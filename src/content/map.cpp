@@ -1,5 +1,6 @@
 #include "nim/content/map.hpp"
 
+#include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
@@ -431,9 +432,13 @@ std::array<float, 3> map_focus(const MapLayout& map) {
 }
 
 std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> center, float radius) {
+    return map_region(map.statics, center, radius);
+}
+
+std::vector<MapStatic> map_region(const std::vector<MapStatic>& placed, std::array<float, 3> center, float radius) {
     std::vector<std::pair<float, MapStatic>> found;
     const float r2 = radius * radius;
-    for (const auto& st : map.statics) {
+    for (const auto& st : placed) {
         MapStatic m{st.mesh, {}};
         float nearest = 1e30f;
         for (const auto& r : st.rows) {
@@ -449,6 +454,87 @@ std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> cen
     std::vector<MapStatic> out;
     out.reserve(found.size());
     for (auto& f : found) out.push_back(std::move(f.second));
+    return out;
+}
+
+namespace {
+std::array<float, 12> quat_rows(const TagReader& r, size_t te) {
+    const float x = r.f32_at(te), y = r.f32_at(te + 4), z = r.f32_at(te + 8), w = r.f32_at(te + 12);
+    const float tx = r.f32_at(te + 0x10), ty = r.f32_at(te + 0x14), tz = r.f32_at(te + 0x18);
+    float s = r.f32_at(te + 0x1C);
+    if (!std::isfinite(s) || s == 0) s = 1;
+    const float xx = x * x, yy = y * y, zz = z * z, xy = x * y, xz = x * z, yz = y * z, wx = w * x, wy = w * y, wz = w * z;
+    return {(1 - 2 * (yy + zz)) * s, 2 * (xy - wz) * s, 2 * (xz + wy) * s, tx,
+            2 * (xy + wz) * s, (1 - 2 * (xx + zz)) * s, 2 * (yz - wx) * s, ty,
+            2 * (xz - wy) * s, 2 * (yz + wx) * s, (1 - 2 * (xx + yy)) * s, tz};
+}
+}  // namespace
+
+MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
+                              const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {
+    MapEntities out;
+    const PackageInfo* home = pm.info(bubble.pkg_id());
+    if (!home) return out;
+    const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
+    std::unordered_multimap<uint32_t, uint32_t> by_component;  // SDynamicModelComponent tag -> model
+    for (const auto& [model, m] : materials) by_component.emplace(m.component.value, model);
+    std::unordered_map<uint32_t, std::vector<uint32_t>> entity_models;
+    std::unordered_map<uint32_t, size_t> slot;  // model -> out.models index
+    for (const auto& info : pm.packages()) {
+        if (!info.name.starts_with(family)) continue;
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& en = p.entries()[i];
+            if (en.type != 8 || en.reference != kClassMapNodeTable) continue;
+            std::vector<uint8_t> data;
+            try {
+                data = p.read_entry(i);
+            } catch (...) {
+                continue;
+            }
+            ++out.node_tables;
+            TagReader r(data);
+            const auto nodes = r.vec_at(0x08);
+            for (uint64_t k = 0; k < nodes.count; ++k) {
+                const size_t e = nodes.data + size_t(k) * 0x90;
+                if (e + 0x90 > data.size()) break;
+                ++out.nodes;
+                const uint64_t h64 = r.u64_at(e + 0x30);
+                if (!h64 || h64 == ~0ull) continue;
+                const auto ent = pm.resolve64(h64);
+                if (!ent) continue;
+                auto it = entity_models.find(ent->value);
+                if (it == entity_models.end()) {
+                    std::vector<uint32_t> models;
+                    const Entry* ee = pm.entry(*ent);
+                    if (ee && ee->type == 8 && ee->reference == 0x8080BAAD) {
+                        try {
+                            const auto ed = pm.read(*ent);
+                            std::set<uint32_t> seen;
+                            for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                                uint32_t v;
+                                std::memcpy(&v, ed.data() + o, 4);
+                                if (!seen.insert(v).second) continue;
+                                const auto [a, b] = by_component.equal_range(v);
+                                for (auto m = a; m != b; ++m) models.push_back(m->second);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                    it = entity_models.emplace(ent->value, std::move(models)).first;
+                    ++out.entities;
+                }
+                if (it->second.empty()) continue;
+                const auto rows = quat_rows(r, e);
+                for (uint32_t m : it->second) {
+                    auto [s, fresh] = slot.try_emplace(m, out.models.size());
+                    if (fresh) out.models.push_back({TagHash(m), {}});
+                    out.models[s->second].rows.push_back(rows);
+                }
+                ++out.placements;
+            }
+        }
+    }
     return out;
 }
 

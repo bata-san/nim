@@ -13,6 +13,7 @@
 
 #include <array>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nim {
@@ -77,6 +78,8 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble);
 std::array<float, 3> map_focus(const MapLayout& map);
 // The instances whose origin lies within `radius` of `center`, grouped by mesh, nearest meshes first.
 std::vector<MapStatic> map_region(const MapLayout& map, std::array<float, 3> center, float radius);
+// The same over any set of placed meshes (e.g. MapEntities::models).
+std::vector<MapStatic> map_region(const std::vector<MapStatic>& placed, std::array<float, 3> center, float radius);
 // The terrain patches whose bounds come within `radius` of `center`, nearest first.
 std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius);
 
@@ -118,5 +121,20 @@ struct MapCubemap {
 };
 std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map);
 std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius);
+
+// ---- entities ------------------------------------------------------------------------------
+// A map's placed entities: every SMapNodeTable of the map's package family (the activity layers
+// as well as the bubble's own) names, per node, an entity (8080BAAD) by hash64 at +0x30, at the
+// node's transform (quat xyzw, translation, uniform scale at +0x00). An entity lists its
+// components (8080BADB); a component that is the SDynamicModelComponent of a dynamic model
+// (index_dynamic_model_materials) puts that model at the node.
+struct DynamicModelMaterials;
+struct MapEntities {
+    std::vector<MapStatic> models;  // per dynamic model, the 3x4 rows of its placements
+    size_t node_tables = 0, nodes = 0, entities = 0, placements = 0;
+};
+// Needs the hash64 index (PackageManager::build_hash64_index).
+MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
+                              const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
 }  // namespace nim
