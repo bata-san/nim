@@ -241,4 +241,5 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 ## 4. 既知の未解決・注意
 - `docs/RENDERING.md` の冒頭 (「未実装」「代替描画を削除」) は古い。現状はこの表が正。
 - エンティティ (2c12304) は nimshade のみ。GUI の MapWorker には未統合 (ギミックと一緒に後回し)。
+- 1 フレームの一時領域 (gpu.hpp): ディスクリプタ 131072 個 / アップロード 128 MB。outpost 全体 (ライト 1300 個描画) で 16k 個 / 12 MB。旧 32768 個では GUI で「per-frame descriptor space exhausted」で描画停止していた。`nimshade` は `frame use` を表示。
 - 子セッション「Reverse-engineer animation clips and play them」は完了、f86350e で main にマージ済み。

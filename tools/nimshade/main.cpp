@@ -445,6 +445,7 @@ int run(int argc, char** argv) {
         // Auto exposure is read back from the previous frame: render again until it has settled
         // (the first measurement is taken as is), with the materials at the same exposure.
         for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
+            gpu.begin_frame(uint32_t(k + 1));  // the previous frame was flushed: its transient space is free
             scene.set_exposure(gl.exposure());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
@@ -458,6 +459,7 @@ int run(int argc, char** argv) {
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
         }
+        std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         if (lp.post && gl.post_ready())
             std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
         if (lp.ssao && gl.ambient_occlusion()) {

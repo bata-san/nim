@@ -92,6 +92,9 @@ public:
     // `n` consecutive shader-visible descriptors (srv() indices), valid for the current frame:
     // per-draw tables, so draws recorded into one list never overwrite each other's views.
     uint32_t transient_descriptors(uint32_t n);
+    // This frame's use of the per-frame regions (descriptors, upload bytes).
+    uint32_t transient_used() const { return transient_offset_ - (transient_end_ - kTransientPerFrame); }
+    size_t dynamic_used() const { return dynamic_offset_ - (dynamic_end_ - kDynamicPerFrame); }
     // Work recorded on the immediate list only and flushed can hand its descriptors back.
     uint32_t transient_mark() const { return transient_offset_; }
     void transient_rewind(uint32_t mark) { transient_offset_ = mark; }
@@ -132,9 +135,9 @@ private:
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
     uint32_t transient_first_ = 0, transient_offset_ = 0, transient_end_ = 0;
-    static constexpr uint32_t kTransientPerFrame = 1 << 15;
+    static constexpr uint32_t kTransientPerFrame = 1 << 17;  // a map frame with ~1300 lights uses ~16k
     std::string adapter_;
-    static constexpr size_t kDynamicPerFrame = 64 << 20;
+    static constexpr size_t kDynamicPerFrame = 128 << 20;  // ~12 MB for the same frame
 };
 
 } // namespace nim
