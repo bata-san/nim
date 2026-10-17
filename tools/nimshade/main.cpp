@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -77,6 +78,7 @@ int run(int argc, char** argv) {
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false;
+    bool no_ssao = false;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -91,6 +93,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--no-entities") no_entities = true;
+        else if (args[i] == "--no-ssao") no_ssao = true;
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
@@ -353,6 +356,7 @@ int run(int argc, char** argv) {
     if (sky_arg >= 0) lp.sky_intensity = sky_arg;
     lp.time = material_time;
     lp.optimize = !reference;
+    lp.ssao = !no_ssao;
     gpu.flush();
     // Lit output is produced only by the original game pipelines below.
     game = true;
@@ -387,6 +391,14 @@ int run(int argc, char** argv) {
         for (const auto& n : gl.notes()) std::println("  {}", n);
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
+        if (lp.ssao && gl.ambient_occlusion()) {
+            auto px = gpu.read_texture(gl.ambient_occlusion(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
+            const uint16_t* hv = reinterpret_cast<const uint16_t*>(px.data());
+            auto half = [](uint16_t v) { const int ex = (v >> 10) & 31; const float m = float(v & 1023) / 1024.0f; return ex ? std::ldexp(1.0f + m, ex - 15) : std::ldexp(m, -14); };
+            double sum = 0; float lo = 1e9f; size_t n = px.size() / 8, dark = 0;
+            for (size_t k = 0; k < n; ++k) { const float a = half(hv[k * 4]); sum += a; lo = std::min(lo, a); dark += a < 0.9f; }
+            std::println("ssao: mean {:.3f}, min {:.3f}, {:.1f}% below 0.9", sum / double(n), lo, 100.0 * double(dark) / double(n));
+        }
         if (gl.cubemap_count()) {
             std::println("cubemap volumes drawn: {}", gl.cubemaps_drawn());
             for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);

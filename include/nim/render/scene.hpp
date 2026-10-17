@@ -422,6 +422,8 @@ struct LightingParams {
     float fog_density = 6.0f, fog_falloff = 8.0f, fog_height = 0.0f, fog_start = 0.0f;
     V3 fog_color{0.55f, 0.62f, 0.70f};
     float fog_sun_glow = 1.5f;
+    // Screen-space ambient occlusion with the game's hdao pass (game lighting only).
+    bool ssao = true;
 };
 
 class LightingPass {

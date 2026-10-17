@@ -650,6 +650,8 @@ std::vector<ShaderInput> shader_outputs(std::span<const uint8_t> bc) {
             for (size_t c = base + name; c < bc.size() && bc[c]; ++c) in.semantic += char(bc[c]);
             in.index = u32(o + 8);
             in.reg = u32(o + 20);
+            const uint8_t mask = bc[o + 24], never_writes = bc[o + 25];
+            in.never_written = mask && (never_writes & mask) == mask;
             out.push_back(std::move(in));
         }
     }

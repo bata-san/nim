@@ -541,7 +541,7 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     pd.RTVFormats[0] = opt.rtv_format;
     for (size_t i = 0; i < opt.additional_rtv_formats.size(); ++i) pd.RTVFormats[i + 1] = opt.additional_rtv_formats[i];
     for (const auto& output : shader_outputs(ps_code))
-        if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
+        if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !output.never_written)
             throw std::runtime_error(std::format("{}: original PS requires SV_Target{}; attachment missing", technique.str(), output.index));
     pd.SampleDesc.Count = 1;
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
@@ -811,6 +811,22 @@ float ps_main(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
+// View-space depth from the reversed depth buffer (z = near / d): the hdao pass's second depth
+// input, gathered from R on one side of each sample pair and from G on the other (both hold the
+// same depth here). The engine's producer of that texture is not identified, so nim makes it.
+constexpr const char* kLinearDepthHlsl = R"(
+cbuffer P : register(b0) { float near_z; float3 pad; };
+Texture2D<float> depth : register(t0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float2 ps_main(float4 pos : SV_Position) : SV_Target {
+    float d = depth.Load(int3(pos.xy, 0));
+    return (d > 0 ? near_z / d : 1e6).xx;
+}
+)";
+
 struct SunShadowConstants {
     V3 fwd; float fx;
     V3 right; float fy;
@@ -847,6 +863,10 @@ ComPtr<ID3DBlob> compile_viewer_env(const char* entry, const char* target, const
 
 void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
+    hdao_.release(gpu);
+    apply_ssao_.release(gpu);
+    ao_.Reset();
+    linear_depth_.Reset();
     final_combine_.release(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
@@ -883,6 +903,24 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     if (shading.is_none() || final.is_none()) throw std::runtime_error("Missing required game shading/final_combine pipeline");
     shading_.load(pm, gpu, shading, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     final_combine_.load(pm, gpu, final, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+    if (const auto hdao = globals_.pipeline("hdao"); !hdao.is_none()) {
+        try {
+            hdao_.load(pm, gpu, hdao, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("hdao (SSAO) not loaded: {}", ex.what()));
+        }
+    }
+    // apply_ssao_to_light_buffers: 1 + (ao - 1) * strength into both light buffers, multiplied in
+    // (engine blend state 3, dest * src).
+    if (const auto apply = globals_.pipeline("apply_ssao_to_light_buffers"); !apply.is_none()) {
+        try {
+            GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
+            opt.blend_state = 3;
+            apply_ssao_.load(pm, gpu, apply, scopes, opt);
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("apply_ssao_to_light_buffers not loaded: {}", ex.what()));
+        }
+    }
     auto lookup = [&](TagHash tag) {
         if (tag.is_none()) throw std::runtime_error("Missing render_globals BRDF lookup");
         return gpu.texture(load_texture(pm, tag));
@@ -959,8 +997,15 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
         pd.SampleDesc.Count = 1;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shadow_pso_)), "sun shadow resolve PSO");
+        auto lvs = compile_viewer_env("vs_main", "vs_5_0", kLinearDepthHlsl);
+        auto lps = compile_viewer_env("ps_main", "ps_5_0", kLinearDepthHlsl);
+        pd.pRootSignature = env_rs_.Get();
+        pd.VS = {lvs->GetBufferPointer(), lvs->GetBufferSize()};
+        pd.PS = {lps->GetBufferPointer(), lps->GetBufferSize()};
+        pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
+        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 7};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     gpu.flush();
 }
@@ -985,6 +1030,12 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     gpu.device()->CreateRenderTargetView(light_diffuse_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 3 * inc});
     gpu.device()->CreateRenderTargetView(light_specular_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 4 * inc});
     if (env_srv_ == UINT32_MAX) env_srv_ = gpu.srv().alloc(4);  // env: depth, rt1; shadow: depth, map
+    D3D12_CLEAR_VALUE ov{DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 1, 1, 1}};
+    ao_ = gpu.texture2d(w, h, ov.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &ov);
+    gpu.device()->CreateRenderTargetView(ao_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 5 * inc});
+    D3D12_CLEAR_VALUE lv{DXGI_FORMAT_R32G32_FLOAT, {0, 0, 0, 0}};
+    linear_depth_ = gpu.texture2d(w, h, lv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lv);
+    gpu.device()->CreateRenderTargetView(linear_depth_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc});
     w_ = w;
     h_ = h;
 }
@@ -1131,7 +1182,9 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.note_estimate("extern 43 +0x30 = 1, +0x34 = 0 (shadow strength / filter)", unshadowed);
     }
     if (!ext_.zero_policy(ext::ShadowMask)) ext_.zero_when_missing(ext::ShadowMask, "no shadow pass yet (sun shadow mask not rendered): zero");
-    if (!ext_.texture(93, 0x00).resource) ext_.estimate_texture(93, 0x00, unshadowed_.Get(), "no SSAO pass yet: unoccluded (white)");
+    // Extern 93 +0x00: the ambient occlusion every cubemap_apply pipeline reads (hdao output).
+    if (p.ssao && hdao_.loaded()) ext_.set_texture(93, 0x00, ao_.Get());
+    else ext_.estimate_texture(93, 0x00, unshadowed_.Get(), p.ssao ? "SSAO pipeline not loaded: unoccluded (white)" : "SSAO off: unoccluded (white)");
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "no volumetric fog pass yet: zero");
     ext_.set_texture(ext::Frame, 0xC0, lobe_lookup_.Get());
     ext_.set_texture(ext::Frame, 0xC8, lobe3d_lookup_.Get());
@@ -1288,22 +1341,35 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
+    if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
     lights_drawn_ = cubemaps_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         env_pass(env_ibl_pso_.Get(), env_rtv);
     }
     if (!lights_.empty() || !cubemaps_.empty()) {
-        // Light buffers: cubemap volumes (diffuse probes + specular IBL over the sky's), then the
-        // local lights added on top, as goriath's render_lighting orders them.
+        // Light buffers: the local lights, occluded by SSAO (apply_ssao_to_light_buffers multiplies
+        // the buffers), then the cubemap volumes (diffuse probes + specular IBL over the sky's),
+        // which read the AO themselves (extern 93) and so come after the multiply.
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const float zero[4]{};
         cl->ClearRenderTargetView({hdr.ptr + 3 * inc}, zero, 0, nullptr);
         cl->ClearRenderTargetView({hdr.ptr + 4 * inc}, zero, 0, nullptr);
-        if (!cubemaps_.empty() && own_env) draw_cubemaps(gpu, cl, vm, scopes);
         if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
+        if (!lights_.empty() && p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
+            constexpr uint8_t kApply = 0x26;
+            // Extern 38 is the full-screen input shared with final_combine: its own store here.
+            hdao_ext_.set_texture(kApply, 0x00, ao_.Get());
+            hdao_ext_.set(kApply, 0x50, float4{float(w_), float(h_), 1 / float(w_), 1 / float(h_)});  // cb0[4].zw: pixel to uv
+            hdao_ext_.set(kApply, 0xC0, float4{1, 1, 1, 1});  // cb0[2].x: strength
+            ext_.note_estimate("apply_ssao_to_light_buffers strength 1 (extern 38 +0xC0)", "engine-side SSAO setting (not in game data)");
+            const D3D12_CPU_DESCRIPTOR_HANDLE bufs[] = {{hdr.ptr + 3 * inc}, {hdr.ptr + 4 * inc}};
+            cl->OMSetRenderTargets(2, bufs, FALSE, nullptr);
+            apply_ssao_.draw(gpu, cl, hdao_ext_, scopes);
+        }
+        if (!cubemaps_.empty() && own_env) draw_cubemaps(gpu, cl, vm, scopes);
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
@@ -1322,6 +1388,66 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+}
+
+// ---- SSAO (hdao) -------------------------------------------------------------------------------
+// hdao_ps (the technique's PS; a CS variant does the same): per pixel, 12 sample pairs mirrored
+// around it in the second depth input; a pair darkens when both samples are nearer than the
+// centre (relative depth, saturate(cb25 / z * z_n + cb26)) and not rejected as too near
+// (saturate(cb27 / z * (z_a + z_b) + cb28)); ao = max(1 - fade(z), exp(cb31 * sum^2)).
+// Its inputs come from extern 0x21 (goriath "hdao", fields unnamed); what each feeds was read from
+// the DXIL. The tuning values are engine code, not data: chosen here and listed as estimates.
+void GameLighting::render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE ao_rtv{base.ptr + 5 * inc}, lin_rtv{base.ptr + 6 * inc};
+    const float near_z = vm.vp_rel.c[3][2];
+    // Linear depth (viewer-made input, see kLinearDepthHlsl).
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        gpu.device()->CreateShaderResourceView(gb.depth.Get(), &sd, gpu.srv().cpu(env_srv_));
+        const float4 k{near_z, 0, 0, 0};
+        const auto cb = gpu.dynamic(sizeof(k));
+        std::memcpy(cb.cpu, &k, sizeof(k));
+        Gpu::barrier(cl, linear_depth_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->OMSetRenderTargets(1, &lin_rtv, FALSE, nullptr);
+        cl->SetGraphicsRootSignature(env_rs_.Get());
+        cl->SetPipelineState(linear_depth_pso_.Get());
+        ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetGraphicsRootConstantBufferView(0, cb.gpu);
+        cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(env_srv_));
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cl->DrawInstanced(3, 1, 0, 0);
+        Gpu::barrier(cl, linear_depth_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    auto& e = hdao_ext_;
+    constexpr uint8_t kHdao = 0x21;
+    const float w = float(w_), h = float(h_);
+    e.set_texture(kHdao, 0x50, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);  // t0: device depth (cb0[3] = its size)
+    e.set_texture(kHdao, 0x58, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);  // t1: view depth, gathered from R and G
+    e.set(kHdao, 0x60, float4{0, 0, 1 / w, 1 / h});           // cb0[2].zw: t1 texel size
+    e.set(kHdao, 0x70, float4{w, h, 0, 0});                    // cb0[3].xy: t0 size
+    e.set(kHdao, 0x80, float4{0, 1 / near_z, 0, 0});           // cb0[4].xy: 1 / z = x + y * d (as Deferred +0x00)
+    // Tuning (estimates): sample radius 10 px; a sample 1 % nearer than the centre half occludes
+    // (slope 50); samples more than 10 % nearer are rejected; exp(-0.04 * sum^2); fade 60 - 100 m.
+    const float radius = 10, slope = 50, reject = 0.1f, falloff = 0.04f;
+    e.set(kHdao, 0x20, float4{0, 0, radius, radius});           // cb0[22].zw: pattern scale (t1 texels)
+    e.set(kHdao, 0x00, float4{-slope, slope, 0, 0});            // cb0[25], cb0[26]
+    e.set(kHdao, 0x10, float4{1 / (2 * reject), -(1 - reject) / reject, 0, 0});  // cb0[27], cb0[28]
+    e.set(kHdao, 0x30, float4{0, 0, -falloff, 0});              // cb0[31]
+    e.set(kHdao, 0x40, float4{0, 1, -1.0f / 40, 2.5f});        // cb0[33..36]: near / far fade
+    ext_.note_estimate("SSAO (hdao) tuning: radius 10 px, slope 50, reject 10 %, exp(-0.04 sum^2), fade 60-100 m",
+                       "engine-side hdao settings (not in game data)");
+    ext_.note_estimate("SSAO second depth input = view depth made by nim", "the engine's producer of hdao t1 is not identified");
+    Gpu::barrier(cl, ao_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->OMSetRenderTargets(1, &ao_rtv, FALSE, nullptr);
+    hdao_.draw(gpu, cl, e, scopes);
+    Gpu::barrier(cl, ao_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 // ---- Local lights ------------------------------------------------------------------------------

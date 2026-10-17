@@ -216,6 +216,8 @@ public:
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
+    ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
+    ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
 
 private:
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
@@ -226,6 +228,12 @@ private:
     ExternStore ext_;
     std::map<uint32_t, float> global_overrides_;
     GamePipeline shading_, final_combine_;
+    // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
+    GamePipeline hdao_, apply_ssao_;
+    ExternStore hdao_ext_;
+    ComPtr<ID3D12Resource> ao_, linear_depth_;
+    ComPtr<ID3D12PipelineState> linear_depth_pso_;
+    void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists

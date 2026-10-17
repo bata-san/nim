@@ -2212,6 +2212,8 @@ public:
             ImGui::SliderFloat("太陽の強さ", &light.sun_intensity, 0, 10);
             ImGui::Checkbox("太陽の影", &shadows);
             ImGui::SetItemTooltip("nim のシャドウマップ (ゲームのカスケードは未解読のため推定)");
+            ImGui::Checkbox("SSAO", &light.ssao);
+            ImGui::SetItemTooltip("ゲームの hdao と apply_ssao_to_light_buffers (調整値は推定)");
             ImGui::ColorEdit3("太陽の色", &light.sun_color.x);
             ImGui::SliderFloat("空の強さ", &light.sky_intensity, 0, 4);
             ImGui::ColorEdit3("空 (天頂)", &light.sky_top.x);
