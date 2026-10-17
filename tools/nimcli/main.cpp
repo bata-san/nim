@@ -15,6 +15,7 @@
 //   nimcli [--install DIR] render-resources [TAG]      original pipeline/scope resource sources (TSV)
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
+//   nimcli [--install DIR] probe-audit BUBBLE [OUT.tsv]  exhaustive map-family probe inventory and cross-check
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
@@ -648,6 +649,127 @@ int cmd_cubemaps(PackageManager& pm, TagHash bubble) {
     std::println("{} cubemap volumes", cubemaps.size());
     for (const auto& [k, n] : variants) std::println("  {:5}  {}", n, k);
     return 0;
+}
+
+// Independently enumerate all node tables and authored cubemap collections in the map family.
+// Do not merge activity layers into rendering: this command records their provenance instead.
+int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& output) {
+    const auto map = load_map_layout(pm, bubble);
+    const auto* home = pm.info(bubble.pkg_id());
+    if (!home) throw std::runtime_error("bubble package missing");
+    const auto family = home->name.substr(0, home->name.rfind('_') + 1);
+    using Key = std::vector<uint8_t>;
+    std::set<Key> rooted, family_nodes, collections;
+    std::map<Key, std::string> origins;
+    struct ManifestRow { Key key; std::string prefix, suffix; };
+    std::vector<ManifestRow> manifest_rows;
+    std::map<uint32_t, std::vector<uint8_t>> auxiliary;
+    size_t tables = 0, records = 0, collection_count = 0;
+    size_t grid_points = 0, texture_failures = 0, dimension_mismatches = 0;
+    std::ofstream manifest;
+    if (!output.empty()) {
+        manifest.open(output);
+        if (!manifest) throw std::runtime_error("cannot open probe manifest");
+        manifest << "collection\tindex\tauthored_id\tinline_source\tcenter_x\tcenter_y\tcenter_z\tgrid_x\tgrid_y\tgrid_z\tspecular\talpha\tdiffuse\tdiffuse_width\tdiffuse_height\tdiffuse_depth\tauxiliary\tauxiliary_records\tvertex_buffer";
+        for (int i = 0; i < 16; ++i) manifest << std::format("\tlocal_to_world_{}", i);
+        manifest << '\n';
+    }
+    auto key = [](const std::vector<uint8_t>& d, size_t c) {
+        if (c > d.size() || d.size() - c < 0x1D0) throw std::runtime_error("truncated cubemap");
+        // Exclude only the serialized record header, compare every authored payload byte.
+        return Key(d.begin() + c + 0x10, d.begin() + c + 0x1D0);
+    };
+    for (const auto& info : pm.packages()) {
+        if (!info.name.starts_with(family)) continue;
+        auto& pkg = pm.open(info);
+        for (uint32_t i = 0; i < pkg.entries().size(); ++i) {
+            const auto& en = pkg.entries()[i];
+            if (en.type != 8 || (en.reference != kClassMapNodeTable && en.reference != 0x80807F4B)) continue;
+            const auto tag = TagHash::make(info.pkg_id, uint16_t(i));
+            const auto data = pm.read(tag);
+            TagReader r(data);
+            if (en.reference == 0x80807F4B) {
+                const auto v = r.vec_at(0x10);
+                if (v.count && v.element_class != 0x80807F50) throw std::runtime_error("unknown cubemap collection layout");
+                ++collection_count;
+                std::println("collection {} {}: {} volumes, spatial resource {}", tag.str(), info.name, v.count, r.tag_at(0x30).str());
+                for (uint64_t k = 0; k < v.count; ++k) {
+                    const size_t c = v.data + size_t(k) * 0x1D0;
+                    const auto identity = key(data, c);
+                    collections.insert(identity);
+                    // Preserve source locations independently of package traversal order.
+                    origins.try_emplace(identity);
+                    const uint32_t gx = r.u32_at(c + 0x160), gy = r.u32_at(c + 0x164), gz = r.u32_at(c + 0x168);
+                    grid_points += size_t(gx) * gy * gz;
+                    const auto diffuse = r.tag_at(c + 0x1C0), aux = r.tag_at(c + 0x1B4);
+                    Texture tx;
+                    try {
+                        tx = load_texture(pm, diffuse);
+                        if (tx.width != gx * 7 || tx.height != gy || tx.depth != gz) ++dimension_mismatches;
+                        // Validate the cube's complete original mip payload too.
+                        (void)load_texture(pm, r.tag_at(c + 0x1B8));
+                        if (!r.tag_at(c + 0x1BC).is_none()) (void)load_texture(pm, r.tag_at(c + 0x1BC));
+                    } catch (const std::exception& ex) {
+                        ++texture_failures;
+                        std::println("texture error {}[{}]: {}", tag.str(), k, ex.what());
+                    }
+                    uint64_t aux_count = 0;
+                    if (!aux.is_none()) {
+                        auto [it, fresh] = auxiliary.try_emplace(aux.value);
+                        if (fresh) it->second = pm.read(aux);
+                        aux_count = TagReader(it->second).vec_at(8).count;
+                    }
+                    if (manifest.is_open()) {
+                        auto suffix = std::format("\t{:.9g}\t{:.9g}\t{:.9g}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            r.f32_at(c + 0x20), r.f32_at(c + 0x24), r.f32_at(c + 0x28),
+                            gx, gy, gz, r.tag_at(c + 0x1B8).str(), r.tag_at(c + 0x1BC).str(), diffuse.str(),
+                            tx.width, tx.height, tx.depth, aux.str(), aux_count, r.tag_at(c + 0x1C4).str());
+                        for (int j = 0; j < 16; ++j) suffix += std::format("\t{:.9g}", r.f32_at(c + 0xC0 + size_t(j) * 4));
+                        manifest_rows.push_back({identity, std::format("{}\t{}\t{:08X}\t", tag.str(), k, r.u32_at(c + 0x1C8)), std::move(suffix)});
+                    }
+                }
+                continue;
+            }
+            ++tables;
+            const bool reachable = std::find(map.node_tables.begin(), map.node_tables.end(), tag) != map.node_tables.end();
+            const auto nodes = r.vec_at(8);
+            for (uint64_t n = 0; n < nodes.count; ++n) {
+                const size_t e = nodes.data + size_t(n) * 0x90;
+                if (e + 0x90 > data.size()) throw std::runtime_error("truncated node table");
+                size_t p = r.pointer_at(e + 0x78);
+                for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                    if (r.u32_at(p - 4) == kClassCubemapComponent) {
+                        const auto k = key(data, p + 0x10);
+                        family_nodes.insert(k);
+                        origins[k] += std::format("{}:node{}:0x{:X} ", tag.str(), n, p + 0x10);
+                        if (reachable) rooted.insert(k);
+                        ++records;
+                        if (!reachable) std::println("unreachable probe: table {} node {} offset {:X}", tag.str(), n, p + 0x10);
+                    }
+                    const auto next = r.u64_at(p);
+                    if (!next) break;
+                    p += size_t(next);
+                }
+            }
+        }
+    }
+    auto missing = [](const auto& a, const auto& b) { size_t n = 0; for (const auto& k : a) n += !b.contains(k); return n; };
+    std::println("family {}: {} tables, {} inline records, {} collections", family, tables, records, collection_count);
+    std::println("unique: bubble nodes {}, family nodes {}, collection records {}", rooted.size(), family_nodes.size(), collections.size());
+    std::println("family absent from bubble {}; collection absent from bubble {}; bubble absent from collection {}",
+                 missing(family_nodes, rooted), missing(collections, rooted), missing(rooted, collections));
+    std::println("authored grid slots {}; texture read failures {}; grid/texture dimension mismatches {}", grid_points, texture_failures, dimension_mismatches);
+    const auto loaded = load_map_cubemaps(pm, map);
+    std::println("runtime loader: {} volumes", loaded.size());
+    size_t auxiliary_records = 0;
+    for (const auto& [tag, data] : auxiliary) auxiliary_records += TagReader(data).vec_at(8).count;
+    std::println("auxiliary tags {}: {} records (semantics not decoded; not counted as extra probes)", auxiliary.size(), auxiliary_records);
+    if (manifest.is_open()) {
+        for (const auto& row : manifest_rows) manifest << row.prefix << origins.at(row.key) << row.suffix << '\n';
+        manifest.flush();
+        if (!manifest) throw std::runtime_error("probe manifest write failed");
+    }
+    return texture_failures || dimension_mismatches || loaded.size() != rooted.size() || missing(family_nodes, rooted) || missing(collections, rooted) || missing(rooted, collections) ? 1 : 0;
 }
 
 int cmd_weather(PackageManager& pm, TagHash bubble) {
@@ -1500,6 +1622,7 @@ int main(int argc, char** argv) {
         if (cmd == "texraw" && args.size() >= 2) return cmd_texraw(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "probe-audit" && args.size() >= 2) return cmd_probe_audit(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2] : "");
         if (cmd == "nodes" && args.size() >= 2)
             return cmd_nodes(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));

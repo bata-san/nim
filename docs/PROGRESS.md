@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (透明物の大気 LUT、当該フレームの入力受け渡し、空・透明物の TAA モーション)
+最終更新: 2026-10-18 (Outpost 全域の原プローブ一覧・全ノード・テクスチャの照合)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -17,7 +17,7 @@
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
 | 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
-| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 完了 (不透明物) | 「Diffuse probes」コミット | §3.4。light_sample_* は透明物/パーティクル用で未 |
+| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 不透明物の適用を実装。原データ全域照合済み、適用の完全一致は未検証 | §3.4, §3.4.1 | Outpost 313 領域 / 703,505 グリッド点分。付属データ・適用条件に未解明あり |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
@@ -151,7 +151,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   (min,max) 線形深度, t3 = フル解像度深度 (R,G 平均)) → HDR に合成 (ブレンドは未確認)。
 - 霧密度スライス (extern 0x58) の生成元は未特定 (マップのフォグボリューム系エンティティと推測)。
 
-### 3.4 拡散プローブ + マップのライティング (実装済み)
+### 3.4 拡散プローブ + マップのライティング (適用を実装、ゲームとの完全一致は未検証)
 - 不透明物の拡散プローブ = キューブマップボリューム (cubemap_apply_*_probes_on, PS 例 80A74B26)。
   プローブは R8G8B8A8_UNORM の 3D テクスチャ (x 方向に 7 枚: 平均 + ±X/±Y/±Z)。PS の出力
   o0 (拡散 → Deferred +0xC0) = 露出 cb13[1].x × global_cubemap_intensity (ch 0x83) × probe × (1 + k·probe)
@@ -166,6 +166,37 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   +0x80 = down (0x5A×0x5B), +0x90 = (up_sharpness 0x59, down_sharpness 0x5C)。シェーディングは半球
   アンビエントに global_ambient_intensity (0x82, 既定 0) を掛けるので、マップでは拡散アンビエントは
   ほぼプローブだけ。+0x50 / +0xD0 は意味だけ読めていて値は推定。大気が無い (ビューア) ときは従来の設定。
+
+### 3.4.1 全域の原プローブ調査 (2026-10-18)
+
+最新のユーザー指示:「見た目を近づけるんじゃなくて、あくまでも絶対にゲーム内に忠実に、全範囲のプローブを見つけ出して」。
+暗い CTRL 壁を基準に全体を暗くする、室内プローブを領域外へ延長する等の調整はしない。
+
+- `nimcli probe-audit 80AF9550 out/outpost-probes.tsv` を追加。バブルの経路とは独立に
+  `w64_outpost_` 全パッケージの **2,441 ノードテーブル**と cubemap collection (80807F4B) を列挙する。
+  読込失敗は中断、一覧の差分・テクスチャ読込失敗・寸法不一致・実行時ローダー件数不一致は終了コード 1。
+- 原一覧 **80AE8026**: +0x10 Vec<80807F50, stride 0x1D0> に **313 領域**。
+  バブルから到達する 88 テーブル中の 313 個の 80807F3C と、ヘッダー以外の **+0x10..+0x1CF をバイト単位で全件一致**。
+  全 2,441 テーブルにも追加の 80807F3C はない。実行時ローダーも 313 領域。
+- 各 +0x160 の grid xyz 積の総和は **703,505** (収録グリッドのスロット数。全点が有効な照明点という意味ではない)。
+  313 個の diffuse texture を全件ロードし、寸法が **(7×grid.x, grid.y, grid.z)** と一致。
+  各 specular cube / 指定された alpha texture もロード検証。読込失敗・寸法不一致とも 0。
+- TSV は領域ごとに元 collection/index/ID (+0x1C8)、対応ノードとオフセット、中心、grid、
+  全 texture 参照・寸法、local_to_world 16 要素、付属タグと件数、vertex buffer 参照を保存する。
+  出力はゲーム由来データなので `out/` のみ。追跡・配布しない。
+- 原一覧 +0x30 は **80A7995A** (type 11 / class 8080A337)。Havok `SDKV20180100` バイナリであり texture ではない。
+  空間データの正確な役割・検索条件は未解析。
+- 各領域 +0x1B4 の **80807F54** 付属タグを全件取得: 163 種、+0x08 の Vec に合計 **624 レコード**。
+  非空のタグは 162 種、空の共通タグ 80A7995B は 151 領域で共有。
+  レコードは 0xD0 バイト、class 80807F57。役割は未確定で、追加の拡散プローブとして数えない。
+  162 領域は +0x1C4 の vertex buffer も参照する (例 80A7996E: stride12 / 3456B の float3 データ)。
+  現描画はこの付属データを使っていない。影響形状・適用条件の候補として原シェーダーと照合が必要。
+- ローダーの重複排除を「行列 + float に変換した specular hash」から原 payload の全バイト比較へ変更。
+  float 変換による hash 下位ビットの消失と、同じ配置・反射 cube で異なる diffuse/flags を持つ領域の誤統合を防ぐ。
+  Outpost は修正前後とも 313 領域で、これ自体による見た目の変化はない。
+- 検証: Release nimcli/nimshade/tests と別出力先 GUI をビルド、ctest 2/2、上記実データ監査を実行。
+  発見済みのクラスの収録範囲を照合した結果であり、未解明の付属データやエンジン側の適用条件を含む
+  「ゲーム内と完全一致」の証明ではない。次はこれらの適用条件・形状、sky ambient との合成を解析する。
 
 ### 3.5 ポストプロセス + アンチエイリアス (実装済み, `src/render/game_post.cpp`)
 - 自動露出: autoexposure_sample_columns (1/16 の bloom 段の列ごとの log 輝度和) を読み戻し、key 0.18、

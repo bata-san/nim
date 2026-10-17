@@ -249,7 +249,9 @@ std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& light
 
 std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map) {
     std::vector<MapCubemap> out;
-    std::set<std::vector<float>> seen;  // the same volume placed by several node tables
+    // Preserve distinct authored records even when they share a transform/specular cube.
+    // Hashes must never pass through float (near 0x80xxxxxx it loses their low bits).
+    std::set<std::vector<uint8_t>> seen;
     for (TagHash t : map.node_tables) {
         std::vector<uint8_t> data;
         try {
@@ -303,8 +305,7 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
                             m.hi[size_t(a)] = std::max(m.hi[size_t(a)], v);
                         }
                     }
-                    std::vector<float> key(m.local_to_world.begin(), m.local_to_world.end());
-                    key.push_back(float(m.specular.value));
+                    std::vector<uint8_t> key(data.begin() + c + 0x10, data.begin() + c + 0x1D0);
                     if (!m.specular.is_none() && seen.insert(std::move(key)).second) out.push_back(m);
                 }
                 const uint64_t next = r.u64_at(p);
