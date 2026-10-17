@@ -316,11 +316,48 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
     return out;
 }
 
+namespace {
+// The global channel expressions (8080B64E sequence nodes) in an entity's components.
+void read_channel_expressions(PackageManager& pm, TagHash entity, std::set<uint32_t>& seen_components,
+                              std::vector<MapChannelExpression>& out) {
+    const Entry* ee = pm.entry(entity);
+    if (!ee || ee->type != 8 || ee->reference != 0x8080BAAD) return;
+    const auto ed = pm.read(entity);
+    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+        uint32_t v;
+        std::memcpy(&v, ed.data() + o, 4);
+        if (v < 0x80800000u || v == 0xFFFFFFFFu) continue;
+        const Entry* ce = pm.entry(TagHash(v));
+        if (!ce || ce->type != 8 || ce->reference != kClassComponent || !seen_components.insert(v).second) continue;
+        const auto cd = pm.read(TagHash(v));
+        TagReader r(cd);
+        for (size_t c = 0; c + 0x50 <= cd.size(); c += 4) {
+            if (r.u32_at(c) != kClassSequenceGlobalChannel) continue;
+            const size_t p = c + 4;
+            MapChannelExpression x;
+            x.channel = r.u32_at(p);
+            x.start = r.f32_at(p + 0x14);
+            x.cycle = r.f32_at(p + 0x18);
+            x.component = TagHash(v);
+            const auto bc = r.vec_at(p + 0x30);
+            const auto k = r.vec_at(p + 0x40);
+            if (bc.data + bc.count > cd.size() || k.data + k.count * 16 > cd.size()) continue;
+            x.bytecode.assign(cd.begin() + ptrdiff_t(bc.data), cd.begin() + ptrdiff_t(bc.data + bc.count));
+            for (uint64_t i = 0; i < k.count; ++i)
+                x.constants.push_back({r.f32_at(k.data + i * 16), r.f32_at(k.data + i * 16 + 4),
+                                       r.f32_at(k.data + i * 16 + 8), r.f32_at(k.data + i * 16 + 12)});
+            out.push_back(std::move(x));
+        }
+    }
+}
+}  // namespace
+
 MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
     MapAtmosphere out;
     bool found_atmosphere = false, found_sun = false;
+    std::set<uint32_t> seen_entities, seen_components;
+    pm.build_hash64_index();
     for (TagHash t : map.node_tables) {
-        if (found_atmosphere && found_sun) break;
         std::vector<uint8_t> data;
         try {
             data = pm.read(t);
@@ -332,6 +369,12 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
         for (uint64_t i = 0; i < nodes.count; ++i) {
             const size_t e = nodes.data + size_t(i) * 0x90;
             if (e + 0x90 > data.size()) break;
+            if (const uint64_t h64 = r.u64_at(e + 0x30); h64 && h64 != ~0ull)
+                if (const auto ent = pm.resolve64(h64); ent && seen_entities.insert(ent->value).second) try {
+                        read_channel_expressions(pm, *ent, seen_components, out.channel_expressions);
+                    } catch (...) {
+                        // An unreadable entity has no environment for nim.
+                    }
             size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
             for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
                 const size_t c = p + 0x10;

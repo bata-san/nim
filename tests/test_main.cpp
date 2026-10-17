@@ -82,6 +82,27 @@ int main() {
         CHECK((out[4] == float4{0, 0, 0, 0}));
     }
 
+    // Sequencer (map environment channel expressions): 0x4A n pushes input n, 0x49 is the
+    // eight-stop gradient, 0x4C n pops to output n.
+    {
+        float4 k[11]{};
+        k[1] = {1, 0, 0, 0};           // red delta at stop 0
+        k[5] = {0, 0, 0, 2};           // red delta at stop 7
+        k[9] = {0.2f, 0.4f, 0.6f, 0.7f};
+        k[10] = {0.8f, 0.9f, 0.95f, 0.97f};
+        const uint8_t bc[] = {0x4A, 0x00, 0x29, 0x00, 0x49, 0x00, 0x4C, 0x01};
+        auto at = [&](float t) {
+            std::vector<float4> out(2);
+            TfxEnvironment env;
+            env.sequencer_input = [t](uint8_t i) { return i == 0 ? float4{t, 0, 0, 0} : float4{}; };
+            run_tfx(bc, k, out, env);
+            return out[1][0];
+        };
+        CHECK(std::fabs(at(0.3f) - 0.5f) < 1e-5f);    // half way through segment 0
+        CHECK(std::fabs(at(0.985f) - 2.0f) < 1e-4f);  // segment 0 full, half way through 7 (ends at 1)
+        CHECK(at(0.1f) == 0);
+    }
+
     // Material frame evaluation: time-driven UVs, edited object state, real global defaults and
     // an output that reads its initial value. Rewinding must reproduce the original frame.
     {

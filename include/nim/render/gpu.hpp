@@ -79,6 +79,10 @@ public:
     uint64_t signal();               // signals the queue fence, returns the value
     void wait(uint64_t fence_value); // blocks until the fence reaches it
     void wait_idle() { wait(signal()); }
+    // Work recorded now completes by fence value pending_fence(): any later signal covers it once
+    // the list holding it was submitted. completed() is the value the GPU has reached.
+    uint64_t pending_fence() const { return fence_value_ + 1; }
+    uint64_t completed() const { return fence_->GetCompletedValue(); }
     // Throws when the device was removed (a GPU fault); with NIM_D3D_DEBUG=1 logs DRED first.
     void check_device();
     bool removed() const { return removed_; }

@@ -128,6 +128,19 @@ std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>&
 // payload = record + 0x10) and the sun path component 80808346. See docs/PROGRESS.md 3.2.
 inline constexpr uint32_t kClassAtmosphereComponent = 0x808084A0;
 inline constexpr uint32_t kClassSunPathComponent = 0x80808346;
+// A map's environment (sun, ambient, fog, sky ... over the day): an entity placed on a map node
+// whose components (8080BADB) hold sequence nodes 8080B64E (cf. D2 SSequenceGlobalChannel), each a
+// sequencer program computing one render-globals channel, named by its FNV-1 hash, from the time
+// of day. Record (payload = class + 4): +0x00 channel hash, +0x14 / +0x18 start / cycle seconds
+// (3600: the day), +0x30 bytecode vector, +0x40 constant vector. See docs/PROGRESS.md 3.2.
+inline constexpr uint32_t kClassSequenceGlobalChannel = 0x8080B64E;
+struct MapChannelExpression {
+    uint32_t channel = 0;
+    float start = 0, cycle = 0;
+    std::vector<uint8_t> bytecode;
+    std::vector<std::array<float, 4>> constants;
+    TagHash component;
+};
 struct MapAtmosphere {
     // +0x80..+0xBF: the sky lookups (3D, one slice per time-of-day key): near0, far0, near1, far1.
     std::array<TagHash, 4> lookups{};
@@ -137,6 +150,7 @@ struct MapAtmosphere {
     // entry per 1/1800 of the day; +0x08 the map's time of day (estimate).
     std::array<std::vector<std::array<float, 3>>, 4> paths;
     float default_time = 0.5f;
+    std::vector<MapChannelExpression> channel_expressions;  // the map environment, in data order
     bool valid() const { return !lookups[1].is_none(); }
     // The direction (toward the sun) of path `i` at time `t` (0..1), interpolated.
     std::array<float, 3> path_direction(int i, float t) const;

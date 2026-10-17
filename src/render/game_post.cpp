@@ -1,0 +1,386 @@
+// Post-processing with the engine's own pipelines (docs/PROGRESS.md 3.5): the bloom pyramid, auto
+// exposure and the tonemap / grading pass screen_area_global_lut3d. Pass order and the bloom
+// structure follow a Destiny 2 frame of the same engine (Alkahest docs/bloom_pipeline.txt); the
+// values the engine sets at run time are estimates, listed with the others.
+#include "nim/render/game_lighting.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <format>
+
+namespace nim {
+
+namespace {
+// Extern blocks of the post passes (TFX extern ids).
+constexpr uint8_t kScreenArea = 0x1E;  // screen_area: the lut3d / color grading passes
+constexpr uint8_t kMotion = 0x38;      // bloom_initial_downsample's offset texture (motion)
+
+void viewport(ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h) {
+    const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+    const D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+}
+
+float4 size4(uint32_t w, uint32_t h) { return {float(w), float(h), 1.0f / float(w), 1.0f / float(h)}; }
+
+// The engine fills the postprocess scope (cb11) of the separable blurs: [0] target size, [3] the
+// weights of five bilinear taps (outer, inner, centre), [4] / [5] their offsets along the axis and
+// the fixed offset across it, [6] scale, [7] bias. A 9-texel gaussian folded into the five taps.
+std::array<float4, 12> blur_scope(uint32_t w, uint32_t h, bool vertical, float sigma) {
+    float g[5];
+    for (int k = 0; k < 5; ++k) g[k] = std::exp(-float(k * k) / (2 * sigma * sigma));
+    const float w1 = g[1] + g[2], w2 = g[3] + g[4];
+    const float total = g[0] + 2 * (w1 + w2);
+    const float o1 = (g[1] + 2 * g[2]) / w1, o2 = (3 * g[3] + 4 * g[4]) / w2;
+    const float texel = vertical ? 1.0f / float(h) : 1.0f / float(w);
+    std::array<float4, 12> cb{};
+    cb[0] = size4(w, h);
+    cb[3] = {w2 / total, w1 / total, g[0] / total, 0};
+    cb[4] = {-o2 * texel, -o1 * texel, 0, 0};
+    cb[5] = {o1 * texel, o2 * texel, 0, 0};
+    cb[6] = {1, 1, 1, 1};
+    return cb;
+}
+} // namespace
+
+void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes) {
+    auto load = [&](GamePipeline& gp, const char* name, GamePipeline::Options opt) {
+        const auto tag = globals_.pipeline(name);
+        try {
+            if (tag.is_none()) throw std::runtime_error("not in render globals");
+            gp.load(pm, gpu, tag, scopes, opt);
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("{} not loaded: {}", name, ex.what()));
+        }
+    };
+    constexpr auto f16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    {
+        // SV_Target1 is the output's luma (for the anti-aliasing passes nim does not run).
+        GamePipeline::Options opt{DXGI_FORMAT_R8G8B8A8_UNORM, false};
+        opt.drop_extra_targets = true;
+        load(post_tonemap_, "screen_area_global_lut3d", opt);
+        // fxaa reads one texture: the colour with the luma in alpha. The same tonemap, drawn
+        // again, puts its SV_Target1 (luma) into that alpha (target 0 masked off).
+        GamePipeline::Options luma{DXGI_FORMAT_R8G8B8A8_UNORM, false};
+        luma.additional_rtv_formats = {DXGI_FORMAT_R8G8B8A8_UNORM};
+        luma.write_masks = {0, D3D12_COLOR_WRITE_ENABLE_ALPHA};
+        load(post_luma_, "screen_area_global_lut3d", luma);
+        load(fxaa_, "fxaa", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+    }
+    load(bloom_initial_, "bloom_initial_downsample_block_2x2", {f16, false});
+    load(bloom_down_, "downsample_block_2x2", {f16, false});
+    load(bloom_blur_h_, "gaussian_10_horz", {f16, false});
+    load(bloom_blur_v_, "gaussian_10_vert", {f16, false});
+    load(bloom_add_, "weighted_add", {f16, false});
+    load(bloom_copy_, "copy_texture_bilinear", {f16, false});
+    load(ae_columns_, "autoexposure_sample_columns", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
+
+    // The grading LUT (32^3, sampled with the tonemapped colour). The engine fills it with the
+    // color_grading_fill_* passes from grading layers (scope color_grading_ubershader) whose source
+    // data is not found; with no layers and an identity matrix those passes write the identity.
+    Texture lut;
+    lut.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    lut.width = lut.height = lut.depth = 32;
+    lut.data.resize(size_t(32) * 32 * 32 * 4);
+    for (uint32_t z = 0; z < 32; ++z)
+        for (uint32_t y = 0; y < 32; ++y)
+            for (uint32_t x = 0; x < 32; ++x) {
+                uint8_t* t = &lut.data[((size_t(z) * 32 + y) * 32 + x) * 4];
+                t[0] = uint8_t((x * 255 + 15) / 31);
+                t[1] = uint8_t((y * 255 + 15) / 31);
+                t[2] = uint8_t((z * 255 + 15) / 31);
+                t[3] = 255;
+            }
+    grading_lut_ = gpu.texture(lut);
+    Texture black;
+    black.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    black.width = black.height = 1;
+    black.data = {0, 0, 0, 0};
+    black_ = gpu.texture(black);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 3};
+    check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
+}
+
+void GameLighting::release_post(Gpu& gpu) {
+    post_ldr_.Reset();
+    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &bloom_copy_, &ae_columns_})
+        gp->release(gpu);
+    for (auto& l : bloom_) l = {};
+    bloom_final_.Reset();
+    ae_columns_rt_.Reset();
+    grading_lut_.Reset();
+    black_.Reset();
+    post_rtv_heap_.Reset();
+    for (auto& r : ae_readback_) r.Reset();
+    ae_fence_ = {};
+    ae_valid_ = false;
+}
+
+void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
+    if (!post_rtv_heap_) return;
+    ID3D12Device* dev = gpu.device();
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
+    auto target = [&](uint32_t tw, uint32_t th, DXGI_FORMAT f, uint32_t slot) {
+        cv.Format = f;
+        auto r = gpu.texture2d(tw, th, f, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+        dev->CreateRenderTargetView(r.Get(), nullptr, {base.ptr + size_t(slot) * inc});
+        return r;
+    };
+    uint32_t lw = w, lh = h;
+    for (int i = 0; i < kBloomLevels; ++i) {
+        lw = std::max(1u, (lw + 1) / 2);
+        lh = std::max(1u, (lh + 1) / 2);
+        auto& l = bloom_[size_t(i)];
+        l.w = lw;
+        l.h = lh;
+        l.down = target(lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, uint32_t(3 * i));
+        l.blur = target(lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, uint32_t(3 * i + 1));
+        l.sum = target(lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, uint32_t(3 * i + 2));
+    }
+    bloom_final_ = target(bloom_[0].w, bloom_[0].h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels);
+    const uint32_t columns = bloom_[kBloomLevels - 1].w;
+    ae_columns_rt_ = target(columns, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 3 * kBloomLevels + 1);
+    post_ldr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 2);
+    const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    ae_fence_ = {};
+}
+
+// Auto exposure: autoexposure_sample_columns writes, per column of the 1/16 bloom level, the
+// centre-weighted sums of log2 luminance, luminance and weight over 22 rows; the engine reduces
+// them on the CPU. The columns were sampled with 1 / exposure (extern 38 +0xC0.z), so the average
+// is the scene's luminance before exposure. Read back a frame or two late (the oldest finished copy).
+void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
+    const bool automatic = p.post && p.auto_exposure && ae_columns_.loaded() && bloom_initial_.loaded() && bloom_down_.loaded();
+    if (!automatic) {
+        ae_valid_ = false;
+        exposure_ = p.exposure;
+        return;
+    }
+    const uint64_t done = gpu.completed();
+    int newest = -1;
+    for (uint64_t back = 1; back <= 2 && back <= ae_frame_; ++back) {
+        const size_t s = size_t((ae_frame_ - back) % ae_readback_.size());
+        if (ae_fence_[s] && ae_readback_[s] && done >= ae_fence_[s]) { newest = int(s); break; }
+    }
+    if (newest >= 0) {
+        ID3D12Resource* rb = ae_readback_[size_t(newest)].Get();
+        const uint32_t columns = uint32_t(ae_columns_rt_->GetDesc().Width);
+        float* v = nullptr;
+        const D3D12_RANGE range{0, size_t(columns) * 16};
+        double log_sum = 0, lin_sum = 0, weight = 0;
+        if (SUCCEEDED(rb->Map(0, &range, reinterpret_cast<void**>(&v)))) {
+            for (uint32_t c = 0; c < columns; ++c) {
+                log_sum += v[c * 4 + 0];
+                lin_sum += v[c * 4 + 1];
+                weight += v[c * 4 + 2];
+            }
+            const D3D12_RANGE none{0, 0};
+            rb->Unmap(0, &none);
+        }
+        ae_fence_[size_t(newest)] = 0;
+        if (weight > 1e-6 && std::isfinite(log_sum)) {
+            ae_luminance_ = float(std::exp2(log_sum / weight));
+            // Key and range: the channels autoexposure_max_stops (0x06) and its pair 0x05 (-3,
+            // named visual_expositing by the hash list: read as the minimum stops) bound the
+            // exposure; the key value is chosen.
+            const auto ch = [&](size_t i, float d) { return i < ext_.channels.size() ? ext_.channels[i][0] : d; };
+            const float lo = std::exp2(ch(0x05, -3)), hi = std::exp2(ch(0x06, 3));
+            constexpr float key = 0.18f;
+            const float target = std::clamp(key / std::max(ae_luminance_, 1e-6f), lo, hi);
+            if (!ae_valid_) ae_auto_ = target;
+            else {
+                const float dt = p.delta_time > 0 ? std::min(p.delta_time, 0.25f) : 1.0f / 60.0f;
+                const float rate = target < ae_auto_ ? 3.0f : 1.5f;  // darken faster than brighten
+                ae_auto_ = std::exp2(std::lerp(std::log2(ae_auto_), std::log2(target), 1 - std::exp(-rate * dt)));
+            }
+            ae_valid_ = true;
+        }
+    }
+    exposure_ = (ae_valid_ ? ae_auto_ : 1.0f) * p.exposure;
+}
+
+void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes) {
+    ID3D12Device* dev = gpu.device();
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    auto rtv = [&](uint32_t slot) { return D3D12_CPU_DESCRIPTOR_HANDLE{base.ptr + size_t(slot) * inc}; };
+    auto begin = [&](ID3D12Resource* r, uint32_t slot, uint32_t w, uint32_t h) {
+        Gpu::barrier(cl, r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const auto h_rtv = rtv(slot);
+        cl->OMSetRenderTargets(1, &h_rtv, FALSE, nullptr);
+        viewport(cl, w, h);
+    };
+    auto end = [&](ID3D12Resource* r) { Gpu::barrier(cl, r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); };
+    // The post passes read the lighting's externs (frame, view) plus their own blocks.
+    auto& e = ext_;
+    if (!e.zero_policy(kScreenArea)) e.zero_when_missing(kScreenArea, "screen_area value not set by nim: zero");
+    if (!e.zero_policy(ext::Postprocess)) e.zero_when_missing(ext::Postprocess, "postprocess value not set by nim: zero");
+    if (!e.zero_policy(kMotion)) e.zero_when_missing(kMotion, "no motion vectors (static camera): zero");
+    const uint8_t pp = ext::Postprocess;
+    constexpr std::string_view engine = "engine post setting (not in game data)";
+
+    const bool pyramid = bloom_initial_.loaded() && bloom_down_.loaded();
+    const bool bloom = p.bloom && pyramid && bloom_blur_h_.loaded() && bloom_blur_v_.loaded() && bloom_add_.loaded() && bloom_copy_.loaded();
+    const bool automatic = p.auto_exposure && pyramid && ae_columns_.loaded();
+    if (bloom || automatic) {
+        // bloom_initial_downsample: a 2x2 box of the HDR at half resolution, scaled by the
+        // luminance curve x L^2 + y L + z (extern 38 +0xC0) with the luminance in .w; motion
+        // offsets (extern 0x38) off.
+        const auto& l0 = bloom_[0];
+        e.set_texture(pp, 0x00, hdr_.Get());
+        e.set(pp, 0x60, size4(w_, h_));
+        e.set(pp, 0xC0, float4{0, 0, 1, 0});
+        ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1 (no threshold)", engine);
+        begin(l0.down.Get(), 0, l0.w, l0.h);
+        bloom_initial_.draw(gpu, cl, e, scopes);
+        end(l0.down.Get());
+        for (int i = 1; i < kBloomLevels; ++i) {
+            const auto& src = bloom_[size_t(i - 1)];
+            const auto& dst = bloom_[size_t(i)];
+            e.set_texture(pp, 0x00, src.down.Get());
+            e.set(pp, 0x60, size4(src.w, src.h));
+            e.set(pp, 0x50, size4(dst.w, dst.h));
+            e.set(pp, 0xC0, float4{0, 0, 0, 0});  // .x: source mip
+            begin(dst.down.Get(), uint32_t(3 * i), dst.w, dst.h);
+            bloom_down_.draw(gpu, cl, e, scopes);
+            end(dst.down.Get());
+        }
+    }
+    if (automatic) {
+        const auto& last = bloom_[kBloomLevels - 1];
+        e.set_texture(pp, 0x00, last.down.Get());
+        e.set(pp, 0x50, size4(last.w, 1));
+        e.set(pp, 0xC0, float4{0, 0, 1.0f / std::max(exposure_, 1e-6f), 0});
+        begin(ae_columns_rt_.Get(), 3 * kBloomLevels + 1, last.w, 1);
+        ae_columns_.draw(gpu, cl, e, scopes);
+        end(ae_columns_rt_.Get());
+        const size_t slot = size_t(ae_frame_ % ae_readback_.size());
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        const auto desc = ae_columns_rt_->GetDesc();
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
+        Gpu::barrier(cl, ae_columns_rt_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst{ae_readback_[slot].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        dst.PlacedFootprint = fp;
+        D3D12_TEXTURE_COPY_LOCATION src{ae_columns_rt_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Gpu::barrier(cl, ae_columns_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ae_fence_[slot] = gpu.pending_fence();
+        ++ae_frame_;
+        ext_.note_estimate("auto exposure: key 0.18 over the centre-weighted log average, clamped to 2^ch05..2^ch06, adapting 3 / 1.5 per s",
+                           "engine auto exposure settings (not in game data); the columns pass is the game's");
+    }
+    ID3D12Resource* bloom_tex = black_.Get();
+    if (bloom) {
+        // Up the pyramid: blur the smallest level, then at each finer level weighted_add the
+        // blurred coarser result to it and blur again (gaussian_10 with the engine's cb11 kernel).
+        auto blur = [&](const BloomLevel& l, uint32_t level) {
+            for (bool vertical : {false, true}) {
+                const auto cb = blur_scope(l.w, l.h, vertical, 2.0f);
+                auto a = gpu.dynamic(cb.size() * sizeof(float4));
+                std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+                const ScopeBufferFn blur_scopes = [&, va = a.gpu](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+                    return reg == 11 ? va : scopes(stage, reg);
+                };
+                ID3D12Resource* src = vertical ? l.blur.Get() : l.sum.Get();
+                ID3D12Resource* dst = vertical ? l.sum.Get() : l.blur.Get();
+                const std::pair<uint32_t, ID3D12Resource*> tex[] = {{0, src}};
+                begin(dst, 3 * level + (vertical ? 2 : 1), l.w, l.h);
+                (vertical ? bloom_blur_v_ : bloom_blur_h_).draw(gpu, cl, e, blur_scopes, std::span(tex));
+                end(dst);
+            }
+        };
+        // The smallest level's sum starts as its downsample.
+        {
+            const auto& l = bloom_[kBloomLevels - 1];
+            e.set_texture(pp, 0x00, l.down.Get());
+            e.set(pp, 0x50, size4(l.w, l.h));
+            e.set(pp, 0xC0, float4{1, 1, 1, 1});
+            begin(l.sum.Get(), 3 * (kBloomLevels - 1) + 2, l.w, l.h);
+            bloom_copy_.draw(gpu, cl, e, scopes);
+            end(l.sum.Get());
+            blur(l, kBloomLevels - 1);
+        }
+        for (int i = kBloomLevels - 2; i >= 0; --i) {
+            const auto& l = bloom_[size_t(i)];
+            e.set_texture(pp, 0x00, bloom_[size_t(i + 1)].sum.Get());
+            e.set_texture(pp, 0x08, l.down.Get());
+            e.set(pp, 0xC0, float4{0.5f, 0.5f, 0.5f, 0.5f});
+            e.set(pp, 0xD0, float4{0.5f, 0.5f, 0.5f, 0.5f});
+            e.set(pp, 0xE0, float4{1, 1, 0, 0});
+            e.set(pp, 0xF0, float4{1, 1, 0, 0});
+            e.set(pp, 0x50, size4(l.w, l.h));
+            begin(l.sum.Get(), uint32_t(3 * i + 2), l.w, l.h);
+            bloom_add_.draw(gpu, cl, e, scopes);
+            end(l.sum.Get());
+            blur(l, uint32_t(i));
+        }
+        // The final bloom buffer: copy_texture_bilinear with the bloom strength.
+        constexpr float strength = 0.04f;
+        const auto& l0 = bloom_[0];
+        e.set_texture(pp, 0x00, l0.sum.Get());
+        e.set(pp, 0x50, size4(l0.w, l0.h));
+        e.set(pp, 0xC0, float4{strength, strength, strength, strength});
+        begin(bloom_final_.Get(), 3 * kBloomLevels, l0.w, l0.h);
+        bloom_copy_.draw(gpu, cl, e, scopes);
+        end(bloom_final_.Get());
+        bloom_tex = bloom_final_.Get();
+        ext_.note_estimate("bloom: 4 levels (1/2..1/16), gaussian sigma 2 texels, weighted_add 0.5 / 0.5, strength 0.04 added after the tonemap",
+                           "engine bloom settings and kernel (postprocess scope cb11) not in game data; structure from a Destiny 2 frame");
+    }
+
+    // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
+    // LUT at +0x30, then out = LUT * t2 (+0x58) + t1 (+0x50).
+    e.set_texture(kScreenArea, 0x00, hdr_.Get());
+    e.set_texture(kScreenArea, 0x30, grading_lut_.Get());
+    e.set_texture(kScreenArea, 0x38, grading_lut_.Get());
+    e.set_texture(kScreenArea, 0x50, bloom_tex);
+    e.set_texture(kScreenArea, 0x58, unshadowed_.Get());
+    e.set(kScreenArea, 0x90, float4{32, 0, 0, 0});
+    e.set(kScreenArea, 0x170, float4{0, 1, 0, 0});  // chromatic aberration ramps (none)
+    e.set(kScreenArea, 0x180, float4{0, 1, 0, 0});
+    e.set(kScreenArea, 0x190, float4{1, 1, 0, 0});
+    e.set(kScreenArea, 0x1A0, 4.0f);
+    ext_.note_estimate("tonemap: screen_area_global_lut3d mode 4 (the curve whose constants the technique carries), hue / highlight options 0, no chromatic aberration",
+                       "engine screen_area settings (extern 0x1E) not in game data");
+    ext_.note_estimate("grading: identity 32^3 LUT (color_grading_fill with no layers, identity matrix)",
+                       "grading layer data (scope color_grading_ubershader) source not found");
+    ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
+    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const bool aa = p.antialias && post_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    if (!aa) {
+        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        viewport(cl, w_, h_);
+        post_tonemap_.draw(gpu, cl, e, scopes);
+    } else {
+        // Tonemap into the fxaa input (colour, then its luma into alpha), then fxaa into lit.
+        const auto ldr_rtv = rtv(3 * kBloomLevels + 2);
+        Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
+        viewport(cl, w_, h_);
+        post_tonemap_.draw(gpu, cl, e, scopes);
+        const D3D12_CPU_DESCRIPTOR_HANDLE both[2] = {gb.lit_rtv, ldr_rtv};
+        cl->OMSetRenderTargets(2, both, FALSE, nullptr);
+        post_luma_.draw(gpu, cl, e, scopes);
+        Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        // Extern 0x33: the input at +0x00; at +0x50..+0x58 FXAA 3.11's subpixel amount, edge threshold and
+        // minimum edge threshold (cb0[3..5].x).
+        constexpr uint8_t kAntialias = 0x33;
+        e.set_texture(kAntialias, 0x00, post_ldr_.Get());
+        e.set(kAntialias, 0x50, 0.75f);
+        e.set(kAntialias, 0x54, 0.166f);
+        e.set(kAntialias, 0x58, 0.0833f);
+        ext_.note_estimate("fxaa: subpixel 0.75, edge threshold 0.166, minimum 0.0833 (extern 0x33 +0x50..+0x58)",
+                           "engine anti-aliasing settings not in game data: the FXAA 3.11 quality defaults");
+        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        fxaa_.draw(gpu, cl, e, scopes);
+    }
+    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+} // namespace nim

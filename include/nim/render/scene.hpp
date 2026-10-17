@@ -253,6 +253,9 @@ public:
     // Global channel values set by the map's world channel controllers (weather), by index:
     // replace the render-globals defaults' x for the materials.
     void set_global_channels(std::map<uint32_t, float> values) { global_overrides_ = std::move(values); }
+    // All global channels (GameLighting::update_global_channels: the map environment), replacing
+    // the render-globals defaults; empty restores them.
+    void set_global_channel_values(std::vector<float4> values) { global_values_ = std::move(values); }
     // Transparent parts (render stage 8), blended into the HDR target `rtv` (R16G16B16A16_FLOAT)
     // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
@@ -265,6 +268,8 @@ public:
     size_t transparent_count() const { return transparent_count_; }
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
+    // The engine exposure scale (extern 1 +0x1C) the emissive materials read: GameLighting::exposure().
+    void set_exposure(float scale) { material_exposure_ = scale; }
     void set_render_inputs(const ExternStore& inputs);
     size_t item_count() const { return items_.size(); }
     void set_channels(const ChannelValues& values) { channel_overrides_ = values; }
@@ -326,10 +331,11 @@ private:
     std::unique_ptr<ExternStore> material_externs_;
     std::vector<float4> global_base_;               // the materials' global channels before overrides
     std::map<uint32_t, float> global_overrides_;
+    std::vector<float4> global_values_;
     const RainOcclusion* rain_ = nullptr;
     ChannelValues channel_overrides_;
     ChannelValues channel_defaults_;
-    float material_time_ = 0, material_delta_ = 0;
+    float material_time_ = 0, material_delta_ = 0, material_exposure_ = 1;
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
     size_t transparent_count_ = 0;
@@ -421,10 +427,20 @@ struct LightingParams {
     // the map's own; the sun then follows the map's sun path instead of sun_azimuth/elevation.
     bool atmosphere = true;
     float time_of_day = -1.0f;
+    // The map environment (its global channel expressions: sun, ambient, fog over the day) with the atmosphere.
+    bool environment = true;
     // Screen-space ambient occlusion with the game's hdao pass (game lighting only).
     bool ssao = true;
     // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.
     bool volumetrics = true;
+    // Post-processing (game lighting only): bloom, auto exposure and the engine's tonemap /
+    // grading pass (screen_area_global_lut3d) instead of final_combine. `exposure` then scales the
+    // auto exposure (as a compensation); without auto exposure it is the exposure itself.
+    bool post = true;
+    bool auto_exposure = true;
+    bool bloom = true;
+    // Anti-aliasing with the engine's fxaa pass over the tonemapped image (with post only).
+    bool antialias = true;
 };
 
 class LightingPass {

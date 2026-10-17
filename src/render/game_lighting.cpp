@@ -298,6 +298,7 @@ void ExternStore::estimate_texture(uint8_t id, uint32_t off, ID3D12Resource* r, 
 
 void ExternStore::estimate_frame_constants(const std::array<float4, 16>& constants, std::string_view why) {
     set_frame_constants(constants);
+    frame_estimated_ = true;
     note_estimate("frame cb13 (exposure, temporal seeds)", why);
 }
 
@@ -523,6 +524,9 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
         bl.BlendOp = D3D12_BLEND_OP_ADD;
         bl.SrcBlendAlpha = bl.DestBlendAlpha = D3D12_BLEND_ONE;
         bl.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    } else if (!opt.write_masks.empty()) {
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        for (size_t r = 0; r < opt.write_masks.size() && r < 8; ++r) pd.BlendState.RenderTarget[r].RenderTargetWriteMask = opt.write_masks[r];
     }
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -563,6 +567,13 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
     execute(gpu, cl, ext, scopes, validated, 0, 0, 0);
 }
 
+void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                        std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures) {
+    if (compute_) throw std::runtime_error("Compute pipeline requires original dispatch dimensions");
+    const Geometry g{nullptr, nullptr, nullptr, 0, ps_textures};
+    execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                                const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
                                uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures) {
@@ -592,7 +603,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     cl->SetPipelineState(pso_.Get());
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
     cl->SetDescriptorHeaps(1, heaps);
-    if (geometry) {
+    if (geometry && geometry->vbv) {
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cl->IASetVertexBuffers(0, 1, geometry->vbv);
         cl->IASetIndexBuffer(geometry->ibv);
@@ -621,11 +632,12 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             uint32_t stride = 0, elements = 0;
             uint64_t first_element = 0;
             if (auto it = st.static_textures.find(s); it != st.static_textures.end()) r = it->second.Get();
+            bool engine_bound = false;  // a view the caller binds wins over the TFX's extern
             if (geometry && st.which == ShaderStage::Pixel)
                 for (const auto& [slot, res] : geometry->ps_textures)
-                    if (slot == s) r = res;
+                    if (slot == s) r = res, engine_bound = true;
             for (const auto& et : textures) {
-                if (et.slot != s) continue;
+                if (et.slot != s || engine_bound) continue;
                 const uint32_t bo = uint32_t(et.offset) * 8;
                 auto t = ext.texture(et.extern_id, bo);
                 r = t.resource;
@@ -643,6 +655,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 write_null_srv(dev, kind, gpu.srv().cpu(base + off + s));
                 continue;
             }
+            if (!r) throw std::runtime_error(std::format("{}: missing t{}; no replacement is permitted", st.tfx.shader.str(), s));
             write_game_srv(dev, {r, fmt, stride, elements, first_element}, kind, gpu.srv().cpu(base + off + s));
         }
         if (st.table_param >= 0) {
@@ -662,7 +675,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         off += st.srv_count + st.uav_count;
     }
     if (compute_) cl->Dispatch(x, y, z);
-    else if (geometry) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
+    else if (geometry && geometry->vbv) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
     else cl->DrawInstanced(4, 1, 0, 0);
 }
 
@@ -893,6 +906,7 @@ void GameLighting::release(Gpu& gpu) {
     ao_.Reset();
     linear_depth_.Reset();
     final_combine_.release(gpu);
+    release_post(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
@@ -1059,6 +1073,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 9};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
+    load_post(pm, gpu, scopes);
     gpu.flush();
 }
 
@@ -1109,6 +1124,7 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     gpu.device()->CreateRenderTargetView(sky_far_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 8 * inc});
     w_ = w;
     h_ = h;
+    resize_post(gpu, w, h);
 }
 
 std::array<float4, 16> frame_constants(float, float, const ExternStore& ext) {
@@ -1143,7 +1159,8 @@ void estimate_engine_frame(ExternStore& ext, float t, float dt) {
     // shading-pass terms. Engine values unknown: full Lambert, no wrap, full scale.
     if (!ext.has(ext::Frame, 0x240, 16)) ext.estimate(ext::Frame, 0x240, float4{1, 1, 0, 1}, "deferred diffuse weights (meaning read from the light PS, value chosen)");
     if (!ext.zero_policy(ext::Frame)) ext.zero_when_missing(ext::Frame, "engine frame value with no known meaning: zero");
-    if (ext.has_frame_constants()) return;
+    // Constants a caller supplied are kept; the estimate follows time and exposure every frame.
+    if (ext.has_frame_constants() && !ext.frame_constants_estimated()) return;
     std::array<float4, 16> f{};
     const float es = ext.get_f(ext::Frame, 0x1C), ir = ext.get_f(ext::Frame, 0x28);
     f[0] = {t, t, dt > 0 ? dt : 1.0f / 60.0f, ext.get_f(ext::Frame, 0x18)};
@@ -1221,7 +1238,17 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set(ext::Frame, 0x00, p.time);
     ext_.set(ext::Frame, 0x04, p.time);
     ext_.set(ext::Frame, 0x14, p.delta_time);
+    // exposure_scale: the auto exposure (post) times the viewer's compensation.
+    ext_.set(ext::Frame, 0x1C, exposure_);
     estimate_engine_frame(ext_, p.time, p.delta_time);
+    // +0x10: the time of day in days (goriath: time_of_day / 3600 s); the shading fog reads the
+    // density LUT's time column with it.
+    if (atm_.valid) ext_.set(ext::Frame, 0x10, p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time);
+    else {
+        ext_.set(ext::Frame, 0x10, 0.5f);
+        ext_.note_estimate("extern 1 +0x10 = 0.5", "time of day without a map: noon");
+    }
+    update_global_channels(p);
     fill_atmosphere(p);
     if (!ext_.texture(ext::Atmosphere, 0x108).resource)
         ext_.estimate_texture(ext::Atmosphere, 0x108, no_atmosphere_.Get(),
@@ -1270,18 +1297,12 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     constexpr std::string_view chosen = "meaning reverse-engineered, value chosen (v0.3.1)";
     ext_.estimate(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0}, chosen);  // hemisphere axis
     ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, 1, 0, 0}, chosen);  // light-buffer occlusion
-    // The viewer overwrites some global channels below; start from the defaults and the weather.
-    auto restore_channel = [&](size_t i) {
-        if (i >= ext_.channels.size() || i >= globals_.channel_defaults.size()) return;
-        ext_.channels[i] = globals_.channel_defaults[i];
-        if (auto it = global_overrides_.find(uint32_t(i)); it != global_overrides_.end()) ext_.channels[i][0] = it->second;
-    };
+    // The global channels were reset this frame (update_global_channels).
     if (atm_.valid && p.atmosphere) {
         // A map: the sun and the hemisphere ambient are the global channels (sun_color x
         // sun_intensity, up / down_ambient_color x intensity, their sharpness), in the order the
         // shading reads GlobalLighting; the ambient is then scaled by global_ambient_intensity
         // (ch 0x82) in the shading pass, and the map's diffuse probes (cubemap volumes) do the rest.
-        for (size_t i : {0x1Du, 0x1Eu, 0x21u, 0x22u, 0x23u, 0x24u, 0x82u}) restore_channel(i);
         auto ch = [&](uint32_t i) { return i < ext_.channels.size() ? ext_.channels[i] : float4{}; };
         auto scaled = [](float4 c, float k) { return float4{c[0] * k, c[1] * k, c[2] * k, 0}; };
         constexpr std::string_view from_channels = "global channels copied into GlobalLighting (order matches; engine copy code not data)";
@@ -1319,6 +1340,39 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.zero_when_missing(ext::GlobalLighting, "global lighting value with no known meaning: zero");
 }
 
+const std::vector<float4>& GameLighting::update_global_channels(const LightingParams& p) {
+    ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
+    env_channels_ = 0;
+    if (atm_.valid && p.atmosphere && p.environment && !atm_.data.channel_expressions.empty()) {
+        // The sequencer inputs: 0 is the time of day (0..1, Alkahest: time_of_day / 3600); 1 is
+        // read by the fog density and a few weather-like channels, source unknown.
+        const float t = p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time;
+        bool input1 = false;
+        TfxEnvironment env;
+        env.sequencer_input = [&](uint8_t i) -> float4 {
+            if (i == 0) return {t, t, t, t};
+            if (i == 1) {
+                input1 = true;
+                return {};
+            }
+            throw std::runtime_error(std::format("sequencer input {} has no known source", i));
+        };
+        for (const auto& x : atm_.data.channel_expressions) {
+            const auto it = std::find(ext_.channel_ids.begin(), ext_.channel_ids.end(), x.channel);
+            if (it == ext_.channel_ids.end()) continue;  // not a render-globals channel (object / unnamed)
+            const size_t slot = size_t(it - ext_.channel_ids.begin());
+            if (slot >= ext_.channels.size()) continue;
+            run_tfx(x.bytecode, x.constants, std::span(ext_.channels).subspan(slot), env);
+            ++env_channels_;
+        }
+        if (input1)
+            ext_.note_estimate("map environment sequencer input 1 = 0", "read by the fog density curves; its engine source is not found");
+    }
+    for (const auto& [slot, v] : global_overrides_)
+        if (slot < ext_.channels.size()) ext_.channels[slot][0] = v;
+    return ext_.channels;
+}
+
 void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) {
     for (const auto& [slot, v] : global_overrides_)
         if (slot < ext_.channels.size() && slot < globals_.channel_defaults.size()) ext_.channels[slot] = globals_.channel_defaults[slot];
@@ -1332,6 +1386,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
     const bool shadowed = shadow && shadow->valid && shadow->depth;
+    update_exposure(gpu, p);
     fill_externs(gb, vm, p, shadowed);
     // Validate every dependency before recording any render-target transitions.
     const auto frame = ext_.frame_constants();
@@ -1351,7 +1406,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
     const bool atmosphere = atm_.valid && p.atmosphere;
     shading_.validate(ext_, scopes);
-    final_combine_.validate(ext_, scopes);
+    const bool post = p.post && post_tonemap_.loaded();
+    if (!post) final_combine_.validate(ext_, scopes);
     if (atmosphere) sky_.validate(ext_, scopes);
     // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal
     // histories) is not yet decoded. Its outputs must be supplied by their real producers.
@@ -1498,10 +1554,14 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
-    final_combine_.draw(gpu, cl, ext_, scopes, true);
-    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (post) {
+        render_post(gpu, cl, gb, p, scopes);
+    } else {
+        Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        final_combine_.draw(gpu, cl, ext_, scopes, true);
+        Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1592,8 +1652,11 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     est(0x170, 1.0f, chosen);  // in-scatter / sky scale
     est(0x174, ch(0x0F)[0], copied);  // fog_density (per km)
     const float lut_start = ch(0x10)[0], lut_end = ch(0x11)[0];
-    est(0x178, lut_start, copied);
-    est(0x17C, lut_end > lut_start ? lut_end : lut_start + 1, "fog_density_lookup_end (start + 1 when unset: avoids 0/0)");
+    // The lookup range is in km (the shading pass scales metres: its fog colour blend runs over
+    // ch 0x27 = 10000 m, and a 5..10 m range would put the far end of the LUT 10 m away).
+    constexpr std::string_view km = "fog_density_lookup_start / _end in km, the pass reads metres";
+    est(0x178, lut_start * 1000.0f, km);
+    est(0x17C, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f, "fog_density_lookup_end in km (start + 1 when unset: avoids 0/0)");
     est(0x188, ch(0x15)[0], copied);  // fog_height_falloff
     est(0x18C, ch(0x14)[0], copied);  // fog_start_height
     est(0x1A4, ch(0x18)[0], copied);  // layered_fog_density

@@ -36,7 +36,7 @@ OpInfo op_info(uint8_t op) {
     case 0x42: return {"push_const", 2}; case 0x43: return {"lerp_const", 2};
     case 0x44: return {"lerp_const_sat", 2}; case 0x45: return {"spline4_const", 2};
     case 0x46: return {"spline8_const", 2}; case 0x47: return {"spline8_chain_const", 2};
-    case 0x48: return {"gradient4_const", 2}; case 0x49: return {"unk49", 2};
+    case 0x48: return {"gradient4_const", 2}; case 0x49: return {"gradient8_const", 2};
     case 0x4A: return {"push_extern_float", 3}; case 0x4B: return {"push_extern_vec4", 3};
     case 0x4C: return {"push_extern_mat4", 3}; case 0x4D: return {"push_extern_texview", 3};
     case 0x4E: return {"push_extern_u32", 3}; case 0x4F: return {"push_extern_uav", 3};
@@ -133,6 +133,23 @@ float4 gradient4(float4 x, const float4* k) {  // base, r, g, b, a, thresholds
         for (int i = 0; i < 4; ++i) r[ch] += k[1 + ch][i] * pct[i];
     return r;
 }
+// Eight-stop gradient (goriath bytecode_op_unk3b_const): base k0, per-channel deltas k1..k4 for
+// stops 0..3 and k5..k8 for stops 4..7, thresholds k9 (0..3) and k10 (4..7); the last segment ends
+// at 1, and a segment narrower than 1e-4 is a step.
+float4 gradient8(float4 x, const float4* k) {
+    float t[9];
+    for (int i = 0; i < 4; ++i) t[i] = k[9][i], t[4 + i] = k[10][i];
+    t[8] = 1.0f;
+    float w[8];
+    for (int i = 0; i < 8; ++i) {
+        const float off = x[i & 3] - t[i], seg = t[i + 1] - t[i];
+        w[i] = std::clamp(std::fabs(seg) > 1e-4f ? off / seg : (off >= 0 ? 1.0f : 0.0f), 0.0f, 1.0f);
+    }
+    float4 r = k[0];
+    for (int ch = 0; ch < 4; ++ch)
+        for (int i = 0; i < 4; ++i) r[ch] += k[1 + ch][i] * w[i] + k[5 + ch][i] * w[4 + i];
+    return r;
+}
 
 class Vm {
 public:
@@ -222,9 +239,16 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         throw std::runtime_error(std::format("TFX: unimplemented opcode {} (substitution is disabled)", name));
     };
 
+    // The sequencer (global channel expressions) shares the opcodes up to 0x49 and has its own
+    // two-byte 0x4A (push input n) and 0x4C (pop to output n).
+    const bool sequencer = bool(env.sequencer_input);
     for (size_t ip = 0; ip < bc.size();) {
         const uint8_t op = bc[ip];
         auto [name, size] = op_info(op);
+        if (sequencer && op > 0x49 && op < 0x80) {
+            name = op == 0x4A ? "push_input" : op == 0x4C ? "pop_output" : nullptr;
+            size = 2;
+        }
         if (!name) throw std::runtime_error(std::format("TFX: unknown opcode {:02X} at {:04X}", op, ip));
         if (ip + size > bc.size()) throw std::runtime_error("TFX: truncated instruction");
         const uint8_t a1 = size > 1 ? bc[ip + 1] : 0, a2 = size > 2 ? bc[ip + 2] : 0;
@@ -232,7 +256,23 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         if ((op >= 0x4A && op <= 0x4F) || op == 0x62 || op == 0x69) res.live_inputs = true;
         if (op == 0x80) break;
 
+        if (sequencer && op == 0x4A) {
+            vm.push(env.sequencer_input(a1));
+            ip += size;
+            continue;
+        }
+        if (sequencer && op == 0x4C) {
+            vm.output(a1) = vm.pop();
+            ip += size;
+            continue;
+        }
         switch (op) {
+        case 0x49: {
+            float4 k[11];
+            for (int i = 0; i < 11; ++i) k[i] = vm.konst(a1 + size_t(i));
+            vm.top() = gradient8(vm.top(), k);
+            break;
+        }
         case 0x01: case 0x06: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x + y; }); }); break;
         case 0x02: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x - y; }); }); break;
         case 0x03: case 0x05: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x * y; }); }); break;

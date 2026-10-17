@@ -18,6 +18,9 @@ struct TfxEnvironment {
     std::function<float4(uint32_t hash)> object_channel;
     std::function<float4(uint8_t texture)> texture_tiling;  // push_tex_tiling (streaming state)
     std::function<float4(uint8_t texture)> texture_layer_count;  // push_tex_layer_count
+    // Set: run as the sequencer VM (global channel expressions), whose 0x4A n pushes input n
+    // (0 = time of day, 0..1) and 0x4C n pops to output n.
+    std::function<float4(uint8_t input)> sequencer_input;
 };
 
 struct TfxExternTexture {

@@ -1592,8 +1592,13 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     ext.set(ext::Frame, 0x00, material_time_);
     ext.set(ext::Frame, 0x04, material_time_);
     ext.set(ext::Frame, 0x14, material_delta_);
+    ext.set(ext::Frame, 0x1C, material_exposure_);
     estimate_engine_frame(ext, material_time_, material_delta_);
-    if (!global_overrides_.empty() || ext.channels.size() != global_base_.size()) {
+    if (global_values_.size() == global_base_.size() && !global_values_.empty()) {
+        ext.channels = global_values_;
+        for (const auto& [slot, v] : global_overrides_)
+            if (slot < ext.channels.size()) ext.channels[slot][0] = v;
+    } else if (!global_overrides_.empty() || ext.channels.size() != global_base_.size() || ext.channels != global_base_) {
         if (!global_base_.empty()) ext.channels = global_base_;
         for (const auto& [slot, v] : global_overrides_)
             if (slot < ext.channels.size()) ext.channels[slot][0] = v;

@@ -68,7 +68,7 @@ int run(int argc, char** argv) {
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
     float time_of_day = -1;
-    bool no_atmosphere = false;
+    bool no_atmosphere = false, no_environment = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     float clip_frame = 0;
     float material_time = 0;
@@ -80,6 +80,8 @@ int run(int argc, char** argv) {
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false;
     bool no_ssao = false, no_volumetrics = false;
+    bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false;
+    float exposure_arg = 1;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -96,6 +98,11 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
+        else if (args[i] == "--no-post") no_post = true;
+        else if (args[i] == "--no-auto-exposure") no_auto_exposure = true;
+        else if (args[i] == "--no-bloom") no_bloom = true;
+        else if (args[i] == "--no-aa") no_aa = true;
+        else if (args[i] == "--exposure" && i + 1 < args.size()) exposure_arg = std::stof(args[++i]);
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
@@ -115,6 +122,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--reference") reference = true;
         else if (args[i] == "--time-of-day" && i + 1 < args.size()) time_of_day = std::stof(args[++i]);
         else if (args[i] == "--no-atmosphere") no_atmosphere = true;
+        else if (args[i] == "--no-environment") no_environment = true;
+        else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
@@ -133,7 +142,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--print-channels] [--no-aa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -356,7 +365,13 @@ int run(int argc, char** argv) {
     lp.ssao = !no_ssao;
     lp.volumetrics = !no_volumetrics;
     lp.atmosphere = !no_atmosphere;
+    lp.environment = !no_environment;
     lp.time_of_day = time_of_day;
+    lp.post = !no_post;
+    lp.auto_exposure = !no_auto_exposure;
+    lp.bloom = !no_bloom;
+    lp.antialias = !no_aa;
+    lp.exposure = exposure_arg;
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
         if (!shadows) return;
         shadow.fit_view(sun_direction(p, atmosphere.valid() ? &atmosphere : nullptr), vm.eye, scene.center(), scene.center(), scene.radius());
@@ -407,8 +422,32 @@ int run(int argc, char** argv) {
             for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
         }
         for (const auto& n : gl.notes()) std::println("  {}", n);
+        // The materials read the same global channels as the lighting (the map environment).
+        scene.set_global_channel_values(gl.update_global_channels(lp));
+        if (gl.environment_channels()) {
+            std::println("map environment: {} global channels at time of day {:.3f}", gl.environment_channels(),
+                         lp.time_of_day >= 0 ? lp.time_of_day : gl.default_time_of_day());
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+        }
+        if (print_channels) {
+            const auto& ch = gl.externs().channels;
+            const auto& ids = gl.externs().channel_ids;
+            for (size_t i = 0; i < ch.size(); ++i)
+                std::println("  channel {:02X} {:08X} = ({:.4g}, {:.4g}, {:.4g}, {:.4g})", i, i < ids.size() ? ids[i] : 0u,
+                             ch[i][0], ch[i][1], ch[i][2], ch[i][3]);
+        }
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
+        // Auto exposure is read back from the previous frame: render again until it has settled
+        // (the first measurement is taken as is), with the materials at the same exposure.
+        for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
+            scene.set_exposure(gl.exposure());
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gpu.flush();
+        }
+        if (lp.post && gl.post_ready())
+            std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
         if (lp.ssao && gl.ambient_occlusion()) {
             auto px = gpu.read_texture(gl.ambient_occlusion(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
             const uint16_t* hv = reinterpret_cast<const uint16_t*>(px.data());

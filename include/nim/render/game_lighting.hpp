@@ -41,8 +41,9 @@ public:
     void set_channel(std::string_view name, float4 v);
     TfxEnvironment environment() const;
     // Engine-produced cb13, including its temporal seeds and exposure state.
-    void set_frame_constants(const std::array<float4, 16>& constants) { frame_ = constants; has_frame_ = true; }
+    void set_frame_constants(const std::array<float4, 16>& constants) { frame_ = constants; has_frame_ = true; frame_estimated_ = false; }
     bool has_frame_constants() const { return has_frame_; }
+    bool frame_constants_estimated() const { return frame_estimated_; }  // refreshed every frame
     bool has(uint8_t id, uint32_t byte_offset, uint32_t size) const;  // every byte supplied
     const std::array<float4, 16>& frame_constants() const;
     void require(uint8_t id, uint32_t offset, uint32_t size) const;
@@ -72,7 +73,7 @@ public:
 private:
     std::vector<uint8_t> data_, present_;
     std::array<float4, 16> frame_{};
-    bool has_frame_ = false;
+    bool has_frame_ = false, frame_estimated_ = false;
     std::map<uint32_t, std::vector<float4>> scopes_;
     std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> stage_scopes_;
     std::map<uint64_t, Tex> textures_;
@@ -114,6 +115,8 @@ public:
         D3D12_COMPARISON_FUNC depth_func = D3D12_COMPARISON_FUNC(0);
         // PS targets beyond the attachments are written to nothing (e.g. the sky's motion vectors).
         bool drop_extra_targets = false;
+        // Per-target write masks (D3D12_COLOR_WRITE_ENABLE_*), when not blending; empty = all.
+        std::vector<uint8_t> write_masks;
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -125,6 +128,10 @@ public:
     // render target, viewport and scissor.
     void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
               bool validated = false);
+    // With PS textures the engine binds itself (slots no TFX fills, e.g. a blur's source). Not
+    // validated: the caller supplies those slots.
+    void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+              std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
     // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
@@ -228,6 +235,11 @@ public:
     bool has_atmosphere() const { return atm_.valid; }
     const std::vector<std::string>& atmosphere_notes() const { return atm_notes_; }
     float default_time_of_day() const { return atm_.valid ? atm_.data.default_time : 0.5f; }
+    // The global channels for these parameters: the render-globals defaults, then (with the map's
+    // atmosphere on) the map environment's channel expressions at the time of day, then the
+    // weather. Runs every frame in render(); call it first to give the materials the same values.
+    const std::vector<float4>& update_global_channels(const LightingParams& p);
+    size_t environment_channels() const { return env_channels_; }  // channels the map environment set
     // The sun direction (toward the sun) for these parameters: the map's sun path with an atmosphere.
     V3 sun_toward(const LightingParams& p) const { return sun_direction(p, atm_.valid ? &atm_.data : nullptr); }
 
@@ -237,6 +249,11 @@ public:
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
     ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
+    // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
+    // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
+    float exposure() const { return exposure_; }
+    float scene_luminance() const { return ae_luminance_; }  // auto exposure's measured average (unexposed)
+    bool post_ready() const { return post_tonemap_.loaded(); }
 
 private:
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
@@ -246,6 +263,7 @@ private:
     Scope frame_scope_, view_scope_;
     ExternStore ext_;
     std::map<uint32_t, float> global_overrides_;
+    size_t env_channels_ = 0;
     GamePipeline shading_, final_combine_;
     // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
     GamePipeline hdao_, apply_ssao_;
@@ -337,6 +355,30 @@ private:
     size_t cubemaps_drawn_ = 0;
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // by tag, kept across maps
 
+    // Post-processing (docs/PROGRESS.md 3.5, src/render/game_post.cpp): the bloom pyramid
+    // (bloom_initial_downsample, downsample_block_2x2, gaussian_10 blurs, weighted_add), auto
+    // exposure (autoexposure_sample_columns read back to the CPU) and the tonemap / grading pass
+    // screen_area_global_lut3d into the 8-bit output.
+    void load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void resize_post(Gpu& gpu, uint32_t w, uint32_t h);
+    void release_post(Gpu& gpu);
+    void update_exposure(Gpu& gpu, const LightingParams& p);
+    void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes);
+    GamePipeline post_tonemap_, post_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_blur_h_, bloom_blur_v_, bloom_add_, bloom_copy_, ae_columns_;
+    static constexpr int kBloomLevels = 4;  // 1/2, 1/4, 1/8, 1/16
+    struct BloomLevel {
+        ComPtr<ID3D12Resource> down, blur, sum;  // downsampled, horizontal pass, result
+        uint32_t w = 0, h = 0;
+    };
+    std::array<BloomLevel, kBloomLevels> bloom_;
+    ComPtr<ID3D12Resource> post_ldr_;  // the tonemapped colour with its luma in alpha (the fxaa input)
+    ComPtr<ID3D12Resource> bloom_final_, ae_columns_rt_, grading_lut_, black_;
+    ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
+    std::array<ComPtr<ID3D12Resource>, 3> ae_readback_;
+    std::array<uint64_t, 3> ae_fence_{};
+    uint64_t ae_frame_ = 0;
+    float exposure_ = 1, ae_luminance_ = 0, ae_auto_ = 1;  // ae_auto_: the adapted auto exposure
+    bool ae_valid_ = false;
 };
 
 } // namespace nim

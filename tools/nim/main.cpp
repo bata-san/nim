@@ -1778,8 +1778,10 @@ public:
         const float material_dt = material_playing ? ImGui::GetIO().DeltaTime * material_speed : 0;
         material_time += material_dt;
         scene.set_material_frame(material_time, material_dt);
+        if (game_ready) scene.set_exposure(game_lighting.exposure());
         light.time = material_time;
         light.delta_time = material_dt;
+        if (game_ready) scene.set_global_channel_values(game_lighting.update_global_channels(light));
         ViewMatrices vm = make_view(current_view());
         try {
             SunShadow* shadow = nullptr;
@@ -2233,6 +2235,17 @@ public:
             ImGui::SetItemTooltip("ゲームの hdao と apply_ssao_to_light_buffers (調整値は推定)");
             ImGui::Checkbox("ライトシャフト", &light.volumetrics);
             ImGui::SetItemTooltip("ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)");
+            ImGui::Checkbox("ポストプロセス", &light.post);
+            ImGui::SetItemTooltip("ゲームの screen_area_global_lut3d (トーンマップ・グレーディング)。オフで final_combine");
+            ImGui::BeginDisabled(!light.post);
+            ImGui::Checkbox("自動露出", &light.auto_exposure);
+            ImGui::SetItemTooltip("autoexposure_sample_columns の読み戻し (キー値・適応速度は推定)。露出スライダーは補正");
+            ImGui::SameLine();
+            ImGui::Checkbox("ブルーム", &light.bloom);
+            ImGui::Checkbox("アンチエイリアス (FXAA)", &light.antialias);
+            ImGui::SetItemTooltip("ゲームの縮小・ガウスぼかし・加算パス (強さ・カーネルは推定)");
+            ImGui::EndDisabled();
+            if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("露出 %.3f", game_lighting.exposure());
             ImGui::ColorEdit3("太陽の色", &light.sun_color.x);
             ImGui::SliderFloat("空の強さ", &light.sky_intensity, 0, 4);
             ImGui::ColorEdit3("空 (天頂)", &light.sky_top.x);
@@ -2244,6 +2257,8 @@ public:
             ImGui::BeginDisabled(!game_lighting.has_atmosphere());
             ImGui::Checkbox("大気", &light.atmosphere);
             ImGui::SetItemTooltip("ゲームの sky_lookup_generate_near/far と sky。フォグ値はグローバルチャンネルの写し (推定)");
+            ImGui::Checkbox(std::format("マップ環境 ({} チャンネル)", game_lighting.environment_channels()).c_str(), &light.environment);
+            ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
             {
                 bool own = light.time_of_day < 0;
                 if (ImGui::Checkbox("マップの時刻", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
