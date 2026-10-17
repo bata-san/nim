@@ -164,6 +164,14 @@ int cmd_survey_entities(PackageManager& pm) {
     return 0;
 }
 
+// A texture's top mip (all slices / faces), raw, for inspection.
+int cmd_texraw(PackageManager& pm, TagHash h, const char* out) {
+    const Texture t = load_texture(pm, h);
+    std::println("{} format {} {}x{}x{} array {} mips {} bytes {}", h.str(), t.dxgi_format, t.width, t.height, t.depth, t.array_size, t.mip_count, t.data.size());
+    if (out) std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(t.data.data()), std::streamsize(t.data.size()));
+    return 0;
+}
+
 int cmd_read(PackageManager& pm, TagHash h, const char* out) {
     const Entry* e = pm.entry(h);
     if (!e) { std::println(stderr, "no such tag {}", h.str()); return 1; }
@@ -848,8 +856,13 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     size_t shadowing = 0;
     for (const auto& l : lights) ++techniques[l.technique.value], shadowing += l.shadowing;
     std::println("{} lights ({} shadowing), {} distinct lighting-apply techniques", lights.size(), shadowing, techniques.size());
-    for (size_t i = 0; i < lights.size() && i < 12; ++i) {
-        const auto& l = lights[i];
+    std::vector<const MapLight*> shown;
+    for (const auto& l : lights)
+        if (shown.size() < 8 && l.shadowing) shown.push_back(&l);
+    for (const auto& l : lights)
+        if (shown.size() < 12 && !l.shadowing) shown.push_back(&l);
+    for (const MapLight* lp : shown) {
+        const auto& l = *lp;
         std::println("  {} {} tech {} pos ({:.1f} {:.1f} {:.1f}) bounds ({:.1f} {:.1f} {:.1f})-({:.1f} {:.1f} {:.1f})", l.source.str(),
                      l.shadowing ? "S" : "C", l.technique.str(), l.node[12], l.node[13], l.node[14], l.lo[0], l.lo[1], l.lo[2], l.hi[0], l.hi[1], l.hi[2]);
     }
@@ -1484,6 +1497,7 @@ int main(int argc, char** argv) {
         if (cmd == "map-components" && args.size() >= 2)
             return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "weather" && args.size() >= 2) return cmd_weather(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "texraw" && args.size() >= 2) return cmd_texraw(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
         if (cmd == "nodes" && args.size() >= 2)

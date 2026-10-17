@@ -1,3 +1,5 @@
+> **Outdated in parts.** Current status and next steps: [PROGRESS.md](PROGRESS.md) (source of truth).
+
 # Renderer fidelity status
 
 The requested complete game renderer port is **not implemented**. Game DXIL and material TFX
