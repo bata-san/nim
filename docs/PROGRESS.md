@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-17 (マップ環境チャンネル・ポストプロセス・FXAA のコミット)
+最終更新: 2026-10-17 (TAA のコミット)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -18,7 +18,7 @@
 | 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
 | 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 完了 (不透明物) | 「Diffuse probes」コミット | §3.4。light_sample_* は透明物/パーティクル用で未 |
-| 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」コミット | §3.5。AE / bloom / トーンマップの設定値は推定 |
+| 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
@@ -174,7 +174,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   トーンマップは輝度を SV_Target1 に出すので、同じパイプラインをもう一度、target0 をマスク 0、target1 =
   入力テクスチャの A だけ書くマスクで描いて合成する。extern 0x33: +0x00 入力, +0x50/+0x54/+0x58 =
   subpix 0.75 / edge 0.166 / edge min 0.0833 (FXAA 既定値 = 推定)。他に smaa_*, cmaa_*, resolve_taa* もある
-  (TAA は前フレーム履歴・ジッター・モーションベクトルが要るので未)。nimshade `--no-aa`、GUI「アンチエイリアス」。
+  (TAA は §3.8)。nimshade `--no-aa`、GUI「アンチエイリアス」。
 
 ### 3.6 マップ環境 = グローバルチャンネル式 (実装済み)
 - 経路 (outpost 80AF9550): マップ → 80AE802C (8080A7BB) → hash64 → 80AF8EE3 (8080A7C1) → 80AF8EA7
@@ -225,6 +225,19 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - 残り: CTRL 建物の外壁の一部は屋内用ボリューム (中心 131.7, −38.1, −24.0、プローブ 18×18×8) の内側にあり、焼き込み値が
   0.01〜0.03 (端の列も暗い) なのでそこだけ暗い。データ通りの結果だが、ゲームでそう見えるかは未確認。
 
+### 3.8 TAA (実装済み, `src/render/game_post.cpp`)
+- `resolve_taa_use_clipping_use_ycocg` (80A74DA3, PS 80A74DA0, VS 80A7430D 全画面)。extern 0x6A: +0x00..+0x0C = cb0[3..6] 履歴の重み、
+  +0x10 = cb0[7] 輝度差の閾値、+0x18/+0x1C 入力サイズ (cb0[9])、+0x20/+0x24 解像度 (cb0[14] = これ / View サイズ)、
+  t0 = +0x48 履歴、t1 = +0x50 動きベクトル (G バッファ RT3)、t2 = +0x58 現フレーム、t3 = +0x60 デバイス深度。
+- PS: 3×3 で最も近い深度の画素の動きベクトルを取り、uv + mv で履歴を Catmull-Rom 9 タップ。現フレームの 3×3 を YCoCg の平均 ± 1.3σ
+  にクリップ。w = cb0[4] + (cb0[5] − cb0[4])·mv.z (クリップ前後の輝度差 ≤ cb0[7])、それ以外は lerp(cb0[3], cb0[6], saturate(|mv px|/50)^0.9)。
+  出力 = 現フレーム·(1 − w) + 履歴·w。画面端は w = 0。
+- **動きベクトルはゲームのシェーダーが書く**: G バッファ PS (例 80A65559) と sky PS が RT3.xy = 0.5·(ndc(View +0x3E0) − ndc(View +0x1A0))、
+  y 反転。つまり **View +0x3E0 = 前フレームのワールド → クリップ** (VS cb12[23..26], PS cb12[20..23])。nim は前フレームの行列に今のジッターを
+  入れて渡す (静止カメラで動き 0)。ジッターは射影の c[2] (NDC オフセット) に入れ、+0x120/+0x160 の視線行列からは差し引く。
+- nim の流れ: トーンマップ → post_ldr_ → resolve_taa (RGBA16F 履歴 2 枚を交互) → copy_texture_bilinear で lit。TAA 中は FXAA を使わない。
+  `GameLighting::temporal_view` が毎フレームのジッター付きビューを作る。nimshade は静止画を 16 フレーム回して収束させる (`--no-taa`)。GUI「TAA」。
+- 推定: 重み 0.92 / 棄却時 0.75〜0.5、輝度閾値 0.1、ジッター = Halton(2,3) 8 フレーム。未: 他の variant (distort)、sky の動きベクトル (捨てている)。
 ## 4. 既知の未解決・注意
 - `docs/RENDERING.md` の冒頭 (「未実装」「代替描画を削除」) は古い。現状はこの表が正。
 - エンティティ (2c12304) は nimshade のみ。GUI の MapWorker には未統合 (ギミックと一緒に後回し)。

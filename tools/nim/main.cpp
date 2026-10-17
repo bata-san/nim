@@ -1782,7 +1782,7 @@ public:
         light.time = material_time;
         light.delta_time = material_dt;
         if (game_ready) scene.set_global_channel_values(game_lighting.update_global_channels(light));
-        ViewMatrices vm = make_view(current_view());
+        ViewMatrices vm = game_ready && light.mode == ViewMode::Lit ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
         try {
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
@@ -2242,8 +2242,11 @@ public:
             ImGui::SetItemTooltip("autoexposure_sample_columns の読み戻し (キー値・適応速度は推定)。露出スライダーは補正");
             ImGui::SameLine();
             ImGui::Checkbox("ブルーム", &light.bloom);
-            ImGui::Checkbox("アンチエイリアス (FXAA)", &light.antialias);
             ImGui::SetItemTooltip("ゲームの縮小・ガウスぼかし・加算パス (強さ・カーネルは推定)");
+            ImGui::Checkbox("TAA", &light.temporal_aa);
+            ImGui::SetItemTooltip("ゲームの resolve_taa (ジッター + 動きベクトル + 履歴)。重み・ジッター列は推定。オンの間は FXAA の代わり");
+            ImGui::SameLine();
+            ImGui::Checkbox("FXAA", &light.antialias);
             ImGui::EndDisabled();
             if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("露出 %.3f", game_lighting.exposure());
             ImGui::ColorEdit3("太陽の色", &light.sun_color.x);

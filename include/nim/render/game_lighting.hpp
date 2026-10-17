@@ -254,6 +254,11 @@ public:
     float exposure() const { return exposure_; }
     float scene_luminance() const { return ae_luminance_; }  // auto exposure's measured average (unexposed)
     bool post_ready() const { return post_tonemap_.loaded(); }
+    // Temporal anti-aliasing: this frame's view, jittered by a sub-pixel offset when resolve_taa
+    // runs, with the previous frame's view (same jitter) for the G-buffer's motion vectors. Call
+    // once per rendered frame and use the result for the G-buffer and render().
+    ViewMatrices temporal_view(const View& v, const LightingParams& p);
+    bool temporal_aa_on(const LightingParams& p) const;
 
 private:
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
@@ -374,6 +379,15 @@ private:
     ComPtr<ID3D12Resource> post_ldr_;  // the tonemapped colour with its luma in alpha (the fxaa input)
     ComPtr<ID3D12Resource> bloom_final_, ae_columns_rt_, grading_lut_, black_;
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
+    // resolve_taa: two RGBA16F history targets (written / read alternately); copy_texture_bilinear
+    // puts the resolved frame into the 8-bit output.
+    GamePipeline taa_, taa_copy_;
+    std::array<ComPtr<ID3D12Resource>, 2> taa_history_;
+    uint32_t taa_current_ = 0;
+    uint64_t taa_index_ = 0;
+    bool taa_valid_ = false;       // the history holds the previous frame
+    View taa_prev_view_;
+    bool taa_prev_valid_ = false;
     std::array<ComPtr<ID3D12Resource>, 3> ae_readback_;
     std::array<uint64_t, 3> ae_fence_{};
     uint64_t ae_frame_ = 0;

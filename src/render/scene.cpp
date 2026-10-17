@@ -50,7 +50,8 @@ ViewMatrices make_view(const View& v) {
     M4 proj;  // reversed-Z, infinite far plane: depth = near / z
     proj.c[0] = {m.fx, 0, 0, 0};
     proj.c[1] = {0, m.fy, 0, 0};
-    proj.c[2] = {0, 0, 0, 1};
+    // The jitter moves the image by whole-NDC offsets: clip.w is the view depth.
+    proj.c[2] = {2 * v.jitter_x / float(std::max(1u, v.width)), -2 * v.jitter_y / float(std::max(1u, v.height)), 0, 1};
     proj.c[3] = {0, 0, v.near_z, 0};
     m.proj = proj;
     m.vp_rel = mul(proj, rot);
@@ -60,6 +61,7 @@ ViewMatrices make_view(const View& v) {
     tr.c[2] = {0, 0, 1, 0};
     tr.c[3] = {-v.eye.x, -v.eye.y, -v.eye.z, 1};
     m.vp_abs = mul(m.vp_rel, tr);
+    m.vp_prev = m.vp_abs;
     return m;
 }
 

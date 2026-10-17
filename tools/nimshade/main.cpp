@@ -80,7 +80,7 @@ int run(int argc, char** argv) {
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false;
     bool no_ssao = false, no_volumetrics = false;
-    bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false;
+    bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
@@ -102,6 +102,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-auto-exposure") no_auto_exposure = true;
         else if (args[i] == "--no-bloom") no_bloom = true;
         else if (args[i] == "--no-aa") no_aa = true;
+        else if (args[i] == "--no-taa") no_taa = true;
         else if (args[i] == "--exposure" && i + 1 < args.size()) exposure_arg = std::stof(args[++i]);
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
@@ -143,7 +144,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -373,6 +374,7 @@ int run(int argc, char** argv) {
     lp.auto_exposure = !no_auto_exposure;
     lp.bloom = !no_bloom;
     lp.antialias = !no_aa;
+    lp.temporal_aa = !no_taa;
     lp.exposure = exposure_arg;
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
         if (!shadows) return;
@@ -444,6 +446,14 @@ int run(int argc, char** argv) {
         // (the first measurement is taken as is), with the materials at the same exposure.
         for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
             scene.set_exposure(gl.exposure());
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gpu.flush();
+        }
+        // TAA: a still camera converges over the jitter sequence (16 frames: two passes of 8).
+        for (int k = 0; k < 16 && gl.temporal_aa_on(lp); ++k) {
+            gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
+            vm = gl.temporal_view(view, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();

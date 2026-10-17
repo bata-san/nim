@@ -35,9 +35,13 @@ struct View {
     float fov_y = 0.7f;  // radians
     float near_z = 0.05f;
     uint32_t width = 1, height = 1;
+    float jitter_x = 0, jitter_y = 0;  // sub-pixel offset of the projection, in pixels (x right, y down)
 };
 struct ViewMatrices {
     M4 vp_abs, vp_rel;  // absolute / camera-relative world -> clip
+    // Absolute world -> clip of the previous frame, with this frame's jitter: the G-buffer's motion
+    // vectors (View +0x3E0). make_view sets it to vp_abs (no motion).
+    M4 vp_prev;
     M4 proj;            // camera space (x right, y up, z forward) -> clip
     V3 eye, fwd, right, up;
     float fx = 1, fy = 1;
@@ -443,6 +447,9 @@ struct LightingParams {
     bool bloom = true;
     // Anti-aliasing with the engine's fxaa pass over the tonemapped image (with post only).
     bool antialias = true;
+    // Temporal anti-aliasing (with post only): a jittered view each frame (GameLighting::temporal_view)
+    // resolved against the previous frames with the engine's resolve_taa. Replaces fxaa when it runs.
+    bool temporal_aa = true;
 };
 
 class LightingPass {

@@ -1197,16 +1197,18 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     world_to_cam.c[2] = {vm.right.z, vm.up.z, vm.fwd.z, 0};
     world_to_cam.c[3] = {-dot(vm.right, vm.eye), -dot(vm.up, vm.eye), -dot(vm.fwd, vm.eye), 1};
     const M4 cam_to_proj = vm.proj;  // perspective, or the sun's orthographic shadow view
+    // A perspective view's jitter (NDC offset, temporal anti-aliasing) is taken out of the rays.
+    const float jx = vm.ortho > 0 ? 0 : vm.proj.c[2][0], jy = vm.ortho > 0 ? 0 : vm.proj.c[2][1];
     M4 proj_to_ray;  // (ndc.x, ndc.y, any, 1) -> camera-space ray with z = 1, w = 0
     proj_to_ray.c[0] = {1 / vm.fx, 0, 0, 0};
     proj_to_ray.c[1] = {0, 1 / vm.fy, 0, 0};
     proj_to_ray.c[2] = {0, 0, 0, 0};
-    proj_to_ray.c[3] = {0, 0, 1, 0};
+    proj_to_ray.c[3] = {-jx / vm.fx, -jy / vm.fy, 1, 0};
     M4 pixel_to_ray;
     pixel_to_ray.c[0] = {2 / (w * vm.fx), 0, 0, 0};
     pixel_to_ray.c[1] = {0, -2 / (h * vm.fy), 0, 0};
     pixel_to_ray.c[2] = {0, 0, 0, 0};
-    pixel_to_ray.c[3] = {-1 / vm.fx, 1 / vm.fy, 1, 0};
+    pixel_to_ray.c[3] = {(-1 - jx) / vm.fx, (1 - jy) / vm.fy, 1, 0};
     ext.set(ext::View, 0x00, w);
     ext.set(ext::View, 0x04, h);
     ext.set(ext::View, 0x10, float4{0, 0, 0, 0});
@@ -1226,7 +1228,9 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     ext.set(ext::View, 0x120, pixel_to_ray);
     ext.set(ext::View, 0x160, proj_to_ray);
     ext.set(ext::View, 0x1A0, vm.vp_abs);
-    ext.set(ext::View, 0x3E0, vm.vp_abs);
+    // +0x3E0: the previous frame's world -> clip. The G-buffer PS (and sky) write the motion vector
+    // 0.5 * (ndc(+0x3E0) - ndc(+0x1A0)), y flipped, into RT3 for resolve_taa.
+    ext.set(ext::View, 0x3E0, vm.vp_prev);
     // +0x2A0 (goriath unk220): target uv (0..1, y down) -> world, the projective inverse after
     // uv -> ndc; cubemap_apply_sky_copy_ao takes its view vector as cb12[7] (eye) minus it.
     M4 uv_to_ndc;

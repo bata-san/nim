@@ -68,6 +68,9 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         luma.write_masks = {0, D3D12_COLOR_WRITE_ENABLE_ALPHA};
         load(post_luma_, "screen_area_global_lut3d", luma);
         load(fxaa_, "fxaa", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+        // TAA: the variant with neighbourhood clipping in YCoCg (the decoded one, docs/PROGRESS.md 3.8).
+        load(taa_, "resolve_taa_use_clipping_use_ycocg", {f16, false});
+        load(taa_copy_, "copy_texture_bilinear", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
     }
     load(bloom_initial_, "bloom_initial_downsample_block_2x2", {f16, false});
     load(bloom_down_, "downsample_block_2x2", {f16, false});
@@ -100,14 +103,16 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 3};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 5};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &bloom_copy_, &ae_columns_})
+    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &bloom_copy_, &ae_columns_})
         gp->release(gpu);
+    for (auto& t : taa_history_) t.Reset();
+    taa_valid_ = taa_prev_valid_ = false;
     for (auto& l : bloom_) l = {};
     bloom_final_.Reset();
     ae_columns_rt_.Reset();
@@ -146,6 +151,8 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
     const uint32_t columns = bloom_[kBloomLevels - 1].w;
     ae_columns_rt_ = target(columns, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 3 * kBloomLevels + 1);
     post_ldr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 2);
+    for (uint32_t i = 0; i < 2; ++i) taa_history_[i] = target(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 3 + i);
+    taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ae_fence_ = {};
@@ -352,8 +359,55 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                        "grading layer data (scope color_grading_ubershader) source not found");
     ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const bool aa = p.antialias && post_luma_.loaded() && fxaa_.loaded() && post_ldr_;
-    if (!aa) {
+    const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
+    const bool aa = !taa && p.antialias && post_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    if (!taa) taa_valid_ = false;
+    if (taa) {
+        // Tonemap into the resolve's input, resolve it against the history into the other history
+        // target, then copy that into lit.
+        const auto ldr_rtv = rtv(3 * kBloomLevels + 2);
+        Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
+        viewport(cl, w_, h_);
+        post_tonemap_.draw(gpu, cl, e, scopes);
+        Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        // Extern 0x6A (resolve_taa, PS 80A74DA0): history weights cb0[3..6] (+0x00..+0x0C), the luma
+        // difference that rejects the unclipped history cb0[7] (+0x10), the input size (+0x18) and
+        // the resolve size (+0x20); t0 history (+0x48), t1 motion (+0x50, G-buffer RT3), t2 the
+        // frame (+0x58), t3 device depth (+0x60, nearest of 3x3 picks the motion).
+        //   w = cb0[4] + (cb0[5] - cb0[4]) * motion.z   history kept by the clip (luma change <= cb0[7])
+        //   w = lerp(cb0[3], cb0[6], saturate(|motion px| / 50)^0.9)   otherwise
+        //   out = frame * (1 - w) + clipped history * w
+        constexpr uint8_t kTaa = 0x6A;
+        const uint32_t cur = taa_current_ ^ 1;
+        const float k = taa_valid_ ? 1.0f : 0.0f;  // no history yet: the frame alone
+        e.set(kTaa, 0x00, 0.75f * k);
+        e.set(kTaa, 0x04, 0.92f * k);
+        e.set(kTaa, 0x08, 0.92f * k);
+        e.set(kTaa, 0x0C, 0.5f * k);
+        e.set(kTaa, 0x10, 0.1f);
+        e.set(kTaa, 0x18, float(w_));
+        e.set(kTaa, 0x1C, float(h_));
+        e.set(kTaa, 0x20, float(w_));
+        e.set(kTaa, 0x24, float(h_));
+        e.set_texture(kTaa, 0x48, taa_history_[taa_current_].Get());
+        e.set_texture(kTaa, 0x50, gb.rt[3].Get());
+        e.set_texture(kTaa, 0x58, post_ldr_.Get());
+        e.set_texture(kTaa, 0x60, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+        ext_.note_estimate("taa: history weight 0.92 (0.75 .. 0.5 by motion when the clip rejects it), luma rejection 0.1, Halton 2,3 jitter over 8 frames",
+                           "engine TAA settings and jitter sequence not in game data");
+        begin(taa_history_[cur].Get(), 3 * kBloomLevels + 3 + cur, w_, h_);
+        taa_.draw(gpu, cl, e, scopes);
+        end(taa_history_[cur].Get());
+        taa_current_ = cur;
+        taa_valid_ = true;
+        e.set_texture(pp, 0x00, taa_history_[cur].Get());
+        e.set(pp, 0x50, size4(w_, h_));
+        e.set(pp, 0xC0, float4{1, 1, 1, 1});
+        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        viewport(cl, w_, h_);
+        taa_copy_.draw(gpu, cl, e, scopes);
+    } else if (!aa) {
         cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
         viewport(cl, w_, h_);
         post_tonemap_.draw(gpu, cl, e, scopes);
@@ -381,6 +435,44 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         fxaa_.draw(gpu, cl, e, scopes);
     }
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+bool GameLighting::temporal_aa_on(const LightingParams& p) const {
+    return p.post && p.temporal_aa && post_tonemap_.loaded() && taa_.loaded() && taa_copy_.loaded();
+}
+
+// The jitter walks the Halton (2, 3) sequence over 8 frames, centred on the pixel (estimate: the
+// engine's sequence is code). The previous view gets the same jitter, so a still camera has no
+// motion and the history lines up with the frame's pixel centres.
+ViewMatrices GameLighting::temporal_view(const View& v, const LightingParams& p) {
+    if (!temporal_aa_on(p)) {
+        taa_prev_valid_ = false;
+        return make_view(v);
+    }
+    auto halton = [](uint32_t i, uint32_t base) {
+        float f = 1, r = 0;
+        for (; i; i /= base) {
+            f /= float(base);
+            r += f * float(i % base);
+        }
+        return r;
+    };
+    const uint32_t i = uint32_t(taa_index_++ % 8) + 1;
+    View cur = v;
+    cur.jitter_x = halton(i, 2) - 0.5f;
+    cur.jitter_y = halton(i, 3) - 0.5f;
+    ViewMatrices vm = make_view(cur);
+    if (taa_prev_valid_) {
+        View prev = taa_prev_view_;
+        prev.width = cur.width;
+        prev.height = cur.height;
+        prev.jitter_x = cur.jitter_x;
+        prev.jitter_y = cur.jitter_y;
+        vm.vp_prev = make_view(prev).vp_abs;
+    }
+    taa_prev_view_ = v;
+    taa_prev_valid_ = true;
+    return vm;
 }
 
 } // namespace nim
