@@ -68,7 +68,7 @@ int run(int argc, char** argv) {
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
     float time_of_day = -1;
-    bool no_atmosphere = false, no_environment = false, print_channels = false;
+    bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     float clip_frame = 0;
     float material_time = 0;
@@ -123,6 +123,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--time-of-day" && i + 1 < args.size()) time_of_day = std::stof(args[++i]);
         else if (args[i] == "--no-atmosphere") no_atmosphere = true;
         else if (args[i] == "--no-environment") no_environment = true;
+        else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
@@ -142,7 +143,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--print-channels] [--no-aa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -366,6 +367,7 @@ int run(int argc, char** argv) {
     lp.volumetrics = !no_volumetrics;
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;
+    lp.sky_ambient = !no_sky_ambient;
     lp.time_of_day = time_of_day;
     lp.post = !no_post;
     lp.auto_exposure = !no_auto_exposure;

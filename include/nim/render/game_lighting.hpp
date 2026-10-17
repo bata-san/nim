@@ -379,6 +379,20 @@ private:
     uint64_t ae_frame_ = 0;
     float exposure_ = 1, ae_luminance_ = 0, ae_auto_ = 1;  // ae_auto_: the adapted auto exposure
     bool ae_valid_ = false;
+
+    // Sky ambient (docs/PROGRESS.md 3.7, src/render/game_sky_ambient.cpp): the atmosphere drawn
+    // into six cube faces (hemisphere_sky_color_generate), folded into a mirror-ball map
+    // (sky_hemisphere_copy_frustum) with a mip chain (sky_hemisphere_downsample_filter_ggx) at
+    // Deferred +0xF8; cubemap_apply_sky_copy_ao then lights every pixel with it into the diffuse
+    // light buffer and the specular IBL buffer, under the cubemap volumes.
+    void load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void release_sky_ambient(Gpu& gpu);
+    bool sky_ambient_on(const LightingParams& p) const;
+    void render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl);
+    GamePipeline hemi_sky_, hemi_copy_, hemi_down_, sky_apply_;
+    static constexpr uint32_t kHemiSize = 256, kHemiMips = 9, kHemiFace = 128;
+    ComPtr<ID3D12Resource> hemi_, hemi_face_;  // RGBA16F: the mirror-ball map (9 mips), one cube face
+    ComPtr<ID3D12DescriptorHeap> hemi_rtv_heap_;  // hemisphere mips 0..8, then the face
 };
 
 } // namespace nim

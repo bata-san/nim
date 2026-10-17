@@ -2259,6 +2259,8 @@ public:
             ImGui::SetItemTooltip("ゲームの sky_lookup_generate_near/far と sky。フォグ値はグローバルチャンネルの写し (推定)");
             ImGui::Checkbox(std::format("マップ環境 ({} チャンネル)", game_lighting.environment_channels()).c_str(), &light.environment);
             ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
+            ImGui::Checkbox("空の環境光", &light.sky_ambient);
+            ImGui::SetItemTooltip("ゲームの空半球マップ (hemisphere_sky_color_generate ほか) と cubemap_apply_sky_copy_ao。日陰の環境光");
             {
                 bool own = light.time_of_day < 0;
                 if (ImGui::Checkbox("マップの時刻", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();

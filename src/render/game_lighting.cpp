@@ -108,7 +108,9 @@ void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKin
         break;
     default:
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = UINT(-1);
+        // A first mip selects that one mip (a mip chain's source while the next is written).
+        sd.Texture2D.MostDetailedMip = UINT(first);
+        sd.Texture2D.MipLevels = first ? 1 : UINT(-1);
         break;
     }
     dev->CreateShaderResourceView(r, &sd, h);
@@ -907,6 +909,7 @@ void GameLighting::release(Gpu& gpu) {
     linear_depth_.Reset();
     final_combine_.release(gpu);
     release_post(gpu);
+    release_sky_ambient(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
@@ -1074,6 +1077,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 9};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
+    load_sky_ambient(pm, gpu, scopes);
     gpu.flush();
 }
 
@@ -1173,6 +1177,10 @@ void estimate_engine_frame(ExternStore& ext, float t, float dt) {
     ext.estimate_frame_constants(f, why);
 }
 
+namespace {
+M4 inverse(const M4& m);
+}
+
 void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm) {
     const float w = float(width), h = float(height);
 
@@ -1219,6 +1227,14 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     ext.set(ext::View, 0x160, proj_to_ray);
     ext.set(ext::View, 0x1A0, vm.vp_abs);
     ext.set(ext::View, 0x3E0, vm.vp_abs);
+    // +0x2A0 (goriath unk220): target uv (0..1, y down) -> world, the projective inverse after
+    // uv -> ndc; cubemap_apply_sky_copy_ao takes its view vector as cb12[7] (eye) minus it.
+    M4 uv_to_ndc;
+    uv_to_ndc.c[0] = {2, 0, 0, 0};
+    uv_to_ndc.c[1] = {0, -2, 0, 0};
+    uv_to_ndc.c[2] = {0, 0, 1, 0};
+    uv_to_ndc.c[3] = {-1, 1, 0, 1};
+    ext.set(ext::View, 0x2A0, mul(inverse(vm.vp_abs), uv_to_ndc));
 
 }
 
@@ -1255,7 +1271,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
                               "atmosphere froxel volume (cascade_raymarch_atmosphere_volume) not ported: transmittance 1, in-scatter 0");
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
-    if (!lights_.empty() || !cubemaps_.empty()) {
+    if (!lights_.empty() || !cubemaps_.empty() || sky_ambient_on(p)) {
         ext_.set_texture(ext::Deferred, 0xC0, light_diffuse_.Get());
         ext_.set_texture(ext::Deferred, 0xC8, light_specular_.Get());
     } else if (ext_.texture(ext::Deferred, 0xC0).resource == light_diffuse_.Get()) {
@@ -1497,6 +1513,13 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
     if (atmosphere) render_sky_lookups(gpu, cl, scopes);
+    // The sky ambient writes the specular IBL buffer in place of the viewer environment.
+    const bool sky_ambient = own_env && sky_ambient_on(p);
+    if (sky_ambient) {
+        render_sky_hemisphere(gpu, cl);
+        cl->RSSetViewports(1, &vp);
+        cl->RSSetScissorRects(1, &sc);
+    }
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
     if ((p.ssao && hdao_.loaded()) || volumetrics) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
@@ -1504,9 +1527,9 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     vol_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        env_pass(env_ibl_pso_.Get(), env_rtv);
+        if (!sky_ambient) env_pass(env_ibl_pso_.Get(), env_rtv);
     }
-    if (!lights_.empty() || !cubemaps_.empty()) {
+    if (!lights_.empty() || !cubemaps_.empty() || sky_ambient) {
         // Light buffers: first the cubemap volumes (diffuse probes + specular IBL over the sky's).
         // Their PS writes alpha = 1 - volume weight for a src + dst * src.a blend, so a volume
         // replaces what is under it (nested volumes over the large ones): drawn after the local
@@ -1518,13 +1541,20 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         const float zero[4]{};
         cl->ClearRenderTargetView({hdr.ptr + 3 * inc}, zero, 0, nullptr);
         cl->ClearRenderTargetView({hdr.ptr + 4 * inc}, zero, 0, nullptr);
+        if (sky_ambient) {
+            // The sky everywhere first (diffuse light buffer, specular IBL); the cubemap volumes
+            // then replace it where they are.
+            const D3D12_CPU_DESCRIPTOR_HANDLE bufs[] = {{hdr.ptr + 3 * inc}, env_rtv};
+            cl->OMSetRenderTargets(2, bufs, FALSE, nullptr);
+            sky_apply_.draw(gpu, cl, ext_, scopes);
+        }
         if (!cubemaps_.empty() && own_env) {
             draw_cubemaps(gpu, cl, vm, scopes);
             ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
                                "engine pass order not in game data; the cubemap alpha replaces what is under it");
         }
         if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
-        if ((!lights_.empty() || !cubemaps_.empty()) && p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
+        if (p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
             constexpr uint8_t kApply = 0x26;
             // Extern 38 is the full-screen input shared with final_combine: its own store here.
             hdao_ext_.set_texture(kApply, 0x00, ao_.Get());
