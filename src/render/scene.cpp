@@ -857,10 +857,14 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
     uint8_t lod = 0xFF;
     bool has_gbuffer_parts = false;
+    // Use the same selected render stages as static meshes. In particular the map's
+    // opaque path must not accidentally enable entity death/spawn/energy FX.
+    const bool gbuffer_only = cache && cache->gbuffer_only;
+    auto drawn = [gbuffer_only](uint8_t st) { return st == 0 || (!gbuffer_only && st == kStageTransparent); };
     for (size_t mi = 0; mi < model.meshes.size(); ++mi) {
         const DynamicMesh& mesh = model.meshes[mi];
         bool any_stage = false;
-        for (uint8_t st : kDrawnStages) any_stage |= mesh.part_range[st] < std::min<size_t>(mesh.part_range[st + 1], mesh.parts.size());
+        for (uint8_t st : kDrawnStages) if (drawn(st)) any_stage |= mesh.part_range[st] < std::min<size_t>(mesh.part_range[st + 1], mesh.parts.size());
         if (!any_stage) continue;
         has_gbuffer_parts = true;
         PreparedMesh::Buffers bufs;
@@ -891,6 +895,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         const uint32_t set = uint32_t(out.buffers.size());
         bool used = false;
         for (uint8_t stage : kDrawnStages) {
+        if (!drawn(stage)) continue;
         const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
         // Highest detail: lod_category bit 0 (goriath); fall back to every part when none has it.
         bool any_high = false;
@@ -953,7 +958,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     cb[5] = {model.model_offset[0], model.model_offset[1], model.model_offset[2], model.model_offset[3]};
     cb[6] = {model.texcoord_scale[0], model.texcoord_scale[1], model.texcoord_offset[0], model.texcoord_offset[1]};
     // Dynamic SH / AO must come from the real object lighting scope, never a guessed 0.8.
-    // c8-c11 skinning transform (identity), c12/c13 packed-position offset + 1D scale, c15-c18 identity.
+    // c8-c11 previous placement (identity before placement), c12/c13 packed-position offset + 1D scale, c15-c18 identity.
     const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
     cb[8] = {1, 0, 0, 0}; cb[9] = {0, 1, 0, 0}; cb[10] = {0, 0, 1, 0}; cb[11] = {0, 0, 0, 1};
     cb[12] = cb[13] = {offset.x, offset.y, offset.z, s1 * kSkinRange};
@@ -1724,6 +1729,9 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             cb[1] = {p[1], p[5], p[9], 0};
             cb[2] = {p[2], p[6], p[10], 0};
             cb[3] = {p[3], p[7], p[11], 1};
+            // Original rigid/skinned VS emit previous world positions through c8..c11.
+            // Map placements are static: previous placement equals current placement.
+            for (size_t c = 0; c < 4; ++c) cb[8 + c] = cb[c];
             const auto upload = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(upload.cpu, cb.data(), cb.size() * sizeof(float4));
             set.object_cb.push_back(upload.gpu);

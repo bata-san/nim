@@ -253,12 +253,7 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
     // Hashes must never pass through float (near 0x80xxxxxx it loses their low bits).
     std::set<std::vector<uint8_t>> seen;
     for (TagHash t : map.node_tables) {
-        std::vector<uint8_t> data;
-        try {
-            data = pm.read(t);
-        } catch (...) {
-            continue;
-        }
+        const auto data = pm.read(t);
         TagReader r(data);
         const auto nodes = r.vec_at(0x08);
         for (uint64_t i = 0; i < nodes.count; ++i) {
@@ -306,6 +301,19 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
                                             s[1] * m.local_to_world[size_t(4 + a)] + s[2] * m.local_to_world[size_t(8 + a)];
                             m.lo[size_t(a)] = std::min(m.lo[size_t(a)], v);
                             m.hi[size_t(a)] = std::max(m.hi[size_t(a)], v);
+                        }
+                        // Normal cubemap VS uses +0x20, quaternion +0x100 and +0x10
+                        // half extents. The auxiliary matrix can have a different centre;
+                        // culling must also contain the cube actually rasterized by that VS.
+                        const auto& q = m.rotation;
+                        const std::array<float, 3> v{s[0] * m.extents[0], s[1] * m.extents[1], s[2] * m.extents[2]};
+                        const float dot = q[0]*v[0] + q[1]*v[1] + q[2]*v[2];
+                        const float norm = q[3]*q[3] - q[0]*q[0] - q[1]*q[1] - q[2]*q[2];
+                        for (size_t a = 0; a < 3; ++a) {
+                            const size_t b = (a + 1) % 3, caxis = (a + 2) % 3;
+                            const float world = m.center[a] + norm*v[a] + 2*q[a]*dot + 2*q[3]*(q[b]*v[caxis] - q[caxis]*v[b]);
+                            m.lo[a] = std::min(m.lo[a], world);
+                            m.hi[a] = std::max(m.hi[a], world);
                         }
                     }
                     std::vector<uint8_t> key(data.begin() + c + 0x10, data.begin() + c + 0x1D0);
@@ -543,11 +551,21 @@ std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<
     return out;
 }
 
-MapLayout load_map_layout(PackageManager& pm, TagHash bubble) {
+MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables) {
     MapLayout out;
     out.bubble = bubble;
     std::vector<TagHash> terrain_tags;
     out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables);
+    for (const auto table : additional_tables) {
+        const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables);
+        out.instance_tags.insert(out.instance_tags.end(), tags.begin(), tags.end());
+    }
+    auto unique = [](auto& tags) { std::sort(tags.begin(), tags.end()); tags.erase(std::unique(tags.begin(), tags.end()), tags.end()); };
+    // Keep the base map's authored order (probe diagnostic indices must stay stable).
+    auto deduplicate = [](auto& tags) { std::set<TagHash> seen; std::erase_if(tags, [&](TagHash t) { return !seen.insert(t).second; }); };
+    deduplicate(out.instance_tags);
+    deduplicate(out.node_tables);
+    unique(terrain_tags);
     for (TagHash t : terrain_tags) {
         try {
             out.terrains.push_back(load_terrain(pm, t));
@@ -616,6 +634,101 @@ std::vector<MapEntry> list_maps(PackageManager& pm) {
     return out;
 }
 
+std::vector<MapEntry> list_activity_maps(PackageManager& pm) {
+    pm.build_hash64_index();
+    std::vector<MapEntry> out;
+    std::map<TagHash, std::string> names;
+    for (const auto& info : pm.packages()) for (const auto& named : pm.open(info).named_tags()) {
+        if (named.class_hash == 0x8080B386) names.try_emplace(named.hash, named.name);
+    }
+    std::vector<NamedTag> candidates;
+    for (const auto& info : pm.packages()) {
+        const auto& entries = pm.open(info).entries();
+        for (uint32_t i = 0; i < entries.size(); ++i) if (entries[i].reference == 0x8080B386 && (entries[i].type == 8 || entries[i].type == 16)) {
+            const auto tag = TagHash::make(info.pkg_id, uint16_t(i));
+            const auto name = names.find(tag);
+            candidates.push_back({tag, 0x8080B386, name == names.end() ? std::format("{} / {} (unnamed)", info.name, tag.str()) : name->second});
+        }
+    }
+    for (const auto& named : candidates) {
+        // Same SActivity map/ambient/phase selection as DEIMOS. Also expose unnamed activities
+        // by their actual tag, and keep registered names without a destination-dot prefix.
+      try {
+        const auto data = pm.read(named.hash);
+        TagReader r(data);
+        const auto maps = r.vec_at(0x50);
+        if (maps.count && maps.element_class != 0x8080AB3E) throw std::runtime_error("unknown activity map row class");
+        for (uint64_t k = 0; k < maps.count; ++k) {
+            const size_t row = maps.data + size_t(k) * 0x38;
+            const auto refs = r.vec_at(row + 0x28);
+            if (!refs.count) continue;
+            // ActivityTab uses map_references[0] (including its documented multi-map limitation).
+            const auto bubble = resolve_wide_hash(pm, r.u32_at(refs.data), r.u64_at(refs.data + 8));
+            if (!bubble) throw std::runtime_error("unresolved activity map reference");
+            const auto* entry = pm.entry(*bubble);
+            if (!entry || entry->reference != kClassBubbleParent) throw std::runtime_error("activity map is not a bubble");
+            MapEntry m;
+            m.bubble = *bubble;
+            m.package = package_of(pm, *bubble);
+            m.name = std::format("{} / {:08X}", named.name, r.u32_at(row + 8));
+            m.activity = named.hash;
+            m.activity_map = uint32_t(k);
+            m.bubble_name = r.u32_at(row + 8);
+            out.push_back(std::move(m));
+        }
+      } catch (const std::exception& ex) {
+        throw std::runtime_error(std::format("activity {} ({}): {}", named.hash.str(), named.name, ex.what()));
+      }
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
+    return out;
+}
+
+std::vector<TagHash> load_activity_node_tables(PackageManager& pm, TagHash activity, uint32_t bubble_name, uint32_t map_index) {
+    std::set<TagHash> tables, activities, components;
+    auto load = [&](auto&& self, TagHash tag) -> void {
+        if (tag.is_none() || !activities.insert(tag).second) return;
+        const auto data = pm.read(tag);
+        TagReader r(data);
+        const auto maps = r.vec_at(0x50);
+        for (uint64_t k = 0; k < maps.count; ++k) {
+            const size_t row = maps.data + size_t(k) * 0x38;
+            if (tag == activity && k != map_index) continue;
+            if (r.u32_at(row + 8) != bubble_name) continue;
+            const auto phases = r.vec_at(row + 0x18);
+            if (phases.count && phases.element_class != 0x8080B463) throw std::runtime_error("unknown activity phase class");
+            for (uint64_t p = 0; p < phases.count; ++p) {
+                // SUnk80808948 -> SUnk80808e89.unk18 -> SUnk80808ebe.components
+                const auto phase = pm.read(r.tag_at(phases.data + size_t(p) * 24 + 0x14));
+                const auto list_data = pm.read(TagReader(phase).tag_at(0x18));
+                TagReader list(list_data);
+                const auto refs = list.vec_at(8);
+                for (uint64_t i = 0; i < refs.count; ++i) {
+                    const auto wrapper = pm.read(list.tag_at(refs.data + size_t(i) * 4));
+                    const auto component = TagReader(wrapper).tag_at(0x20);
+                    if (!components.insert(component).second) continue;
+                    const auto bytes = pm.read(component);
+                    TagReader cr(bytes);
+                    // Marathon's definition class ids differ from the older DEIMOS B1A5/B250
+                    // cases. Resolve only typed node-table references authored in THIS selected
+                    // phase component, never all node tables in the package family.
+                    for (size_t off = 8; off + 4 <= bytes.size(); off += 4) {
+                        const auto target = cr.tag_at(off);
+                        if (!target.is_pkg_ref()) continue;
+                        const auto* entry = pm.entry(target);
+                        if (entry && entry->reference == kClassMapNodeTable && entry->type == 8) tables.insert(target);
+                    }
+                }
+            }
+            break;  // DEIMOS ambient lookup selects the first matching bubble_name
+        }
+        const auto ambient = resolve_wide_hash(pm, r.u32_at(0x68), r.u64_at(0x70));
+        if (ambient) self(self, *ambient);
+    };
+    load(load, activity);
+    return {tables.begin(), tables.end()};
+}
+
 std::array<float, 3> map_focus(const MapLayout& map) {
     std::array<float, 3> out{};
     for (int a = 0; a < 3; ++a) {
@@ -669,25 +782,17 @@ std::array<float, 12> quat_rows(const TagReader& r, size_t te) {
 }
 }  // namespace
 
-MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
+MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {
     MapEntities out;
-    const PackageInfo* home = pm.info(bubble.pkg_id());
-    if (!home) return out;
-    const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
     std::unordered_multimap<uint32_t, uint32_t> by_component;  // SDynamicModelComponent tag -> model
     for (const auto& [model, m] : materials) by_component.emplace(m.component.value, model);
     std::unordered_map<uint32_t, std::vector<uint32_t>> entity_models;
     std::unordered_map<uint32_t, size_t> slot;  // model -> out.models index
-    for (const auto& info : pm.packages()) {
-        if (!info.name.starts_with(family)) continue;
-        Package& p = pm.open(info);
-        for (uint32_t i = 0; i < p.entries().size(); ++i) {
-            const Entry& en = p.entries()[i];
-            if (en.type != 8 || en.reference != kClassMapNodeTable) continue;
+    for (const auto table : map.node_tables) {
             std::vector<uint8_t> data;
             try {
-                data = p.read_entry(i);
+                data = pm.read(table);
             } catch (...) {
                 continue;
             }
@@ -732,7 +837,6 @@ MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
                 }
                 ++out.placements;
             }
-        }
     }
     return out;
 }

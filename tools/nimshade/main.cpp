@@ -10,6 +10,10 @@
 //   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]
 //            [--clip CLIP_TAG [--frame F]]   (skinned dynamic models: posed with an animation clip)
 //            [--probe-index N --dump-probe-mask] (original CSG/GPU membership verification)
+//            [--probe-distance-fade] (opt in to the unverified camera-distance fade)
+//            [--activity TAG --activity-map N] (DEIMOS ActivityTab selection)
+//            [--entity-range BEGIN:END] (diagnostic half-open indices in the region's model list)
+//            [--verify-static-motion] (16 frozen TAA frames must have < 0.1 px motion)
 #include "nim/content/animation.hpp"
 #include "nim/content/object_channels.hpp"
 #include "nim/core/package_manager.hpp"
@@ -83,6 +87,11 @@ int run(int argc, char** argv) {
     bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false;
     std::optional<size_t> probe_index;
     bool dump_probe_mask = false;
+    bool verify_static_motion = false;
+    bool probe_distance_fade = false;
+    std::optional<std::pair<size_t, size_t>> entity_range;
+    TagHash selected_activity;
+    uint32_t selected_activity_map = 0;
     bool no_ssao = false, no_volumetrics = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
@@ -101,6 +110,16 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
+        else if (args[i] == "--verify-static-motion") verify_static_motion = true;
+        else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
+        else if (args[i] == "--entity-range" && i + 1 < args.size()) {
+            const auto value = args[++i];
+            const auto split = value.find(':');
+            if (split == std::string::npos) throw std::runtime_error("--entity-range expects BEGIN:END (exclusive)");
+            entity_range = {std::stoull(value.substr(0, split)), std::stoull(value.substr(split + 1))};
+        }
+        else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
+        else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
@@ -186,7 +205,17 @@ int run(int argc, char** argv) {
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
-        MapLayout map = load_map_layout(pm, mesh_tag);
+        std::vector<TagHash> activity_tables;
+        if (!selected_activity.is_none()) {
+            const auto entries = list_activity_maps(pm);
+            const auto choice = std::find_if(entries.begin(), entries.end(), [&](const MapEntry& m) {
+                return m.activity == selected_activity && m.activity_map == selected_activity_map && m.bubble == mesh_tag;
+            });
+            if (choice == entries.end()) throw std::runtime_error("activity/map selection does not reference this bubble");
+            activity_tables = load_activity_node_tables(pm, choice->activity, choice->bubble_name, choice->activity_map);
+            std::println("activity_view {} map[{}]: {} selected phase/ambient node tables", selected_activity.str(), selected_activity_map, activity_tables.size());
+        } else std::println("map_view: bubble node tables only");
+        MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
         is_map = true;
         if (heat_cascade || !weather_args.empty()) {
             const MapWeather weather = load_map_weather(pm, mesh_tag);
@@ -220,14 +249,18 @@ int run(int argc, char** argv) {
         if (!no_entities) {
             const auto te = std::chrono::steady_clock::now();
             entity_materials = index_dynamic_model_materials(pm);
-            const MapEntities ents = load_map_entities(pm, mesh_tag, entity_materials);
+            const MapEntities ents = load_map_entities(pm, map, entity_materials);
             auto er = map_region(ents.models, focus, map_radius);
             size_t n = 0;
             for (const auto& m : er) n += m.rows.size();
             std::println("entities: {} placements of {} models ({} entities, {} node tables); {} models / {} placements in range ({:.1f}s)",
                          ents.placements, ents.models.size(), ents.entities, ents.node_tables, er.size(), n,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - te).count());
-            for (auto& m : er) region.push_back(std::move(m));
+            for (size_t i = 0; i < er.size(); ++i) {
+                if (entity_range && (i < entity_range->first || i >= entity_range->second)) continue;
+                if (entity_range) std::println("entity model [{}]: {} ({} placements)", i, er[i].mesh.str(), er[i].rows.size());
+                region.push_back(std::move(er[i]));
+            }
         }
         // The sky objects (distant scenery kilometres out): all of them, whatever the radius.
         if (!no_sky_objects) {
@@ -389,6 +422,7 @@ int run(int argc, char** argv) {
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
+    lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
     lp.post = !no_post;
     lp.auto_exposure = !no_auto_exposure;
@@ -440,7 +474,7 @@ int run(int argc, char** argv) {
         }
         if (!region_cubemaps.empty()) {
             auto tc = std::chrono::steady_clock::now();
-            gl.set_cubemaps(pm, gpu, region_cubemaps);
+            gl.set_cubemaps(pm, gpu, region_cubemaps, dump_probe_mask);
             std::println("cubemap volumes: {} prepared in {:.1f}s", gl.cubemap_count(),
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - tc).count());
             for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
@@ -472,13 +506,34 @@ int run(int argc, char** argv) {
             gpu.flush();
         }
         // TAA: a still camera converges over the jitter sequence (16 frames: two passes of 8).
+        float stationary_motion_max = 0;
         for (int k = 0; k < 16 && gl.temporal_aa_on(lp); ++k) {
             gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
             vm = gl.temporal_view(view, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
+            if (verify_static_motion) {
+                const auto motion = gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8);
+                auto half = [](uint16_t v) {
+                    const int ex = (v >> 10) & 31;
+                    const float m = float(v & 1023) / 1024;
+                    const float f = ex ? std::ldexp(1 + m, ex - 15) : std::ldexp(m, -14);
+                    return v & 0x8000 ? -f : f;
+                };
+                const auto* h = reinterpret_cast<const uint16_t*>(motion.data());
+                float worst = 0;
+                for (size_t n = 0; n < motion.size() / 2; n += 4) {
+                    const float x = half(h[n]) * float(width), y = half(h[n + 1]) * float(height);
+                    if (!std::isfinite(x) || !std::isfinite(y)) throw std::runtime_error("non-finite stationary motion");
+                    worst = std::max(worst, std::sqrt(x * x + y * y));
+                }
+                std::println("stationary motion frame {}: max {} pixels", k, worst);
+                stationary_motion_max = std::max(stationary_motion_max, worst);
+            }
         }
+        if (verify_static_motion && (!gl.temporal_aa_on(lp) || stationary_motion_max > 0.1f))
+            throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         if (lp.post && gl.post_ready())
@@ -495,7 +550,7 @@ int run(int argc, char** argv) {
             std::println("cubemap volumes drawn: {}", gl.cubemaps_drawn());
             for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
         }
-        if (gl.light_count()) {
+        if (gl.light_count() || gl.cubemap_count()) {
             std::println("local lights drawn: {}, light shafts {} of {}", gl.lights_drawn(), gl.volumetrics_drawn(), gl.volumetric_lights());
             for (int b = 0; b < 2; ++b) {
                 auto px = gpu.read_texture(gl.light_buffer(b), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
@@ -599,6 +654,8 @@ int run(int argc, char** argv) {
         };
         save("probe-depth.bin", depth);
         save("probe-stencil.bin", gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 1, 1));
+        save("probe-light-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        save("probe-light-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("probe-shapes.bin", m.shape_records.is_none() ? std::vector<uint8_t>{} : pm.read(m.shape_records));
         std::ofstream f(out_dir / "probe-mask.json");
         f << std::format("{{\"width\":{},\"height\":{},\"index\":{},\"vp\":[", width, height, *probe_index);

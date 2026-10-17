@@ -439,6 +439,9 @@ struct LightingParams {
     bool environment = true;
     // Sky ambient with the atmosphere: the sky hemisphere map and cubemap_apply_sky_copy_ao.
     bool sky_ambient = true;
+    // Full-map viewing keeps every authored probe active at its own spatial bounds. The
+    // optional camera-distance fade is an unverified interpretation of +0x3C/+0x40.
+    bool probe_distance_fade = false;
     // Screen-space ambient occlusion with the game's hdao pass (game lighting only).
     bool ssao = true;
     // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.

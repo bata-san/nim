@@ -999,7 +999,7 @@ int cmd_map_placements(PackageManager& pm, TagHash bubble) {
 int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
     pm.build_hash64_index();
     const auto materials = index_dynamic_model_materials(pm);
-    const MapEntities me = load_map_entities(pm, bubble, materials);
+    const MapEntities me = load_map_entities(pm, load_map_layout(pm, bubble), materials);
     std::println("{} node tables, {} nodes, {} entities, {} placements with a model, {} models", me.node_tables, me.nodes, me.entities,
                  me.placements, me.models.size());
     for (const auto& m : me.models) std::println("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
@@ -1648,6 +1648,19 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "activities") {
+            for (const auto& m : list_activity_maps(pm)) {
+                std::println("{} map[{}] bubble {} name {:08X} {}", m.activity.str(), m.activity_map, m.bubble.str(), m.bubble_name, m.name);
+                if (args.size() >= 2 && args[1] == "--verify") {
+                    const auto tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+                    const auto layout = load_map_layout(pm, m.bubble, tables);
+                    const auto probes = load_map_cubemaps(pm, layout);
+                    std::println("  verified: {} phase/ambient tables, {} combined tables, {} instances, {} probes",
+                                 tables.size(), layout.node_tables.size(), layout.instances, probes.size());
+                }
+            }
+            return 0;
+        }
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));

@@ -13,6 +13,7 @@
 
 #include <array>
 #include <string>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -53,9 +54,15 @@ struct MapEntry {
     TagHash bubble;
     std::string package;  // the package the bubble tag is in (w64_perimeter_0147 ...)
     size_t statics = 0, instances = 0;
+    std::string name;
+    TagHash activity;                    // none = DEIMOS MapTab; otherwise ActivityTab
+    uint32_t activity_map = 0, bubble_name = 0;
 };
 // Every bubble with static geometry, in package order. Walks each bubble's structure tags.
 std::vector<MapEntry> list_maps(PackageManager& pm);
+std::vector<MapEntry> list_activity_maps(PackageManager& pm);
+// DEIMOS ActivityTab: selected SActivity.unk50 row plus matching ambient activity row.
+std::vector<TagHash> load_activity_node_tables(PackageManager& pm, TagHash activity, uint32_t bubble_name, uint32_t map_index);
 
 struct MapStatic {
     TagHash mesh;
@@ -71,7 +78,7 @@ struct MapLayout {
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
 };
-MapLayout load_map_layout(PackageManager& pm, TagHash bubble);
+MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
 
 // Where the geometry is: the per-axis median of the instance origins (bounds are stretched by
 // far-off outliers such as skyboxes).
@@ -106,7 +113,7 @@ std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& light
 inline constexpr uint32_t kClassCubemapComponent = 0x80807F3C;
 struct MapCubemap {
     std::array<float, 3> extents{}, center{};   // +0x10 half extents, +0x20 bounds centre
-    std::array<float, 3> origin{};              // +0x110: sampling/shape origin (not the bounds centre)
+    std::array<float, 3> origin{};              // +0x110: auxiliary shape transform origin; lighting use unverified
     std::array<float, 4> rotation{};             // +0x100 quaternion (x, y, z, w)
     std::array<float, 16> local_to_world{};      // +0xC0, unit cube -> world, column-major
     std::array<float, 16> axes{};                // +0x120 rotation (columns) + centre
@@ -163,8 +170,9 @@ struct MapAtmosphere {
 MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map);
 
 // ---- entities ------------------------------------------------------------------------------
-// A map's placed entities: every SMapNodeTable of the map's package family (the activity layers
-// as well as the bubble's own) names, per node, an entity (8080BAAD) by hash64 at +0x30, at the
+// A selection's placed entities: only its MapLayout.node_tables (bubble, or bubble plus the
+// selected activity/ambient phases), never the whole package family. Each node names an entity
+// (8080BAAD) by hash64 at +0x30, at the
 // node's transform (quat xyzw, translation, uniform scale at +0x00). An entity lists its
 // components (8080BADB); a component that is the SDynamicModelComponent of a dynamic model
 // (index_dynamic_model_materials) puts that model at the node.
@@ -180,7 +188,7 @@ struct MapEntities {
 // dynamic model, the 3x4 rows of its placements. Kind 5 is left out (goriath: draws solid red).
 std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map);
 // Needs the hash64 index (PackageManager::build_hash64_index).
-MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
+MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
 }  // namespace nim

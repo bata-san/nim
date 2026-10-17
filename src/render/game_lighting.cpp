@@ -1629,7 +1629,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             sky_apply_.draw(gpu, cl, ext_, scopes);
         }
         if (!cubemaps_.empty() && own_env) {
-            draw_cubemaps(gpu, cl, gb, vm, scopes);
+            draw_cubemaps(gpu, cl, gb, vm, scopes, p.probe_distance_fade);
             ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
                                "engine pass order not in game data; the cubemap alpha replaces what is under it");
         }
@@ -2314,8 +2314,9 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 }
 
 // ---- Cubemap volumes ---------------------------------------------------------------------------
-void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps) {
+void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg) {
     cubemaps_.clear();
+    cubemap_csg_diagnostic_ = diagnostic_csg;
     cubemap_notes_.clear();
     make_cube(gpu);
     const Scope* scopes[] = {&frame_scope_, &view_scope_};
@@ -2326,7 +2327,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         if (!slot) slot = gpu.texture(load_texture(pm, t));
         return slot;
     };
-    if (!cubemap_stencil_) {
+    if (diagnostic_csg && !cubemap_stencil_) {
         auto stencil = std::make_unique<GamePipeline>();
         GamePipeline::Options opt;
         opt.volume = true;
@@ -2352,7 +2353,8 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             // The volume's permutation, as goriath's get_specialized_cubemap_pipeline (box shape).
             const std::string name = std::format("cubemap_apply_cube_alpha_{}_probes_{}_relighting_{}", m->use_alpha() ? "on" : "off",
                                                  m->use_probes() ? "on" : "off", m->use_relighting() ? "on" : "off");
-            auto it = cubemap_variants_.find(name);
+            const auto variant_key = name + (diagnostic_csg ? "/CSG-diagnostic" : "");
+            auto it = cubemap_variants_.find(variant_key);
             if (it == cubemap_variants_.end()) {
                 const TagHash technique = globals_.pipeline(name);
                 if (technique.is_none()) throw std::runtime_error("render_globals has no pipeline " + name);
@@ -2361,14 +2363,14 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
                     auto gp = std::make_unique<GamePipeline>();
                     GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                     opt.volume = true;
-                    opt.stencil_test = true;
+                    opt.stencil_test = diagnostic_csg;
                     opt.cull_front = front;
                     opt.cbuffer_floor = 64;
                     opt.blend_state = 23;  // goriath CubemapRenderer: src + dst * src.a over both targets
                     gp->load(pm, gpu, technique, scopes, opt);
                     cubemap_pipelines_.push_back(std::move(gp));
                 }
-                it = cubemap_variants_.emplace(name, index).first;
+                it = cubemap_variants_.emplace(variant_key, index).first;
             }
             CubemapVolume v;
             v.pipeline = it->second;
@@ -2378,7 +2380,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;
             v.alpha = texture(m->alpha);
             v.diffuse = texture(m->diffuse);
-            if (!m->shape_vertices.is_none()) {
+            if (diagnostic_csg && !m->shape_vertices.is_none()) {
                 auto& shape = probe_shapes_[m->shape_vertices.value];
                 if (!shape) {
                     const auto mesh = load_vertex_buffer(pm, m->shape_vertices);
@@ -2420,13 +2422,12 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         constexpr std::string_view layout = "cubemap_volume scope (cb11) has no bytecode: filled from the SCubemapComponent";
         ext_.note_estimate("cubemaps: cb11 face fades from component +0x50 / +0x60 as fractions of the half extent", layout);
         ext_.note_estimate("cubemaps: cb11 [2].w intensity = component +0x30", layout);
-        ext_.note_estimate("cubemaps: cb11 [14].w = camera distance fade over component +0x3C..+0x40 (m)", layout);
         ext_.note_estimate("cubemaps: cb11 [15] = component +0x170, [18].w = 0 for UNORM (gamma-2) cubes (the PS squares them)", layout);
         ext_.note_estimate("cubemaps: GGX filter roughness = mip / last mip, chain down to 4x4",
                            "cubemap_face_filter_ggx inputs (extern 84) are engine-set");
         ext_.note_estimate("cubemaps: draw order largest volume first", "engine sort order not decoded");
-        ext_.note_estimate("cubemaps: scene depth stencil winding mask from authored CSG boundary",
-                           "geometric membership uses the original mesh; engine stencil scheduling/state not decoded");
+        if (diagnostic_csg) ext_.note_estimate("cubemaps: CSG diagnostic (not normal game lighting)",
+                           "authored shape membership only; its role in engine lighting application is unverified");
     }
 }
 
@@ -2562,7 +2563,10 @@ void GameLighting::filter_specular_cubes(PackageManager& pm, Gpu& gpu, std::span
     ext_.set_texture(kFilter, 0x108, nullptr);
 }
 
-void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes, bool distance_fade) {
+    ext_.note_estimate(distance_fade ? "cubemaps: cb11 [14].w = camera distance fade (+0x3C..+0x40)" :
+                                     "cubemaps: cb11 [14].w = 1 (full-map probe viewing)",
+                       "engine distance fade semantics unverified; full-map mode preserves authored spatial bounds, samples and intensities");
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + inc}};  // light diffuse, specular IBL
@@ -2575,8 +2579,11 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         b.Transition = {gb.depth.Get(), 1, before, after};
         cl->ResourceBarrier(1, &b);
     };
-    stencil_state(depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    cl->OMSetStencilRef(0);
+    if (cubemap_csg_diagnostic_) {
+        stencil_state(depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        cl->OMSetStencilRef(0);
+    }
+    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
     constexpr float kHardEdge = 1e-3f;  // a face with no blend: fades over the last 0.1% of its half extent
     auto upload = [&](std::span<const float4> values) {
         auto a = gpu.dynamic(values.size() * sizeof(float4));
@@ -2601,10 +2608,11 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
             d2 += d * d;
         }
         const float dist = std::sqrt(d2);
-        const float fade = m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
+        const float fade = distance_fade && m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
         if (fade <= 0) continue;
         std::array<float4, 4> vs{};
-        vs[0] = {m.origin[0], m.origin[1], m.origin[2], 1};
+        const auto& center = cubemap_csg_diagnostic_ ? m.origin : m.center;
+        vs[0] = {center[0], center[1], center[2], 1};
         vs[1] = {m.rotation[0], m.rotation[1], m.rotation[2], m.rotation[3]};
         vs[2] = {m.extents[0], m.extents[1], m.extents[2], 0};
         std::array<float4, 32> ps{};
@@ -2642,6 +2650,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         if (cv.alpha) textures.push_back({1, cv.alpha.Get()});
         if (cv.diffuse) textures.push_back({2, cv.diffuse.Get()});
         try {
+          if (cubemap_csg_diagnostic_) {
             cl->OMSetRenderTargets(0, nullptr, FALSE, &gb.dsv_ro);
             cl->ClearDepthStencilView(gb.dsv_ro, D3D12_CLEAR_FLAG_STENCIL, 0, 0, 0, nullptr);
             if (cv.shape) {
@@ -2651,6 +2660,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
                 cubemap_stencil_->draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36);
             }
             cl->OMSetRenderTargets(2, rtvs, FALSE, &gb.dsv_ro);
+          }
             gp.draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36, textures);
             ++cubemaps_drawn_;
         } catch (const std::exception& ex) {
@@ -2658,7 +2668,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         }
     }
     cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
-    stencil_state(D3D12_RESOURCE_STATE_DEPTH_WRITE, depth_read);
+    if (cubemap_csg_diagnostic_) stencil_state(D3D12_RESOURCE_STATE_DEPTH_WRITE, depth_read);
 }
 
 } // namespace nim

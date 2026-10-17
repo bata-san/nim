@@ -223,7 +223,7 @@ public:
     // A map's reflection / ambient probe volumes (load_map_cubemaps), drawn each frame with the
     // engine's cubemap_apply pipelines into the diffuse light buffer and the specular IBL buffer,
     // before the local lights. Volumes that cannot be loaded are left out and listed.
-    void set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps);
+    void set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg = false);
     void clear_cubemaps() { cubemaps_.clear(); }
     size_t filtered_cube_count() const { return filtered_cubes_.size(); }
     size_t cubemap_count() const { return cubemaps_.size(); }
@@ -349,7 +349,7 @@ private:
     D3D12_INDEX_BUFFER_VIEW cube_ibv_{};
     void make_cube(Gpu& gpu);
 
-    void draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    void draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes, bool distance_fade);
     struct CubemapVolume {
         uint32_t pipeline = 0;  // index of the variant's pipeline pair (both windings)
         MapCubemap volume;
@@ -367,6 +367,7 @@ private:
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> filtered_cubes_;  // by specular tag
     std::vector<std::unique_ptr<GamePipeline>> cubemap_pipelines_;
     std::unique_ptr<GamePipeline> cubemap_stencil_;
+    bool cubemap_csg_diagnostic_ = false;
     std::map<std::string, uint32_t> cubemap_variants_;  // pipeline name -> pipeline pair
     std::vector<CubemapVolume> cubemaps_;
     std::vector<std::string> cubemap_notes_;

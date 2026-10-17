@@ -649,9 +649,9 @@ public:
         return list_error_;
     }
     // center: nullopt = where the map's geometry is (map_focus).
-    uint64_t request(TagHash bubble, std::optional<std::array<float, 3>> center, float radius, uint32_t texture_cap) {
+    uint64_t request(const MapEntry& selection, std::optional<std::array<float, 3>> center, float radius, uint32_t texture_cap) {
         std::lock_guard lk(m_);
-        request_ = Request{++generation_, bubble, center, radius, texture_cap};
+        request_ = Request{++generation_, selection.bubble, center, radius, texture_cap, selection.activity, selection.bubble_name, selection.activity_map};
         pieces_.clear();
         progress_ = Progress{generation_};
         cv_.notify_all();
@@ -690,6 +690,8 @@ private:
         std::optional<std::array<float, 3>> center;
         float radius;
         uint32_t texture_cap;
+        TagHash activity;
+        uint32_t bubble_name = 0, activity_map = 0;
     };
     void run(fs::path install) {
         std::unique_ptr<PackageManager> pm;
@@ -703,6 +705,8 @@ private:
             return;
         }
         std::optional<MapLayout> layout;
+        TagHash layout_activity;
+        uint32_t layout_activity_map = 0;
         std::optional<PrepareCache> cache;
         std::vector<std::vector<InputElement>> layouts;
         try {
@@ -737,6 +741,8 @@ private:
                 std::string err;
                 try {
                     maps = list_maps(*pm);
+                    auto activities = list_activity_maps(*pm);
+                    maps.insert(maps.end(), std::make_move_iterator(activities.begin()), std::make_move_iterator(activities.end()));
                 } catch (const std::exception& ex) {
                     err = ex.what();
                 }
@@ -751,7 +757,14 @@ private:
                 return quit_ || generation_ != req.generation;
             };
             try {
-                if (!layout || layout->bubble != req.bubble) layout = load_map_layout(*pm, req.bubble);
+                const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map;
+                if (selection_changed) {
+                    const auto tables = req.activity.is_none() ? std::vector<TagHash>{} : load_activity_node_tables(*pm, req.activity, req.bubble_name, req.activity_map);
+                    layout = load_map_layout(*pm, req.bubble, tables);
+                    layout_activity = req.activity;
+                    layout_activity_map = req.activity_map;
+                    entities.reset();
+                }
                 if (!cache || cache->max_texture_dim != req.texture_cap) {
                     cache.emplace();
                     cache->max_texture_dim = req.texture_cap;
@@ -764,7 +777,7 @@ private:
                 const auto terrain = map_terrain_region(*layout, center, req.radius);
                 if (!entities || entities_bubble != req.bubble) {
                     if (!entity_materials) entity_materials = index_dynamic_model_materials(*pm);
-                    entities = load_map_entities(*pm, req.bubble, *entity_materials);
+                    entities = load_map_entities(*pm, *layout, *entity_materials);
                     entities_bubble = req.bubble;
                 }
                 auto entity_region = map_region(entities->models, center, req.radius);
@@ -781,12 +794,10 @@ private:
                     // a map whose node tables cannot be read is drawn without local lights
                 }
                 auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
-                try {
-                    *cubemaps = load_map_cubemaps(*pm, *layout);
-                } catch (const std::exception&) {
-                    // likewise without cubemap volumes
-                }
-                if (!weather || weather_bubble_ != req.bubble) {
+                // Surface probe failures through the worker's existing error path; silently
+                // continuing with zero probes makes a data failure look like missing lighting.
+                *cubemaps = load_map_cubemaps(*pm, *layout);
+                if (selection_changed || !weather || weather_bubble_ != req.bubble) {
                     try {
                         weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
                     } catch (const std::exception&) {
@@ -1013,6 +1024,7 @@ public:
 
     // The loaded map region (the live scene holds its meshes).
     struct MapView {
+        int selection_mode = 0;  // DEIMOS MapTab / ActivityTab
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
@@ -1023,6 +1035,8 @@ public:
         bool streaming = false, framed = false;
         TagHash bubble;
         std::string name;
+        TagHash activity;
+        uint32_t activity_map = 0;
         std::array<float, 3> center{};
     };
     MapView map;
@@ -1340,7 +1354,9 @@ public:
         const bool same = map_scene && map.bubble == m.bubble;
         map.framed = same && center.has_value();  // reloading around the camera keeps the view
         map.bubble = m.bubble;
-        map.name = m.package;
+        map.activity = m.activity;
+        map.activity_map = m.activity_map;
+        map.name = m.name.empty() ? m.package : m.name;
         map.selected = index;
         map.streaming = true;
         map_scene = true;
@@ -1352,7 +1368,7 @@ public:
         apply_weather();
         map.lights_set = false;
         const bool whole = map.radius >= MapView::kUnlimited;
-        map.generation = map_worker.request(m.bubble, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
+        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
         info(whole ? std::format("マップ {} ({}) を読込: 全域", m.package, m.bubble.str())
                    : std::format("マップ {} ({}) を読込: 半径 {:.0f} m", m.package, m.bubble.str(), map.radius));
     }
@@ -1507,7 +1523,7 @@ public:
         const auto& maps = map_worker.maps();
         if (pending_map) {
             for (size_t i = 0; i < maps.size(); ++i)
-                if (maps[i].bubble == *pending_map) load_map(int(i), std::nullopt);
+                if (maps[i].bubble == *pending_map && maps[i].activity.is_none()) { load_map(int(i), std::nullopt); break; }
             pending_map.reset();
         }
         const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -1518,17 +1534,21 @@ public:
         ImGui::BeginChild("maps", {left_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         ImGui::SetCursorPos({pad, pad});
         ImGui::SetNextItemWidth(left_w - 2 * pad);
+        if (ImGui::Combo("##map_view_kind", &map.selection_mode, "map_view\0activity_view\0")) map.selected = -1;
+        ImGui::SetItemTooltip("DEIMOS と同じ選択元: map_view = SBubbleParent / activity_view = SActivity のマップ参照 + ambient + phase");
+        ImGui::SetNextItemWidth(left_w - 2 * pad);
         ImGui::InputTextWithHint("##mfilter", (icon(ico::Search) + "  マップ / タグ").c_str(), map.filter, sizeof(map.filter));
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 3 + ImGui::GetTextLineHeightWithSpacing() * 2 + pad * 2;
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 3 + ImGui::GetTextLineHeightWithSpacing() * 3 + pad * 2;
         ImGui::SetCursorPosX(0);
         ImGui::BeginChild("maplist", {0, -footer}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         const std::string f = lower_ascii(map.filter);
         for (size_t i = 0; i < maps.size(); ++i) {
             const auto& m = maps[i];
-            if (!f.empty() && !contains_ci(m.package, f) && !contains_ci(m.bubble.str(), f)) continue;
+            if (int(!m.activity.is_none()) != map.selection_mode) continue;
+            if (!f.empty() && !contains_ci(m.package, f) && !contains_ci(m.name, f) && !contains_ci(m.bubble.str(), f) && !contains_ci(m.activity.str(), f)) continue;
             ImGui::PushID(int(i));
             const ImVec2 pos = ImGui::GetCursorScreenPos();
-            const bool live = map_scene && map.bubble == m.bubble;
+            const bool live = map_scene && map.selected == int(i);
             if (ImGui::Selectable("##m", int(i) == map.selected, 0, {0, ImGui::GetTextLineHeight() * 2 + 4 * sc})) {
                 map.selected = int(i);
                 load_map(int(i), std::nullopt);
@@ -1537,9 +1557,10 @@ public:
             auto* dl = ImGui::GetWindowDrawList();
             const float lh = ImGui::GetTextLineHeight();
             if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, kGreen);
-            dl->AddText({pos.x + pad, pos.y + 2 * sc}, IM_COL32_WHITE, m.package.c_str());
+            dl->AddText({pos.x + pad, pos.y + 2 * sc}, IM_COL32_WHITE, (m.name.empty() ? m.package : m.name).c_str());
             dl->AddText({pos.x + pad, pos.y + 2 * sc + lh}, grey,
-                        std::format("{}   {} メッシュ · {} 配置", m.bubble.str(), m.statics, m.instances).c_str());
+                        (m.activity.is_none() ? std::format("{}   {} メッシュ · {} 配置", m.bubble.str(), m.statics, m.instances) :
+                        std::format("activity {} / map[{}] → {}", m.activity.str(), m.activity_map, m.bubble.str())).c_str());
             ImGui::PopID();
         }
         if (maps.empty()) {
@@ -1574,6 +1595,7 @@ public:
             else
                 ImGui::TextDisabled("%zu メッシュ · %zu 配置", scene.mesh_count(), scene.instance_count());
             ImGui::TextDisabled("中心 (%.0f, %.0f, %.0f)", map.center[0], map.center[1], map.center[2]);
+            ImGui::TextDisabled("原プローブ %zu 領域 / 描画 %zu", game_lighting.cubemap_count(), game_lighting.cubemaps_drawn());
         }
         ImGui::EndGroup();
         ImGui::EndChild();
@@ -1618,6 +1640,8 @@ public:
         ImGui::TextDisabled("%s", map.bubble.str().c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(map.bubble.str().c_str());
+        if (map.activity.is_none()) ImGui::TextDisabled("map_view · SBubbleParent %s", map.bubble.str().c_str());
+        else ImGui::TextDisabled("activity_view · SActivity %s / map[%u] → %s", map.activity.str().c_str(), map.activity_map, map.bubble.str().c_str());
         weather_ui();
         ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
         const auto pr = map_worker.progress();
@@ -2299,6 +2323,8 @@ public:
             ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
             ImGui::Checkbox("空の環境光", &light.sky_ambient);
             ImGui::SetItemTooltip("ゲームの空半球マップ (hemisphere_sky_color_generate ほか) と cubemap_apply_sky_copy_ao。日陰の環境光");
+            ImGui::Checkbox("プローブの距離フェード (推定)", &light.probe_distance_fade);
+            ImGui::SetItemTooltip("既定では全域の原プローブ照明を描画。オンでカメラ距離によるフェードを使用 (エンジンの判定条件は未解明)。各プローブの空間範囲・色・強度は元データのまま");
             {
                 bool own = light.time_of_day < 0;
                 if (ImGui::Checkbox("マップの時刻", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
