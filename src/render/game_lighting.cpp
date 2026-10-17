@@ -877,6 +877,17 @@ void GameLighting::release(Gpu& gpu) {
     sky_.release(gpu);
     sky_near_rt_.Reset();
     sky_far_rt_.Reset();
+    vol_downsample_.release(gpu);
+    vol_blur_.release(gpu);
+    vol_upres_.release(gpu);
+    for (auto& vp : vol_pipelines_) vp->release(gpu);
+    vol_pipelines_.clear();
+    vol_lights_.clear();
+    vol_minmax_.Reset();
+    for (auto& r : vol_layer_) r.Reset();
+    for (auto& r : vol_blurred_) r.Reset();
+    vol_rtv_heap_.Reset();
+    vw_ = vh_ = 0;
     atm_ = {};
     atm_notes_.clear();
     ao_.Reset();
@@ -946,6 +957,14 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
             shading_.notes.push_back(std::format("{} not loaded: {}", name, ex.what()));
         }
     };
+    rigid_scope_ = load_scope(pm, globals_.scope("rigid_model"));
+    transparent_scope_ = load_scope(pm, globals_.scope("transparent"));
+    transparent_adv_scope_ = load_scope(pm, globals_.scope("transparent_advanced"));
+    // Volumetrics: the quarter-resolution min / max depth (x = max, y = min view depth, z = mean,
+    // w = where the mean lies between them), the blur (far, near) and the upres, added to the HDR.
+    load_sky(vol_downsample_, "downsample_full_depth_to_quarter_max_min", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
+    load_sky(vol_blur_, "volumetrics_blur_results", {DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}});
+    load_sky(vol_upres_, "volumetrics_upres_1", {DXGI_FORMAT_R16G16B16A16_FLOAT, true});
     load_sky(sky_near_, "sky_lookup_generate_near", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     load_sky(sky_far_, "sky_lookup_generate_far", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     {
@@ -1069,6 +1088,21 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     D3D12_CLEAR_VALUE lv{DXGI_FORMAT_R32G32_FLOAT, {0, 0, 0, 0}};
     linear_depth_ = gpu.texture2d(w, h, lv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lv);
     gpu.device()->CreateRenderTargetView(linear_depth_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc});
+    {
+        vw_ = std::max(1u, (w + 3) / 4);
+        vh_ = std::max(1u, (h + 3) / 4);
+        D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 7};
+        check_hr(gpu.device()->CreateDescriptorHeap(&vd, IID_PPV_ARGS(&vol_rtv_heap_)), "volumetrics RTV heap");
+        const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CLEAR_VALUE mm{DXGI_FORMAT_R32G32B32A32_FLOAT, {0, 0, 0, 0}};
+        vol_minmax_ = gpu.texture2d(vw_, vh_, mm.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &mm);
+        gpu.device()->CreateRenderTargetView(vol_minmax_.Get(), nullptr, vb);
+        for (int i = 0; i < 6; ++i) {
+            auto& r = i < 4 ? vol_layer_[i] : vol_blurred_[i - 4];
+            r = gpu.texture2d(vw_, vh_, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+            gpu.device()->CreateRenderTargetView(r.Get(), nullptr, {vb.ptr + size_t(1 + i) * inc});
+        }
+    }
     sky_near_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     sky_far_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     gpu.device()->CreateRenderTargetView(sky_near_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 7 * inc});
@@ -1382,8 +1416,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
     if (atmosphere) render_sky_lookups(gpu, cl, scopes);
+    const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
+    if ((p.ssao && hdao_.loaded()) || volumetrics) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
     lights_drawn_ = cubemaps_drawn_ = 0;
+    vol_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         env_pass(env_ibl_pso_.Get(), env_rtv);
@@ -1428,6 +1465,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         env_pass(env_bg_pso_.Get(), hdr);
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
     }
+    if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
@@ -1566,12 +1604,12 @@ void GameLighting::render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
 // (saturate(cb27 / z * (z_a + z_b) + cb28)); ao = max(1 - fade(z), exp(cb31 * sum^2)).
 // Its inputs come from extern 0x21 (goriath "hdao", fields unnamed); what each feeds was read from
 // the DXIL. The tuning values are engine code, not data: chosen here and listed as estimates.
-void GameLighting::render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+// Linear depth (viewer-made input, see kLinearDepthHlsl): hdao t1 and volumetrics_upres_1 t3.
+void GameLighting::render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-    const D3D12_CPU_DESCRIPTOR_HANDLE ao_rtv{base.ptr + 5 * inc}, lin_rtv{base.ptr + 6 * inc};
+    const D3D12_CPU_DESCRIPTOR_HANDLE lin_rtv{base.ptr + 6 * inc};
     const float near_z = vm.vp_rel.c[3][2];
-    // Linear depth (viewer-made input, see kLinearDepthHlsl).
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1594,6 +1632,13 @@ void GameLighting::render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         cl->DrawInstanced(3, 1, 0, 0);
         Gpu::barrier(cl, linear_depth_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+}
+
+void GameLighting::render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE ao_rtv{base.ptr + 5 * inc};
+    const float near_z = vm.vp_rel.c[3][2];
     auto& e = hdao_ext_;
     constexpr uint8_t kHdao = 0x21;
     const float w = float(w_), h = float(h_);
@@ -1766,6 +1811,47 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
         }
     }
     for (const auto& [why, n] : failures) light_notes_.push_back(std::format("{} lights left out: {}", n, why));
+    // Light shafts: the same per-shader pipeline sharing, four quarter-resolution targets added
+    // into (far, near, slices 0-3, slices 4-7). The techniques also read the rigid_model,
+    // transparent and transparent_advanced scopes.
+    vol_lights_.clear();
+    std::map<std::string, uint32_t> vol_keys;
+    std::map<std::string, size_t> vol_failures;
+    for (size_t i = 0; i < lights_.size(); ++i) {
+        const MapLight& l = lights_[i].light;
+        if (l.volumetrics.is_none()) continue;
+        try {
+            auto& tech = techniques[l.volumetrics.value];
+            if (!tech) tech = std::make_shared<const Technique>(load_technique(pm, l.volumetrics));
+            std::string key;
+            for (auto which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+                const auto& st = tech->stage(which);
+                key += std::format("{:08X}:", st.shader.value);
+                for (const auto& t : st.textures) key += std::format("t{}={:08X},", t.slot, t.texture.value);
+                for (const auto& sm : st.samplers) key += std::format("s{:08X},", sm.value);
+                key += '|';
+            }
+            auto it = vol_keys.find(key);
+            if (it == vol_keys.end()) {
+                const uint32_t index = uint32_t(vol_pipelines_.size());
+                for (bool front : {true, false}) {
+                    auto vp = std::make_unique<GamePipeline>();
+                    GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true,
+                                              {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT}};
+                    opt.volume = true;
+                    opt.cull_front = front;
+                    opt.cbuffer_floor = 80;
+                    vp->load(pm, gpu, l.volumetrics, scopes, opt);
+                    vol_pipelines_.push_back(std::move(vp));
+                }
+                it = vol_keys.emplace(key, index).first;
+            }
+            vol_lights_.push_back({it->second, tech, i});
+        } catch (const std::exception& ex) {
+            ++vol_failures[std::string(ex.what()).substr(0, 120)];
+        }
+    }
+    for (const auto& [why, n] : vol_failures) light_notes_.push_back(std::format("{} light shafts left out: {}", n, why));
     if (!lights_.empty())
         ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1) (plane masks off), +0x150 = 1, +0x154 = 0, +0x158 = 1 (fade: fully on)",
                            "goriath DeferredLight layout; +0x158 read from the light PS (output scale)");
@@ -1822,6 +1908,151 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));
         }
     }
+}
+
+// ---- Volumetrics -------------------------------------------------------------------------------
+// The light shaft chain (docs/PROGRESS.md 3.3), read from the DXIL of the passes:
+//  1. downsample_full_depth_to_quarter_max_min (extern 35): per 4x4 block, view depth max / min.
+//  2. each light's volumetrics technique, drawn as the light volume at quarter resolution with a
+//     quarter-resolution view: marches the lit cone between the eye and the block's max (far
+//     layer, o0) and min (near layer, o1) depth and spreads the energy into 8 depth slices (o2,
+//     o3, for transparents). t10 (transparent scope, Deferred +0x98) is the min / max texture.
+//  3. volumetrics_blur_results: depth-aware 3x3 blur of both layers (extern 38 inputs).
+//  4. volumetrics_upres_1: bilateral upsample against the full-resolution view depth (Deferred
+//     +0x98 = (depth, depth) as nim's linear depth), added to the HDR target.
+void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
+                                      D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& full_scopes) {
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    auto rtv = [&](size_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{vb.ptr + i * inc}; };
+    const float w = float(w_), h = float(h_), lw = float(vw_), lh = float(vh_);
+    const float near_z = vm.vp_rel.c[3][2];
+    constexpr std::string_view chosen = "meaning read from the volumetrics DXIL, value chosen";
+    auto upload = [&](const std::vector<float4>& values) {
+        auto a = gpu.dynamic(std::max<size_t>(values.size(), 1) * sizeof(float4));
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
+        return a.gpu;
+    };
+    const D3D12_VIEWPORT qvp{0, 0, lw, lh, 0, 1}, fvp{0, 0, w, h, 0, 1};
+    const D3D12_RECT qsc{0, 0, LONG(vw_), LONG(vh_)}, fsc{0, 0, LONG(w_), LONG(h_)};
+    cl->RSSetViewports(1, &qvp);
+    cl->RSSetScissorRects(1, &qsc);
+
+    // 1. Quarter-resolution min / max view depth.
+    constexpr uint8_t kDownsample = 0x23;
+    ext_.set_texture(kDownsample, 0x00, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set(kDownsample, 0x10, float4{lw, lh, 1 / lw, 1 / lh});  // cb0[2]: target size
+    ext_.set(kDownsample, 0x20, float4{w, h, 1 / w, 1 / h});      // cb0[3]: source size (x: 4 source texels per target texel)
+    ext_.set(kDownsample, 0x30, float4{0, 1 / near_z, 0, 0});     // cb0[4]: 1 / view depth = x + y * device depth
+    Gpu::barrier(cl, vol_minmax_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto minmax_rtv = rtv(0);
+    cl->OMSetRenderTargets(1, &minmax_rtv, FALSE, nullptr);
+    vol_downsample_.draw(gpu, cl, ext_, full_scopes);
+    Gpu::barrier(cl, vol_minmax_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // 2. The lights, with a quarter-resolution view (cb12 and the pixel -> world matrix).
+    fill_view_externs(ext_, vw_, vh_, vm);
+    M4 pixel_to_ndc;
+    pixel_to_ndc.c[0] = {2.0f / lw, 0, 0, 0};
+    pixel_to_ndc.c[1] = {0, -2.0f / lh, 0, 0};
+    pixel_to_ndc.c[2] = {0, 0, 1, 0};
+    pixel_to_ndc.c[3] = {-1, 1, 0, 1};
+    const M4 pixel_to_rel = mul(inverse(vm.vp_rel), pixel_to_ndc);
+    ext_.set(ext::View, 0x2E0, pixel_to_rel);
+    const auto q12v = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
+    const auto q12p = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
+    const Scope* extra_scopes[] = {&rigid_scope_, &transparent_scope_, &transparent_adv_scope_};
+    ScopeBufferFn qscopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        if (reg == 12) return stage == ShaderStage::Vertex ? q12v : q12p;
+        if (reg == 13) return full_scopes(stage, 13);
+        const ScopeStage ss = scope_stage(stage);
+        for (const Scope* s : extra_scopes) {
+            const auto& st = s->stages[size_t(ss)];
+            if (st.cbuffer_slot == int32_t(reg) && !st.cbuffer_init.empty()) return upload(evaluate_scope(*s, ss, ext_));
+        }
+        return 0;
+    };
+    ext_.set_texture(ext::Deferred, 0x98, vol_minmax_.Get());  // t10 of the transparent scope
+    constexpr uint8_t kVolumetricsPass = 0x58, kTemporal = 0x59;
+    if (!ext_.zero_policy(kVolumetricsPass))
+        ext_.zero_when_missing(kVolumetricsPass, "volumetric fog density slices (extern 88 t0/t1): producer not identified, zero (base density only)");
+    ext_.set(kVolumetricsPass, 0x10, 0.0f);
+    ext_.note_estimate("extern 88 +0x10 = 0 (march dither off)", "no temporal filter yet: an undithered march instead of temporal noise");
+    if (!ext_.zero_policy(ext::Transparent))
+        ext_.zero_when_missing(ext::Transparent, "transparent pass inputs (atmosphere volumes, coverage weight) not produced: zero");
+    if (!ext_.zero_policy(ext::RigidModel)) ext_.zero_when_missing(ext::RigidModel, "rigid model value with no known meaning: zero");
+    if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "volume fog value with no known meaning: zero");
+    ext_.set(ext::VolumeFog, 0xB0, 1.0f);  // cb0[39]: shaft intensity scale
+    ext_.set(ext::VolumeFog, 0xB4, 1.0f);  // cb0[40]: march direction (+1: from the far face toward the eye)
+    ext_.note_estimate("extern 50 +0xB0 = 1 (shaft intensity), +0xB4 = 1 (march direction)", chosen);
+    for (auto& r : vol_layer_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE layers[4] = {rtv(1), rtv(2), rtv(3), rtv(4)};
+    const float zero[4]{};
+    for (const auto& l : layers) cl->ClearRenderTargetView(l, zero, 0, nullptr);
+    cl->OMSetRenderTargets(4, layers, FALSE, nullptr);
+    M4 to_rel;  // world -> camera-relative world
+    to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
+    to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    for (const auto& vl : vol_lights_) {
+        const MapLight& l = lights_[vl.light].light;
+        if (off_screen(vm, l.lo, l.hi)) continue;
+        const M4 node = m4(l.node), space = m4(l.light_space);
+        const M4 node_rel = mul(to_rel, node);
+        const M4 volume = mul(node_rel, space);
+        const M4 box = light_box_to_world(node, space);  // light box [0,1]^3 -> world
+        const M4 rel_to_box = inverse(mul(to_rel, box));
+        ext_.set(15, 0x00, mul(vm.vp_rel, volume));
+        ext_.set(ext::DeferredLight, 0x00, 0.0f);
+        ext_.set(ext::DeferredLight, 0x40, rel_to_box);
+        ext_.set(ext::DeferredLight, 0xC0, node_rel);
+        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
+        ext_.set(ext::DeferredLight, 0x150, 1.0f);
+        ext_.set(ext::DeferredLight, 0x154, 0.0f);
+        ext_.set(ext::DeferredLight, 0x158, 1.0f);
+        ext_.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
+        ext_.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
+        ext_.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
+        const bool mirrored = det4(volume) > 0;
+        GamePipeline& gp = *vol_pipelines_[vl.pipeline + (mirrored ? 1 : 0)];
+        try {
+            gp.draw_volume(gpu, cl, ext_, qscopes, vl.technique.get(), cube_vbv_, cube_ibv_, 36);
+            ++vol_drawn_;
+        } catch (const std::exception& ex) {
+            if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));
+        }
+    }
+    for (auto& r : vol_layer_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // 3. Blur: extern 38 +0x08 near, +0x00 far, +0x18 min / max; out (far, near).
+    const auto post = ext_.texture(ext::Postprocess, 0x00);
+    ext_.set_texture(ext::Postprocess, 0x00, vol_layer_[0].Get());
+    ext_.set_texture(ext::Postprocess, 0x08, vol_layer_[1].Get());
+    ext_.set_texture(ext::Postprocess, 0x18, vol_minmax_.Get());
+    ext_.set(ext::Postprocess, 0x50, float4{lw, lh, 1 / lw, 1 / lh});
+    ext_.set(kTemporal, 0xA0, 1.0f);  // cb0[10]: blur on (else the layers pass through)
+    for (auto& r : vol_blurred_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE blurred[2] = {rtv(5), rtv(6)};
+    cl->OMSetRenderTargets(2, blurred, FALSE, nullptr);
+    vol_blur_.draw(gpu, cl, ext_, qscopes);
+    for (auto& r : vol_blurred_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // 4. Upres into the HDR target (added: the technique carries no blend state).
+    cl->RSSetViewports(1, &fvp);
+    cl->RSSetScissorRects(1, &fsc);
+    fill_view_externs(ext_, w_, h_, vm);
+    ext_.set_texture(ext::Postprocess, 0x00, vol_blurred_[0].Get());
+    ext_.set_texture(ext::Postprocess, 0x08, vol_blurred_[1].Get());
+    ext_.set(ext::Postprocess, 0x50, float4{w, h, 1 / w, 1 / h});
+    ext_.set(ext::Postprocess, 0x60, float4{lw, lh, 1 / lw, 1 / lh});
+    ext_.set(ext::Postprocess, 0xC0, float4{1, 1, 1, 1});
+    ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
+    ext_.note_estimate("volumetrics: upres added to HDR, scale 1 (extern 38 +0xC0), blur on (extern 89 +0xA0)", chosen);
+    cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
+    vol_upres_.draw(gpu, cl, ext_, full_scopes);
+
+    // Restore what the other passes read.
+    ext_.set_texture(ext::Postprocess, 0x00, post.resource, post.format);
+    ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
 }
 
 // ---- Cubemap volumes ---------------------------------------------------------------------------

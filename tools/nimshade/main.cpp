@@ -79,7 +79,7 @@ int run(int argc, char** argv) {
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false;
-    bool no_ssao = false;
+    bool no_ssao = false, no_volumetrics = false;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -95,6 +95,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
+        else if (args[i] == "--no-volumetrics") no_volumetrics = true;
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
@@ -353,6 +354,7 @@ int run(int argc, char** argv) {
     lp.time = material_time;
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
+    lp.volumetrics = !no_volumetrics;
     lp.atmosphere = !no_atmosphere;
     lp.time_of_day = time_of_day;
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
@@ -420,7 +422,7 @@ int run(int argc, char** argv) {
             for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
         }
         if (gl.light_count()) {
-            std::println("local lights drawn: {}", gl.lights_drawn());
+            std::println("local lights drawn: {}, light shafts {} of {}", gl.lights_drawn(), gl.volumetrics_drawn(), gl.volumetric_lights());
             for (int b = 0; b < 2; ++b) {
                 auto px = gpu.read_texture(gl.light_buffer(b), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
                 const uint16_t* h = reinterpret_cast<const uint16_t*>(px.data());

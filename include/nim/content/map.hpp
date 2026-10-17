@@ -90,6 +90,7 @@ inline constexpr uint32_t kClassLightCollection = 0x8080854B, kClassShadowingLig
 struct MapLight {
     TagHash source;                    // the SShadowingLight / SLightCollection tag
     TagHash technique;                 // lighting_apply technique (deferred light into the light buffers)
+    TagHash volumetrics;               // light shaft technique (SShadowingLight +0xDC, collection light +0xC8)
     std::array<float, 16> node{};      // light local -> world (node / collection transform)
     std::array<float, 16> light_space{};  // unit cube (NDC) -> light local, projective
     std::array<float, 20> params{};    // SLight +0x00..+0x4F: two clip planes, two more, plane exponents

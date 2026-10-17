@@ -164,6 +164,7 @@ MapLight read_light(const TagReader& r, size_t o, size_t technique, const Mat& n
     l.light_space = read_mat(r, o + 0x60);
     for (size_t i = 0; i < 20; ++i) l.params[i] = r.f32_at(o + i * 4);
     l.technique = r.tag_at(o + technique);
+    l.volumetrics = r.tag_at(o + technique + (shadowing ? 8 : 4));
     // Bounds: the unit cube's corners through light space (projective) and the node transform.
     const Mat to_world = mat_mul(node, l.light_space);
     l.lo = {1e30f, 1e30f, 1e30f};

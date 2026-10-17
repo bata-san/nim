@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-17 (大気 + 空の実装コミット)
+最終更新: 2026-10-17 (ボリューメトリクスの実装コミット)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -15,9 +15,9 @@
 |---|------|------|-----------------|------|
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
-| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 「Atmosphere and sky」コミット | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
-| 4 | ボリューメトリクス (ライトシャフト) | **作業中** (解析途中) | — | §3.3。大気/フォグ密度スライスに依存 |
-| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 未着手 | — | キューブマップボリュームは 666fc85 で実装済み |
+| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
+| 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 「Volumetrics」コミット | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
+| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | **次** | — | キューブマップボリュームは 666fc85 で実装済み |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, vignette, final_combine) | 未着手 | — | final_combine だけは既に描画 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
 
@@ -104,7 +104,24 @@ GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」
 シェーディング → `sky` を env_bg の代わりに描画。GamePipeline に深度テストのオプションを足す。
 GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no-atmosphere`。
 
-### 3.3 ボリューメトリクス (解析途中)
+### 3.3 ボリューメトリクス (実装済み)
+実装: `GameLighting::render_volumetrics` (src/render/game_lighting.cpp)。順序 (シェーディングと空の後):
+1. `downsample_full_depth_to_quarter_max_min` (extern 35: +0x00 深度, +0x10 出力サイズ, +0x20 入力サイズ,
+   +0x30 = (0, 1/near)) → 1/4 解像度 RGBA32F (x = 最大ビュー深度, y = 最小, z = 平均, w = 平均の位置)。
+2. ライトごとの volumetrics 技法 (MapLight::volumetrics) をライトボリュームとして 1/4 解像度で加算描画。
+   ビューは 1/4 解像度に切り替え (fill_view_externs + View +0x2E0 + cb12 再評価)。Deferred +0x98 = 1.
+   の min/max (transparent スコープ t10)。extern 50: +0x40 = (画素, デバイス深度) → ライト箱空間,
+   +0x80 = 箱空間の視点, +0xB0 = 1, +0xB4 = 1 (推定)。extern 8 +0x00 = 箱 → ワールド。cb1/cb2/cb8 は
+   rigid_model / transparent / transparent_advanced スコープを都度評価。出力 o0 = 遠 (max 深度まで),
+   o1 = 近 (min 深度まで), o2/o3 = 透明物用の 8 スライス (今は未使用)。
+3. `volumetrics_blur_results` (extern 38: +0x00 遠, +0x08 近, +0x18 min/max, +0x50 1/4 サイズ;
+   extern 89 +0xA0 = 1 でブラー有効) → (遠, 近)。
+4. `volumetrics_upres_1` (extern 38 同上 + +0x50 フル, +0x60 1/4, +0xC0 = 1; Deferred +0x98 = nim の
+   R32G32 線形深度) → HDR に加算 (技法にブレンド状態が無いので加算は推定)。終わったら extern 38 +0x00 と
+   Deferred +0x98 を元に戻す (final_combine と他パスが読む)。
+未: 霧密度スライス extern 88 t0/t1 (0 = 推定。基礎密度 1e-4/m だけなのでとても淡い)、temporal filter
+(extern 89 の履歴。今はディザ 0 で縞が少し出る)、assemble (透明物用)、t20/t21/t25 の大気ボリューム。
+以下は解析メモ。
 - ライトごとの技法: SShadowingLight は +0xD4 shading, +0xD8 shading_shadowing, **+0xDC volumetrics**,
   +0xE0 volumetrics_shadowing, +0xE4/+0xE8 lightprobe CS。SLightCollection の各ライト (0x100 バイト)
   は +0xC4 shading, **+0xC8 volumetrics**, +0xCC lightprobe CS。

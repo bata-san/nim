@@ -199,9 +199,11 @@ public:
     // techniques into the light buffers the shading pass reads. Lights whose technique cannot be
     // loaded are left out and listed in light_notes().
     void set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights);
-    void clear_lights() { lights_.clear(); }
+    void clear_lights() { lights_.clear(); vol_lights_.clear(); }
     size_t light_count() const { return lights_.size(); }
     size_t lights_drawn() const { return lights_drawn_; }
+    size_t volumetric_lights() const { return vol_lights_.size(); }
+    size_t volumetrics_drawn() const { return vol_drawn_; }
     const std::vector<std::string>& light_notes() const { return light_notes_; }
     ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE
 
@@ -251,6 +253,28 @@ private:
     ComPtr<ID3D12Resource> ao_, linear_depth_;
     ComPtr<ID3D12PipelineState> linear_depth_pso_;
     void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    void render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
+
+    // Volumetrics (docs/PROGRESS.md 3.3): each local light's volumetrics technique is marched at
+    // quarter resolution into a near / far layer pair (plus the transparents' 8 intensity slices),
+    // then volumetrics_blur_results and volumetrics_upres_1 add the shafts to the HDR target.
+    void render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
+                            D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes);
+    Scope rigid_scope_, transparent_scope_, transparent_adv_scope_;
+    GamePipeline vol_downsample_, vol_blur_, vol_upres_;
+    struct VolumetricLight {
+        uint32_t pipeline = 0;  // pair: both windings
+        std::shared_ptr<const Technique> technique;
+        size_t light = 0;       // index into lights_
+    };
+    std::vector<std::unique_ptr<GamePipeline>> vol_pipelines_;
+    std::vector<VolumetricLight> vol_lights_;
+    size_t vol_drawn_ = 0;
+    // Quarter resolution: min/max depth, the light pass targets (far, near, slices 0-3, 4-7), the
+    // blurred far / near layers.
+    ComPtr<ID3D12Resource> vol_minmax_, vol_layer_[4], vol_blurred_[2];
+    ComPtr<ID3D12DescriptorHeap> vol_rtv_heap_;
+    uint32_t vw_ = 0, vh_ = 0;
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded
     struct Atmosphere {

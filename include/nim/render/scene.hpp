@@ -423,6 +423,8 @@ struct LightingParams {
     float time_of_day = -1.0f;
     // Screen-space ambient occlusion with the game's hdao pass (game lighting only).
     bool ssao = true;
+    // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.
+    bool volumetrics = true;
 };
 
 class LightingPass {

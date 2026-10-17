@@ -2231,6 +2231,8 @@ public:
             ImGui::SetItemTooltip("nim のシャドウマップ (ゲームのカスケードは未解読のため推定)");
             ImGui::Checkbox("SSAO", &light.ssao);
             ImGui::SetItemTooltip("ゲームの hdao と apply_ssao_to_light_buffers (調整値は推定)");
+            ImGui::Checkbox("ライトシャフト", &light.volumetrics);
+            ImGui::SetItemTooltip("ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)");
             ImGui::ColorEdit3("太陽の色", &light.sun_color.x);
             ImGui::SliderFloat("空の強さ", &light.sky_intensity, 0, 4);
             ImGui::ColorEdit3("空 (天頂)", &light.sky_top.x);
