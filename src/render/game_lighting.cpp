@@ -1431,10 +1431,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (atmosphere) sky_.validate(ext_, scopes);
     // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal
     // histories) is not yet decoded. Its outputs must be supplied by their real producers.
-    // Transparent parts are left out (not substituted): the original pass's shared inputs and MRT
-    // attachments are not reconstructed yet.
+    // Transparent parts (render stage 8: the sky objects, glass ...) are drawn over the sky into the
+    // HDR target, before the light shafts; their motion target (SV_Target4) is not bound.
     if (transparents)
-        ext_.note_estimate("transparent parts are NOT drawn", "original transparent pass inputs / MRTs not reconstructed");
+        ext_.note_estimate("transparent parts: drawn in item order (not sorted back to front), motion target dropped",
+                           "engine transparent sorting not decoded");
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     const auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1585,6 +1586,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     } else {
         env_pass(env_bg_pso_.Get(), hdr);
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
+    }
+    if (transparents) {
+        transparents(cl, hdr);
+        cl->RSSetViewports(1, &vp);
+        cl->RSSetScissorRects(1, &sc);
     }
     if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

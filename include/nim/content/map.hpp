@@ -170,6 +170,12 @@ struct MapEntities {
     std::vector<MapStatic> models;  // per dynamic model, the 3x4 rows of its placements
     size_t node_tables = 0, nodes = 0, entities = 0, placements = 0;
 };
+// The map's sky objects: node components 80808378 (SSkyObjectCollectionComponent) name a
+// collection (8080837C: +0x08 Vec of 0x90-byte objects: +0x00 transform (column-major mat4),
+// +0x40 bounds, +0x60 model ref 80808383 (+0x08 the dynamic model), +0x64 draw order, +0x70 kind).
+// The distant scenery (mountains, terrain far out, celestial shapes) placed kilometres away; per
+// dynamic model, the 3x4 rows of its placements. Kind 5 is left out (goriath: draws solid red).
+std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map);
 // Needs the hash64 index (PackageManager::build_hash64_index).
 MapEntities load_map_entities(PackageManager& pm, TagHash bubble,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);

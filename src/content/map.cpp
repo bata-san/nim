@@ -414,6 +414,73 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
     return out;
 }
 
+std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map) {
+    constexpr uint32_t kClassSkyComponent = 0x80808378, kClassSkyModelRef = 0x80808383;
+    std::map<uint32_t, MapStatic> models;
+    std::set<std::vector<float>> seen;  // the activity layers repeat the same collection
+    std::set<uint32_t> collections;
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(t);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                if (r.u32_at(p - 4) == kClassSkyComponent) collections.insert(r.u32_at(p + 0x10));
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    for (uint32_t c : collections) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(TagHash(c));
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto objects = r.vec_at(0x08);
+        for (uint64_t i = 0; i < objects.count; ++i) {
+            const size_t o = objects.data + size_t(i) * 0x90;
+            if (o + 0x90 > data.size()) break;
+            if (r.u32_at(o + 0x70) == 5) continue;
+            const TagHash ref = r.tag_at(o + 0x60);
+            const Entry* re = pm.entry(ref);
+            if (!re || re->reference != kClassSkyModelRef) continue;
+            TagHash model;
+            try {
+                const auto rd = pm.read(ref);
+                if (rd.size() < 0x0C) continue;
+                model = TagReader(rd).tag_at(0x08);
+            } catch (...) {
+                continue;
+            }
+            if (model.is_none()) continue;
+            std::array<float, 12> row{};
+            for (int k = 0; k < 4; ++k)
+                for (int a = 0; a < 3; ++a) row[size_t(a * 4 + k)] = r.f32_at(o + size_t(k) * 16 + size_t(a) * 4);
+            std::vector<float> key(row.begin(), row.end());
+            key.push_back(float(model.value));
+            if (!seen.insert(std::move(key)).second) continue;
+            auto& m = models[model.value];
+            m.mesh = model;
+            m.rows.push_back(row);
+        }
+    }
+    std::vector<MapStatic> out;
+    for (auto& [_, m] : models) out.push_back(std::move(m));
+    return out;
+}
+
 std::array<float, 3> MapAtmosphere::path_direction(int i, float t) const {
     const auto& path = paths[size_t(i)];
     if (path.empty()) return {0, 0, 1};

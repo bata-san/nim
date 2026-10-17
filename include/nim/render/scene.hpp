@@ -265,6 +265,12 @@ public:
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                             const ViewMatrices& vm);
     bool has_transparent() const { return transparent_count_ > 0; }
+    // The transparent scope's engine inputs produced by the lighting (GameLighting): extern 40
+    // +0x00 / +0x10 the near / far sky lookups (the fog colour by distance) and Deferred +0x98 the
+    // linear depth. The rest of extern 40 (atmosphere froxels, light shaft slices) is zero (estimate).
+    void set_transparent_inputs(ID3D12Resource* sky_near, ID3D12Resource* sky_far, ID3D12Resource* linear_depth) {
+        transparent_inputs_ = {sky_near, sky_far, linear_depth};
+    }
     // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
     // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
     bool skinned() const { return skinned_; }
@@ -337,6 +343,7 @@ private:
     std::map<uint32_t, float> global_overrides_;
     std::vector<float4> global_values_;
     const RainOcclusion* rain_ = nullptr;
+    std::array<ID3D12Resource*, 3> transparent_inputs_{};  // sky near, sky far, linear depth
     ChannelValues channel_overrides_;
     ChannelValues channel_defaults_;
     float material_time_ = 0, material_delta_ = 0, material_exposure_ = 1;

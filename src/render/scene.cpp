@@ -1518,10 +1518,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (g.part.primitive_type == 5)
             pd.IBStripCutValue = mesh.buffers.at(g.buffers).ib.is_32bit ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+        // Transparents draw into the HDR target. Their SV_Target4 is the motion vector (the sky's and
+        // the G-buffer's convention), left unbound like the sky pass's.
         pd.NumRenderTargets = transparent ? 1 : 4;
-        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = GBuffer::kFormats[r];
+        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : GBuffer::kFormats[r];
         for (const auto& output : shader_outputs(g.ps))
-            if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
+            if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !(transparent && output.index == 4))
                 throw std::runtime_error(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
@@ -1615,6 +1617,17 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // A single model has no map around it: no atmosphere, no overhead visibility map.
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext.zero_policy(id)) ext.zero_when_missing(id, "world state from a map (not loaded): zero");
+    // Transparent scope (extern 40, docs/PROGRESS.md 3.9): the sky lookups and the linear depth
+    // from the lighting; the atmosphere froxels (+0x78) and light shaft slices (+0x48 / +0x50) are
+    // not produced yet.
+    if (transparent_count_) {
+        if (transparent_inputs_[0]) ext.set_texture(ext::Transparent, 0x00, transparent_inputs_[0]);
+        if (transparent_inputs_[1]) ext.set_texture(ext::Transparent, 0x10, transparent_inputs_[1]);
+        if (transparent_inputs_[2]) ext.set_texture(ext::Deferred, 0x98, transparent_inputs_[2]);
+        if (!ext.zero_policy(ext::Transparent))
+            ext.zero_when_missing(ext::Transparent, "transparent pass inputs (atmosphere froxels, light shaft slices) not produced: zero");
+        if (!ext.zero_policy(ext::Deferred)) ext.zero_when_missing(ext::Deferred, "deferred value of the transparent pass not produced: zero");
+    }
     // PatternBlending (97): an engine-produced pattern texture whose producer is not decoded.
     if (!ext.zero_policy(97)) ext.zero_when_missing(97, "pattern-blending engine input (producer not decoded): zero");
     ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
@@ -2003,10 +2016,13 @@ void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList*
     rain.valid = true;
 }
 
-void StaticMeshScene::render_transparent(Gpu&, ID3D12GraphicsCommandList*, GBuffer&, D3D12_CPU_DESCRIPTOR_HANDLE,
-                                         const ViewMatrices&) {
+void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                                         const ViewMatrices& vm) {
     if (!transparent_count_) return;
-    throw std::runtime_error("Original transparent pass inputs/MRTs have not been reconstructed; substitution is disabled");
+    // The constants were evaluated with the G-buffer pass (update_materials); parts whose game
+    // inputs are missing failed there and are not drawn.
+    cl->OMSetRenderTargets(1, &rtv, FALSE, &gb.dsv_ro);
+    draw_items(gpu, cl, kStageTransparent, gb.width(), gb.height(), vm, false);
 }
 
 // ---- LightingPass ---------------------------------------------------------------------------------

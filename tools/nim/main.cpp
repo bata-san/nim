@@ -1796,6 +1796,7 @@ public:
                 scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
             }
             scene.set_rain_occlusion(map_scene && rain.valid ? &rain : nullptr);
+            if (game_ready) scene.set_transparent_inputs(game_lighting.sky_near(), game_lighting.sky_far(), game_lighting.linear_depth());
             scene.render_gbuffer(gpu, cl, gb, vm);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");

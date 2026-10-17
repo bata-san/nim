@@ -78,7 +78,7 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
-    bool no_lights = false, no_cubemaps = false, no_entities = false;
+    bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false;
     bool no_ssao = false, no_volumetrics = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
@@ -96,6 +96,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--no-entities") no_entities = true;
+        else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
         else if (args[i] == "--no-post") no_post = true;
@@ -144,7 +145,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -220,9 +221,17 @@ int run(int argc, char** argv) {
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - te).count());
             for (auto& m : er) region.push_back(std::move(m));
         }
+        // The sky objects (distant scenery kilometres out): all of them, whatever the radius.
+        if (!no_sky_objects) {
+            auto sky = load_map_sky_objects(pm, map);
+            size_t n = 0;
+            for (const auto& m : sky) n += m.rows.size();
+            std::println("sky objects: {} placements of {} models", n, sky.size());
+            for (auto& m : sky) region.push_back(std::move(m));
+        }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;
-        cache.gbuffer_only = true;
+        cache.gbuffer_only = no_sky_objects;  // the transparents (stage 8) carry the sky objects
         cache.all_lods = true;
         scene.begin(gpu);
         std::map<std::string, size_t> failures;
@@ -431,6 +440,7 @@ int run(int argc, char** argv) {
         if (gl.environment_channels()) {
             std::println("map environment: {} global channels at time of day {:.3f}", gl.environment_channels(),
                          lp.time_of_day >= 0 ? lp.time_of_day : gl.default_time_of_day());
+            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
         }
         if (print_channels) {
@@ -447,6 +457,7 @@ int run(int argc, char** argv) {
         for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
             gpu.begin_frame(uint32_t(k + 1));  // the previous frame was flushed: its transient space is free
             scene.set_exposure(gl.exposure());
+            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
@@ -455,10 +466,12 @@ int run(int argc, char** argv) {
         for (int k = 0; k < 16 && gl.temporal_aa_on(lp); ++k) {
             gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
             vm = gl.temporal_view(view, lp);
+            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
         }
+        for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         if (lp.post && gl.post_ready())
             std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
