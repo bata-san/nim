@@ -1169,6 +1169,14 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.zero_when_missing(ext::GlobalLighting, "global lighting value with no known meaning: zero");
 }
 
+void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) {
+    for (const auto& [slot, v] : global_overrides_)
+        if (slot < ext_.channels.size() && slot < globals_.channel_defaults.size()) ext_.channels[slot] = globals_.channel_defaults[slot];
+    global_overrides_ = values;
+    for (const auto& [slot, v] : global_overrides_)
+        if (slot < ext_.channels.size()) ext_.channels[slot][0] = v;
+}
+
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                           const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");

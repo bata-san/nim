@@ -209,6 +209,9 @@ public:
     size_t cubemaps_drawn() const { return cubemaps_drawn_; }
     const std::vector<std::string>& cubemap_notes() const { return cubemap_notes_; }
 
+    // Weather: global channel values by index (world channel controllers), over the defaults.
+    void set_global_channels(const std::map<uint32_t, float>& values);
+
     ExternStore& externs() { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
@@ -221,6 +224,7 @@ private:
     RenderGlobals globals_;
     Scope frame_scope_, view_scope_;
     ExternStore ext_;
+    std::map<uint32_t, float> global_overrides_;
     GamePipeline shading_, final_combine_;
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded

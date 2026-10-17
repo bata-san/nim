@@ -41,6 +41,11 @@ from the entity component that places them; skinned meshes show their bind pose.
 The UI is set in the game's own fonts (PP Fraktion Mono, Marathon Shapiro, KH Interference,
 Noto Sans JP/KR/SC/TC), read from your install at startup; nothing is bundled.
 
+MAPS: a map's weather comes from its world channel controllers (the activity scripts that set
+world global channels such as rain_amount). The map details offer a Heat Cascade toggle where the
+map has one (Outpost) and a state per controller; rain-aware materials are kept dry under cover
+by an overhead visibility map nim draws from straight above (an estimate, listed with the others).
+
 Camera: left drag orbits, middle drag pans, wheel zooms, right drag flies (WASD/QE, Shift
 faster, Ctrl slower, wheel = speed), F frames, Ctrl+S saves a PNG to `captures/` next to the exe.
 
@@ -74,6 +79,7 @@ build/Release/nimcli refs 80A4A8D0 8080BADB   # tags of a class that reference a
 build/Release/nimcli globals           # render globals: engine pipelines, scopes, global channels
 build/Release/nimcli scope 80A74035    # scope bytecode (shared cbuffers)
 build/Release/nimcli fonts out/fonts   # the game's UI fonts (for your own inspection)
+build/Release/nimcli weather 80AF9550    # a map's world channel controllers (weather, Heat Cascade) and their states
 ```
 
 ### Shading test
@@ -82,6 +88,8 @@ build/Release/nimcli fonts out/fonts   # the game's UI fonts (for your own inspe
 build/Release/nimshade 80A878C8 out/shade --size 1600x1000
 build/Release/nimshade 80A48549 out/animated --game --time 2
 build/Release/nimshade 80A48549 out/benchmark --game --benchmark 480
+build/Release/nimshade 80AF9550 out/outpost --heat-cascade   # a map with its Heat Cascade state
+build/Release/nimshade 80AF9550 out/rain --weather outpost_ambient=STATE_HASH
 ```
 
 The renderer loads original game DXIL and assets. It currently rejects lit rendering when

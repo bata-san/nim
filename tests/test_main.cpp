@@ -1,5 +1,6 @@
 // Unit tests that do not need a game install.
 #include "nim/content/tfx_vm.hpp"
+#include "nim/content/weather.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
 #include "nim/core/tag_reader.hpp"
@@ -116,6 +117,19 @@ int main() {
         CHECK(out == first);
         const uint8_t globals_only[] = {0x63, 0xCA, 0x53, 0x00};
         CHECK(!evaluate_tfx(globals_only, {}, initial, out, env).live_inputs);
+    }
+
+    {
+        // Weather: a state's channels at the middle of their range; unregistered channels skipped.
+        WeatherController c;
+        c.name = "exp_outpost/hz_emberwave";
+        c.states = {{1, {{0xA, 19, 0, 0}, {0xB, 17, 0, 0}}}, {2, {{0xA, 19, 1, 1}, {0xB, 17, 1, 1}, {0xC, -1, 5, 5}}}};
+        CHECK(c.heat_cascade());
+        CHECK(c.strongest_state() == &c.states[1]);
+        WeatherState rain{3, {{0xD, 7, 50, 100}}};
+        const auto v = weather_values(rain);
+        CHECK(v.size() == 1 && v[0].first == 7 && v[0].second == 75);
+        CHECK(weather_values(c.states[1]).size() == 2);
     }
 
     if (g_failures) return 1;

@@ -67,6 +67,28 @@ struct SunShadow {
     void fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius);
 };
 
+// ---- rain occlusion ------------------------------------------------------------------------------
+// The engine's overhead visibility map (material extern 80): a top-down depth of the map that
+// rain-aware materials compare against (LESS_EQUAL, standard depth: the top surface is the
+// smallest value) to keep covered surfaces dry. Not an engine pass here either: nim draws the
+// scene's depth from straight above (SunShadow, reversed depth) and stores 1 - depth.
+struct RainOcclusion {
+    SunShadow top;                  // straight down, reversed depth
+    ComPtr<ID3D12Resource> mask;    // R32_FLOAT standard depth: extern 80 +0x0
+    float4 scale{}, offset{};       // extern 80 +0x10 / +0x20: world xyz -> (u, v, depth)
+    size_t items = 0;               // scene item count it was drawn with (redraw when it changes)
+    bool valid = false;
+    void resize(Gpu& gpu, uint32_t size);
+    void release(Gpu& gpu);
+    // Converts `top` into `mask` (top in DEPTH_WRITE before and after).
+    void resolve(Gpu& gpu, ID3D12GraphicsCommandList* cl);
+
+private:
+    ComPtr<ID3D12RootSignature> root_;
+    ComPtr<ID3D12PipelineState> pso_;
+    uint32_t srv_ = UINT32_MAX;
+};
+
 // One render target of the engine's blend state `index` (goriath blend_states.bin, 90 entries).
 D3D12_RENDER_TARGET_BLEND_DESC engine_blend_desc(int index, int rt = 0);
 
@@ -224,6 +246,13 @@ public:
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
     // Depth of the G-buffer parts from the sun (shadow.fit first); sets shadow.valid.
     void render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow);
+    // Draws the overhead visibility map over the scene (radius around `center`) and hands it to
+    // the materials (extern 80) from then on.
+    void render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl, RainOcclusion& rain, V3 center, float radius);
+    void set_rain_occlusion(const RainOcclusion* rain) { rain_ = rain; }
+    // Global channel values set by the map's world channel controllers (weather), by index:
+    // replace the render-globals defaults' x for the materials.
+    void set_global_channels(std::map<uint32_t, float> values) { global_overrides_ = std::move(values); }
     // Transparent parts (render stage 8), blended into the HDR target `rtv` (R16G16B16A16_FLOAT)
     // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
@@ -237,6 +266,7 @@ public:
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
     void set_render_inputs(const ExternStore& inputs);
+    size_t item_count() const { return items_.size(); }
     void set_channels(const ChannelValues& values) { channel_overrides_ = values; }
 
     TagHash tag() const { return tag_; }
@@ -292,6 +322,9 @@ private:
                     bool shadow = false);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm);
     std::unique_ptr<ExternStore> material_externs_;
+    std::vector<float4> global_base_;               // the materials' global channels before overrides
+    std::map<uint32_t, float> global_overrides_;
+    const RainOcclusion* rain_ = nullptr;
     ChannelValues channel_overrides_;
     ChannelValues channel_defaults_;
     float material_time_ = 0, material_delta_ = 0;

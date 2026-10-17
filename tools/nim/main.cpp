@@ -9,6 +9,7 @@
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/strings.hpp"
+#include "nim/content/weather.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/object_channels.hpp"
@@ -607,6 +608,7 @@ public:
         float extent = 0;  // farthest loaded placement from the centre (m)
         std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
         std::shared_ptr<const std::vector<MapCubemap>> cubemaps;  // the region's reflection / ambient volumes
+        std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -699,6 +701,7 @@ private:
         std::optional<PrepareCache> cache;
         const auto layouts = load_input_layouts(*pm);
         std::vector<std::unique_ptr<PackageManager>> helpers;
+        std::shared_ptr<const MapWeather> weather;
         for (;;) {
             Request req;
             bool list = false;
@@ -759,9 +762,18 @@ private:
                 } catch (const std::exception&) {
                     // likewise without cubemap volumes
                 }
+                if (!weather || weather_bubble_ != req.bubble) {
+                    try {
+                        weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
+                    } catch (const std::exception&) {
+                        weather = std::make_shared<const MapWeather>();  // no weather controls
+                    }
+                    weather_bubble_ = req.bubble;
+                }
                 {
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
+                    progress_.weather = weather;
                     progress_.total = region.size() + terrain.size();
                     progress_.center = center;
                     progress_.extent = extent;
@@ -831,6 +843,7 @@ private:
     uint64_t generation_ = 0;
     std::optional<Request> request_;
     std::deque<Piece> pieces_;
+    TagHash weather_bubble_;
     Progress progress_;
 };
 
@@ -1229,6 +1242,9 @@ public:
                     map_scene = false;
                     game_lighting.clear_lights();
                     game_lighting.clear_cubemaps();
+                    map_weather.reset();
+                    weather_states.clear();
+                    apply_weather();
                     scene.upload(g, std::move(*r->mesh), layouts);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
@@ -1285,6 +1301,9 @@ public:
         map_scene = true;
         game_lighting.clear_lights();
         game_lighting.clear_cubemaps();
+        if (!same) map_weather.reset(), weather_states.clear();
+        rain.valid = false;
+        apply_weather();
         map.lights_set = false;
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m.bubble, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
@@ -1310,6 +1329,11 @@ public:
         const auto pr = map_worker.progress();
         if (pr.generation != map.generation) return;
         map.center = pr.center;
+        if (pr.weather && map_weather != pr.weather) {
+            map_weather = pr.weather;
+            weather_states.assign(map_weather->controllers.size(), -1);
+            apply_weather();
+        }
         if (pr.lights && !map.lights_set) {
             map.lights_set = true;
             std::vector<const MapLight*> ptrs;
@@ -1348,6 +1372,68 @@ public:
     std::map<std::string, size_t> map_add_failures;
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
+    // Weather: the map's world channel controllers and the state chosen for each (-1 = none,
+    // the render-globals defaults).
+    std::shared_ptr<const MapWeather> map_weather;
+    std::vector<int> weather_states;
+    RainOcclusion rain;
+
+    void apply_weather() {
+        std::map<uint32_t, float> channels;
+        if (map_scene && map_weather)
+            for (size_t i = 0; i < weather_states.size() && i < map_weather->controllers.size(); ++i) {
+                const auto& c = map_weather->controllers[i];
+                if (weather_states[i] >= 0 && size_t(weather_states[i]) < c.states.size())
+                    for (const auto& [slot, v] : weather_values(c.states[size_t(weather_states[i])])) channels[slot] = v;
+            }
+        scene.set_global_channels(channels);
+        game_lighting.set_global_channels(channels);
+    }
+    std::string weather_state_label(const WeatherState& st) const {
+        std::string s = map_weather->name(st.name);
+        for (const auto& v : st.values) {
+            if (v.slot < 0) continue;
+            s += std::format("  {}={:.3g}", map_weather->name(v.channel), 0.5f * (v.min + v.max));
+        }
+        return s;
+    }
+    void weather_ui() {
+        if (!map_weather || map_weather->controllers.empty()) return;
+        ImGui::Spacing();
+        const auto& cs = map_weather->controllers;
+        for (size_t i = 0; i < cs.size(); ++i) {
+            if (!cs[i].heat_cascade()) continue;
+            const WeatherState* on = cs[i].strongest_state();
+            bool hc = on && weather_states[i] == int(on - cs[i].states.data());
+            if (ImGui::Checkbox("ヒートカスケード", &hc)) {
+                weather_states[i] = hc && on ? int(on - cs[i].states.data()) : -1;
+                apply_weather();
+            }
+            ImGui::SetItemTooltip("%s: 熱い雨 (global channel 19) と床の熱模様。値は状態の範囲の中央 (推定)", cs[i].name.c_str());
+            break;
+        }
+        if (ImGui::CollapsingHeader(std::format("天候とワールドチャンネル ({})###mapweather", cs.size()).c_str())) {
+            const float w = ImGui::GetContentRegionAvail().x * 0.6f;
+            for (size_t i = 0; i < cs.size(); ++i) {
+                const auto& c = cs[i];
+                ImGui::PushID(int(i));
+                const int cur = weather_states[i];
+                const std::string preview = cur < 0 ? "既定" : weather_state_label(c.states[size_t(cur)]);
+                ImGui::SetNextItemWidth(w);
+                if (ImGui::BeginCombo("##state", preview.c_str())) {
+                    if (ImGui::Selectable("既定", cur < 0)) weather_states[i] = -1, apply_weather();
+                    for (size_t k = 0; k < c.states.size(); ++k)
+                        if (ImGui::Selectable(std::format("{}##{}", weather_state_label(c.states[k]), k).c_str(), cur == int(k)))
+                            weather_states[i] = int(k), apply_weather();
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", c.name.c_str());
+                ImGui::PopID();
+            }
+            ImGui::TextDisabled("状態の値は範囲の中央 (推定: ゲームは範囲内で選び、遷移時間で補間)");
+        }
+    }
 
     void maps_tab() {
         if (!pm) return;
@@ -1480,6 +1566,7 @@ public:
         ImGui::TextDisabled("%s", map.bubble.str().c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(map.bubble.str().c_str());
+        weather_ui();
         ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
         const auto pr = map_worker.progress();
         std::map<std::string, size_t> skipped = map_add_failures;
@@ -1497,7 +1584,7 @@ public:
         }
         ImGui::Spacing();
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("未対応: 半透明パス・デカール・マップのライト / 大気 / 反射プローブ (ビューア環境で代用、推定値に記載)");
+        ImGui::TextDisabled("未対応: マップの大気 / 空・雨や VFX のパーティクル・ギミックの動き (推定値は下に記載)");
         ImGui::PopTextWrapPos();
         estimates_panel();
     }
@@ -1685,6 +1772,11 @@ public:
                 scene.render_shadow(gpu, cl, sun_shadow);
                 shadow = &sun_shadow;
             }
+            if (map_scene && !map.streaming && scene.loaded() && (!rain.valid || rain.items != scene.item_count())) {
+                if (!rain.mask) rain.resize(gpu, 4096);
+                scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
+            }
+            scene.set_rain_occlusion(map_scene && rain.valid ? &rain : nullptr);
             scene.render_gbuffer(gpu, cl, gb, vm);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
@@ -2593,6 +2685,7 @@ public:
         thumbs.clear();
         game_lighting.release(gpu);
         thumb_lighting.release(gpu);
+        rain.release(gpu);
         scene.release(gpu);
         thumb_scene.release(gpu);
         gb.release(gpu);

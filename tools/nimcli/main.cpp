@@ -33,6 +33,7 @@
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
+#include "nim/content/weather.hpp"
 #include "nim/content/strings.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
@@ -638,6 +639,20 @@ int cmd_cubemaps(PackageManager& pm, TagHash bubble) {
     }
     std::println("{} cubemap volumes", cubemaps.size());
     for (const auto& [k, n] : variants) std::println("  {:5}  {}", n, k);
+    return 0;
+}
+
+int cmd_weather(PackageManager& pm, TagHash bubble) {
+    const MapWeather w = load_map_weather(pm, bubble);
+    std::println("world channel registry {}: {} channels", w.registry.tag.str(), w.registry.slots.size());
+    for (const auto& c : w.controllers) {
+        std::println("controller {} {}{}", c.tag.str(), c.name, c.heat_cascade() ? "  (Heat Cascade)" : "");
+        for (const auto& st : c.states) {
+            std::string vals;
+            for (const auto& v : st.values) vals += std::format("  {}[{}]={:g}..{:g}", w.name(v.channel), v.slot, v.min, v.max);
+            std::println("  state {:<12}{}", w.name(st.name), vals);
+        }
+    }
     return 0;
 }
 
@@ -1278,6 +1293,7 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "weather" && args.size() >= 2) return cmd_weather(pm, TagHash(parse_hex(args[1])));
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
         if (cmd == "nodes" && args.size() >= 2)

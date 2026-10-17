@@ -135,6 +135,81 @@ void SunShadow::fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float sc
     else fit(sun_dir, focus, reach);
 }
 
+void RainOcclusion::resize(Gpu& gpu, uint32_t n) {
+    if (n == top.size && mask) return;
+    top.resize(gpu, n);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rd.Height = n;
+    rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    mask.Reset();
+    check_hr(gpu.device()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                   nullptr, IID_PPV_ARGS(&mask)),
+             "rain occlusion mask");
+    if (srv_ == UINT32_MAX) srv_ = gpu.srv().alloc(2);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    gpu.device()->CreateShaderResourceView(top.depth.Get(), &sd, gpu.srv().cpu(srv_));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+    ud.Format = DXGI_FORMAT_R32_FLOAT;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    gpu.device()->CreateUnorderedAccessView(mask.Get(), nullptr, &ud, gpu.srv().cpu(srv_ + 1));
+    valid = false;
+}
+
+void RainOcclusion::release(Gpu& gpu) {
+    if (srv_ != UINT32_MAX) gpu.srv().free(srv_, 2);
+    srv_ = UINT32_MAX;
+    mask.Reset();
+    top = SunShadow{};
+    valid = false;
+}
+
+void RainOcclusion::resolve(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
+    ID3D12Device* dev = gpu.device();
+    if (!pso_) {
+        static constexpr const char* kHlsl = R"(
+Texture2D<float> top : register(t0);
+RWTexture2D<float> mask : register(u0);
+[numthreads(8, 8, 1)] void main(uint2 id : SV_DispatchThreadID) { mask[id] = 1 - top[id]; }
+)";
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(kHlsl, std::strlen(kHlsl), "nim_rain_occlusion.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+            throw std::runtime_error(std::format("rain occlusion shader: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "compile failed"));
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
+        D3D12_ROOT_PARAMETER param{};
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param.DescriptorTable = {2, ranges};
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rs{1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ComPtr<ID3DBlob> blob;
+        check_hr(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err), "rain occlusion root signature");
+        check_hr(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_)), "rain occlusion root signature");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = root_.Get();
+        pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        check_hr(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_)), "rain occlusion pipeline");
+    }
+    Gpu::barrier(cl, top.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(root_.Get());
+    cl->SetPipelineState(pso_.Get());
+    cl->SetComputeRootDescriptorTable(0, gpu.srv().gpu(srv_));
+    cl->Dispatch((top.size + 7) / 8, (top.size + 7) / 8, 1);
+    Gpu::barrier(cl, mask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, top.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+}
+
 View frame_sphere(V3 center, float radius, uint32_t w, uint32_t h, float yaw, float pitch) {
     View v;
     v.width = w;
@@ -463,6 +538,7 @@ const std::map<std::string, std::string>& StaticMeshScene::estimates() const {
 void StaticMeshScene::set_render_inputs(const ExternStore& inputs) {
     if (!material_externs_) throw std::runtime_error("No scene is loaded");
     *material_externs_ = inputs;
+    global_base_ = inputs.channels;
 }
 
 void StaticMeshScene::set_material_frame(float seconds, float delta_seconds) {
@@ -1125,6 +1201,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         channel_defaults_ = std::move(mesh.channel_defaults);
         material_externs_ = std::make_unique<ExternStore>();
         if (mesh.global_channels) material_externs_->channels = *mesh.global_channels;
+        global_base_ = material_externs_->channels;
     } else {
         for (const auto& n : mesh.notes) notes_.push_back(n);
         for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
@@ -1492,6 +1569,18 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     ext.set(ext::Frame, 0x04, material_time_);
     ext.set(ext::Frame, 0x14, material_delta_);
     estimate_engine_frame(ext, material_time_, material_delta_);
+    if (!global_overrides_.empty() || ext.channels.size() != global_base_.size()) {
+        if (!global_base_.empty()) ext.channels = global_base_;
+        for (const auto& [slot, v] : global_overrides_)
+            if (slot < ext.channels.size()) ext.channels[slot][0] = v;
+    }
+    if (rain_ && rain_->valid) {
+        ext.set_texture(80, 0x00, rain_->mask.Get(), DXGI_FORMAT_R32_FLOAT);
+        ext.set(80, 0x10, rain_->scale);
+        ext.set(80, 0x20, rain_->offset);
+        ext.note_estimate("extern 80 overhead visibility (rain occlusion)",
+                          "nim draws the scene's depth from straight above (engine pass not decoded)");
+    }
     // A single model has no map around it: no atmosphere, no overhead visibility map.
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext.zero_policy(id)) ext.zero_when_missing(id, "world state from a map (not loaded): zero");
@@ -1839,6 +1928,23 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
     cl->OMSetRenderTargets(0, nullptr, FALSE, &shadow.dsv);
     draw_items(gpu, cl, 0, shadow.size, shadow.size, shadow.vm, true);
     shadow.valid = true;
+}
+
+void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl, RainOcclusion& rain, V3 center, float radius) {
+    rain.valid = false;
+    if (!rain.top.depth) return;
+    rain.top.fit(V3{0, 0, 1}, center, radius);
+    render_shadow(gpu, cl, rain.top);
+    if (!rain.top.valid) return;
+    rain.resolve(gpu, cl);
+    // Straight down: right = +x, up = +y. u = 0.5 + (x - eye.x) / 2h, v = 0.5 - (y - eye.y) / 2h,
+    // depth = (eye.z - z) / range (1 - the reversed depth the pass wrote).
+    const float h2 = 2 * rain.top.half;
+    const V3 e = rain.top.vm.eye;
+    rain.scale = {1 / h2, -1 / h2, -1 / rain.top.range, 0};
+    rain.offset = {0.5f - e.x / h2, 0.5f + e.y / h2, e.z / rain.top.range, 0};
+    rain.items = items_.size();
+    rain.valid = true;
 }
 
 void StaticMeshScene::render_transparent(Gpu&, ID3D12GraphicsCommandList*, GBuffer&, D3D12_CPU_DESCRIPTOR_HANDLE,

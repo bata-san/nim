@@ -31,6 +31,7 @@ add_library(nim_core STATIC
   src/content/map.cpp
   src/content/fonts.cpp
   src/content/animation.cpp
+  src/content/weather.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)

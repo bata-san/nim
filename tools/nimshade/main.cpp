@@ -14,6 +14,7 @@
 #include "nim/core/package_manager.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/map.hpp"
+#include "nim/content/weather.hpp"
 #include "nim/render/scene.hpp"
 
 #include <wincodec.h>
@@ -79,6 +80,8 @@ int run(int argc, char** argv) {
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
+    bool heat_cascade = false;
+    std::vector<std::pair<std::string, uint32_t>> weather_args;  // controller name part, state hash
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
@@ -96,6 +99,13 @@ int run(int argc, char** argv) {
         else if (args[i] == "--sun" && i + 1 < args.size()) sun_arg = std::stof(args[++i]);
         else if (args[i] == "--sky" && i + 1 < args.size()) sky_arg = std::stof(args[++i]);
         else if (args[i] == "--game") game = true;
+        else if (args[i] == "--heat-cascade") heat_cascade = true;
+        else if (args[i] == "--weather" && i + 1 < args.size()) {
+            const auto value = args[++i];
+            const auto eq = value.find('=');
+            if (eq == std::string::npos) throw std::runtime_error("--weather expects CONTROLLER=STATE_HASH");
+            weather_args.push_back({value.substr(0, eq), uint32_t(std::stoul(value.substr(eq + 1), nullptr, 16))});
+        }
         else if (args[i] == "--reference") reference = true;
         else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
@@ -144,10 +154,31 @@ int run(int argc, char** argv) {
     std::vector<const MapLight*> region_lights;
     std::vector<MapCubemap> map_cubemaps;
     std::vector<const MapCubemap*> region_cubemaps;
+    std::map<uint32_t, float> weather_channels;
+    bool is_map = false;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
         MapLayout map = load_map_layout(pm, mesh_tag);
+        is_map = true;
+        if (heat_cascade || !weather_args.empty()) {
+            const MapWeather weather = load_map_weather(pm, mesh_tag);
+            std::println("weather: {} controller(s)", weather.controllers.size());
+            auto apply = [&](const WeatherController& c, const WeatherState& st) {
+                std::println("  {} state {}", c.name, weather.name(st.name));
+                for (const auto& v : weather_values(st)) weather_channels[v.first] = v.second;
+            };
+            for (const auto& c : weather.controllers) {
+                if (heat_cascade && c.heat_cascade())
+                    if (const WeatherState* st = c.strongest_state()) apply(c, *st);
+                for (const auto& [part, state] : weather_args) {
+                    if (c.name.find(part) == std::string::npos && c.tag.str().find(part) == std::string::npos) continue;
+                    for (const auto& st : c.states)
+                        if (st.name == state) apply(c, st);
+                }
+            }
+            for (const auto& [slot, v] : weather_channels) std::println("  global channel {} = {:.3g}", slot, v);
+        }
         const auto focus = map_focus(map);
         auto region = map_region(map, focus, map_radius);
         size_t in_region = 0;
@@ -273,6 +304,13 @@ int run(int argc, char** argv) {
     auto* cl = gpu.immediate();
     scene.set_material_frame(material_time);
     if (!channel_values.empty()) scene.set_channels(channel_values);
+    if (!weather_channels.empty()) scene.set_global_channels(weather_channels);
+    RainOcclusion rain;
+    if (is_map) {
+        rain.resize(gpu, 4096);
+        scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
+        scene.set_rain_occlusion(&rain);
+    }
     SunShadow shadow;
     if (shadows) shadow.resize(gpu, 4096);
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
@@ -307,6 +345,7 @@ int run(int argc, char** argv) {
     GameLighting gl;
     if (game) {
         gl.init(pm, gpu);
+        if (!weather_channels.empty()) gl.set_global_channels(weather_channels);
         std::println("game shading: technique {}", gl.shading_technique().str());
         if (!region_lights.empty()) {
             auto tl = std::chrono::steady_clock::now();
