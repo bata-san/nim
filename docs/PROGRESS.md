@@ -99,6 +99,17 @@ GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」
   cb0[9]·露出。t20 = ext7 +0xE0 (far 出力)、cb0[4] = +0x150 (太陽グロー色)、cb0[9] = +0x170。
   SV_Target1 = モーションベクトル (捨ててよい)。深度 = cb12[13].x → 深度テスト GREATER_EQUAL で空だけに描く。
 - フロクセル (t14) は `cascade_raymarch_atmosphere_volume*` (CS, extern 0x65) が作る。後段の課題。
+- 霧の検証 (2026-10-17, outpost 80AF9550): 霧のスケールは正しい。距離 m × 0.001 = km、密度 /km、
+  密度 LUT (80AF8EA8, 16x1024 RGBA8) は全面 1.0、cb0[42] = (0, 1/(end−start), ext1 +0x10, −start/(end−start))
+  で LUT の v は m 単位の距離。40 m で T ≈ 0.79。霧密度を 0 にしても壁は暗いまま。
+  **暗さの本当の原因はマップのライティング値**: 大気ありの経路では太陽・半球アンビエントが
+  レンダーグローバルの既定値 (sun_intensity 10、up/down ambient 0.1/0.15、global_ambient_intensity
+  ch 0x82 = 0) のまま。日陰は拡散プローブだけになり ≈ 0.01 (日向 ≈ 0.8 の 1/80)。
+  マップ固有の値の出どころは未特定。天気コントローラー (outpost_ambient など) が設定するのは
+  ワールドチャンネル (78C38B72 ほか、レンダーのチャンネル 0x08 とはハッシュが別) で、
+  マップのノードテーブルの既知コンポーネント (静的物・ライト・デカール・デコレーター・空オブジェクト・
+  大気・太陽経路) にも見当たらない。未知の 8080311C / 80807EB0 / 8080315D / 80803135 / 80802A95 /
+  8080AECA が次の候補。
 実装計画: `MapAtmosphere load_map_atmosphere(pm, layout)` (content/map) → GameLighting::set_atmosphere
 → 毎フレーム 時刻→スライス座標・太陽方向 (表0) → near/far を全画面 RT に描画 → ext7 +0xE0/+0xF0 →
 シェーディング → `sky` を env_bg の代わりに描画。GamePipeline に深度テストのオプションを足す。
