@@ -1,4 +1,5 @@
 #include "nim/render/scene.hpp"
+#include "nim/core/profile.hpp"
 #include "nim/content/map.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/object_channels.hpp"
@@ -176,8 +177,8 @@ void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     srv_first = gpu.srv().alloc(6);
     for (int i = 0; i < 4; ++i) {
-        D3D12_CLEAR_VALUE cv{kFormat, {0, 0, 0, 0}};
-        rt[i] = gpu.texture2d(w, h, kFormat, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
+        D3D12_CLEAR_VALUE cv{kFormats[i], {0, 0, 0, 0}};
+        rt[i] = gpu.texture2d(w, h, kFormats[i], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv);
         rtv[i] = {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(i) * inc};
         dev->CreateRenderTargetView(rt[i].Get(), nullptr, rtv[i]);
         dev->CreateShaderResourceView(rt[i].Get(), nullptr, gpu.srv().cpu(srv_first + i));
@@ -292,28 +293,103 @@ ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool 
     return signature;
 }
 
-// The engine's blend states, render target 0 (from goriath's dump of the state table; indexed by
-// the technique's blend state byte): enable, src, dst, op, src alpha, dst alpha, op alpha, write mask.
+// The engine's blend states for render targets 0..4 (from goriath's dump of the state table; indexed
+// by the technique's blend state byte): enable, src, dst, op, src alpha, dst alpha, op alpha, write mask.
 struct BlendRow { uint8_t enable, src, dst, op, src_a, dst_a, op_a, mask; };
-constexpr BlendRow kBlendStates[90] = {
-    {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {1,2,2,1,2,2,1,15}, {1,9,1,1,7,1,1,15}, {1,9,3,1,7,5,1,15}, {1,2,5,1,2,5,1,15},
-    {1,2,5,1,7,1,1,15}, {1,7,2,1,7,1,1,15}, {1,2,6,1,2,6,1,15}, {1,2,2,4,2,2,4,15}, {1,2,2,5,2,2,5,15}, {1,9,2,1,7,2,1,15},
-    {1,5,6,1,5,6,1,15}, {1,14,15,1,14,15,1,15}, {1,6,5,1,6,5,1,15}, {1,7,8,1,2,1,1,15}, {1,2,6,1,1,6,1,15}, {0,2,1,1,2,1,1,1},
-    {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,6}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7},
-    {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7},
-    {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0},
-    {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7},
-    {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7},
-    {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,8},
-    {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0},
-    {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0},
-    {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7},
-    {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {1,9,1,1,1,2,1,7}, {1,9,3,1,1,2,1,7},
-    {0,2,1,1,2,1,1,0}, {1,7,2,1,1,2,1,7}, {1,8,2,1,1,2,1,7}, {1,1,7,1,1,2,1,7}, {1,1,8,1,1,2,1,7}, {1,1,6,1,2,6,1,15},
-    {1,2,6,1,2,6,1,7}, {1,2,6,1,2,6,1,8}, {1,16,17,1,18,19,1,15}, {1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,2,2,3,2,2,3,15},
+constexpr BlendRow kBlendStates[90][5] = {
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}},
+    {{1,2,2,1,2,2,1,15}, {1,2,2,1,2,2,1,15}, {1,2,2,1,2,2,1,15}, {1,2,2,1,2,2,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,9,1,1,7,1,1,15}, {1,9,1,1,7,1,1,15}, {1,9,1,1,7,1,1,15}, {1,9,1,1,7,1,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,9,3,1,7,5,1,15}, {1,9,3,1,7,5,1,15}, {1,9,3,1,7,5,1,15}, {1,9,3,1,7,5,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,2,5,1,15}, {1,2,5,1,2,5,1,15}, {1,2,5,1,2,5,1,15}, {1,2,5,1,2,5,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,7,1,1,15}, {1,2,5,1,7,1,1,15}, {1,2,5,1,7,1,1,15}, {1,2,5,1,7,1,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,7,2,1,7,1,1,15}, {1,7,2,1,7,1,1,15}, {1,7,2,1,7,1,1,15}, {1,7,2,1,7,1,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,6,1,2,6,1,15}, {1,2,6,1,2,6,1,15}, {1,2,6,1,2,6,1,15}, {1,2,6,1,2,6,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,2,4,2,2,4,15}, {1,2,2,4,2,2,4,15}, {1,2,2,4,2,2,4,15}, {1,2,2,4,2,2,4,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,2,5,2,2,5,15}, {1,2,2,5,2,2,5,15}, {1,2,2,5,2,2,5,15}, {1,2,2,5,2,2,5,15}, {1,5,6,1,5,6,1,15}},
+    {{1,9,2,1,7,2,1,15}, {1,9,2,1,7,2,1,15}, {1,9,2,1,7,2,1,15}, {1,9,2,1,7,2,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,5,6,1,5,6,1,15}, {1,5,6,1,5,6,1,15}, {1,5,6,1,5,6,1,15}, {1,5,6,1,5,6,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,14,15,1,14,15,1,15}, {1,14,15,1,14,15,1,15}, {1,14,15,1,14,15,1,15}, {1,14,15,1,14,15,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,6,5,1,6,5,1,15}, {1,6,5,1,6,5,1,15}, {1,6,5,1,6,5,1,15}, {1,6,5,1,6,5,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,7,8,1,2,1,1,15}, {1,7,8,1,2,1,1,15}, {1,7,8,1,2,1,1,15}, {1,7,8,1,2,1,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,5,6,1,5,6,1,15}},
+    {{0,2,1,1,2,1,1,1}, {0,2,1,1,2,1,1,1}, {0,2,1,1,2,1,1,1}, {0,2,1,1,2,1,1,1}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,2}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,1}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,5}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,2}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,1}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,3}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,1}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,7}, {1,2,5,1,1,2,1,2}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,1}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,0}, {1,2,5,1,1,2,1,2}, {1,2,5,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,5}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,5}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,8}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,5}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,5}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,1}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,5}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,4}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,2}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{0,2,1,1,2,1,1,7}, {0,2,1,1,2,1,1,15}, {0,2,1,1,2,1,1,6}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{1,9,1,1,1,2,1,7}, {1,9,1,1,1,2,1,0}, {1,9,1,1,1,2,1,0}, {1,9,1,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{1,9,3,1,1,2,1,7}, {1,9,3,1,1,2,1,0}, {1,9,3,1,1,2,1,0}, {1,9,3,1,1,2,1,0}, {1,5,6,1,5,6,1,15}},
+    {{0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{1,7,2,1,1,2,1,7}, {1,7,2,1,1,2,1,7}, {1,7,2,1,1,2,1,7}, {1,7,2,1,1,2,1,7}, {1,5,6,1,5,6,1,15}},
+    {{1,8,2,1,1,2,1,7}, {1,8,2,1,1,2,1,7}, {1,8,2,1,1,2,1,7}, {1,8,2,1,1,2,1,7}, {1,5,6,1,5,6,1,15}},
+    {{1,1,7,1,1,2,1,7}, {1,1,7,1,1,2,1,7}, {1,1,7,1,1,2,1,7}, {1,1,7,1,1,2,1,7}, {1,5,6,1,5,6,1,15}},
+    {{1,1,8,1,1,2,1,7}, {1,1,8,1,1,2,1,7}, {1,1,8,1,1,2,1,7}, {1,1,8,1,1,2,1,7}, {1,5,6,1,5,6,1,15}},
+    {{1,1,6,1,2,6,1,15}, {1,1,6,1,2,6,1,15}, {1,1,6,1,2,6,1,15}, {1,1,6,1,2,6,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,6,1,2,6,1,7}, {1,2,6,1,2,6,1,7}, {1,2,6,1,2,6,1,7}, {1,2,6,1,2,6,1,7}, {1,5,6,1,5,6,1,15}},
+    {{1,2,6,1,2,6,1,8}, {1,2,6,1,2,6,1,8}, {1,2,6,1,2,6,1,8}, {1,2,6,1,2,6,1,8}, {1,5,6,1,5,6,1,8}},
+    {{1,16,17,1,18,19,1,15}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,0}, {0,2,1,1,2,1,1,15}},
+    {{1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,2,2,1,2,2,1,15}, {1,2,2,1,2,2,1,15}, {0,2,1,1,2,1,1,15}},
+    {{1,2,6,1,1,6,1,15}, {1,2,6,1,1,6,1,15}, {1,1,6,1,1,6,1,15}, {1,1,6,1,1,6,1,15}, {1,5,6,1,5,6,1,15}},
+    {{1,2,2,3,2,2,3,15}, {1,2,2,3,2,2,3,15}, {1,2,2,3,2,2,3,15}, {1,2,2,3,2,2,3,15}, {1,5,6,1,5,6,1,15}},
 };
 
-D3D12_RENDER_TARGET_BLEND_DESC blend_desc(int index) {
+D3D12_RENDER_TARGET_BLEND_DESC blend_desc(int index, int rt = 0) {
     D3D12_RENDER_TARGET_BLEND_DESC d{};
     d.RenderTargetWriteMask = 0xF;
     d.SrcBlend = d.SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -322,7 +398,7 @@ D3D12_RENDER_TARGET_BLEND_DESC blend_desc(int index) {
     d.LogicOp = D3D12_LOGIC_OP_NOOP;
     if (index < 0 || index >= int(std::size(kBlendStates)))
         throw std::runtime_error(std::format("Missing original blend state {}", index));
-    const BlendRow& b = kBlendStates[index];
+    const BlendRow& b = kBlendStates[index][rt];
     d.BlendEnable = b.enable;
     d.SrcBlend = D3D12_BLEND(b.src);
     d.DestBlend = D3D12_BLEND(b.dst);
@@ -471,8 +547,12 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
 void prepare_material_inputs(PackageManager& pm, PreparedMesh& mesh, const ChannelValues* channels) {
     if (channels) mesh.channel_overrides = *channels;
     auto globals = load_render_globals(pm);
-    mesh.global_channels = std::move(globals.channel_defaults);
-    for (const auto& [name, tag] : globals.scopes) mesh.scopes.push_back(load_scope(pm, tag));
+    auto global_channels = std::make_shared<std::vector<float4>>(std::move(globals.channel_defaults));
+    auto scopes = std::make_shared<std::vector<Scope>>();
+    scopes->reserve(globals.scopes.size());
+    for (const auto& [name, tag] : globals.scopes) scopes->push_back(load_scope(pm, tag));
+    mesh.global_channels = std::move(global_channels);
+    mesh.scopes = std::move(scopes);
 
 }
 
@@ -481,20 +561,28 @@ struct TextureCache {
     PrepareCache* shared = nullptr;
 };
 std::shared_ptr<const Texture> cached_texture(PackageManager& pm, TagHash tag, TextureCache& cache) {
-    auto& map = cache.shared ? cache.shared->textures : cache.local;
-    std::mutex unshared;
-    std::unique_lock lk(cache.shared ? *cache.shared->mutex : unshared);
-    if (auto it = map.find(tag.value); it != map.end()) return it->second;
-    lk.unlock();  // decoded outside the lock; a texture two threads load at once is kept once
-    const uint32_t cap = cache.shared ? cache.shared->max_texture_dim : 0;
-    auto texture = std::make_shared<const Texture>(cap ? load_texture(pm, tag, cap) : load_texture(pm, tag));
-    lk.lock();
-    return map.emplace(tag.value, texture).first->second;
+    ProfileScope profile("prepare.texture_cache");
+    if (cache.shared) {
+        auto& map = cache.shared->textures;
+        std::shared_lock lk(*cache.shared->texture_mutex);
+        if (auto it = map.find(tag.value); it != map.end()) {
+            Profile::instance().count("prepare.texture_cache_hits");
+            return it->second;
+        }
+        lk.unlock();
+        Profile::instance().count("prepare.texture_cache_misses");
+        auto texture = std::make_shared<const Texture>(load_texture(pm, tag, cache.shared->max_texture_dim));
+        std::unique_lock write(*cache.shared->texture_mutex);
+        return map.emplace(tag.value, texture).first->second;
+    }
+    if (auto it = cache.local.find(tag.value); it != cache.local.end()) return it->second;
+    auto texture = std::make_shared<const Texture>(load_texture(pm, tag));
+    return cache.local.emplace(tag.value, texture).first->second;
 }
 
 PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const StaticMeshPart& part,
                                 uint16_t part_index, uint8_t input_layout,
-                                TextureCache& texture_cache, std::span<const Scope> available_scopes) {
+                                TextureCache& texture_cache, std::shared_ptr<const std::vector<Scope>> available_scopes) {
     PreparedMesh::Group g;
     g.part = part;
     g.input_layout = input_layout;
@@ -504,12 +592,13 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     g.vs_material = vs_stage;
     g.ps_material = ps_stage;
     std::vector<const Scope*> scope_ptrs;
+    const auto& scopes = *available_scopes;
     for (size_t bit = 0; bit < 64; ++bit) {
         if (!(tech.used_scopes & (uint64_t{1} << bit))) continue;
-        if (bit >= available_scopes.size()) throw std::runtime_error("Unknown original scope index");
-        g.scopes.push_back(available_scopes[bit]);
+        if (bit >= scopes.size()) throw std::runtime_error("Unknown original scope index");
+        scope_ptrs.push_back(&scopes[bit]);
     }
-    for (const auto& scope : g.scopes) scope_ptrs.push_back(&scope);
+    g.scopes = std::move(available_scopes);
     g.vs_sources = resolve_stage_resources(tech, ShaderStage::Vertex, scope_ptrs);
     g.ps_sources = resolve_stage_resources(tech, ShaderStage::Pixel, scope_ptrs);
     for (const auto& [slot, tag] : g.vs_sources.samplers) g.vs_samplers[slot] = load_sampler(pm, tag);
@@ -780,6 +869,7 @@ PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMat
 }
 
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelValues* channels, PrepareCache* cache) {
+    ProfileScope profile_total("prepare.static.total");
     PreparedMesh out;
     if (cache) {
         std::lock_guard lk(*cache->mutex);
@@ -797,7 +887,9 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
         prepare_material_inputs(pm, out, channels);
     }
     out.tag = tag;
+    ProfileScope profile_mesh("prepare.static.mesh_decode");
     StaticMesh mesh = load_static_mesh(pm, tag);
+    profile_mesh.stop();
     TextureCache texture_cache;
     texture_cache.shared = cache;
 
@@ -827,6 +919,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     out.lod = lod;
     if (all_lods) out.lod_levels = 0;
 
+    ProfileScope profile_buffers("prepare.static.buffers_bounds");
     const auto& bufs = mesh.buffers.at(pending[0].part.buffer_index);
     out.buffers.emplace_back();
     auto& set = out.buffers.back();
@@ -873,6 +966,8 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
                          mesh.texcoord_scale, mesh.texcoord_offset[0], mesh.texcoord_offset[1], 0};
     std::memcpy(out.instance.data() + 80, mb, sizeof(mb));
 
+    profile_buffers.stop();
+    ProfileScope profile_groups("prepare.static.build_groups");
     for (auto& p : pending) {
         out.groups.push_back(build_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes));
         out.groups.back().stage = p.group.render_stage;
@@ -884,6 +979,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
 
 PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
                              PrepareCache* cache) {
+    ProfileScope profile_total("prepare.terrain.total");
     PreparedMesh out;
     if (cache) {
         std::lock_guard lk(*cache->mutex);
@@ -1005,6 +1101,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
 
 void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                                      std::span<const std::array<float, 12>> placements) {
+    ProfileScope profile_total("add.mesh_parts.total");
     ID3D12Device* dev = gpu.device();
     const bool first_mesh = sets_.empty();
     if (mesh.dynamic && (!first_mesh || placements.size() != 1))
@@ -1025,7 +1122,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         channel_overrides_ = mesh.channel_overrides;
         channel_defaults_ = std::move(mesh.channel_defaults);
         material_externs_ = std::make_unique<ExternStore>();
-        material_externs_->channels = std::move(mesh.global_channels);
+        if (mesh.global_channels) material_externs_->channels = *mesh.global_channels;
     } else {
         for (const auto& n : mesh.notes) notes_.push_back(n);
         for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
@@ -1037,6 +1134,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     const uint32_t n = uint32_t(placements.size());
     std::vector<uint32_t> iota(n);
     for (uint32_t i = 0; i < n; ++i) iota[i] = i;
+    ProfileScope profile_geometry("add.geometry_upload");
     const GpuBuffer inst = arena_.upload(gpu, iota.data(), iota.size() * 4);
     GpuBuffer t2;
     if (!mesh.dynamic) {
@@ -1103,11 +1201,13 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (b.color.size() >= 4) set.color = arena_.upload(gpu, b.color.data(), b.color.size() & ~size_t(3));
         sets_.push_back(std::move(set));
     }
+    profile_geometry.stop();
 
     auto& shared_textures = texture_cache_;
     auto& shared_roots = root_cache_;
     auto& shared_pipelines = pipeline_cache_;
     auto upload_textures = [&](const auto& source, const StageResourceSources& sources, auto& destination) {
+        ProfileScope profile_textures("add.texture_upload");
         for (const auto& [slot, tx] : source) {
             const TagHash tag = sources.textures.at(slot);
             auto found = shared_textures.find(tag.value);
@@ -1147,9 +1247,11 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.scopes = std::move(g.scopes);
         item.vs_sources = std::move(g.vs_sources);
         item.ps_sources = std::move(g.ps_sources);
+        ProfileScope profile_root("add.root_signature");
         auto& root = shared_roots[g.info.technique.value];
         if (!root) root = make_gbuffer_root_signature(dev, mesh.dynamic, g.vs_samplers, g.ps_samplers);
         item.root_sig = root;
+        profile_root.stop();
         upload_textures(g.textures, item.ps_sources, item.textures);
         upload_textures(g.vs_textures, item.vs_sources, item.vs_textures);
         for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}})
@@ -1209,6 +1311,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 item.owns_srv = false;
             }
         }
+        ProfileScope profile_descriptors("add.descriptors");
         if (item.owns_srv) {
             item.srv_first = gpu.srv().alloc(kItemSrvs * item.srv_copies);
             if (!table_key.empty()) table_cache_.emplace(table_key, item.srv_first);
@@ -1254,6 +1357,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
 
         }
+        profile_descriptors.stop();
 
 
         // Input layout straight from the game's vertex layout table.
@@ -1285,15 +1389,24 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.pRootSignature = item.root_sig.Get();
         pd.VS = {g.vs.data(), g.vs.size()};
         pd.PS = {g.ps.data(), g.ps.size()};
+        // G-buffer decals blend into some targets and leave the others alone (their state masks them).
+        bool blended = false;
         if (transparent) pd.BlendState.RenderTarget[0] = blend_desc(g.blend);
-        else pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        else if (g.blend >= 0) {
+            pd.BlendState.IndependentBlendEnable = TRUE;
+            for (int r = 0; r < 4; ++r) {
+                pd.BlendState.RenderTarget[r] = blend_desc(g.blend, r);
+                blended |= pd.BlendState.RenderTarget[r].BlendEnable || pd.BlendState.RenderTarget[r].RenderTargetWriteMask != 0xF;
+            }
+        } else pd.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        item.blended = blended;
         pd.SampleMask = UINT_MAX;
         pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = TRUE;
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = transparent ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
-        pd.DepthStencilState.DepthFunc = transparent ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
+        pd.DepthStencilState.DepthWriteMask = transparent || blended ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = transparent || blended ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
         pd.InputLayout = {ied.data(), UINT(ied.size())};
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         // Strips restart at the all-ones index.
@@ -1301,7 +1414,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             pd.IBStripCutValue = mesh.buffers.at(g.buffers).ib.is_32bit ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
         pd.NumRenderTargets = transparent ? 1 : 4;
-        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = GBuffer::kFormat;
+        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = GBuffer::kFormats[r];
         for (const auto& output : shader_outputs(g.ps))
             if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw std::runtime_error(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
@@ -1310,6 +1423,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{g.info.technique.value, g.input_layout, g.stage, g.part.primitive_type,
                                              mesh.buffers.at(g.buffers).ib.is_32bit};
+        ProfileScope profile_pso("add.pso");
         HRESULT pipeline_hr = S_OK;
         if (auto existing = shared_pipelines.find(pipeline_key); existing != shared_pipelines.end()) item.pso = existing->second;
         else {
@@ -1330,6 +1444,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             throw std::runtime_error(std::format("CreateGraphicsPipelineState (game DXIL) failed (hr=0x{:08X}); VS in:{}; layout {}:{}",
                                                  uint32_t(hr), vs_in, g.input_layout, layout));
         }
+        profile_pso.stop();
 
         if (!transparent) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
@@ -1409,8 +1524,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                     const auto key = std::tuple{source->second.value, stage, reg};
                     auto slot = slots.find(key);
                     if (slot == slots.end()) {
-                        const auto scope = std::find_if(it.scopes.begin(), it.scopes.end(), [&](const Scope& value) { return value.tag == source->second; });
-                        if (scope == it.scopes.end()) throw std::runtime_error("Original shared scope was not loaded");
+                        const auto scope = std::find_if(it.scopes->begin(), it.scopes->end(), [&](const Scope& value) { return value.tag == source->second; });
+                        if (scope == it.scopes->end()) throw std::runtime_error("Original shared scope was not loaded");
                         slot = slots.emplace(key, uint32_t(scope_defs_.size())).first;
                         scope_defs_.push_back({&*scope, stage, reg});
                     }
@@ -1522,9 +1637,11 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         bound_cbv[param] = address;
         cl->SetGraphicsRootConstantBufferView(param, address);
     };
+    // Blended G-buffer items (decals) go over the opaque surfaces, so they are drawn after them.
+    for (int pass = 0; pass < 2; ++pass)
     for (const auto& it : items_) {
-        if (it.stage != stage) continue;
-        if (shadow && !it.shadow_pso) continue;
+        if (it.stage != stage || it.blended != (pass == 1)) continue;
+        if (shadow && (!it.shadow_pso || it.blended)) continue;
         if (bound_root != it.root_sig.Get()) {
             bind_common(gpu, cl, w, h, vm, it.root_sig.Get());
             bound_root = it.root_sig.Get();

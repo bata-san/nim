@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <shared_mutex>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -67,8 +68,10 @@ struct SunShadow {
 };
 
 // ---- G-buffer ---------------------------------------------------------------------------------
-// RT0 albedo, RT1 packed normal+smoothness, RT2 material params, RT3 motion; all RGBA16F as
-// the game's PS writes them. `lit` is the lighting pass output (RGBA8, sRGB-encoded values).
+// RT0 albedo, RT1 packed normal+smoothness, RT2 material params, RT3 motion, in the engine's
+// formats: the material shaders rely on the UNORM targets clamping what they write (a remap
+// like `x * -10 + 5.5` is a hard mask only after the clamp). `lit` is the lighting pass output
+// (RGBA8, sRGB-encoded values).
 class GBuffer {
 public:
     void resize(Gpu& gpu, uint32_t w, uint32_t h);
@@ -79,7 +82,8 @@ public:
     ComPtr<ID3D12Resource> rt[4], depth, lit;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
     uint32_t srv_first = UINT32_MAX;  // 6 SRVs: rt0..3, depth, lit
-    static constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    static constexpr DXGI_FORMAT kFormats[4] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+                                                DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
 
 private:
     ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_;
@@ -132,7 +136,7 @@ struct PreparedMesh {
         std::vector<float4> vs_cb0;                // the VS stage's own cb0
         std::map<uint32_t, std::shared_ptr<const Texture>> vs_textures;
         TechniqueStage vs_material, ps_material;  // original TFX, retained for frame updates
-        std::vector<Scope> scopes;
+        std::shared_ptr<const std::vector<Scope>> scopes;
         StageResourceSources vs_sources, ps_sources;
         bool vs_live = false, ps_live = false;
         std::map<uint32_t, SamplerDesc> vs_samplers, ps_samplers;
@@ -156,8 +160,8 @@ struct PreparedMesh {
     std::map<uint32_t, ChannelUse> channels;  // object channels the materials read
     ChannelValues channel_overrides;
     ChannelValues channel_defaults;
-    std::vector<float4> global_channels;
-    std::vector<Scope> scopes;
+    std::shared_ptr<const std::vector<float4>> global_channels;
+    std::shared_ptr<const std::vector<Scope>> scopes;
     TagHash component;               // dynamic models: the component the materials came from
     uint32_t permutation = 0, permutation_count = 0;
 };
@@ -168,11 +172,12 @@ struct PrepareCache {
     bool gbuffer_only = false;
     bool all_lods = false;  // every LOD level (maps pick one per instance by screen size)
     bool ready = false;
-    std::vector<float4> global_channels;
-    std::vector<Scope> scopes;
+    std::shared_ptr<const std::vector<float4>> global_channels;
+    std::shared_ptr<const std::vector<Scope>> scopes;
     std::unordered_map<uint32_t, std::shared_ptr<const Texture>> textures;
     // Shared by the threads preparing a map's meshes in parallel (each with its own PackageManager).
     std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
+    std::shared_ptr<std::shared_mutex> texture_mutex = std::make_shared<std::shared_mutex>();
 };
 // Throws on failure.
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr,
@@ -253,7 +258,7 @@ private:
         ComPtr<ID3D12RootSignature> root_sig;
         GpuBuffer cb0, vs_cb0;
         TechniqueStage vs_material, ps_material;
-        std::vector<Scope> scopes;
+        std::shared_ptr<const std::vector<Scope>> scopes;
         StageResourceSources vs_sources, ps_sources;
         std::map<uint32_t, BindingKind> vs_kinds, ps_kinds;
         std::vector<uint32_t> vs_cbvs, ps_cbvs;
@@ -265,6 +270,7 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
         TagHash technique;
         bool vs_live = false, ps_live = false;
+        bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items
         bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
         uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
         uint32_t srv_copies = 1;          // kSrvCopies when engine textures are rebound per frame

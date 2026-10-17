@@ -9,6 +9,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -103,9 +105,9 @@ private:
     std::vector<Hash64Entry> hash64s_;
     std::unique_ptr<PackageCipher> cipher_;
 
-    static constexpr size_t kCacheSlots = 32;
-    mutable std::mutex cache_mutex_;
-    mutable std::vector<std::pair<uint32_t, std::shared_ptr<const std::vector<uint8_t>>>> cache_;
+    static constexpr size_t kCacheSlots = 1024;  // decompressed blocks kept per package
+    mutable std::shared_mutex cache_mutex_;
+    mutable std::unordered_map<uint32_t, std::shared_ptr<const std::vector<uint8_t>>> cache_;
 
     mutable std::mutex files_mutex_;
     mutable std::map<uint16_t, std::unique_ptr<MappedFile>> files_;

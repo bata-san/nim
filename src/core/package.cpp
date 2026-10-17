@@ -1,6 +1,7 @@
 #include "nim/core/package.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/oodle.hpp"
+#include "nim/core/profile.hpp"
 
 #include <cstring>
 #include <format>
@@ -103,6 +104,8 @@ const MappedFile& Package::file_for_patch(uint16_t patch) const {
 }
 
 std::vector<uint8_t> Package::read_block(uint32_t index) const {
+    ProfileScope profile("package.block_read_decode");
+    Profile::instance().count("package.block_reads");
     const Block& b = blocks_.at(index);
     auto src = file_for_patch(b.patch_id).bytes();
     if (size_t(b.offset) + b.size > src.size())
@@ -126,21 +129,19 @@ std::vector<uint8_t> Package::read_block(uint32_t index) const {
 
 std::shared_ptr<const std::vector<uint8_t>> Package::cached_block(uint32_t index) const {
     {
-        std::lock_guard lock(cache_mutex_);
-        for (size_t i = 0; i < cache_.size(); ++i) {
-            if (cache_[i].first == index) {
-                auto hit = cache_[i];
-                cache_.erase(cache_.begin() + i);
-                cache_.insert(cache_.begin(), hit);
-                return hit.second;
-            }
+        ProfileScope profile("package.block_cache_lookup");
+        std::shared_lock lock(cache_mutex_);
+        if (auto it = cache_.find(index); it != cache_.end()) {
+            Profile::instance().count("package.block_cache_hits");
+            return it->second;
         }
     }
+    Profile::instance().count("package.block_cache_misses");
     auto data = std::make_shared<const std::vector<uint8_t>>(read_block(index));
-    std::lock_guard lock(cache_mutex_);
-    cache_.insert(cache_.begin(), {index, data});
-    if (cache_.size() > kCacheSlots) cache_.pop_back();
-    return data;
+    std::unique_lock lock(cache_mutex_);
+    if (cache_.size() >= kCacheSlots) cache_.erase(cache_.begin());  // bounded: an arbitrary block makes room
+    auto [it, inserted] = cache_.emplace(index, data);
+    return inserted ? data : it->second;
 }
 
 std::vector<uint8_t> Package::read_entry(uint32_t index) const {

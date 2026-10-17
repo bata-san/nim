@@ -604,6 +604,8 @@ public:
         size_t total = 0, prepared = 0, failed = 0;
         bool done = false;
         std::array<float, 3> center{};
+        float extent = 0;  // farthest loaded placement from the centre (m)
+        std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -738,11 +740,24 @@ private:
                 const auto center = req.center ? *req.center : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
                 const auto terrain = map_terrain_region(*layout, center, req.radius);
+                float extent = 1;
+                for (const auto& st : region)
+                    for (const auto& r : st.rows)
+                        extent = std::max(extent, std::hypot(r[3] - center[0], r[7] - center[1], r[11] - center[2]));
+                auto lights = std::make_shared<std::vector<MapLight>>();
+                try {
+                    const auto all = load_map_lights(*pm, *layout);
+                    for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
+                } catch (const std::exception&) {
+                    // a map whose node tables cannot be read is drawn without local lights
+                }
                 {
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
                     progress_.total = region.size() + terrain.size();
                     progress_.center = center;
+                    progress_.extent = extent;
+                    progress_.lights = std::move(lights);
                 }
                 // Prepared in parallel (one PackageManager per thread), terrain first, then the
                 // statics nearest first; pieces arrive roughly in that order.
@@ -940,7 +955,9 @@ public:
     struct MapView {
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
-        float radius = 250;    // m around the region centre
+        static constexpr float kUnlimited = 5000;
+        float radius = kUnlimited;  // m around the region centre; kUnlimited = the whole map
+        bool lights_set = false;
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
         bool streaming = false, framed = false;
@@ -1059,6 +1076,7 @@ public:
             map_worker.start(dir);
             map = MapView{};
             map_scene = false;
+            game_lighting.clear_lights();
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -1199,6 +1217,7 @@ public:
                     const TagHash prev = map_scene ? TagHash{} : scene.tag();
                     stop_map();
                     map_scene = false;
+                    game_lighting.clear_lights();
                     scene.upload(g, std::move(*r->mesh), layouts);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
@@ -1253,8 +1272,12 @@ public:
         map.selected = index;
         map.streaming = true;
         map_scene = true;
-        map.generation = map_worker.request(m.bubble, center, map.radius, kMapTextureCaps[map.texture_cap]);
-        info(std::format("マップ {} ({}) を読込: 半径 {:.0f} m", m.package, m.bubble.str(), map.radius));
+        game_lighting.clear_lights();
+        map.lights_set = false;
+        const bool whole = map.radius >= MapView::kUnlimited;
+        map.generation = map_worker.request(m.bubble, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
+        info(whole ? std::format("マップ {} ({}) を読込: 全域", m.package, m.bubble.str())
+                   : std::format("マップ {} ({}) を読込: 半径 {:.0f} m", m.package, m.bubble.str(), map.radius));
     }
     void stream_map(Gpu& g) {
         if (!map.streaming) return;
@@ -1275,8 +1298,19 @@ public:
         const auto pr = map_worker.progress();
         if (pr.generation != map.generation) return;
         map.center = pr.center;
+        if (pr.lights && !map.lights_set) {
+            map.lights_set = true;
+            std::vector<const MapLight*> ptrs;
+            for (const auto& l : *pr.lights) ptrs.push_back(&l);
+            map_lights = pr.lights;  // kept alive while the lighting refers to it
+            try {
+                game_lighting.set_lights(*pm, g, ptrs);
+            } catch (const std::exception& ex) {
+                ++map_add_failures[std::string("local lights: ") + std::string(ex.what()).substr(0, 100)];
+            }
+        }
         if (added) {
-            scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, map.radius * 0.6f);
+            scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
             if (!map.framed && scene.loaded()) {
                 frame_scene();
                 map.framed = true;
@@ -1289,6 +1323,7 @@ public:
         }
     }
     std::map<std::string, size_t> map_add_failures;
+    std::shared_ptr<const std::vector<MapLight>> map_lights;
 
     void maps_tab() {
         if (!pm) return;
@@ -1356,8 +1391,9 @@ public:
         ImGui::BeginGroup();
         const float w = left_w - 2 * pad;
         ImGui::SetNextItemWidth(w);
-        ImGui::SliderFloat("##radius", &map.radius, 50, 2000, "範囲  %.0f m", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("領域の中心からこの距離にある配置を読み込みます");
+        ImGui::SliderFloat("##radius", &map.radius, 50, MapView::kUnlimited,
+                           map.radius >= MapView::kUnlimited ? "範囲  無制限" : "範囲  %.0f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("領域の中心からこの距離にある配置を読み込みます (右端 = マップ全域)");
         ImGui::SetNextItemWidth(w);
         const char* caps[] = {"テクスチャ  256", "テクスチャ  512", "テクスチャ  1024", "テクスチャ  原寸"};
         ImGui::Combo("##texcap", &map.texture_cap, caps, 4);

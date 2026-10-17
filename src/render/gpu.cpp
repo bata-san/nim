@@ -1,4 +1,5 @@
 #include "nim/render/gpu.hpp"
+#include "nim/core/profile.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -130,10 +131,15 @@ void Gpu::wait(uint64_t v) {
 }
 
 void Gpu::flush() {
+    ProfileScope profile_flush("gpu.flush.total");
+    Profile::instance().count("gpu.flushes");
     check_hr(list_->Close(), "Close");
     ID3D12CommandList* lists[] = {list_.Get()};
     queue_->ExecuteCommandLists(1, lists);
-    wait(signal());
+    {
+        ProfileScope profile_wait("gpu.flush.wait");
+        wait(signal());
+    }
     check_device();
     keep_.clear();
     staging_used_ = 0;
@@ -214,6 +220,8 @@ ComPtr<ID3D12Resource> Gpu::buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESO
 
 void Gpu::stage_copy(ID3D12Resource* dst, uint64_t dst_offset, const void* data, size_t size) {
     if (!size) return;
+    Profile::instance().count("gpu.stage_copy.calls");
+    Profile::instance().count("gpu.stage_copy.bytes", size);
     if (size > kStagingChunk) {
         auto up = upload(data, size);
         list_->CopyBufferRegion(dst, dst_offset, up.Get(), 0, size);
