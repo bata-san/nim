@@ -597,7 +597,7 @@ int cmd_nodes(PackageManager& pm, TagHash bubble, uint32_t show_type) {
                     std::println("{} #{} type {:08X} pos ({:.2f} {:.2f} {:.2f}) scale {:.2f} entity {}", t.str(), i, type,
                                  r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C), ent ? ent->str() : "-");
                     std::string hex;
-                    for (size_t k = 0; k < 0x140 && pnt + 0x10 + k + 4 <= data.size(); k += 4)
+                    for (size_t k = 0; k < 0x1D0 && pnt + 0x10 + k + 4 <= data.size(); k += 4)
                         hex += std::format("{}{:08X}", k % 32 ? " " : std::format("\n    +{:03X} ", k), r.u32_at(pnt + 0x10 + k));
                     std::println("{}", hex);
                 }
@@ -612,6 +612,32 @@ int cmd_nodes(PackageManager& pm, TagHash bubble, uint32_t show_type) {
     for (auto& [c, v] : components) std::println("  {:08X} {:6}  e.g. {}", c, v.first, v.second);
     std::println("entity classes:");
     for (auto& [c, v] : entities) std::println("  {:08X} {:6}  e.g. {}", c, v.first, v.second);
+    return 0;
+}
+
+int cmd_cubemaps(PackageManager& pm, TagHash bubble) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    const auto cubemaps = load_map_cubemaps(pm, map);
+    std::map<std::string, size_t> variants;
+    for (size_t i = 0; i < cubemaps.size(); ++i) {
+        const auto& m = cubemaps[i];
+        variants[std::format("alpha {} probes {} relighting {}", m.use_alpha(), m.use_probes(), m.use_relighting())]++;
+        if (i >= 12) continue;
+        auto fmt = [&](TagHash t) -> std::string {
+            if (t.is_none()) return "-";
+            try {
+                const Texture tx = load_texture(pm, t);
+                return std::format("{} {}x{}x{} a{} m{} f{}", t.str(), tx.width, tx.height, tx.depth, tx.array_size, tx.mip_count, tx.dxgi_format);
+            } catch (const std::exception& ex) { return std::format("{} ({})", t.str(), ex.what()); }
+        };
+        std::println("#{} centre ({:.1f} {:.1f} {:.1f}) extents ({:.1f} {:.1f} {:.1f}) probes {}x{}x{} +30 {:.3g} fade {:.0f}..{:.0f} params ({:.3g} {:.3g} {:.3g} {:.3g}) flags ({:.3g} {:.3g} {:.3g} {:.3g})",
+                     i, m.center[0], m.center[1], m.center[2], m.extents[0], m.extents[1], m.extents[2], m.probes[0], m.probes[1], m.probes[2],
+                     m.unk30, m.fade_start, m.fade_end, m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3],
+                     m.flags[0], m.flags[1], m.flags[2], m.flags[3]);
+        std::println("    specular {}  alpha {}  diffuse {}", fmt(m.specular), fmt(m.alpha), fmt(m.diffuse));
+    }
+    std::println("{} cubemap volumes", cubemaps.size());
+    for (const auto& [k, n] : variants) std::println("  {:5}  {}", n, k);
     return 0;
 }
 
@@ -1253,6 +1279,7 @@ int main(int argc, char** argv) {
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
         if (cmd == "nodes" && args.size() >= 2)
             return cmd_nodes(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));

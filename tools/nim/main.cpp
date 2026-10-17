@@ -606,6 +606,7 @@ public:
         std::array<float, 3> center{};
         float extent = 0;  // farthest loaded placement from the centre (m)
         std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
+        std::shared_ptr<const std::vector<MapCubemap>> cubemaps;  // the region's reflection / ambient volumes
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -751,6 +752,13 @@ private:
                 } catch (const std::exception&) {
                     // a map whose node tables cannot be read is drawn without local lights
                 }
+                auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
+                try {
+                    const auto all = load_map_cubemaps(*pm, *layout);
+                    for (const MapCubemap* c : map_cubemap_region(all, center, req.radius)) cubemaps->push_back(*c);
+                } catch (const std::exception&) {
+                    // likewise without cubemap volumes
+                }
                 {
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
@@ -758,6 +766,7 @@ private:
                     progress_.center = center;
                     progress_.extent = extent;
                     progress_.lights = std::move(lights);
+                    progress_.cubemaps = std::move(cubemaps);
                 }
                 // Prepared in parallel (one PackageManager per thread), terrain first, then the
                 // statics nearest first; pieces arrive roughly in that order.
@@ -1077,6 +1086,7 @@ public:
             map = MapView{};
             map_scene = false;
             game_lighting.clear_lights();
+            game_lighting.clear_cubemaps();
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -1218,6 +1228,7 @@ public:
                     stop_map();
                     map_scene = false;
                     game_lighting.clear_lights();
+                    game_lighting.clear_cubemaps();
                     scene.upload(g, std::move(*r->mesh), layouts);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
@@ -1273,6 +1284,7 @@ public:
         map.streaming = true;
         map_scene = true;
         game_lighting.clear_lights();
+        game_lighting.clear_cubemaps();
         map.lights_set = false;
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m.bubble, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
@@ -1308,6 +1320,17 @@ public:
             } catch (const std::exception& ex) {
                 ++map_add_failures[std::string("local lights: ") + std::string(ex.what()).substr(0, 100)];
             }
+            if (pr.cubemaps) {
+                std::vector<const MapCubemap*> cps;
+                for (const auto& c : *pr.cubemaps) cps.push_back(&c);
+                map_cubemaps = pr.cubemaps;
+                try {
+                    game_lighting.set_cubemaps(*pm, g, cps);
+                } catch (const std::exception& ex) {
+                    ++map_add_failures[std::string("cubemaps: ") + std::string(ex.what()).substr(0, 100)];
+                }
+                for (const auto& n : game_lighting.cubemap_notes()) ++map_add_failures[n.substr(0, 120)];
+            }
         }
         if (added) {
             scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
@@ -1324,6 +1347,7 @@ public:
     }
     std::map<std::string, size_t> map_add_failures;
     std::shared_ptr<const std::vector<MapLight>> map_lights;
+    std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
 
     void maps_tab() {
         if (!pm) return;

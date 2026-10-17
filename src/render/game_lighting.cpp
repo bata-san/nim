@@ -93,6 +93,7 @@ void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKin
         break;
     case BindingKind::TextureCube:
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        sd.TextureCube.MostDetailedMip = UINT(first);  // a cube view's first mip (filter source chains)
         sd.TextureCube.MipLevels = UINT(-1);
         break;
     case BindingKind::TextureCubeArray:
@@ -389,8 +390,6 @@ TfxEnvironment ExternStore::environment() const {
 
 // ---- GamePipeline -----------------------------------------------------------------------------------
 void GamePipeline::release(Gpu& gpu) {
-    if (srv_first_ != UINT32_MAX) gpu.srv().free(srv_first_, srv_total_ * kRing);
-    srv_first_ = UINT32_MAX;
     srv_total_ = 0;
     stages_.clear();
     pso_.Reset();
@@ -514,7 +513,11 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     pd.PS = {ps_code.data(), ps_code.size()};
     auto& bl = pd.BlendState.RenderTarget[0];
     bl.RenderTargetWriteMask = 0xF;
-    if (opt.additive) {
+    if (opt.blend_state >= 0) {
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        for (UINT r = 0; r < 1 + opt.additional_rtv_formats.size() && r < 5; ++r)
+            pd.BlendState.RenderTarget[r] = engine_blend_desc(opt.blend_state, int(r));
+    } else if (opt.additive) {
         bl.BlendEnable = TRUE;
         bl.SrcBlend = bl.DestBlend = D3D12_BLEND_ONE;
         bl.BlendOp = D3D12_BLEND_OP_ADD;
@@ -545,7 +548,6 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
 
     }
     for (const auto& st : stages_) srv_total_ += st.srv_count + st.uav_count;
-    if (srv_total_) srv_first_ = gpu.srv().alloc(srv_total_ * kRing);
 }
 
 void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -555,9 +557,9 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
 }
 
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                               const Technique& materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                               uint32_t indices) {
-    const Geometry g{&materials, &vbv, &ibv, indices};
+                               const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
+                               uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures) {
+    const Geometry g{materials, &vbv, &ibv, indices, ps_textures};
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
 }
 
@@ -574,8 +576,9 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
     const TfxEnvironment env = ext.environment();
-    const uint32_t base = srv_first_ + ring_ * srv_total_;
-    ring_ = (ring_ + 1) % kRing;
+    // Fresh views per draw: a list holds many draws of one pipeline (light and cubemap volumes),
+    // and every draw must keep its own textures until the GPU has run it.
+    const uint32_t base = srv_total_ ? gpu.transient_descriptors(srv_total_) : 0;
 
     if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
     else cl->SetGraphicsRootSignature(root_sig_.Get());
@@ -605,14 +608,15 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
-        auto& cached = st.bound_views[(ring_ + kRing - 1) % kRing];
-        cached.resize(st.srv_count);
         for (const auto& [s, kind] : st.srv_kinds) {
             ID3D12Resource* r = nullptr;
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             uint32_t stride = 0, elements = 0;
             uint64_t first_element = 0;
             if (auto it = st.static_textures.find(s); it != st.static_textures.end()) r = it->second.Get();
+            if (geometry && st.which == ShaderStage::Pixel)
+                for (const auto& [slot, res] : geometry->ps_textures)
+                    if (slot == s) r = res;
             for (const auto& et : textures) {
                 if (et.slot != s) continue;
                 const uint32_t bo = uint32_t(et.offset) * 8;
@@ -630,19 +634,9 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                     if (et.slot == s && ext.estimate_null_texture(et.extern_id, uint32_t(et.offset) * 8)) null_view = true;
             if (null_view) {
                 write_null_srv(dev, kind, gpu.srv().cpu(base + off + s));
-                cached[s].valid = false;
                 continue;
             }
-            auto& previous = cached[s];
-            if (!cache_bindings || !previous.valid || previous.resource.Get() != r || previous.format != fmt || previous.stride != stride || previous.elements != elements || previous.first_element != first_element) {
-                write_game_srv(dev, {r, fmt, stride, elements, first_element}, kind, gpu.srv().cpu(base + off + s));
-                previous.resource = r;
-                previous.format = fmt;
-                previous.stride = stride;
-                previous.elements = elements;
-                previous.first_element = first_element;
-                previous.valid = true;
-            }
+            write_game_srv(dev, {r, fmt, stride, elements, first_element}, kind, gpu.srv().cpu(base + off + s));
         }
         if (st.table_param >= 0) {
             if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
@@ -864,6 +858,14 @@ void GameLighting::release(Gpu& gpu) {
     lights_.clear();
     for (auto& lp : light_pipelines_) lp->release(gpu);
     light_pipelines_.clear();
+    cubemaps_.clear();
+    for (auto& cp : cubemap_pipelines_) cp->release(gpu);
+    cubemap_pipelines_.clear();
+    cubemap_variants_.clear();
+    probe_textures_.clear();
+    filtered_cubes_.clear();
+    if (cube_filter_) cube_filter_->release(gpu);
+    cube_filter_.reset();
     hdr_.Reset();
     rtv_heap_.Reset();
     w_ = h_ = 0;
@@ -1103,7 +1105,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
                               "no map atmosphere: transmittance 1, in-scatter 0 (clear air)");
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
-    if (!lights_.empty()) {
+    if (!lights_.empty() || !cubemaps_.empty()) {
         ext_.set_texture(ext::Deferred, 0xC0, light_diffuse_.Get());
         ext_.set_texture(ext::Deferred, 0xC8, light_specular_.Get());
     } else if (ext_.texture(ext::Deferred, 0xC0).resource == light_diffuse_.Get()) {
@@ -1129,6 +1131,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.note_estimate("extern 43 +0x30 = 1, +0x34 = 0 (shadow strength / filter)", unshadowed);
     }
     if (!ext_.zero_policy(ext::ShadowMask)) ext_.zero_when_missing(ext::ShadowMask, "no shadow pass yet (sun shadow mask not rendered): zero");
+    if (!ext_.texture(93, 0x00).resource) ext_.estimate_texture(93, 0x00, unshadowed_.Get(), "no SSAO pass yet: unoccluded (white)");
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "no volumetric fog pass yet: zero");
     ext_.set_texture(ext::Frame, 0xC0, lobe_lookup_.Get());
     ext_.set_texture(ext::Frame, 0xC8, lobe3d_lookup_.Get());
@@ -1277,13 +1280,26 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
-    lights_drawn_ = 0;
-    if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
+    lights_drawn_ = cubemaps_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         env_pass(env_ibl_pso_.Get(), env_rtv);
-        Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    if (!lights_.empty() || !cubemaps_.empty()) {
+        // Light buffers: cubemap volumes (diffuse probes + specular IBL over the sky's), then the
+        // local lights added on top, as goriath's render_lighting orders them.
+        Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        const float zero[4]{};
+        cl->ClearRenderTargetView({hdr.ptr + 3 * inc}, zero, 0, nullptr);
+        cl->ClearRenderTargetView({hdr.ptr + 4 * inc}, zero, 0, nullptr);
+        if (!cubemaps_.empty() && own_env) draw_cubemaps(gpu, cl, vm, scopes);
+        if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
+        Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    if (own_env) Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
     cl->SetGraphicsRootSignature(nullptr);
@@ -1342,6 +1358,22 @@ M4 inverse(const M4& m) {
     for (int c = 0; c < 4; ++c) for (int rr = 0; rr < 4; ++rr) r.c[c][size_t(rr)] = inv[c * 4 + rr] * det;
     return r;
 }
+// A world box entirely outside one clip plane.
+bool off_screen(const ViewMatrices& vm, const std::array<float, 3>& lo, const std::array<float, 3>& hi) {
+    int out[5]{};
+    for (int c = 0; c < 8; ++c) {
+        const float4 p{c & 1 ? hi[0] - vm.eye.x : lo[0] - vm.eye.x, c & 2 ? hi[1] - vm.eye.y : lo[1] - vm.eye.y,
+                       c & 4 ? hi[2] - vm.eye.z : lo[2] - vm.eye.z, 1};
+        float4 q{};
+        for (int r = 0; r < 4; ++r)
+            for (int k = 0; k < 4; ++k) q[size_t(r)] += vm.vp_rel.c[k][size_t(r)] * p[size_t(k)];
+        out[0] += q[0] < -q[3]; out[1] += q[0] > q[3]; out[2] += q[1] < -q[3]; out[3] += q[1] > q[3]; out[4] += q[3] <= 0;
+    }
+    for (int i = 0; i < 5; ++i)
+        if (out[i] == 8) return true;
+    return false;
+}
+
 // goriath compute_light_bounds + compute_light_local_to_world: the light volume's box (in light
 // space) as a transform of the unit cube [0,1]^3 with x and z swapped.
 M4 light_box_to_world(const M4& node, const M4& light_space) {
@@ -1377,20 +1409,23 @@ M4 light_box_to_world(const M4& node, const M4& light_space) {
 
 }  // namespace
 
+void GameLighting::make_cube(Gpu& gpu) {
+    if (cube_) return;
+    // Unit cube, outward-facing counter-clockwise triangles.
+    const float v[8][3] = {{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1}, {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}};
+    const uint16_t idx[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5};
+    std::vector<uint8_t> bytes(sizeof(v) + sizeof(idx));
+    std::memcpy(bytes.data(), v, sizeof(v));
+    std::memcpy(bytes.data() + sizeof(v), idx, sizeof(idx));
+    cube_ = gpu.upload(bytes.data(), bytes.size());
+    cube_vbv_ = {cube_->GetGPUVirtualAddress(), UINT(sizeof(v)), 12};
+    cube_ibv_ = {cube_->GetGPUVirtualAddress() + sizeof(v), UINT(sizeof(idx)), DXGI_FORMAT_R16_UINT};
+}
+
 void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
     lights_.clear();
     light_notes_.clear();
-    if (!cube_) {
-        // Unit cube, outward-facing counter-clockwise triangles.
-        const float v[8][3] = {{-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1}, {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}};
-        const uint16_t idx[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5};
-        std::vector<uint8_t> bytes(sizeof(v) + sizeof(idx));
-        std::memcpy(bytes.data(), v, sizeof(v));
-        std::memcpy(bytes.data() + sizeof(v), idx, sizeof(idx));
-        cube_ = gpu.upload(bytes.data(), bytes.size());
-        cube_vbv_ = {cube_->GetGPUVirtualAddress(), UINT(sizeof(v)), 12};
-        cube_ibv_ = {cube_->GetGPUVirtualAddress() + sizeof(v), UINT(sizeof(idx)), DXGI_FORMAT_R16_UINT};
-    }
+    make_cube(gpu);
     // One pipeline pair per (shaders, textures, samplers); techniques are cached by tag.
     std::map<std::string, uint32_t> keys;
     std::unordered_map<uint32_t, std::shared_ptr<const Technique>> techniques;
@@ -1434,14 +1469,9 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
 }
 
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
-    Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + 4 * inc}};
-    const float zero[4]{};
-    cl->ClearRenderTargetView(rtvs[0], zero, 0, nullptr);
-    cl->ClearRenderTargetView(rtvs[1], zero, 0, nullptr);
     cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
     if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
     if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
@@ -1458,21 +1488,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
     for (const auto& ll : lights_) {
         const MapLight& l = ll.light;
-        // Off-screen volumes: all eight box corners outside one clip plane.
-        bool outside = false;
-        {
-            int out[5]{};
-            for (int c = 0; c < 8; ++c) {
-                const float4 p{c & 1 ? l.hi[0] - vm.eye.x : l.lo[0] - vm.eye.x, c & 2 ? l.hi[1] - vm.eye.y : l.lo[1] - vm.eye.y,
-                               c & 4 ? l.hi[2] - vm.eye.z : l.lo[2] - vm.eye.z, 1};
-                float4 q{};
-                for (int r = 0; r < 4; ++r)
-                    for (int k = 0; k < 4; ++k) q[size_t(r)] += vm.vp_rel.c[k][size_t(r)] * p[size_t(k)];
-                out[0] += q[0] < -q[3]; out[1] += q[0] > q[3]; out[2] += q[1] < -q[3]; out[3] += q[1] > q[3]; out[4] += q[3] <= 0;
-            }
-            for (int i = 0; i < 5; ++i) outside |= out[i] == 8;
-        }
-        if (outside) continue;
+        if (off_screen(vm, l.lo, l.hi)) continue;
         const M4 node = m4(l.node), space = m4(l.light_space);
         const M4 node_rel = mul(to_rel, node);
         const M4 volume = mul(node_rel, space);  // unit cube -> camera-relative world
@@ -1489,7 +1505,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
         const bool mirrored = det4(volume) > 0;  // the clip-space map flips handedness when its determinant is positive (D3D NDC is left-handed)
         GamePipeline& gp = *light_pipelines_[ll.pipeline + (mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, scopes, *ll.technique, cube_vbv_, cube_ibv_, 36);
+            gp.draw_volume(gpu, cl, ext_, scopes, ll.technique.get(), cube_vbv_, cube_ibv_, 36);
             if (std::getenv("NIM_LIGHT_DEBUG") && lights_drawn_ < 2) {
                 const auto& vs = gp.stage_constants(0);
                 const auto& ps = gp.stage_constants(1);
@@ -1503,8 +1519,288 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));
         }
     }
-    Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+// ---- Cubemap volumes ---------------------------------------------------------------------------
+void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps) {
+    cubemaps_.clear();
+    cubemap_notes_.clear();
+    make_cube(gpu);
+    const Scope* scopes[] = {&frame_scope_, &view_scope_};
+    std::map<std::string, size_t> failures;
+    auto texture = [&](TagHash t) -> ComPtr<ID3D12Resource> {
+        if (t.is_none()) return nullptr;
+        auto& slot = probe_textures_[t.value];
+        if (!slot) slot = gpu.texture(load_texture(pm, t));
+        return slot;
+    };
+    {
+        std::vector<uint32_t> wanted;
+        for (const MapCubemap* m : cubemaps)
+            if (!m->specular.is_none() && !filtered_cubes_.contains(m->specular.value)) wanted.push_back(m->specular.value);
+        std::ranges::sort(wanted);
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+        try {
+            filter_specular_cubes(pm, gpu, wanted);
+        } catch (const std::exception& ex) {
+            cubemap_notes_.push_back(std::format("specular cube filtering failed: {}", ex.what()));
+        }
+    }
+    for (const MapCubemap* m : cubemaps) {
+        try {
+            // The volume's permutation, as goriath's get_specialized_cubemap_pipeline (box shape).
+            const std::string name = std::format("cubemap_apply_cube_alpha_{}_probes_{}_relighting_{}", m->use_alpha() ? "on" : "off",
+                                                 m->use_probes() ? "on" : "off", m->use_relighting() ? "on" : "off");
+            auto it = cubemap_variants_.find(name);
+            if (it == cubemap_variants_.end()) {
+                const TagHash technique = globals_.pipeline(name);
+                if (technique.is_none()) throw std::runtime_error("render_globals has no pipeline " + name);
+                const uint32_t index = uint32_t(cubemap_pipelines_.size());
+                for (bool front : {true, false}) {
+                    auto gp = std::make_unique<GamePipeline>();
+                    GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
+                    opt.volume = true;
+                    opt.cull_front = front;
+                    opt.cbuffer_floor = 64;
+                    opt.blend_state = 23;  // goriath CubemapRenderer: src + dst * src.a over both targets
+                    gp->load(pm, gpu, technique, scopes, opt);
+                    cubemap_pipelines_.push_back(std::move(gp));
+                }
+                it = cubemap_variants_.emplace(name, index).first;
+            }
+            CubemapVolume v;
+            v.pipeline = it->second;
+            v.volume = *m;
+            const auto raw = texture(m->specular);
+            const auto filtered = filtered_cubes_.find(m->specular.value);
+            v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;
+            v.alpha = texture(m->alpha);
+            v.diffuse = texture(m->diffuse);
+            if (!v.specular || (m->use_alpha() && !v.alpha) || (m->use_probes() && !v.diffuse))
+                throw std::runtime_error("volume without its cube / probe textures");
+            const auto desc = raw->GetDesc();
+            v.max_mip = float(v.specular->GetDesc().MipLevels - 1);
+            v.squared = desc.Format != DXGI_FORMAT_BC6H_UF16 && desc.Format != DXGI_FORMAT_BC6H_SF16 &&
+                        desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format != DXGI_FORMAT_R11G11B10_FLOAT;
+            cubemaps_.push_back(std::move(v));
+        } catch (const std::exception& ex) {
+            ++failures[std::string(ex.what()).substr(0, 120)];
+        }
+    }
+    // The blend keeps what is drawn last on top: large volumes first, nested small ones over them.
+    std::stable_sort(cubemaps_.begin(), cubemaps_.end(), [](const CubemapVolume& a, const CubemapVolume& b) {
+        const auto& ea = a.volume.extents;
+        const auto& eb = b.volume.extents;
+        return ea[0] * ea[1] * ea[2] > eb[0] * eb[1] * eb[2];
+    });
+    for (const auto& [why, n] : failures) cubemap_notes_.push_back(std::format("{} cubemap volumes left out: {}", n, why));
+    if (!cubemaps_.empty()) {
+        constexpr std::string_view layout = "cubemap_volume scope (cb11) has no bytecode: filled from the SCubemapComponent";
+        ext_.note_estimate("cubemaps: cb11 face fades from component +0x50 / +0x60 as fractions of the half extent", layout);
+        ext_.note_estimate("cubemaps: cb11 [2].w intensity = component +0x30", layout);
+        ext_.note_estimate("cubemaps: cb11 [14].w = camera distance fade over component +0x3C..+0x40 (m)", layout);
+        ext_.note_estimate("cubemaps: cb11 [15] = component +0x170, [18].w = 0 for UNORM (gamma-2) cubes (the PS squares them)", layout);
+        ext_.note_estimate("cubemaps: GGX filter roughness = mip / last mip, chain down to 4x4",
+                           "cubemap_face_filter_ggx inputs (extern 84) are engine-set");
+        ext_.note_estimate("cubemaps: draw order largest volume first", "engine sort order not decoded");
+    }
+}
+
+void GameLighting::filter_specular_cubes(PackageManager& pm, Gpu& gpu, std::span<const uint32_t> tags) {
+    if (tags.empty()) return;
+    ID3D12Device* dev = gpu.device();
+    constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (!cube_filter_) {
+        const TagHash technique = globals_.pipeline("cubemap_face_filter_ggx");
+        if (technique.is_none()) throw std::runtime_error("render_globals has no pipeline cubemap_face_filter_ggx");
+        const Scope* scopes[] = {&frame_scope_, &view_scope_};
+        GamePipeline::Options opt{kFormat};
+        opt.cbuffer_floor = 16;
+        auto gp = std::make_unique<GamePipeline>();
+        gp->load(pm, gpu, technique, scopes, opt);
+        cube_filter_ = std::move(gp);
+    }
+    // Extern 84 (cubemap filter state), as the technique's TFX reads it: +0xB0 the face's
+    // forward, +0xA0 / +0x90 its axes along the target's x / y, +0xC8 / +0xC4 roughness as mip /
+    // last mip, +0xCC the source face size, +0x108 the source cube. D3D cube face order.
+    static const float4 kForward[6] = {{1, 0, 0, 0}, {-1, 0, 0, 0}, {0, 1, 0, 0}, {0, -1, 0, 0}, {0, 0, 1, 0}, {0, 0, -1, 0}};
+    static const float4 kAxisX[6] = {{0, 0, 1, 0}, {0, 0, -1, 0}, {-1, 0, 0, 0}, {-1, 0, 0, 0}, {-1, 0, 0, 0}, {1, 0, 0, 0}};
+    static const float4 kAxisY[6] = {{0, 1, 0, 0}, {0, 1, 0, 0}, {0, 0, -1, 0}, {0, 0, 1, 0}, {0, 1, 0, 0}, {0, 1, 0, 0}};
+    constexpr uint8_t kFilter = 84;
+    std::array<float4, 16> vs_scope{};  // the full-screen VS reads cb12[13].x (depth) only
+    const auto vs_cb = gpu.dynamic(sizeof(vs_scope));
+    std::memcpy(vs_cb.cpu, vs_scope.data(), sizeof(vs_scope));
+    const ScopeBufferFn scopes = [&](ShaderStage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS { return reg == 12 ? vs_cb.gpu : 0; };
+
+    constexpr size_t kBatch = 16;  // cubes per submission (bounds the temporary source chains)
+    constexpr uint32_t kRtvs = 2 * 6 * 9 * kBatch;
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvs};
+    check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)), "CreateDescriptorHeap (cube filter)");
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    uint32_t rtv_next = 0;
+    auto rtv = [&](ID3D12Resource* r, uint32_t mip, uint32_t face) {
+        D3D12_RENDER_TARGET_VIEW_DESC d{};
+        d.Format = kFormat;
+        d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray.MipSlice = mip;
+        d.Texture2DArray.FirstArraySlice = face;
+        d.Texture2DArray.ArraySize = 1;
+        const D3D12_CPU_DESCRIPTOR_HANDLE h{rtv_heap->GetCPUDescriptorHandleForHeapStart().ptr + size_t(rtv_next++ % kRtvs) * inc};
+        dev->CreateRenderTargetView(r, &d, h);
+        return h;
+    };
+    auto make = [&](uint32_t size, uint32_t mips) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = rd.Height = size;
+        rd.DepthOrArraySize = 6;
+        rd.MipLevels = UINT16(mips);
+        rd.Format = kFormat;
+        rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ComPtr<ID3D12Resource> r;
+        check_hr(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&r)),
+                 "CreateCommittedResource (filtered cube)");
+        return r;
+    };
+    auto to_read = [&](ID3D12GraphicsCommandList* cl, ID3D12Resource* r, uint32_t mip, uint32_t mips) {
+        D3D12_RESOURCE_BARRIER b[6]{};
+        for (uint32_t f = 0; f < 6; ++f) {
+            b[f].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[f].Transition = {r, mip + f * mips, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        }
+        cl->ResourceBarrier(6, b);
+    };
+    bool validated = false;
+    auto pass = [&](ID3D12GraphicsCommandList* cl, ID3D12Resource* target, uint32_t mip, uint32_t size, ID3D12Resource* source,
+                    uint32_t source_mip, float roughness_mip, float last_mip, float source_size) {
+        const D3D12_VIEWPORT vp{0, 0, float(size), float(size), 0, 1};
+        const D3D12_RECT sc{0, 0, LONG(size), LONG(size)};
+        for (uint32_t f = 0; f < 6; ++f) {
+            ext_.set(kFilter, 0xB0, kForward[f]);
+            ext_.set(kFilter, 0xA0, kAxisX[f]);
+            ext_.set(kFilter, 0x90, kAxisY[f]);
+            ext_.set(kFilter, 0xC8, roughness_mip);
+            ext_.set(kFilter, 0xC4, last_mip);
+            ext_.set(kFilter, 0xCC, source_size);
+            ext_.set_texture(kFilter, 0x108, source, DXGI_FORMAT_UNKNOWN, 0, 0, source_mip);
+            const auto h = rtv(target, mip, f);
+            cl->OMSetRenderTargets(1, &h, FALSE, nullptr);
+            cl->RSSetViewports(1, &vp);
+            cl->RSSetScissorRects(1, &sc);
+            cube_filter_->draw(gpu, cl, ext_, scopes, validated);
+            validated = true;
+        }
+    };
+    for (size_t first = 0; first < tags.size(); first += kBatch) {
+        // Each batch runs on the immediate list and is flushed before the next: its per-draw
+        // descriptors are reused, and its source chains live until the GPU is done with them.
+        const uint32_t mark = gpu.transient_mark();
+        std::vector<ComPtr<ID3D12Resource>> temps;
+        auto* cl = gpu.immediate();
+        try {
+            for (size_t i = first; i < tags.size() && i < first + kBatch; ++i) {
+                auto& raw = probe_textures_[tags[i]];
+                if (!raw) raw = gpu.texture(load_texture(pm, TagHash(tags[i])));
+                const auto rd = raw->GetDesc();
+                if (rd.DepthOrArraySize != 6 || rd.Width != rd.Height) continue;
+                const uint32_t size = uint32_t(rd.Width);
+                const uint32_t mips = std::max(1, int(std::bit_width(size)) - 2);  // down to 4x4
+                // Source chain: mip 0 resampled from the stored cube, each further mip a bilinear
+                // half of the one above (the filter's copy path, roughness 0).
+                auto src = make(size, mips);
+                pass(cl, src.Get(), 0, size, raw.Get(), 0, 0, 1, float(size));
+                to_read(cl, src.Get(), 0, mips);
+                for (uint32_t m = 1; m < mips; ++m) {
+                    pass(cl, src.Get(), m, std::max(1u, size >> m), src.Get(), m - 1, 0, 1, float(size));
+                    to_read(cl, src.Get(), m, mips);
+                }
+                // The filtered chain the cubemap_apply PS samples by roughness.
+                auto dst = make(size, mips);
+                for (uint32_t m = 0; m < mips; ++m) {
+                    pass(cl, dst.Get(), m, std::max(1u, size >> m), src.Get(), 0, float(m), float(mips - 1), float(size));
+                    to_read(cl, dst.Get(), m, mips);
+                }
+                temps.push_back(std::move(src));
+                filtered_cubes_[tags[i]] = std::move(dst);
+            }
+        } catch (...) {
+            gpu.flush();  // what was recorded still refers to the source chains
+            gpu.transient_rewind(mark);
+            for (size_t i = first; i < tags.size() && i < first + kBatch; ++i) filtered_cubes_.erase(tags[i]);
+            throw;
+        }
+        gpu.flush();
+        gpu.transient_rewind(mark);
+    }
+    ext_.set_texture(kFilter, 0x108, nullptr);
+}
+
+void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + inc}};  // light diffuse, specular IBL
+    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    auto upload = [&](std::span<const float4> values) {
+        auto a = gpu.dynamic(values.size() * sizeof(float4));
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
+        return a.gpu;
+    };
+    for (const auto& cv : cubemaps_) {
+        const MapCubemap& m = cv.volume;
+        if (off_screen(vm, m.lo, m.hi)) continue;
+        float d2 = 0;  // camera to the volume's box
+        for (int a = 0; a < 3; ++a) {
+            const float e = (&vm.eye.x)[a];
+            const float d = e < m.lo[size_t(a)] ? m.lo[size_t(a)] - e : e > m.hi[size_t(a)] ? e - m.hi[size_t(a)] : 0;
+            d2 += d * d;
+        }
+        const float dist = std::sqrt(d2);
+        const float fade = m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
+        if (fade <= 0) continue;
+        std::array<float4, 4> vs{};
+        vs[0] = {m.center[0], m.center[1], m.center[2], 1};
+        vs[1] = {m.rotation[0], m.rotation[1], m.rotation[2], m.rotation[3]};
+        vs[2] = {m.extents[0], m.extents[1], m.extents[2], 0};
+        std::array<float4, 32> ps{};
+        // Face fades: 1 - saturate(|x| * scale - offset) over the outer `blend` of each half extent.
+        for (int a = 0; a < 3; ++a) {
+            const float bn = m.blend_neg[size_t(a)], bp = m.blend_pos[size_t(a)];
+            if (bn > 1e-4f) ps[0][size_t(a)] = 1.0f / bn, ps[2][size_t(a)] = (1.0f - bn) / bn;
+            if (bp > 1e-4f) ps[1][size_t(a)] = 1.0f / bp, ps[3][size_t(a)] = (1.0f - bp) / bp;
+        }
+        ps[2][3] = m.unk30;
+        ps[3][3] = cv.max_mip;
+        for (int c = 0; c < 4; ++c)
+            ps[size_t(5 + c)] = {m.local_to_world[size_t(c * 4)], m.local_to_world[size_t(c * 4 + 1)], m.local_to_world[size_t(c * 4 + 2)],
+                                 m.local_to_world[size_t(c * 4 + 3)]};
+        for (int c = 0; c < 3; ++c) ps[size_t(9 + c)] = {m.axes[size_t(c * 4)], m.axes[size_t(c * 4 + 1)], m.axes[size_t(c * 4 + 2)], 0};
+        ps[14] = {1.0f / float(m.probes[0]), 1.0f / float(m.probes[1]), 1.0f / float(m.probes[2]), fade};
+        ps[15] = {m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3]};
+        ps[18][3] = cv.squared ? 0.0f : 1.0f;  // zero: square the samples
+        const auto vs_cb = upload(vs), ps_cb = upload(ps);
+        const ScopeBufferFn volume_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+            if (reg == 11) return stage == ShaderStage::Vertex ? vs_cb : ps_cb;
+            return scopes(stage, reg);
+        };
+        // The VS places -position (the cube turned inside out); the far side is drawn as for lights.
+        M4 l2w = m4(m.local_to_world);
+        for (int c = 0; c < 3; ++c)
+            for (auto& x : l2w.c[c]) x = -x;
+        const bool mirrored = det4(mul(vm.vp_abs, l2w)) > 0;
+        GamePipeline& gp = *cubemap_pipelines_[cv.pipeline + (mirrored ? 1 : 0)];
+        std::vector<std::pair<uint32_t, ID3D12Resource*>> textures{{0, cv.specular.Get()}};
+        if (cv.alpha) textures.push_back({1, cv.alpha.Get()});
+        if (cv.diffuse) textures.push_back({2, cv.diffuse.Get()});
+        try {
+            gp.draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36, textures);
+            ++cubemaps_drawn_;
+        } catch (const std::exception& ex) {
+            if (cubemap_notes_.size() < 32) cubemap_notes_.push_back(std::format("cubemap {}: {}", m.specular.str(), ex.what()));
+        }
+    }
 }
 
 } // namespace nim

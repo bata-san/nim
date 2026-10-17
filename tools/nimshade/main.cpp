@@ -75,7 +75,7 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
-    bool no_lights = false;
+    bool no_lights = false, no_cubemaps = false;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -86,6 +86,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--warp") warp = true;
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
+        else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
@@ -141,6 +142,8 @@ int run(int argc, char** argv) {
     StaticMeshScene scene;
     std::vector<MapLight> map_lights;
     std::vector<const MapLight*> region_lights;
+    std::vector<MapCubemap> map_cubemaps;
+    std::vector<const MapCubemap*> region_cubemaps;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -164,6 +167,11 @@ int run(int argc, char** argv) {
             map_lights = load_map_lights(pm, map);
             region_lights = map_light_region(map_lights, focus, map_radius);
             std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
+        }
+        if (!no_cubemaps) {
+            map_cubemaps = load_map_cubemaps(pm, map);
+            region_cubemaps = map_cubemap_region(map_cubemaps, focus, map_radius);
+            std::println("cubemap volumes: {} of {} within range", region_cubemaps.size(), map_cubemaps.size());
         }
         // Prepared on every core (one forked PackageManager per thread), then added in order.
         const size_t jobs = terrain.size() + region.size();
@@ -307,9 +315,20 @@ int run(int argc, char** argv) {
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count());
             for (const auto& n : gl.light_notes()) std::println("  {}", n);
         }
+        if (!region_cubemaps.empty()) {
+            auto tc = std::chrono::steady_clock::now();
+            gl.set_cubemaps(pm, gpu, region_cubemaps);
+            std::println("cubemap volumes: {} prepared in {:.1f}s", gl.cubemap_count(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tc).count());
+            for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
+        }
         for (const auto& n : gl.notes()) std::println("  {}", n);
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
+        if (gl.cubemap_count()) {
+            std::println("cubemap volumes drawn: {}", gl.cubemaps_drawn());
+            for (const auto& n : gl.cubemap_notes()) std::println("  {}", n);
+        }
         if (gl.light_count()) {
             std::println("local lights drawn: {}", gl.lights_drawn());
             for (int b = 0; b < 2; ++b) {

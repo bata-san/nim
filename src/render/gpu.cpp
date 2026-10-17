@@ -113,6 +113,7 @@ void Gpu::init(bool warp) {
     check_hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     srv_.init(device_.Get(), 1000000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
+    transient_first_ = srv_.alloc(kTransientPerFrame * kFramesInFlight);
 
     dynamic_ = buffer(kDynamicPerFrame * kFramesInFlight, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     check_hr(dynamic_->Map(0, nullptr, reinterpret_cast<void**>(&dynamic_cpu_)), "Map(dynamic)");
@@ -191,6 +192,15 @@ uint64_t Gpu::vram_budget() const {
 void Gpu::begin_frame(uint32_t frame_index) {
     dynamic_offset_ = size_t(frame_index % kFramesInFlight) * kDynamicPerFrame;
     dynamic_end_ = dynamic_offset_ + kDynamicPerFrame;
+    transient_offset_ = transient_first_ + (frame_index % kFramesInFlight) * kTransientPerFrame;
+    transient_end_ = transient_offset_ + kTransientPerFrame;
+}
+
+uint32_t Gpu::transient_descriptors(uint32_t n) {
+    if (transient_offset_ + n > transient_end_) throw std::runtime_error("per-frame descriptor space exhausted");
+    const uint32_t first = transient_offset_;
+    transient_offset_ += n;
+    return first;
 }
 
 DynamicAlloc Gpu::dynamic(size_t size) {

@@ -97,4 +97,26 @@ std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map);
 // The lights whose volume comes within `radius` of `center`.
 std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& lights, std::array<float, 3> center, float radius);
 
+// A reflection / ambient probe volume: a node's SCubemapComponent (80807F3C, inline, 0x1D0 bytes,
+// world space). Layout per goriath SCubemapComponent, checked against the cubemap_apply shaders.
+inline constexpr uint32_t kClassCubemapComponent = 0x80807F3C;
+struct MapCubemap {
+    std::array<float, 3> extents{}, center{};   // +0x10 half extents, +0x20 centre
+    std::array<float, 4> rotation{};             // +0x100 quaternion (x, y, z, w)
+    std::array<float, 16> local_to_world{};      // +0xC0, unit cube -> world, column-major
+    std::array<float, 16> axes{};                // +0x120 rotation (columns) + centre
+    std::array<uint32_t, 3> probes{1, 1, 1};     // +0x160 diffuse probe grid resolution
+    std::array<float, 4> probe_params{};         // +0x170
+    std::array<float, 4> flags{};                // +0x180 (.y > 0 relighting, .z > 0 && .w != 0 alpha)
+    float unk30 = 0, fade_start = 0, fade_end = 0;  // +0x30, +0x3C, +0x40
+    std::array<float, 3> blend_neg{}, blend_pos{};  // +0x50 / +0x60: per-face blend widths (fraction of the half extent)
+    TagHash specular, alpha, diffuse;            // +0x1B8 cube, +0x1BC cube, +0x1C0 3D probe volume
+    std::array<float, 3> lo{}, hi{};             // world bounds
+    bool use_alpha() const { return flags[2] > 0 && flags[3] != 0; }
+    bool use_relighting() const { return flags[1] > 0; }
+    bool use_probes() const { return probes[0] * probes[1] * probes[2] > 1; }
+};
+std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map);
+std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius);
+
 }  // namespace nim

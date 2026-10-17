@@ -67,6 +67,9 @@ struct SunShadow {
     void fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius);
 };
 
+// One render target of the engine's blend state `index` (goriath blend_states.bin, 90 entries).
+D3D12_RENDER_TARGET_BLEND_DESC engine_blend_desc(int index, int rt = 0);
+
 // ---- G-buffer ---------------------------------------------------------------------------------
 // RT0 albedo, RT1 packed normal+smoothness, RT2 material params, RT3 motion, in the engine's
 // formats: the material shaders rely on the UNORM targets clamping what they write (a remap

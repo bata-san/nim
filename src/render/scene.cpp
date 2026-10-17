@@ -450,6 +450,8 @@ void create_buffer_srv(ID3D12Device* dev, const GpuBuffer& b, DXGI_FORMAT fmt, D
 
 } // namespace
 
+D3D12_RENDER_TARGET_BLEND_DESC engine_blend_desc(int index, int rt) { return blend_desc(index, rt); }
+
 StaticMeshScene::StaticMeshScene() = default;
 StaticMeshScene::~StaticMeshScene() = default;
 

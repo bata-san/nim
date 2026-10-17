@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 namespace nim {
 
@@ -108,6 +109,7 @@ public:
         bool volume = false;
         bool cull_front = true;
         uint32_t cbuffer_floor = 256;  // float4s allocated per stage cbuffer (TFX outputs beyond fail)
+        int blend_state = -1;          // >= 0: the engine's blend state (every target), instead of `additive`
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -121,16 +123,17 @@ public:
               bool validated = false);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
-    // brings its own technique's TFX, constants and cbuffer (textures and samplers must match).
+    // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
+    // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
+    // (slots no TFX fills, e.g. a cubemap volume's cubes).
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                     const Technique& materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                     uint32_t indices);
+                     const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
+                     uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {});
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
 
     std::vector<std::string> notes;  // binding diagnostics, for the UI / nimshade
     const std::vector<float4>& stage_constants(size_t i) const { return stages_.at(i).constants; }  // last draw's cbuffer
-    bool cache_bindings = true;
 
 private:
     struct Stage {
@@ -145,11 +148,15 @@ private:
         std::map<uint32_t, BindingKind> uav_kinds;
         std::vector<std::pair<uint32_t, uint32_t>> cbvs;  // (register, root parameter)
         int table_param = -1, uav_table_param = -1;
-        struct BoundView { ComPtr<ID3D12Resource> resource; DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; bool valid = false; uint32_t stride = 0, elements = 0; uint64_t first_element = 0; };
-        std::array<std::vector<BoundView>, 3> bound_views;
         std::vector<float4> constants;
     };
-    struct Geometry { const Technique* materials; const D3D12_VERTEX_BUFFER_VIEW* vbv; const D3D12_INDEX_BUFFER_VIEW* ibv; uint32_t indices; };
+    struct Geometry {
+        const Technique* materials;
+        const D3D12_VERTEX_BUFFER_VIEW* vbv;
+        const D3D12_INDEX_BUFFER_VIEW* ibv;
+        uint32_t indices;
+        std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures;
+    };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
     bool compute_ = false;
@@ -158,8 +165,7 @@ private:
     std::vector<Stage> stages_;
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3D12PipelineState> pso_;
-    uint32_t srv_first_ = UINT32_MAX, srv_total_ = 0, ring_ = 0;
-    static constexpr uint32_t kRing = 3;
+    uint32_t srv_total_ = 0;  // descriptors per draw (every stage)
 };
 
 // Runs a scope's bytecode for one stage into a cbuffer (cbuffer_init patched by the program).
@@ -192,6 +198,16 @@ public:
     size_t lights_drawn() const { return lights_drawn_; }
     const std::vector<std::string>& light_notes() const { return light_notes_; }
     ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE
+
+    // A map's reflection / ambient probe volumes (load_map_cubemaps), drawn each frame with the
+    // engine's cubemap_apply pipelines into the diffuse light buffer and the specular IBL buffer,
+    // before the local lights. Volumes that cannot be loaded are left out and listed.
+    void set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps);
+    void clear_cubemaps() { cubemaps_.clear(); }
+    size_t filtered_cube_count() const { return filtered_cubes_.size(); }
+    size_t cubemap_count() const { return cubemaps_.size(); }
+    size_t cubemaps_drawn() const { return cubemaps_drawn_; }
+    const std::vector<std::string>& cubemap_notes() const { return cubemap_notes_; }
 
     ExternStore& externs() { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
@@ -235,6 +251,27 @@ private:
     ComPtr<ID3D12Resource> cube_;
     D3D12_VERTEX_BUFFER_VIEW cube_vbv_{};
     D3D12_INDEX_BUFFER_VIEW cube_ibv_{};
+    void make_cube(Gpu& gpu);
+
+    void draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    struct CubemapVolume {
+        uint32_t pipeline = 0;  // index of the variant's pipeline pair (both windings)
+        MapCubemap volume;
+        ComPtr<ID3D12Resource> specular, alpha, diffuse;
+        float max_mip = 0;      // the specular cube's last mip
+        bool squared = false;   // specular cube stored gamma-2 (UNORM): the PS squares its samples
+    };
+    // The engine keeps two mips of a specular cube on disc and GGX-filters the rest at load with
+    // its cubemap_face_filter_ggx pipeline; this does the same for the cubes not filtered yet.
+    void filter_specular_cubes(PackageManager& pm, Gpu& gpu, std::span<const uint32_t> tags);
+    std::unique_ptr<GamePipeline> cube_filter_;
+    std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> filtered_cubes_;  // by specular tag
+    std::vector<std::unique_ptr<GamePipeline>> cubemap_pipelines_;
+    std::map<std::string, uint32_t> cubemap_variants_;  // pipeline name -> pipeline pair
+    std::vector<CubemapVolume> cubemaps_;
+    std::vector<std::string> cubemap_notes_;
+    size_t cubemaps_drawn_ = 0;
+    std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // by tag, kept across maps
 
 };
 

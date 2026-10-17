@@ -85,6 +85,12 @@ public:
 
     void begin_frame(uint32_t frame_index);  // recycles that frame's dynamic region
     DynamicAlloc dynamic(size_t size);       // 256-byte aligned, valid for the current frame
+    // `n` consecutive shader-visible descriptors (srv() indices), valid for the current frame:
+    // per-draw tables, so draws recorded into one list never overwrite each other's views.
+    uint32_t transient_descriptors(uint32_t n);
+    // Work recorded on the immediate list only and flushed can hand its descriptors back.
+    uint32_t transient_mark() const { return transient_offset_; }
+    void transient_rewind(uint32_t mark) { transient_offset_ = mark; }
 
     ComPtr<ID3D12Resource> buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
@@ -121,6 +127,8 @@ private:
     ComPtr<ID3D12Resource> dynamic_;
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
+    uint32_t transient_first_ = 0, transient_offset_ = 0, transient_end_ = 0;
+    static constexpr uint32_t kTransientPerFrame = 1 << 15;
     std::string adapter_;
     static constexpr size_t kDynamicPerFrame = 64 << 20;
 };

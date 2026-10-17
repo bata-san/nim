@@ -245,6 +245,88 @@ std::vector<const MapLight*> map_light_region(const std::vector<MapLight>& light
     return out;
 }
 
+std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map) {
+    std::vector<MapCubemap> out;
+    std::set<std::vector<float>> seen;  // the same volume placed by several node tables
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(t);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                const size_t c = p + 0x10;  // the component's payload
+                if (r.u32_at(p - 4) == kClassCubemapComponent && c + 0x1D0 <= data.size()) {
+                    MapCubemap m;
+                    for (int a = 0; a < 3; ++a) {
+                        m.extents[size_t(a)] = std::fabs(r.f32_at(c + 0x10 + size_t(a) * 4));
+                        m.center[size_t(a)] = r.f32_at(c + 0x20 + size_t(a) * 4);
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        m.rotation[size_t(k)] = r.f32_at(c + 0x100 + size_t(k) * 4);
+                        m.probe_params[size_t(k)] = r.f32_at(c + 0x170 + size_t(k) * 4);
+                        m.flags[size_t(k)] = r.f32_at(c + 0x180 + size_t(k) * 4);
+                    }
+                    for (int k = 0; k < 16; ++k) {
+                        m.local_to_world[size_t(k)] = r.f32_at(c + 0xC0 + size_t(k) * 4);
+                        m.axes[size_t(k)] = r.f32_at(c + 0x120 + size_t(k) * 4);
+                    }
+                    for (int a = 0; a < 3; ++a) m.probes[size_t(a)] = std::max(1u, r.u32_at(c + 0x160 + size_t(a) * 4));
+                    m.unk30 = r.f32_at(c + 0x30);
+                    for (int k = 0; k < 3; ++k) {
+                        m.blend_neg[size_t(k)] = r.f32_at(c + 0x50 + uint32_t(k) * 4);
+                        m.blend_pos[size_t(k)] = r.f32_at(c + 0x60 + uint32_t(k) * 4);
+                    }
+                    m.fade_start = r.f32_at(c + 0x3C);
+                    m.fade_end = r.f32_at(c + 0x40);
+                    m.specular = r.tag_at(c + 0x1B8);
+                    m.alpha = r.tag_at(c + 0x1BC);
+                    m.diffuse = r.tag_at(c + 0x1C0);
+                    // World bounds: the eight corners of the unit cube through local_to_world.
+                    m.lo = {1e30f, 1e30f, 1e30f};
+                    m.hi = {-1e30f, -1e30f, -1e30f};
+                    for (int k = 0; k < 8; ++k) {
+                        const float s[3] = {k & 1 ? 1.0f : -1.0f, k & 2 ? 1.0f : -1.0f, k & 4 ? 1.0f : -1.0f};
+                        for (int a = 0; a < 3; ++a) {
+                            const float v = m.local_to_world[size_t(12 + a)] + s[0] * m.local_to_world[size_t(a)] +
+                                            s[1] * m.local_to_world[size_t(4 + a)] + s[2] * m.local_to_world[size_t(8 + a)];
+                            m.lo[size_t(a)] = std::min(m.lo[size_t(a)], v);
+                            m.hi[size_t(a)] = std::max(m.hi[size_t(a)], v);
+                        }
+                    }
+                    std::vector<float> key(m.local_to_world.begin(), m.local_to_world.end());
+                    key.push_back(float(m.specular.value));
+                    if (!m.specular.is_none() && seen.insert(std::move(key)).second) out.push_back(m);
+                }
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius) {
+    std::vector<const MapCubemap*> out;
+    for (const auto& m : cubemaps) {
+        float d2 = 0;
+        for (int a = 0; a < 3; ++a) {
+            const float c = center[size_t(a)], d = c < m.lo[size_t(a)] ? m.lo[size_t(a)] - c : c > m.hi[size_t(a)] ? c - m.hi[size_t(a)] : 0;
+            d2 += d * d;
+        }
+        if (d2 <= radius * radius) out.push_back(&m);
+    }
+    return out;
+}
+
 std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius) {
     std::vector<std::pair<float, const Terrain*>> found;
     for (const auto& t : map.terrains) {
