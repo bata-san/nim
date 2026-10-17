@@ -109,7 +109,7 @@ public:
     uint32_t height() const { return h_; }
 
     ComPtr<ID3D12Resource> rt[4], depth, lit;
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, null_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
     uint32_t srv_first = UINT32_MAX;  // 6 SRVs: rt0..3, depth, lit
     static constexpr DXGI_FORMAT kFormats[4] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
                                                 DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
@@ -262,15 +262,10 @@ public:
     void set_global_channel_values(std::vector<float4> values) { global_values_ = std::move(values); }
     // Transparent parts (render stage 8), blended into the HDR target `rtv` (R16G16B16A16_FLOAT)
     // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
+    // Call from GameLighting's callback: inputs belong to this frame, after its atmosphere passes.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                            const ViewMatrices& vm);
+                            const ViewMatrices& vm, const ExternStore& inputs);
     bool has_transparent() const { return transparent_count_ > 0; }
-    // The transparent scope's engine inputs produced by the lighting (GameLighting): extern 40
-    // +0x00 / +0x10 the near / far sky lookups (the fog colour by distance) and Deferred +0x98 the
-    // linear depth. The rest of extern 40 (atmosphere froxels, light shaft slices) is zero (estimate).
-    void set_transparent_inputs(ID3D12Resource* sky_near, ID3D12Resource* sky_far, ID3D12Resource* linear_depth) {
-        transparent_inputs_ = {sky_near, sky_far, linear_depth};
-    }
     // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
     // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
     bool skinned() const { return skinned_; }
@@ -337,13 +332,13 @@ private:
                      ID3D12RootSignature* root = nullptr);
     void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                     bool shadow = false);
-    void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm);
+    void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage = 0,
+                          const ExternStore* frame_inputs = nullptr);
     std::unique_ptr<ExternStore> material_externs_;
     std::vector<float4> global_base_;               // the materials' global channels before overrides
     std::map<uint32_t, float> global_overrides_;
     std::vector<float4> global_values_;
     const RainOcclusion* rain_ = nullptr;
-    std::array<ID3D12Resource*, 3> transparent_inputs_{};  // sky near, sky far, linear depth
     ChannelValues channel_overrides_;
     ChannelValues channel_defaults_;
     float material_time_ = 0, material_delta_ = 0, material_exposure_ = 1;

@@ -1,10 +1,11 @@
 # nim
 
-**Renderer status:** the complete game renderer port is unfinished. Approximate lighting,
-placeholder textures and silent fallback have been removed. Missing original frame inputs
-now stop rendering, so lit previews and many thumbnails are currently unavailable. See
-[rendering status](docs/RENDERING.md) and [original game resources](docs/GAME_RESOURCES.md). The separate current build is `build-strict/Release/nim.exe`.
-
+**Renderer status:** the complete game renderer port is unfinished. Map rendering now includes
+original-shader SSAO, sky/atmosphere, local lights and probes, light shafts, post-processing and
+TAA. Engine values without decoded sources are listed as estimates; missing unestimated
+inputs stop the affected draw. Transparency and sky objects remain partial, with known
+compositing issues. See [current progress](docs/PROGRESS.md) for implemented and pending work.
+The normal build is `build/Release/nim.exe`.
 
 A fast, faithful asset viewer for Bungie's *Marathon* (2026, Tiger engine).
 Goal: every line of text and dialogue, every model, map, texture and sound — rendered with the game's own shaders.

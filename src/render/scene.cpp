@@ -246,7 +246,7 @@ void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     h_ = h;
     ID3D12Device* dev = gpu.device();
     if (!rtv_heap_) {
-        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 5};
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 6};
         check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "rtv heap");
         hd = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2};
         check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_)), "dsv heap");
@@ -282,6 +282,11 @@ void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lc);
     lit_rtv = {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(4) * inc};
     dev->CreateRenderTargetView(lit.Get(), nullptr, lit_rtv);
+    null_rtv = {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(5) * inc};
+    D3D12_RENDER_TARGET_VIEW_DESC unused{};
+    unused.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    unused.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    dev->CreateRenderTargetView(nullptr, &unused, null_rtv);  // unused MRT slots, no backing texture
     dev->CreateShaderResourceView(lit.Get(), nullptr, gpu.srv().cpu(srv_first + 5));
 }
 
@@ -1490,13 +1495,22 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
+        const auto outputs = shader_outputs(g.ps);
+        const bool motion = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+            return _stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index == 4 && !output.never_written;
+        });
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = item.root_sig.Get();
         pd.VS = {g.vs.data(), g.vs.size()};
         pd.PS = {g.ps.data(), g.ps.size()};
         // G-buffer decals blend into some targets and leave the others alone (their state masks them).
         bool blended = false;
-        if (transparent) pd.BlendState.RenderTarget[0] = blend_desc(g.blend);
+        if (transparent) {
+            pd.BlendState.IndependentBlendEnable = TRUE;
+            pd.BlendState.RenderTarget[0] = blend_desc(g.blend);
+            pd.BlendState.RenderTarget[4] = blend_desc(g.blend, 4);  // original motion blend / coverage
+            if (!motion) pd.BlendState.RenderTarget[4].RenderTargetWriteMask = 0;
+        }
         else if (g.blend >= 0) {
             pd.BlendState.IndependentBlendEnable = TRUE;
             for (int r = 0; r < 4; ++r) {
@@ -1518,12 +1532,11 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (g.part.primitive_type == 5)
             pd.IBStripCutValue = mesh.buffers.at(g.buffers).ib.is_32bit ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
-        // Transparents draw into the HDR target. Their SV_Target4 is the motion vector (the sky's and
-        // the G-buffer's convention), left unbound like the sky pass's.
-        pd.NumRenderTargets = transparent ? 1 : 4;
+        // SV_Target4 is the motion vector. Slots 1..3 are null RTVs with writes disabled.
+        pd.NumRenderTargets = transparent ? 5 : 4;
         for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : GBuffer::kFormats[r];
-        for (const auto& output : shader_outputs(g.ps))
-            if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !(transparent && output.index == 4))
+        for (const auto& output : outputs)
+            if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw std::runtime_error(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
         pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
@@ -1589,7 +1602,8 @@ void StaticMeshScene::bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint3
     cl->SetDescriptorHeaps(1, heaps);
 }
 
-void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm) {
+void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage,
+                                       const ExternStore* frame_inputs) {
     if (!material_externs_) return;
     auto& ext = *material_externs_;
     fill_view_externs(ext, w, h, vm);
@@ -1617,17 +1631,6 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // A single model has no map around it: no atmosphere, no overhead visibility map.
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext.zero_policy(id)) ext.zero_when_missing(id, "world state from a map (not loaded): zero");
-    // Transparent scope (extern 40, docs/PROGRESS.md 3.9): the sky lookups and the linear depth
-    // from the lighting; the atmosphere froxels (+0x78) and light shaft slices (+0x48 / +0x50) are
-    // not produced yet.
-    if (transparent_count_) {
-        if (transparent_inputs_[0]) ext.set_texture(ext::Transparent, 0x00, transparent_inputs_[0]);
-        if (transparent_inputs_[1]) ext.set_texture(ext::Transparent, 0x10, transparent_inputs_[1]);
-        if (transparent_inputs_[2]) ext.set_texture(ext::Deferred, 0x98, transparent_inputs_[2]);
-        if (!ext.zero_policy(ext::Transparent))
-            ext.zero_when_missing(ext::Transparent, "transparent pass inputs (atmosphere froxels, light shaft slices) not produced: zero");
-        if (!ext.zero_policy(ext::Deferred)) ext.zero_when_missing(ext::Deferred, "deferred value of the transparent pass not produced: zero");
-    }
     // PatternBlending (97): an engine-produced pattern texture whose producer is not decoded.
     if (!ext.zero_policy(97)) ext.zero_when_missing(97, "pattern-blending engine input (producer not decoded): zero");
     ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
@@ -1686,7 +1689,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         std::vector<float4> constants;
         if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
         else if (scope->name == "frame") {
-            const auto& frame = ext.frame_constants();
+            const auto& frame = frame_inputs ? frame_inputs->frame_constants() : ext.frame_constants();
             constants.assign(frame.begin(), frame.end());
         } else {
             const auto& core = scope->stages[size_t(scope_stage(stage))];
@@ -1726,6 +1729,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         }
     }
     for (auto& it : items_) {
+        if (it.stage != render_stage) continue;  // transparent inputs are produced after the G-buffer
         if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
       try {
         it.scope_addresses.resize(it.scope_slots.size());
@@ -2017,12 +2021,21 @@ void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList*
 }
 
 void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                                         const ViewMatrices& vm) {
+                                         const ViewMatrices& vm, const ExternStore& inputs) {
     if (!transparent_count_) return;
-    // The constants were evaluated with the G-buffer pass (update_materials); parts whose game
-    // inputs are missing failed there and are not drawn.
-    cl->OMSetRenderTargets(1, &rtv, FALSE, &gb.dsv_ro);
+    auto& ext = *material_externs_;
+    ext.copy_block_from(ext::Atmosphere, inputs);
+    ext.copy_block_from(ext::Transparent, inputs);
+    ext.copy_block_from(ext::Deferred, inputs);
+    material_exposure_ = inputs.get_f(ext::Frame, 0x1C);  // lighting's newly adapted exposure
+    // Supply cb13 for this pass without freezing the scene's own frame constants next frame.
+    // Reevaluate only transparents: descriptors used by recorded G-buffer/shadow draws stay intact.
+    update_materials(gpu, gb.width(), gb.height(), vm, kStageTransparent, &inputs);
+    Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {rtv, gb.null_rtv, gb.null_rtv, gb.null_rtv, gb.rtv[3]};
+    cl->OMSetRenderTargets(5, targets, FALSE, &gb.dsv_ro);
     draw_items(gpu, cl, kStageTransparent, gb.width(), gb.height(), vm, false);
+    Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 // ---- LightingPass ---------------------------------------------------------------------------------

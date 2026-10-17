@@ -71,3 +71,8 @@ enable_testing()
 add_executable(nim_tests tests/test_main.cpp)
 target_link_libraries(nim_tests PRIVATE nim_core)
 add_test(NAME nim_tests COMMAND nim_tests)
+
+# Frame-input replacement is CPU-only, even though its types belong to nim_render.
+add_executable(nim_render_tests tests/render_inputs.cpp)
+target_link_libraries(nim_render_tests PRIVATE nim_render)
+add_test(NAME nim_render_tests COMMAND nim_render_tests)

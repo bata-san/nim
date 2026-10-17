@@ -255,6 +255,20 @@ void write_game_srv(ID3D12Device* device, const ExternStore::Tex& view, BindingK
 // ---- ExternStore ------------------------------------------------------------------------------
 ExternStore::ExternStore() : data_(size_t(kBlockSize) * kBlocks, 0), present_(data_.size(), 0) {}
 
+void ExternStore::copy_block_from(uint8_t id, const ExternStore& source) {
+    if (this == &source) return;
+    const size_t base = size_t(id) * kBlockSize;
+    std::copy_n(source.data_.begin() + base, kBlockSize, data_.begin() + base);
+    std::copy_n(source.present_.begin() + base, kBlockSize, present_.begin() + base);
+    const auto first = tex_key(id, 0), last = first + (uint64_t(1) << 32);
+    textures_.erase(textures_.lower_bound(first), textures_.lower_bound(last));
+    textures_.insert(source.textures_.lower_bound(first), source.textures_.lower_bound(last));
+    zero_policy_.erase(id);
+    if (const auto policy = source.zero_policy_.find(id); policy != source.zero_policy_.end())
+        zero_policy_[id] = policy->second;
+    estimates_.insert(source.estimates_.begin(), source.estimates_.end());
+}
+
 void ExternStore::require(uint8_t id, uint32_t off, uint32_t size) const {
     if (id >= kBlocks || off > kBlockSize || size > kBlockSize - off)
         throw std::out_of_range("extern offset");
@@ -890,6 +904,8 @@ void GameLighting::release(Gpu& gpu) {
     sky_near_.release(gpu);
     sky_far_.release(gpu);
     sky_.release(gpu);
+    atmo_density_.release(gpu);
+    atmo_density_rt_.Reset();
     sky_near_rt_.Reset();
     sky_far_rt_.Reset();
     vol_downsample_.release(gpu);
@@ -982,12 +998,14 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     load_sky(vol_downsample_, "downsample_full_depth_to_quarter_max_min", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
     load_sky(vol_blur_, "volumetrics_blur_results", {DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}});
     load_sky(vol_upres_, "volumetrics_upres_1", {DXGI_FORMAT_R16G16B16A16_FLOAT, true});
+    load_sky(atmo_density_, "atmo_depth_angle_density_lookup_generate", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     load_sky(sky_near_, "sky_lookup_generate_near", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     load_sky(sky_far_, "sky_lookup_generate_far", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     {
-        GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false};
+        GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+            {GBuffer::kFormats[3], GBuffer::kFormats[3], GBuffer::kFormats[3], GBuffer::kFormats[3]}};
+        opt.write_masks = {0xF, 0, 0, 0, 0xF};
         opt.depth_func = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-        opt.drop_extra_targets = true;  // SV_Target1: motion vectors for the temporal passes
         load_sky(sky_, "sky", opt);
     }
     auto lookup = [&](TagHash tag) {
@@ -1074,7 +1092,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 9};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
@@ -1082,6 +1100,15 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
 }
 
 void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
+    // Conditional extern bindings may still reference the targets about to be released. Own
+    // this invalidation here so headless callers and GUI callers have the same resize contract.
+    auto clear_owned = [&](uint8_t id, uint32_t offset, ID3D12Resource* old) {
+        if (old && ext_.texture(id, offset).resource == old) ext_.set_texture(id, offset, nullptr);
+    };
+    clear_owned(ext::Deferred, 0xC0, light_diffuse_.Get());
+    clear_owned(ext::Deferred, 0xC8, light_specular_.Get());
+    clear_owned(ext::Deferred, 0xD0, env_.Get());
+    for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
     D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
     hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -1126,6 +1153,10 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     sky_far_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     gpu.device()->CreateRenderTargetView(sky_near_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 7 * inc});
     gpu.device()->CreateRenderTargetView(sky_far_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 8 * inc});
+    atmo_density_rt_ = gpu.texture2d(kAtmoDensitySize, kAtmoDensitySize, cv.Format,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    gpu.device()->CreateRenderTargetView(atmo_density_rt_.Get(), nullptr,
+        {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 9 * inc});
     w_ = w;
     h_ = h;
     resize_post(gpu, w, h);
@@ -1228,6 +1259,13 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     ext.set(ext::View, 0x120, pixel_to_ray);
     ext.set(ext::View, 0x160, proj_to_ray);
     ext.set(ext::View, 0x1A0, vm.vp_abs);
+    // sky PS reconstructs a point at device depth zero through +0x1E0. The infinite
+    // projection's inverse gives w=0 there, so use a finite 50km sky point to avoid 0/0
+    // in its motion-vector reprojection (the shader uses a finite engine far plane).
+    M4 sky_clip_to_world = inverse(vm.vp_abs);
+    const float sky_depth = vm.ortho > 0 ? 0 : vm.vp_rel.c[3][2] / 50000.0f;
+    for (int a = 0; a < 4; ++a) sky_clip_to_world.c[3][a] += sky_clip_to_world.c[2][a] * sky_depth;
+    ext.estimate(ext::View, 0x1E0, sky_clip_to_world, "sky motion reprojection at 50km (engine far distance unknown)");
     // +0x3E0: the previous frame's world -> clip. The G-buffer PS (and sky) write the motion vector
     // 0.5 * (ndc(+0x3E0) - ndc(+0x1A0)), y flipped, into RT3 for resolve_taa.
     ext.set(ext::View, 0x3E0, vm.vp_prev);
@@ -1432,9 +1470,9 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal
     // histories) is not yet decoded. Its outputs must be supplied by their real producers.
     // Transparent parts (render stage 8: the sky objects, glass ...) are drawn over the sky into the
-    // HDR target, before the light shafts; their motion target (SV_Target4) is not bound.
+    // HDR target, before the light shafts; SV_Target4 updates the G-buffer motion texture for TAA.
     if (transparents)
-        ext_.note_estimate("transparent parts: drawn in item order (not sorted back to front), motion target dropped",
+        ext_.note_estimate("transparent parts: drawn in item order (not sorted back to front)",
                            "engine transparent sorting not decoded");
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1517,7 +1555,19 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
-    if (atmosphere) render_sky_lookups(gpu, cl, scopes);
+    if (atmosphere) {
+        render_sky_lookups(gpu, cl, scopes);
+        render_atmosphere_density(gpu, cl);
+        cl->RSSetViewports(1, &vp);
+        cl->RSSetScissorRects(1, &sc);
+    }
+    // Consumed inside the callback, after resize and this frame's producers.
+    ext_.set_texture(ext::Transparent, 0x00, atmosphere ? sky_near_rt_.Get() : nullptr);
+    ext_.set_texture(ext::Transparent, 0x10, atmosphere ? sky_far_rt_.Get() : nullptr);
+    ext_.set_texture(ext::Transparent, 0x20, atmosphere ? atmo_density_rt_.Get() : nullptr);
+    ext_.estimate_texture(ext::Transparent, 0x78, no_atmosphere_.Get(),
+        "transparent atmosphere froxels not reconstructed: clear air (1,1,0,0)");
+    ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
     if (sky_ambient) {
@@ -1526,7 +1576,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->RSSetScissorRects(1, &sc);
     }
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
-    if ((p.ssao && hdao_.loaded()) || volumetrics) render_linear_depth(gpu, cl, gb, vm);
+    if ((p.ssao && hdao_.loaded()) || volumetrics || transparents) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
     lights_drawn_ = cubemaps_drawn_ = 0;
     vol_drawn_ = 0;
@@ -1581,14 +1631,20 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (atmosphere) {
         // The sky pipeline puts its triangle at the view's far depth (cb12[13].x): with the depth
         // test it covers only the pixels no surface was drawn to.
-        cl->OMSetRenderTargets(1, &hdr, FALSE, &gb.dsv_ro);
+        // Map sky SV_Target4 to RT3: resolve_taa needs sky motion when the camera turns.
+        Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {hdr, gb.null_rtv, gb.null_rtv, gb.null_rtv, gb.rtv[3]};
+        cl->OMSetRenderTargets(5, targets, FALSE, &gb.dsv_ro);
         sky_.draw(gpu, cl, ext_, scopes, true);
+        Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     } else {
         env_pass(env_bg_pso_.Get(), hdr);
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
     }
     if (transparents) {
+        ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
         transparents(cl, hdr);
+        ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), DXGI_FORMAT_R32_FLOAT);
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
@@ -1619,7 +1675,7 @@ void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosph
         atm_notes_.push_back("map has no atmosphere component (808084A0)");
         return;
     }
-    if (!sky_near_.loaded() || !sky_far_.loaded() || !sky_.loaded()) {
+    if (!sky_near_.loaded() || !sky_far_.loaded() || !sky_.loaded() || !atmo_density_.loaded()) {
         atm_notes_.push_back("sky pipelines not loaded");
         return;
     }
@@ -1697,6 +1753,9 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     constexpr std::string_view km = "fog_density_lookup_start / _end in km, the pass reads metres";
     est(0x178, lut_start * 1000.0f, km);
     est(0x17C, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f, "fog_density_lookup_end in km (start + 1 when unset: avoids 0/0)");
+    ext_.set(A, 0x190, ch(0x16));  // fog_decay_color for transparent spectral attenuation
+    ext_.note_estimate("extern 7 +0x190 = fog_decay_color", copied);
+    est(0x1A0, 1.0f, "fog decay color multiplier (engine value unknown)");
     est(0x188, ch(0x15)[0], copied);  // fog_height_falloff
     est(0x18C, ch(0x14)[0], copied);  // fog_start_height
     est(0x1A4, ch(0x18)[0], copied);  // layered_fog_density
@@ -1729,6 +1788,46 @@ void GameLighting::render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
     sky_far_.draw(gpu, cl, ext_, scopes);
     Gpu::barrier(cl, sky_near_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, sky_far_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+// PS SV_Position minus 0.5: first texel = distance 0 / elevation -1; last = 50km / +1.
+void GameLighting::render_atmosphere_density(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
+    if (!atmo_density_.loaded()) throw std::runtime_error("Atmosphere density LUT pipeline is unavailable");
+    ExternStore lut;
+    for (uint8_t id : {ext::Atmosphere, ext::View, ext::Frame}) lut.copy_block_from(id, ext_);
+    M4 identity;
+    for (int a = 0; a < 4; ++a) identity.c[a][a] = 1;
+    lut.set(ext::View, 0x160, identity);  // fullscreen quad, independent of the perspective camera
+    const float step = 1.0f / float(kAtmoDensitySize - 1);
+    lut.set(ext::Atmosphere, 0xD0, float4{float(kAtmoDensitySize), float(kAtmoDensitySize), step, step});
+    const auto frame = ext_.frame_constants();
+    const auto view_vs = evaluate_scope(view_scope_, ScopeStage::Vertex, lut);
+    const auto view_ps = evaluate_scope(view_scope_, ScopeStage::Pixel, lut);
+    auto upload = [&](const auto& values) {
+        const auto a = gpu.dynamic(values.size() * sizeof(float4));
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
+        return a.gpu;
+    };
+    const auto cb13 = upload(frame), cb12_vs = upload(view_vs), cb12_ps = upload(view_ps);
+    ScopeBufferFn scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        if (reg == 13) return cb13;
+        if (reg == 12) return stage == ShaderStage::Vertex ? cb12_vs : cb12_ps;
+        return 0;
+    };
+    atmo_density_.validate(lut, scopes);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const auto inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE target{base.ptr + 9 * inc};
+    const D3D12_VIEWPORT vp{0, 0, float(kAtmoDensitySize), float(kAtmoDensitySize), 0, 1};
+    const D3D12_RECT sc{0, 0, LONG(kAtmoDensitySize), LONG(kAtmoDensitySize)};
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    Gpu::barrier(cl, atmo_density_rt_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    atmo_density_.draw(gpu, cl, lut, scopes, true);
+    Gpu::barrier(cl, atmo_density_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ext_.note_estimate("transparent atmosphere density LUT: 256x256 RGBA16F",
+        "original game shader; engine texture resolution and format unknown");
 }
 
 // ---- SSAO (hdao) -------------------------------------------------------------------------------

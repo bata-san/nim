@@ -68,6 +68,7 @@ int run(int argc, char** argv) {
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
     float time_of_day = -1;
+    bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     float clip_frame = 0;
@@ -96,6 +97,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--no-entities") no_entities = true;
+        else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
@@ -145,7 +147,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -406,10 +408,10 @@ int run(int argc, char** argv) {
         std::println("transparent parts: {} (blended after the game's shading pass)", scene.transparent_count());
         game = true;
     }
-    auto transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-        scene.render_transparent(gpu, c, gb, hdr, vm);
-    };
     GameLighting gl;
+    auto transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+        scene.render_transparent(gpu, c, gb, hdr, vm, gl.externs());
+    };
     if (game) {
         gl.init(pm, gpu);
         if (!weather_channels.empty()) gl.set_global_channels(weather_channels);
@@ -440,7 +442,6 @@ int run(int argc, char** argv) {
         if (gl.environment_channels()) {
             std::println("map environment: {} global channels at time of day {:.3f}", gl.environment_channels(),
                          lp.time_of_day >= 0 ? lp.time_of_day : gl.default_time_of_day());
-            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
         }
         if (print_channels) {
@@ -457,7 +458,6 @@ int run(int argc, char** argv) {
         for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
             gpu.begin_frame(uint32_t(k + 1));  // the previous frame was flushed: its transient space is free
             scene.set_exposure(gl.exposure());
-            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
@@ -466,7 +466,6 @@ int run(int argc, char** argv) {
         for (int k = 0; k < 16 && gl.temporal_aa_on(lp); ++k) {
             gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
             vm = gl.temporal_view(view, lp);
-            scene.set_transparent_inputs(gl.sky_near(), gl.sky_far(), gl.linear_depth());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
             gpu.flush();
@@ -590,8 +589,85 @@ int run(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     std::println("rendered {} pixels covered ({:.1f}%) in {:.2f}s", covered, 100.0 * covered / (size_t(width) * height),
                  std::chrono::duration<double>(t1 - t0).count());
-    if (!covered && !scene.has_transparent()) throw std::runtime_error("nothing was rendered");
+    if (!covered && !scene.has_transparent() && !(gl.has_atmosphere() && lp.atmosphere)) throw std::runtime_error("nothing was rendered");
     std::println("wrote {}", fs::absolute(out_dir).string());
+    if (verify_frame_inputs) {
+        lp.mode = ViewMode::Lit;
+        if (!gl.has_atmosphere() || !lp.atmosphere) throw std::runtime_error("--verify-frame-inputs requires a map atmosphere");
+        const auto source = load_texture(pm, atmosphere.density_lut);
+        const bool white = (source.dxgi_format == DXGI_FORMAT_R8G8B8A8_UNORM || source.dxgi_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+            std::all_of(source.data.begin(), source.data.end(), [](uint8_t b) { return b == 255; });
+        auto half = [](uint16_t v) {
+            const int exponent = (v >> 10) & 31;
+            const float mantissa = float(v & 1023) / 1024;
+            const float value = exponent == 31 ? INFINITY : exponent ? std::ldexp(1 + mantissa, exponent - 15) : std::ldexp(mantissa, -14);
+            return (v & 0x8000) ? -value : value;
+        };
+        auto verify_lut = [&](const ViewMatrices& camera) {
+            const auto& ext = gl.externs();
+            auto* texture = ext.texture(ext::Transparent, 0x20).resource;
+            if (!texture) throw std::runtime_error("Missing transparent atmosphere LUT");
+            const auto desc = texture->GetDesc();
+            const auto data = gpu.read_texture(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
+            const auto* pixels = reinterpret_cast<const uint16_t*>(data.data());
+            float error = 0;
+            for (uint32_t y = 0; y < desc.Height; ++y) for (uint32_t x = 0; x < desc.Width; ++x) {
+                const float u = float(x) / float(desc.Width - 1), elevation = 2 * float(y) / float(desc.Height - 1) - 1;
+                const float distance = u * u * 50000, z = distance * elevation + camera.eye.z;
+                auto density = [&](uint32_t amount, uint32_t falloff, uint32_t height) {
+                    return 1.442695f * ext.get_f(ext::Atmosphere, amount) *
+                        std::exp2(-0.001f * 1.442695f * ext.get_f(ext::Atmosphere, falloff) * std::max(z - ext.get_f(ext::Atmosphere, height), 0.0f));
+                };
+                const float optical_depth = std::max(distance - ext.get_v(ext::Atmosphere, 0x130)[1], 0.0f) * 0.001f *
+                    (density(0x174, 0x188, 0x18C) + density(0x1A4, 0x1A8, 0x1AC));
+                for (uint32_t c = 0; c < 4; ++c) {
+                    const float actual = half(pixels[(size_t(y) * desc.Width + x) * 4 + c]);
+                    if (!std::isfinite(actual) || actual < 0 || actual > 1.001f || (!x && std::abs(actual - 1) > 0.001f))
+                        throw std::runtime_error("Atmosphere LUT contains invalid transmittance / zero-distance endpoint");
+                    if (white) {
+                        const float scale = c == 3 ? 1 : ext.get_v(ext::Atmosphere, 0x190)[c] * ext.get_f(ext::Atmosphere, 0x1A0);
+                        error = std::max(error, std::abs(actual - std::exp2(-optical_depth * scale)));
+                    }
+                }
+            }
+            if (error > 0.003f) throw std::runtime_error(std::format("Atmosphere LUT / CPU equation mismatch: {}", error));
+            std::println("verified atmosphere LUT: {}x{}, finite transmittance, zero-distance = 1, CPU max error {}{}",
+                desc.Width, desc.Height, error, white ? "" : " (nonuniform source: analytic comparison skipped)");
+        };
+        verify_lut(vm);
+        // Both a larger target and the original size: the first transparent draw after resize
+        // must receive the new depth / sky resources without needing a warm-up frame.
+        for (int pass = 0; pass < 2; ++pass) {
+            gpu.begin_frame(uint32_t(pass));
+            const uint32_t w = pass ? width : width + 17, h = pass ? height : height + 11;
+            gb.resize(gpu, w, h);
+            View moved = view;
+            moved.width = w; moved.height = h;
+            moved.target = moved.eye + normalize(V3{1, 0, 1});  // mostly empty sky, rotated from the previous view
+            vm = gl.temporal_view(moved, lp);
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gpu.flush();
+            verify_lut(vm);
+            const auto depth = gl.externs().texture(ext::Deferred, 0x98);
+            if (depth.resource != gb.depth.Get()) throw std::runtime_error("Stale depth binding after resize");
+            for (uint32_t offset : {0u, 0x10u}) {
+                const auto sky = gl.externs().texture(ext::Transparent, offset).resource->GetDesc();
+                if (sky.Width != w || sky.Height != h) throw std::runtime_error("Stale transparent sky dimensions after resize");
+            }
+            const auto motion = gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8);
+            const auto* values = reinterpret_cast<const uint16_t*>(motion.data());
+            size_t moving = 0;
+            for (size_t i = 0; i < motion.size() / 2; i += 4) {
+                const float x = half(values[i]), y = half(values[i + 1]);
+                if (!std::isfinite(x) || !std::isfinite(y)) throw std::runtime_error("Non-finite motion vectors after camera rotation");
+                moving += std::abs(x) + std::abs(y) > 1e-5f;
+            }
+            if (!pass && !moving) throw std::runtime_error("Camera rotation did not produce motion vectors");
+            std::println("verified resized frame {}x{}: current depth / sky, finite motion ({} moving pixels)", w, h, moving);
+        }
+    }
+
     return 0;
 }
 

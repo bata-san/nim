@@ -26,6 +26,8 @@ public:
     static constexpr uint32_t kBlockSize = 0x800, kBlocks = 256;
     ExternStore();
 
+    // Replace a complete block, including missing-value policy and texture views. Removes stale views.
+    void copy_block_from(uint8_t id, const ExternStore& source);
     void set(uint8_t id, uint32_t byte_offset, float v);
     void set(uint8_t id, uint32_t byte_offset, float4 v);
     void set(uint8_t id, uint32_t byte_offset, const M4& m);
@@ -249,10 +251,6 @@ public:
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
     ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
-    // The sky lookups of the frame (RGBA16F, PIXEL_SHADER_RESOURCE; null before the first frame or
-    // without a map atmosphere): the transparents' fog colours (StaticMeshScene::set_transparent_inputs).
-    ID3D12Resource* sky_near() const { return atm_.valid ? sky_near_rt_.Get() : nullptr; }
-    ID3D12Resource* sky_far() const { return atm_.valid ? sky_far_rt_.Get() : nullptr; }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
     // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
     float exposure() const { return exposure_; }
@@ -311,7 +309,10 @@ private:
         bool valid = false;
     } atm_;
     std::vector<std::string> atm_notes_;
-    GamePipeline sky_near_, sky_far_, sky_;
+    GamePipeline sky_near_, sky_far_, sky_, atmo_density_;
+    static constexpr uint32_t kAtmoDensitySize = 256;  // engine resolution unknown (estimate)
+    ComPtr<ID3D12Resource> atmo_density_rt_;  // sqrt(distance/50km) x elevation
+    void render_atmosphere_density(Gpu& gpu, ID3D12GraphicsCommandList* cl);
     ComPtr<ID3D12Resource> sky_near_rt_, sky_far_rt_;  // RGBA16F, full resolution: ext 7 +0xF0 / +0xE0
     void fill_atmosphere(const LightingParams& p);
     void render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);

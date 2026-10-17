@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-17 (TAA、GUI のクラッシュ対策とマップエンティティ統合)
+最終更新: 2026-10-18 (透明物の大気 LUT、当該フレームの入力受け渡し、空・透明物の TAA モーション)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -22,6 +22,7 @@
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
 | 6d | GUI マップのエンティティ表示・クラッシュ対策 | 完了 (UI 操作の実機検証は一部未) | 「GUI crash fixes and entities」コミット | §4。MapWorker に nimshade と同じモデル経路を追加 |
+| 6e | 透明描画の大気透過 LUT・当該フレーム入力・モーション | 実装済み (空オブジェクトの合成は未完) | §3.9 | 原シェーダーの LUT とリサイズの GPU 検証を追加。雲等の GUI 読込は未統合 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
 
 後回し (ユーザー指示で保留): マップのギミック (アニメーション、状態変化)。エンティティの静止表示は GUI に統合済み。
@@ -100,7 +101,7 @@ GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」
   sun_glow_shape/intensity ch0x0B/0x0C (far の g = 1−1/shape と推定), sky_sun_glow_* ch0x0D/0x0E。
 - `sky` パイプライン (80A7439F, PS 80A7439A): 背景 = (t20.rgb + (cb0[25]·froxel.z + t20.w)·cb0[4]) ·
   cb0[9]·露出。t20 = ext7 +0xE0 (far 出力)、cb0[4] = +0x150 (太陽グロー色)、cb0[9] = +0x170。
-  SV_Target1 = モーションベクトル (捨ててよい)。深度 = cb12[13].x → 深度テスト GREATER_EQUAL で空だけに描く。
+  SV_Target4 = モーションベクトル (§3.9 で TAA に接続)。深度 = cb12[13].x → 深度テスト GREATER_EQUAL で空だけに描く。
 - フロクセル (t14) は `cascade_raymarch_atmosphere_volume*` (CS, extern 0x65) が作る。後段の課題。
 - 霧の検証 (2026-10-17, outpost 80AF9550): 霧のスケールは正しい。距離 m × 0.001 = km、密度 /km、
   密度 LUT (80AF8EA8, 16x1024 RGBA8) は全面 1.0、cb0[42] = (0, 1/(end−start), ext1 +0x10, −start/(end−start))
@@ -238,9 +239,25 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   入れて渡す (静止カメラで動き 0)。ジッターは射影の c[2] (NDC オフセット) に入れ、+0x120/+0x160 の視線行列からは差し引く。
 - nim の流れ: トーンマップ → post_ldr_ → resolve_taa (RGBA16F 履歴 2 枚を交互) → copy_texture_bilinear で lit。TAA 中は FXAA を使わない。
   `GameLighting::temporal_view` が毎フレームのジッター付きビューを作る。nimshade は静止画を 16 フレーム回して収束させる (`--no-taa`)。GUI「TAA」。
-- 推定: 重み 0.92 / 棄却時 0.75〜0.5、輝度閾値 0.1、ジッター = Halton(2,3) 8 フレーム。未: 他の variant (distort)、sky の動きベクトル (捨てている)。
+- 推定: 重み 0.92 / 棄却時 0.75〜0.5、輝度閾値 0.1、ジッター = Halton(2,3) 8 フレーム。未: 他の variant (distort)。sky / stage 8 の SV_Target4 は §3.9 で RT3 に接続済み。
+
+### 3.9 透明物の大気とモーション (2026-10-18)
+- 82f6532 の WIP を継承: `load_map_sky_objects` は outpost の 104 配置 / 68 モデルを読み、nimshade は stage 8 を HDR 上に描く。GUI の MapWorker はまだ gbuffer_only のため、空オブジェクトの読込は未統合。
+- `atmo_depth_angle_density_lookup_generate` (technique 80A743EF / PS 80A743EC / VS 80A74397) をゲームの DXIL のまま実行。256² RGBA16F (サイズ・形式は推定)。透明スコープ t15 = extern 40 +0x20 に接続。
+- PS の入力は SV_Position (TEXCOORD ではない)。extern 7 +0xD0.zw = 1/(サイズ−1)。D = ((pixel.x−0.5)/(W−1))²×50000 m、仰角 = 2×(pixel.y−0.5)/(H−1)−1、評価高さ = eye.z + D×仰角。VS の View +0x160 はこのパスだけ単位行列。既存の近・遠空パスの行列を変更しない。
+- フォグの減衰色 = extern 7 +0x190 に ch0x16、+0x1A0 に倍率 1 (推定)。密度・高さ・距離 LUT は不透明物と共通。距離ゼロは透過率 1。
+- 透明物の材質・共有定数・SRV は G-buffer 生成時に評価せず、GameLighting 内の透明描画コールバックで、そのフレームの大気 / Transparent / Deferred ブロックから評価。`ExternStore::copy_block_from` は古い参照・定数・ゼロ規則を置換する。G-buffer と影で使用中の材質ディスクリプタは透明物の更新で書き換えない。露出も照明側で更新した値を使い、cb13 は当該パスの共有定数として渡す (次フレームの scene の時計を固定しない)。
+- t10 = Deferred +0x98 は、この時点の R32G32 線形深度。SSAO と volumetrics が無効でも透明物には生成する。t25 = extern 40 +0x78 は未実装フロクセルの clear-air (1,1,0,0) を明示的な推定として渡す (null の全ゼロでは透過率も 0 になる)。ライトシャフトスライス等は未接続。
+- **モーションの実際のセマンティクスは SV_Target4**。逆コンパイル補助ツールの `o1` は出力リスト上の番号であり、SV_Target1 を意味しない。空と stage 8 の出力4を G-buffer RT3 に接続。中間の MRT 1..3 は null RTV・書込無効。透明物のモーション合成は元の blend state の RT4 を使う。出力4が無い PS は motion write mask 0。
+- 空の PS は View +0x1E0 で深度0の点を復元して再投影する。未設定のゼロ行列 / 無限遠射影の逆行列では 0/0 になるため、50km の有限点として復元 (距離は推定として一覧表示)。空・透明物のモーションを finite な値で TAA へ渡す。
+- リサイズ時の自前 light diffuse/specular、env、shadow mask の条件付き extern 参照の無効化を `GameLighting::resize` に集約。GUI 以外の呼出元にも適用。旧参照を保持する GPU 検証は対策前に 0xc0000005 で終了し、対策後は大小2回の変更で成功。
+- 検証: `ctest --test-dir build -C Release --output-on-failure` (nim_tests + nim_render_tests)。CPU テストはブロック置換時の古いビュー除去・欠落入力のエラー・空の有限点復元を確認。
+- GPU 検証: `nimshade 80AF9550 out/verify_frame_inputs --eye 155,-60,-12 --look 125,-28,-26 --map-radius 50 --size 640x360 --verify-frame-inputs`。`--no-sky-objects` を付けた経路も確認。256² の全成分が finite / 0..1、距離0は1。outpost の元密度 LUT は RGBA8 SRGB・全白なので、元 PS の式との最大絶対誤差は 0.00048828125。640×360→657×371→640×360 の最初のフレームから入力サイズが一致、回転時の motion は finite。D3D12 デバッグレイヤーの警告・エラーなし。
+- GUI: 起動中の build/Release/nim.exe がロックされるため、`cmake --build build --config Release --target nim -- /p:OutDir=.../out/verified-bin/` で別出力にビルド成功。更新版を outpost 引数で35秒起動し、D3D12 デバッグログは空。専用のテストプロセスは終了済み。マップ切替・リサイズ・タブ閉じの UI 操作は未検証。空の既知不具合が残るため v0.4.0 の正式リリースは未実施。
+- **空の合成は未完成**: モデルごとの分離描画で、色の大きな破綻を `80AF906A` (technique 80AF9063 / PS 80AF905F) 単体でも再現。PS alpha の係数 cb0[24].x は `0x64 04` から来る。現 VM は 0x64 を 0x63 と同じ global channel として扱い ch4=6 を渡すため、alpha が 1 を超え得る。これが正しい解釈か、別入力かは未確認。見た目合わせのクランプや任意の色変更は入れていない。以降はこのオペコード / 入力源と空の合成順を解析する。extern 4/5 が未提供の 5 技法も明示的にスキップされる。
+
 ## 4. 既知の未解決・注意
-- `docs/RENDERING.md` の冒頭 (「未実装」「代替描画を削除」) は古い。現状はこの表が正。
+- README と `docs/RENDERING.md` 冒頭を現状に更新済み。RENDERING の後半には過去の解析メモが残るため、状態はこの表を優先する。
 - 1 フレームの一時領域 (gpu.hpp): ディスクリプタ 131072 個 / アップロード 128 MB。outpost 全体 (ライト 1300 個描画) で 16k 個 / 12 MB。旧 32768 個では GUI で「per-frame descriptor space exhausted」で描画停止していた。`nimshade` は `frame use` を表示。
 - エンティティ (2c12304): GUI の MapWorker でも材質索引・配置を読み、nimshade と同じ dynamic model 準備経路で表示する。配置なしや描画不可のモデルは明示的にスキップ。
 - GUI クラッシュ (2026-10-17): outpost `80AF9550` の旧既定「全域」起動は約 31 秒後に `nvwgf2umx.dll` 内の 0xc0000005 で終了した (Windows Application Error 1000)。範囲 50 m の outpost と小さい `80A76433` でも同じアドレスで 4〜7 秒後に再現。ダンプとシンボルで `shading_.draw` の D3D12 SRV 作成と特定し、診断ログで最後の SRV が t12 = Deferred +0xD0 と判明した。ビューポートが 665 px から 1364 px に変わった後も旧サイズの環境テクスチャを指す生ポインターが ExternStore に残っていた。GUI の `gb.resize` 時に Deferred +0xC0/+0xC8/+0xD0 と ShadowMask +0x00/+0x08/+0x10 の参照を無効化して次の描画で再結合する。静的メッシュの extern SRV はフレームごとのリングに変更。既定範囲は 50 m (全域時は約 8 GB の private memory を確認)。修正後の `80A76433` と `80AF9550` は D3D12 デバッグレイヤー付きでそれぞれ 40 秒・50 秒以上継続し、ログは空だった。

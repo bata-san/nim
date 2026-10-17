@@ -6,26 +6,25 @@ The requested complete game renderer port is **not implemented**. Game DXIL and 
 alone do not define the entire frame graph or its engine-generated inputs. No claim of
 pixel equality with the running game has been established.
 
-## Substitution removal
+## Current implementation
 
-The current source removes the previous custom IBL, fog, background, exposure and ACES
-helpers, constant filler textures, guessed object-channel values, forced detail fades,
-material non-finite-to-zero repairs, sampler fallback and automatic GGX renderer switching.
-The remaining custom fullscreen shader is for explicitly selected G-buffer diagnostics only;
-its Lit mode is rejected.
+Map rendering uses original game DXIL for SSAO, near/far sky lookups, sky ambient, local lights,
+reflection/diffuse probe volumes, volumetrics, bloom, tonemapping and TAA. Static geometry and
+placed entities render in the GUI; sky objects are currently loaded only by nimshade.
+The normal build is `build/Release/nim.exe`.
 
-Missing scalar/vector externs, resources, shared constant buffers, authored samplers and
-unimplemented TFX operations now raise errors. The GUI reports rendering failure instead of
-showing a substituted scene. Consequently, normal lit previews and many thumbnails are
-currently unavailable. This is an explicit incomplete implementation, not a fidelity fix.
+Unknown engine-owned constants, incomplete froxel inputs and viewer-produced shadow/depth
+inputs are explicitly listed as estimates in the UI and logs. Missing unestimated inputs,
+resources, shared constant buffers or authored samplers fail the affected draw. This is a
+partial reconstruction; it has not been shown to match the game pixel for pixel.
 
-Numeric externs track which bytes were supplied. Original frame cb13 and shared object scopes
-can be supplied through ExternStore; set_render_inputs forwards that context to a loaded scene.
-No producer currently populates the full context from a running game or decoded map.
+Transparent stage 8 now runs over the HDR image with the current frame's near/far sky,
+atmospheric transmittance LUT and linear depth. Sky and transparent SV_Target4 outputs feed
+the motion texture used by TAA. Froxels, transparent light-probe inputs, sorting and several
+sky-object inputs/compositing details remain unfinished. See [PROGRESS §3.9](PROGRESS.md#39-透明物の大気とモーション-2026-10-18).
 
-The original global_lighting_and_shading and final_combine DXIL loaders remain. Their required
-inputs are validated before render-target state transitions. Transparency remains blocked
-until its shared inputs, MRT outputs and pass ordering have been reconstructed.
+The notes below record resource-binding research and earlier fidelity work. The progress
+table is authoritative when older notes disagree with the implemented pipeline.
 
 ## Original resource binding update
 

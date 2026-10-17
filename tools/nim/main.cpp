@@ -1258,11 +1258,6 @@ public:
         if (view_w && view_h && (view_w != gb.width() || view_h != gb.height())) {
             g.wait_idle();
             gb.resize(g, view_w, view_h);
-            // GameLighting recreates its viewport-sized targets on the next render. ExternStore
-            // keeps raw views, so its conditional bindings must not retain the old resources.
-            auto& externs = game_lighting.externs();
-            for (uint32_t off : {0xC0u, 0xC8u, 0xD0u}) externs.set_texture(ext::Deferred, off, nullptr);
-            for (uint32_t off : {0x00u, 0x08u, 0x10u}) externs.set_texture(ext::ShadowMask, off, nullptr);
         }
         if (auto r = worker.take(false)) {
             const bool expected = loading && *loading == r->tag;
@@ -1676,7 +1671,7 @@ public:
             lp.time = lp.delta_time = 0;
             if (thumb_game_ready)
                 thumb_lighting.render(g, cl, thumb_gb, vm, lp, [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                    thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm);
+                    thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm, thumb_lighting.externs());
                 });
             else throw std::runtime_error("Original game lighting is unavailable; thumbnail rendering stopped");
             if (!t.tex) {
@@ -1837,13 +1832,12 @@ public:
                 scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
             }
             scene.set_rain_occlusion(map_scene && rain.valid ? &rain : nullptr);
-            if (game_ready) scene.set_transparent_inputs(game_lighting.sky_near(), game_lighting.sky_far(), game_lighting.linear_depth());
             scene.render_gbuffer(gpu, cl, gb, vm);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
                 GameLighting::TransparentFn transparents;
                 if (scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                    scene.render_transparent(gpu, c, gb, hdr, vm);
+                    scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
                 };
                 game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow);
             } else lighting.render(gpu, cl, gb, vm, light);
