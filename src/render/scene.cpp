@@ -1385,14 +1385,14 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 !instance_data)
                 throw std::runtime_error(std::format("{}: missing original VS resource t{}", item.technique.str(), slot));
         }
-        // Descriptor copies per frame in flight only where engine textures are rebound each frame.
+        // A descriptor referenced by an in-flight command list must not be rewritten.
         const bool rebinds = std::any_of(item.ps_sources.extern_textures.begin(), item.ps_sources.extern_textures.end(),
                                          [&](const auto& e) { return ps_kinds.contains(e.first); }) ||
                              std::any_of(item.vs_sources.extern_textures.begin(), item.vs_sources.extern_textures.end(),
                                          [&](const auto& e) { return vs_kinds.contains(e.first); });
-        // Static parts: engine views rarely change, so one table rewritten on change is enough.
-        item.srv_copies = rebinds && mesh.dynamic ? kSrvCopies : 1;
-        // Static parts whose views are all fixed share one table per distinct set of views.
+        // Extern views use a ring even when a static part owns the table.
+        item.srv_copies = rebinds ? kSrvCopies : 1;
+        // Static parts with the same views and extern sources share one table or ring.
         std::vector<uint64_t> table_key;
         if (!mesh.dynamic) {
             for (const auto* src : {&item.ps_sources.extern_textures, &item.vs_sources.extern_textures}) {

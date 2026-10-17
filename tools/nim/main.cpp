@@ -677,6 +677,10 @@ public:
         std::lock_guard lk(m_);
         return progress_;
     }
+    bool drained(uint64_t generation) {
+        std::lock_guard lk(m_);
+        return progress_.generation == generation && progress_.done && pieces_.empty();
+    }
     ~MapWorker() { stop(); }
 
 private:
@@ -700,10 +704,21 @@ private:
         }
         std::optional<MapLayout> layout;
         std::optional<PrepareCache> cache;
-        const auto layouts = load_input_layouts(*pm);
+        std::vector<std::vector<InputElement>> layouts;
+        try {
+            layouts = load_input_layouts(*pm);
+        } catch (const std::exception& ex) {
+            std::lock_guard lk(m_);
+            list_error_ = ex.what();
+            listed_ = true;
+            return;
+        }
         std::vector<std::unique_ptr<PackageManager>> helpers;
         std::shared_ptr<const MapWeather> weather;
         std::shared_ptr<const MapAtmosphere> atmosphere;
+        std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> entity_materials;
+        std::optional<MapEntities> entities;
+        TagHash entities_bubble;
         for (;;) {
             Request req;
             bool list = false;
@@ -745,7 +760,15 @@ private:
                 }
                 const auto center = req.center ? *req.center : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
+                const size_t static_count = region.size();
                 const auto terrain = map_terrain_region(*layout, center, req.radius);
+                if (!entities || entities_bubble != req.bubble) {
+                    if (!entity_materials) entity_materials = index_dynamic_model_materials(*pm);
+                    entities = load_map_entities(*pm, req.bubble, *entity_materials);
+                    entities_bubble = req.bubble;
+                }
+                auto entity_region = map_region(entities->models, center, req.radius);
+                for (auto& model : entity_region) region.push_back(std::move(model));
                 float extent = 1;
                 for (const auto& st : region)
                     for (const auto& r : st.rows)
@@ -807,13 +830,21 @@ private:
                             if (j < terrain.size()) {
                                 piece.mesh = prepare_terrain(wpm, *terrain[j], layouts, &*cache);
                                 piece.rows = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}};
-                            } else {
+                            } else if (j - terrain.size() < static_count) {
                                 auto& st = region[j - terrain.size()];
                                 piece.mesh = prepare_static_mesh(wpm, st.mesh, nullptr, &*cache);
                                 piece.rows = std::move(st.rows);
+                            } else {
+                                auto& model = region[j - terrain.size()];
+                                const auto mat = entity_materials->find(model.mesh.value);
+                                piece.mesh = prepare_dynamic_model(wpm, model.mesh,
+                                    mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr, &*cache);
+                                if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
+                                piece.rows = std::move(model.rows);
                             }
                         } catch (const std::exception& ex) {
-                            failure = (j < terrain.size() ? "terrain: " : "") + std::string(ex.what()).substr(0, 110);
+                            failure = (j < terrain.size() ? "terrain: " : j - terrain.size() >= static_count ? "entity: " : "")
+                                    + std::string(ex.what()).substr(0, 110);
                         }
                         std::unique_lock lk(m_);
                         // Back-pressure: the UI adds a few meshes per frame.
@@ -826,7 +857,7 @@ private:
                         } else pieces_.push_back(std::move(piece));
                     }
                 };
-                std::vector<std::thread> threads;
+                std::vector<std::jthread> threads;
                 for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
                 work(*pm);
                 for (auto& t : threads) t.join();
@@ -986,7 +1017,7 @@ public:
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
-        float radius = kUnlimited;  // m around the region centre; kUnlimited = the whole map
+        float radius = 50;  // start with a local region; the whole map can exhaust GPU and system memory
         bool lights_set = false;
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
@@ -1227,6 +1258,11 @@ public:
         if (view_w && view_h && (view_w != gb.width() || view_h != gb.height())) {
             g.wait_idle();
             gb.resize(g, view_w, view_h);
+            // GameLighting recreates its viewport-sized targets on the next render. ExternStore
+            // keeps raw views, so its conditional bindings must not retain the old resources.
+            auto& externs = game_lighting.externs();
+            for (uint32_t off : {0xC0u, 0xC8u, 0xD0u}) externs.set_texture(ext::Deferred, off, nullptr);
+            for (uint32_t off : {0x00u, 0x08u, 0x10u}) externs.set_texture(ext::ShadowMask, off, nullptr);
         }
         if (auto r = worker.take(false)) {
             const bool expected = loading && *loading == r->tag;
@@ -1283,7 +1319,12 @@ public:
             }
         }
         make_thumbnail(g);
-        stream_map(g);
+        try {
+            stream_map(g);
+        } catch (const std::exception& ex) {
+            stop_map();
+            error(std::format("マップの読込を停止: {}", ex.what()));
+        }
     }
 
     // ---- maps ----
@@ -1379,7 +1420,7 @@ public:
                 map.framed = true;
             }
         }
-        if (pr.done && !added && !map_worker.take(map.generation)) {
+        if (map_worker.drained(map.generation)) {
             map.streaming = false;
             info(std::format("マップ {}: {} メッシュ / {} インスタンス{}", map.name, scene.mesh_count(), scene.instance_count(),
                              pr.failed ? std::format(" ({} スキップ)", pr.failed) : ""));
