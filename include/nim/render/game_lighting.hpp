@@ -110,6 +110,10 @@ public:
         bool cull_front = true;
         uint32_t cbuffer_floor = 256;  // float4s allocated per stage cbuffer (TFX outputs beyond fail)
         int blend_state = -1;          // >= 0: the engine's blend state (every target), instead of `additive`
+        // Depth test against a D32_FLOAT depth buffer (no writes); 0 = no depth buffer.
+        D3D12_COMPARISON_FUNC depth_func = D3D12_COMPARISON_FUNC(0);
+        // PS targets beyond the attachments are written to nothing (e.g. the sky's motion vectors).
+        bool drop_extra_targets = false;
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -175,6 +179,8 @@ std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const E
 // missing producers are reported instead of being approximated.
 // The sun direction (toward the sun) of nim's light set-up.
 V3 sun_direction(const LightingParams& p);
+// With a map atmosphere (and p.atmosphere): its sun path at the time of day.
+V3 sun_direction(const LightingParams& p, const MapAtmosphere* atmosphere);
 
 class GameLighting {
 public:
@@ -212,6 +218,17 @@ public:
     // Weather: global channel values by index (world channel controllers), over the defaults.
     void set_global_channels(const std::map<uint32_t, float>& values);
 
+    // A map's atmosphere (load_map_atmosphere): each frame the engine's sky_lookup_generate_near /
+    // _far pipelines render the in-scatter seen along every view ray for the time of day, the
+    // shading pass fogs with them and the `sky` pipeline draws the background. nullptr clears.
+    void set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* atmosphere);
+    void clear_atmosphere() { atm_ = {}; atm_notes_.clear(); }
+    bool has_atmosphere() const { return atm_.valid; }
+    const std::vector<std::string>& atmosphere_notes() const { return atm_notes_; }
+    float default_time_of_day() const { return atm_.valid ? atm_.data.default_time : 0.5f; }
+    // The sun direction (toward the sun) for these parameters: the map's sun path with an atmosphere.
+    V3 sun_toward(const LightingParams& p) const { return sun_direction(p, atm_.valid ? &atm_.data : nullptr); }
+
     ExternStore& externs() { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
@@ -236,6 +253,17 @@ private:
     void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded
+    struct Atmosphere {
+        MapAtmosphere data;
+        std::array<ComPtr<ID3D12Resource>, 4> lookups;
+        ComPtr<ID3D12Resource> density_lut;
+        bool valid = false;
+    } atm_;
+    std::vector<std::string> atm_notes_;
+    GamePipeline sky_near_, sky_far_, sky_;
+    ComPtr<ID3D12Resource> sky_near_rt_, sky_far_rt_;  // RGBA16F, full resolution: ext 7 +0xF0 / +0xE0
+    void fill_atmosphere(const LightingParams& p);
+    void render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists
     ComPtr<ID3D12Resource> hdr_;
     // Viewer environment (not game data): nim's sky as the specular-IBL light buffer and background.

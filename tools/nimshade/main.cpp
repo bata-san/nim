@@ -67,7 +67,8 @@ int run(int argc, char** argv) {
     fs::path install;
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
-    float fog = 0;
+    float time_of_day = -1;
+    bool no_atmosphere = false;
     std::optional<TagHash> clip_tag;
     float clip_frame = 0;
     float material_time = 0;
@@ -111,7 +112,8 @@ int run(int argc, char** argv) {
             weather_args.push_back({value.substr(0, eq), uint32_t(std::stoul(value.substr(eq + 1), nullptr, 16))});
         }
         else if (args[i] == "--reference") reference = true;
-        else if (args[i] == "--fog" && i + 1 < args.size()) fog = std::stof(args[++i]);
+        else if (args[i] == "--time-of-day" && i + 1 < args.size()) time_of_day = std::stof(args[++i]);
+        else if (args[i] == "--no-atmosphere") no_atmosphere = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
@@ -130,7 +132,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--game [--fog DENSITY_PER_KM]] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -157,6 +159,7 @@ int run(int argc, char** argv) {
     std::vector<MapLight> map_lights;
     std::vector<const MapLight*> region_lights;
     std::vector<MapCubemap> map_cubemaps;
+    MapAtmosphere atmosphere;
     std::vector<const MapCubemap*> region_cubemaps;
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
@@ -217,6 +220,11 @@ int run(int argc, char** argv) {
             map_lights = load_map_lights(pm, map);
             region_lights = map_light_region(map_lights, focus, map_radius);
             std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
+        }
+        if (!no_atmosphere) {
+            atmosphere = load_map_atmosphere(pm, map);
+            std::println("atmosphere: {}, sun path {} entries, map time of day {:.3f}", atmosphere.valid() ? atmosphere.lookups[1].str() : "none",
+                         atmosphere.paths[0].size(), atmosphere.default_time);
         }
         if (!no_cubemaps) {
             map_cubemaps = load_map_cubemaps(pm, map);
@@ -339,24 +347,26 @@ int run(int argc, char** argv) {
     }
     SunShadow shadow;
     if (shadows) shadow.resize(gpu, 4096);
-    auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
-        if (!shadows) return;
-        shadow.fit_view(sun_direction(p), vm.eye, scene.center(), scene.center(), scene.radius());
-        scene.render_shadow(gpu, list, shadow);
-    };
-    shadow_pass(cl, LightingParams{});
-    scene.render_gbuffer(gpu, cl, gb, vm);
-    for (const auto& [hash, channel] : scene.channels()) {
-        const char* name = object_channel_name(hash);
-        std::println("  channel {:08X} {}{}{} = ({:.4g}, {:.4g}, {:.4g}, {:.4g})", hash, name ? name : "",
-                     channel.vs ? " VS" : "", channel.ps ? " PS" : "", channel.value[0], channel.value[1], channel.value[2], channel.value[3]);
-    }
     LightingParams lp;
     if (sun_arg >= 0) lp.sun_intensity = sun_arg;
     if (sky_arg >= 0) lp.sky_intensity = sky_arg;
     lp.time = material_time;
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
+    lp.atmosphere = !no_atmosphere;
+    lp.time_of_day = time_of_day;
+    auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
+        if (!shadows) return;
+        shadow.fit_view(sun_direction(p, atmosphere.valid() ? &atmosphere : nullptr), vm.eye, scene.center(), scene.center(), scene.radius());
+        scene.render_shadow(gpu, list, shadow);
+    };
+    shadow_pass(cl, lp);
+    scene.render_gbuffer(gpu, cl, gb, vm);
+    for (const auto& [hash, channel] : scene.channels()) {
+        const char* name = object_channel_name(hash);
+        std::println("  channel {:08X} {}{}{} = ({:.4g}, {:.4g}, {:.4g}, {:.4g})", hash, name ? name : "",
+                     channel.vs ? " VS" : "", channel.ps ? " PS" : "", channel.value[0], channel.value[1], channel.value[2], channel.value[3]);
+    }
     gpu.flush();
     // Lit output is produced only by the original game pipelines below.
     game = true;
@@ -374,6 +384,12 @@ int run(int argc, char** argv) {
         gl.init(pm, gpu);
         if (!weather_channels.empty()) gl.set_global_channels(weather_channels);
         std::println("game shading: technique {}", gl.shading_technique().str());
+        if (atmosphere.valid()) {
+            gl.set_atmosphere(pm, gpu, &atmosphere);
+            const V3 s = gl.sun_toward(lp);
+            std::println("atmosphere {}: sun ({:.3f}, {:.3f}, {:.3f})", gl.has_atmosphere() ? "loaded" : "not loaded", s.x, s.y, s.z);
+            for (const auto& n : gl.atmosphere_notes()) std::println("  {}", n);
+        }
         if (!region_lights.empty()) {
             auto tl = std::chrono::steady_clock::now();
             gl.set_lights(pm, gpu, region_lights);
@@ -439,17 +455,6 @@ int run(int argc, char** argv) {
             std::vector<uint8_t> rgba(mask.size() * 4);
             for (size_t i = 0; i < mask.size(); ++i) rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = mask[i], rgba[i * 4 + 3] = 255;
             write_png(out_dir / "sun_shadow_mask.png", width, height, rgba);
-        }
-        if (fog > 0) {
-            LightingParams lp;
-            lp.time = material_time;
-            lp.optimize = !reference;
-            lp.fog = true;
-            lp.fog_density = fog;
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, transparents, &shadow);
-            gpu.flush();
-            write_png(out_dir / "composite_game_fog.png", width, height,
-                      gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
         }
         for (const auto& n : gl.notes()) std::println("  {}", n);
     }

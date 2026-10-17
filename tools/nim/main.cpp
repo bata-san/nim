@@ -609,6 +609,7 @@ public:
         std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
         std::shared_ptr<const std::vector<MapCubemap>> cubemaps;  // the region's reflection / ambient volumes
         std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
+        std::shared_ptr<const MapAtmosphere> atmosphere;  // the map's sky lookups and sun path
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -702,6 +703,7 @@ private:
         const auto layouts = load_input_layouts(*pm);
         std::vector<std::unique_ptr<PackageManager>> helpers;
         std::shared_ptr<const MapWeather> weather;
+        std::shared_ptr<const MapAtmosphere> atmosphere;
         for (;;) {
             Request req;
             bool list = false;
@@ -768,12 +770,18 @@ private:
                     } catch (const std::exception&) {
                         weather = std::make_shared<const MapWeather>();  // no weather controls
                     }
+                    try {
+                        atmosphere = std::make_shared<const MapAtmosphere>(load_map_atmosphere(*pm, *layout));
+                    } catch (const std::exception&) {
+                        atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
+                    }
                     weather_bubble_ = req.bubble;
                 }
                 {
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
                     progress_.weather = weather;
+                    progress_.atmosphere = atmosphere;
                     progress_.total = region.size() + terrain.size();
                     progress_.center = center;
                     progress_.extent = extent;
@@ -1100,6 +1108,7 @@ public:
             map_scene = false;
             game_lighting.clear_lights();
             game_lighting.clear_cubemaps();
+            game_lighting.clear_atmosphere(), map_atmosphere.reset();
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -1242,6 +1251,7 @@ public:
                     map_scene = false;
                     game_lighting.clear_lights();
                     game_lighting.clear_cubemaps();
+                    game_lighting.clear_atmosphere(), map_atmosphere.reset();
                     map_weather.reset();
                     weather_states.clear();
                     apply_weather();
@@ -1301,6 +1311,7 @@ public:
         map_scene = true;
         game_lighting.clear_lights();
         game_lighting.clear_cubemaps();
+        game_lighting.clear_atmosphere(), map_atmosphere.reset();
         if (!same) map_weather.reset(), weather_states.clear();
         rain.valid = false;
         apply_weather();
@@ -1333,6 +1344,11 @@ public:
             map_weather = pr.weather;
             weather_states.assign(map_weather->controllers.size(), -1);
             apply_weather();
+        }
+        if (pr.atmosphere && map_atmosphere != pr.atmosphere) {
+            map_atmosphere = pr.atmosphere;
+            game_lighting.set_atmosphere(*pm, g, map_atmosphere.get());
+            for (const auto& n : game_lighting.atmosphere_notes()) ++map_add_failures[n.substr(0, 120)];
         }
         if (pr.lights && !map.lights_set) {
             map.lights_set = true;
@@ -1372,6 +1388,7 @@ public:
     std::map<std::string, size_t> map_add_failures;
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
+    std::shared_ptr<const MapAtmosphere> map_atmosphere;
     // Weather: the map's world channel controllers and the state chosen for each (-1 = none,
     // the render-globals defaults).
     std::shared_ptr<const MapWeather> map_weather;
@@ -1768,7 +1785,7 @@ public:
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
-                sun_shadow.fit_view(sun_direction(light), vm.eye, cam.target, scene.center(), scene.radius());
+                sun_shadow.fit_view(game_lighting.sun_toward(light), vm.eye, cam.target, scene.center(), scene.radius());
                 scene.render_shadow(gpu, cl, sun_shadow);
                 shadow = &sun_shadow;
             }
@@ -2221,15 +2238,20 @@ public:
             ImGui::ColorEdit3("地面", &light.ground.x);
             ImGui::ColorEdit3("背景 (上)", &light.background_top.x);
             ImGui::ColorEdit3("背景 (下)", &light.background_bottom.x);
-            ImGui::SeparatorText("フォグ (ゲームのシェーダで評価)");
-            ImGui::Checkbox("高さフォグ", &light.fog);
-            ImGui::BeginDisabled(!light.fog || engine != Engine::Game);
-            ImGui::SliderFloat("密度 (/km)", &light.fog_density, 0.1f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("高さ減衰 (/km)", &light.fog_falloff, 0.0f, 100.0f, "%.1f");
-            ImGui::DragFloat("基準高さ (m)", &light.fog_height, 0.1f);
-            ImGui::DragFloat("開始距離 (m)", &light.fog_start, 0.1f, 0.0f, 1e5f);
-            ImGui::ColorEdit3("フォグの色", &light.fog_color.x);
-            ImGui::SliderFloat("太陽方向の散乱", &light.fog_sun_glow, 0.0f, 8.0f);
+            ImGui::SeparatorText("大気 (マップの空とフォグ)");
+            ImGui::BeginDisabled(!game_lighting.has_atmosphere());
+            ImGui::Checkbox("大気", &light.atmosphere);
+            ImGui::SetItemTooltip("ゲームの sky_lookup_generate_near/far と sky。フォグ値はグローバルチャンネルの写し (推定)");
+            {
+                bool own = light.time_of_day < 0;
+                if (ImGui::Checkbox("マップの時刻", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
+                ImGui::BeginDisabled(own);
+                float t = own ? game_lighting.default_time_of_day() : light.time_of_day;
+                const int minutes = int(t * 24 * 60 + 0.5f);
+                if (ImGui::SliderFloat("時刻", &t, 0.0f, 1.0f, std::format("{:02}:{:02}", minutes / 60 % 24, minutes % 60).c_str()))
+                    light.time_of_day = t;
+                ImGui::EndDisabled();
+            }
             ImGui::EndDisabled();
             if (ImGui::Button("既定値に戻す")) {
                 ViewMode m = light.mode;

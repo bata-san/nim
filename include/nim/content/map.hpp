@@ -122,6 +122,28 @@ struct MapCubemap {
 std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map);
 std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius);
 
+// ---- atmosphere ----------------------------------------------------------------------------
+// A map's sky / atmosphere: the node component 808084A0 (D2 SAtmosphereDataComponent layout,
+// payload = record + 0x10) and the sun path component 80808346. See docs/PROGRESS.md 3.2.
+inline constexpr uint32_t kClassAtmosphereComponent = 0x808084A0;
+inline constexpr uint32_t kClassSunPathComponent = 0x80808346;
+struct MapAtmosphere {
+    // +0x80..+0xBF: the sky lookups (3D, one slice per time-of-day key): near0, far0, near1, far1.
+    std::array<TagHash, 4> lookups{};
+    TagHash density_lut;                    // +0xC0: 2D, time x distance
+    std::array<float, 16> slice_times{};    // +0xC8: the time of day of each lookup slice
+    // 80808346 +0x00 -> 80808349: four 8080ACD3 direction tables (table 0 = the moving sun), one
+    // entry per 1/1800 of the day; +0x08 the map's time of day (estimate).
+    std::array<std::vector<std::array<float, 3>>, 4> paths;
+    float default_time = 0.5f;
+    bool valid() const { return !lookups[1].is_none(); }
+    // The direction (toward the sun) of path `i` at time `t` (0..1), interpolated.
+    std::array<float, 3> path_direction(int i, float t) const;
+    // The lookup slice coordinate (0..1, at texel centres) for time `t`.
+    float slice_coordinate(float t) const;
+};
+MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map);
+
 // ---- entities ------------------------------------------------------------------------------
 // A map's placed entities: every SMapNodeTable of the map's package family (the activity layers
 // as well as the bubble's own) names, per node, an entity (8080BAAD) by hash64 at +0x30, at the

@@ -315,6 +315,90 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
     return out;
 }
 
+MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
+    MapAtmosphere out;
+    bool found_atmosphere = false, found_sun = false;
+    for (TagHash t : map.node_tables) {
+        if (found_atmosphere && found_sun) break;
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(t);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                const size_t c = p + 0x10;
+                const uint32_t type = r.u32_at(p - 4);
+                if (type == kClassAtmosphereComponent && !found_atmosphere && c + 0x108 <= data.size()) {
+                    for (size_t k = 0; k < 4; ++k)
+                        if (auto h = resolve_wide_hash(pm, r.u32_at(c + 0x80 + k * 16), r.u64_at(c + 0x88 + k * 16)))
+                            out.lookups[k] = *h;
+                    out.density_lut = r.tag_at(c + 0xC0);
+                    for (size_t k = 0; k < 16; ++k) out.slice_times[k] = r.f32_at(c + 0xC8 + k * 4);
+                    found_atmosphere = out.valid();
+                } else if (type == kClassSunPathComponent && !found_sun && c + 0x10 <= data.size()) {
+                    out.default_time = r.f32_at(c + 0x08);
+                    try {
+                        auto set = pm.read(r.tag_at(c));
+                        TagReader sr(set);
+                        for (size_t k = 0; k < 4; ++k) {
+                            auto table = pm.read(sr.tag_at(0x10 + k * 4));
+                            TagReader tr(table);
+                            const auto dirs = tr.vec_at(0x30);
+                            for (uint64_t d = 0; d < dirs.count && dirs.data + d * 16 + 12 <= table.size(); ++d) {
+                                const size_t o = dirs.data + size_t(d) * 16;
+                                out.paths[k].push_back({tr.f32_at(o), tr.f32_at(o + 4), tr.f32_at(o + 8)});
+                            }
+                        }
+                        found_sun = !out.paths[0].empty();
+                    } catch (...) {
+                        // Without a sun path the viewer sun direction is used.
+                    }
+                }
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    return out;
+}
+
+std::array<float, 3> MapAtmosphere::path_direction(int i, float t) const {
+    const auto& path = paths[size_t(i)];
+    if (path.empty()) return {0, 0, 1};
+    const float f = (t - std::floor(t)) * float(path.size());
+    const size_t a = size_t(f) % path.size(), b = (a + 1) % path.size();
+    const float w = f - std::floor(f);
+    std::array<float, 3> d{};
+    float len = 0;
+    for (size_t k = 0; k < 3; ++k) {
+        d[k] = path[a][k] * (1 - w) + path[b][k] * w;
+        len += d[k] * d[k];
+    }
+    len = std::sqrt(std::max(len, 1e-12f));
+    for (auto& v : d) v /= len;
+    return d;
+}
+
+float MapAtmosphere::slice_coordinate(float t) const {
+    // The keys are increasing times; before the first or after the last key the end slice is held.
+    const auto& k = slice_times;
+    if (t <= k[0]) return 0.5f / 16;
+    for (size_t i = 0; i + 1 < k.size(); ++i)
+        if (t < k[i + 1]) {
+            const float f = k[i + 1] > k[i] ? (t - k[i]) / (k[i + 1] - k[i]) : 0;
+            return (float(i) + f + 0.5f) / 16;
+        }
+    return 15.5f / 16;
+}
+
 std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius) {
     std::vector<const MapCubemap*> out;
     for (const auto& m : cubemaps) {

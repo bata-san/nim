@@ -1,4 +1,5 @@
 // Unit tests that do not need a game install.
+#include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/content/weather.hpp"
 #include "nim/core/binary.hpp"
@@ -130,6 +131,19 @@ int main() {
         const auto v = weather_values(rain);
         CHECK(v.size() == 1 && v[0].first == 7 && v[0].second == 75);
         CHECK(weather_values(c.states[1]).size() == 2);
+    }
+
+    {
+        // Atmosphere: lookup slice coordinates between time keys, sun path interpolation.
+        MapAtmosphere a;
+        for (size_t i = 0; i < 16; ++i) a.slice_times[i] = 0.1f + 0.05f * float(i);
+        CHECK(std::fabs(a.slice_coordinate(0.0f) - 0.5f / 16) < 1e-6f);
+        CHECK(std::fabs(a.slice_coordinate(0.125f) - 1.0f / 16) < 1e-5f);  // half way from key 0 to key 1
+        CHECK(std::fabs(a.slice_coordinate(0.99f) - 15.5f / 16) < 1e-6f);
+        a.paths[0] = {{1, 0, 0}, {0, 1, 0}};
+        const auto d = a.path_direction(0, 0.25f);  // half way between the two entries
+        CHECK(std::fabs(d[0] - d[1]) < 1e-6f && std::fabs(d[0] * d[0] + d[1] * d[1] - 1) < 1e-5f);
+        CHECK(a.path_direction(1, 0.5f)[2] == 1);  // an empty path points up
     }
 
     if (g_failures) return 1;

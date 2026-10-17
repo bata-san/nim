@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-17 (main 97bf077 の次のコミット)
+最終更新: 2026-10-17 (大気 + 空の実装コミット)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -15,8 +15,8 @@
 |---|------|------|-----------------|------|
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
-| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | **作業中** (解析済み・未実装) | — | §3.2。ボリューメトリクスが依存するので順番を入れ替えた |
-| 4 | ボリューメトリクス (ライトシャフト) | 解析途中 | — | §3.3。大気/フォグ密度スライスに依存 |
+| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 「Atmosphere and sky」コミット | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
+| 4 | ボリューメトリクス (ライトシャフト) | **作業中** (解析途中) | — | §3.3。大気/フォグ密度スライスに依存 |
 | 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 未着手 | — | キューブマップボリュームは 666fc85 で実装済み |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, vignette, final_combine) | 未着手 | — | final_combine だけは既に描画 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
@@ -56,7 +56,14 @@
 - extern 0x26 は final_combine など全画面パス共通の入力スロット。別パスで使うときは別 ExternStore に入れる。
 - 調整値 (半径 10px 等) はエンジン側の値で推定。
 
-### 3.2 大気 + 空 (次に実装するもの)
+### 3.2 大気 + 空 (実装済み)
+実装: `load_map_atmosphere` (src/content/map.cpp) → `GameLighting::set_atmosphere` / `fill_atmosphere` /
+`render_sky_lookups` (src/render/game_lighting.cpp)。毎フレーム near → ext7 +0xF0、far → +0xE0 を
+全画面 RGBA16F に描き、シェーディング後に `sky` を深度テスト GREATER_EQUAL (gb.dsv_ro) で描く。
+太陽方向は表0 (`sun_direction(p, atmosphere)`) で GlobalLighting +0x30 と nim の影にも使う。
+GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」。nimshade: `--time-of-day D`, `--no-atmosphere`。
+未: フロクセル t14 (no_atmosphere のまま)、t2 パラボロイド (白)、太陽強度の時刻変化 (ビューア値)。
+以下は解析メモ。
 マップのコンポーネント (outpost のノードテーブル 80AF8EBF):
 - 型 **808084A0** (D2 の SAtmosphereDataComponent と同じ配置、ペイロード = レコード+0x10):
   +0x80..+0xBF WideHash×4 (lookup near0, far0, near1, far1。outpost は全部 3D テクスチャ 80AC9019:
@@ -116,6 +123,5 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 
 ## 4. 既知の未解決・注意
 - `docs/RENDERING.md` の冒頭 (「未実装」「代替描画を削除」) は古い。現状はこの表が正。
-- GUI のフォグ設定 (LightingParams.fog_*) はゲームパスでは未使用。大気実装時に置き換える。
 - エンティティ (2c12304) は nimshade のみ。GUI の MapWorker には未統合 (ギミックと一緒に後回し)。
 - 子セッション「Reverse-engineer animation clips and play them」は完了、f86350e で main にマージ済み。

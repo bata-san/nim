@@ -541,8 +541,15 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     pd.RTVFormats[0] = opt.rtv_format;
     for (size_t i = 0; i < opt.additional_rtv_formats.size(); ++i) pd.RTVFormats[i + 1] = opt.additional_rtv_formats[i];
     for (const auto& output : shader_outputs(ps_code))
-        if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !output.never_written)
+        if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets && !output.never_written &&
+            !opt.drop_extra_targets)
             throw std::runtime_error(std::format("{}: original PS requires SV_Target{}; attachment missing", technique.str(), output.index));
+    if (opt.depth_func) {
+        pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pd.DepthStencilState.DepthEnable = TRUE;
+        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        pd.DepthStencilState.DepthFunc = opt.depth_func;
+    }
     pd.SampleDesc.Count = 1;
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
 
@@ -865,6 +872,13 @@ void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
     hdao_.release(gpu);
     apply_ssao_.release(gpu);
+    sky_near_.release(gpu);
+    sky_far_.release(gpu);
+    sky_.release(gpu);
+    sky_near_rt_.Reset();
+    sky_far_rt_.Reset();
+    atm_ = {};
+    atm_notes_.clear();
     ao_.Reset();
     linear_depth_.Reset();
     final_combine_.release(gpu);
@@ -920,6 +934,25 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         } catch (const std::exception& ex) {
             shading_.notes.push_back(std::format("apply_ssao_to_light_buffers not loaded: {}", ex.what()));
         }
+    }
+    // Atmosphere: the sky lookups (one full-screen pass each, into RGBA16F) and the sky background,
+    // drawn where the depth buffer is still clear (depth test against the read-only depth).
+    auto load_sky = [&](GamePipeline& gp, const char* name, const GamePipeline::Options& opt) {
+        const auto tag = globals_.pipeline(name);
+        try {
+            if (tag.is_none()) throw std::runtime_error("not in render globals");
+            gp.load(pm, gpu, tag, scopes, opt);
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("{} not loaded: {}", name, ex.what()));
+        }
+    };
+    load_sky(sky_near_, "sky_lookup_generate_near", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
+    load_sky(sky_far_, "sky_lookup_generate_far", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
+    {
+        GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false};
+        opt.depth_func = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        opt.drop_extra_targets = true;  // SV_Target1: motion vectors for the temporal passes
+        load_sky(sky_, "sky", opt);
     }
     auto lookup = [&](TagHash tag) {
         if (tag.is_none()) throw std::runtime_error("Missing render_globals BRDF lookup");
@@ -1005,7 +1038,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 7};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 9};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     gpu.flush();
 }
@@ -1036,6 +1069,10 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     D3D12_CLEAR_VALUE lv{DXGI_FORMAT_R32G32_FLOAT, {0, 0, 0, 0}};
     linear_depth_ = gpu.texture2d(w, h, lv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lv);
     gpu.device()->CreateRenderTargetView(linear_depth_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc});
+    sky_near_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    sky_far_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    gpu.device()->CreateRenderTargetView(sky_near_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 7 * inc});
+    gpu.device()->CreateRenderTargetView(sky_far_rt_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 8 * inc});
     w_ = w;
     h_ = h;
 }
@@ -1151,9 +1188,10 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set(ext::Frame, 0x04, p.time);
     ext_.set(ext::Frame, 0x14, p.delta_time);
     estimate_engine_frame(ext_, p.time, p.delta_time);
+    fill_atmosphere(p);
     if (!ext_.texture(ext::Atmosphere, 0x108).resource)
         ext_.estimate_texture(ext::Atmosphere, 0x108, no_atmosphere_.Get(),
-                              "no map atmosphere: transmittance 1, in-scatter 0 (clear air)");
+                              "atmosphere froxel volume (cascade_raymarch_atmosphere_volume) not ported: transmittance 1, in-scatter 0");
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
     if (!lights_.empty() || !cubemaps_.empty()) {
@@ -1195,7 +1233,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     // (the panel's sun / sky), laid out as the shading reads it: the sun is multiplied by
     // 1/(4 pi) and the ambient by 1/4 there, so nim's values are scaled to match.
     constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
-    const V3 sun_dir = sun_direction(p);
+    const V3 sun_dir = sun_toward(p);
     const V3 sun = p.sun_color * (p.sun_intensity * 4.0f);
     const float ka = 4.0f * p.sky_intensity;
     ext_.estimate(ext::GlobalLighting, 0x10, v4(sun, 0), viewer_light);
@@ -1252,8 +1290,10 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         return 0;
     };
     ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
+    const bool atmosphere = atm_.valid && p.atmosphere;
     shading_.validate(ext_, scopes);
     final_combine_.validate(ext_, scopes);
+    if (atmosphere) sky_.validate(ext_, scopes);
     // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal
     // histories) is not yet decoded. Its outputs must be supplied by their real producers.
     // Transparent parts are left out (not substituted): the original pass's shared inputs and MRT
@@ -1341,6 +1381,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow_mask_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
+    if (atmosphere) render_sky_lookups(gpu, cl, scopes);
     if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
     lights_drawn_ = cubemaps_drawn_ = 0;
     if (own_env) {
@@ -1378,8 +1419,15 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
     cl->SetGraphicsRootSignature(nullptr);
     shading_.draw(gpu, cl, ext_, scopes, true);
-    env_pass(env_bg_pso_.Get(), hdr);
-    ext_.note_estimate("background gradient", "viewer environment (no map sky)");
+    if (atmosphere) {
+        // The sky pipeline puts its triangle at the view's far depth (cb12[13].x): with the depth
+        // test it covers only the pixels no surface was drawn to.
+        cl->OMSetRenderTargets(1, &hdr, FALSE, &gb.dsv_ro);
+        sky_.draw(gpu, cl, ext_, scopes, true);
+    } else {
+        env_pass(env_bg_pso_.Get(), hdr);
+        ext_.note_estimate("background gradient", "viewer environment (no map sky)");
+    }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
@@ -1388,6 +1436,127 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+}
+
+// ---- atmosphere ----------------------------------------------------------------------------------
+// See docs/PROGRESS.md 3.2. The map gives the sky lookups (3D: azimuth, elevation, time-of-day key),
+// the density LUT and the sun path; the remaining extern 7 values are the global fog / sky
+// channels copied in their own order (estimate), the engine code that copies them is not data.
+void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* a) {
+    atm_ = {};
+    atm_notes_.clear();
+    if (!a) return;
+    if (!a->valid()) {
+        atm_notes_.push_back("map has no atmosphere component (808084A0)");
+        return;
+    }
+    if (!sky_near_.loaded() || !sky_far_.loaded() || !sky_.loaded()) {
+        atm_notes_.push_back("sky pipelines not loaded");
+        return;
+    }
+    try {
+        for (size_t k = 0; k < 4; ++k) {
+            // A map without the second lookup set reads the first (the sets blend by channel 0x2D).
+            const TagHash tag = !a->lookups[k].is_none() ? a->lookups[k] : a->lookups[k & 1];
+            if (tag.is_none()) throw std::runtime_error(std::format("sky lookup {} missing", k));
+            if (k >= 2 && tag == a->lookups[k & 1]) atm_.lookups[k] = atm_.lookups[k & 1];
+            else atm_.lookups[k] = gpu.texture(load_texture(pm, tag));
+        }
+        if (a->density_lut.is_none()) throw std::runtime_error("density LUT missing");
+        atm_.density_lut = gpu.texture(load_texture(pm, a->density_lut));
+        atm_.data = *a;
+        atm_.valid = true;
+        if (a->paths[0].empty()) atm_notes_.push_back("no sun path (80808346): the viewer sun direction is used");
+    } catch (const std::exception& ex) {
+        atm_ = {};
+        atm_notes_.push_back(std::format("atmosphere not loaded: {}", ex.what()));
+    }
+    gpu.flush();
+}
+
+V3 sun_direction(const LightingParams& p, const MapAtmosphere* a) {
+    if (!a || !p.atmosphere || a->paths[0].empty()) return sun_direction(p);
+    const auto d = a->path_direction(0, p.time_of_day >= 0 ? p.time_of_day : a->default_time);
+    return {d[0], d[1], d[2]};
+}
+
+void GameLighting::fill_atmosphere(const LightingParams& p) {
+    constexpr uint8_t A = ext::Atmosphere;
+    if (!atm_.valid || !p.atmosphere) {
+        // Clear air: no fog density, no sky textures (the shading pass then reads zero in-scatter).
+        for (uint32_t off : {0x40u, 0x58u, 0x80u, 0xC0u, 0xE0u, 0xF0u})
+            if (ext_.texture(A, off).resource) ext_.set_texture(A, off, nullptr);
+        for (uint32_t off : {0x174u, 0x1A4u}) ext_.set(A, off, 0.0f);
+        return;
+    }
+    const float t = p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time;
+    auto ch = [&](uint32_t i) { return i < ext_.channels.size() ? ext_.channels[i] : float4{}; };
+    constexpr std::string_view copied = "global channel copied into extern 7 (order matches; engine copy code not data)";
+    constexpr std::string_view chosen = "meaning read from the sky / shading DXIL, value chosen";
+    auto est = [&](uint32_t off, float v, std::string_view why) {
+        ext_.set(A, off, v);
+        ext_.note_estimate(std::format("extern 7 +0x{:X} = {:g}", off, v), why);
+    };
+    ext_.set_texture(A, 0x40, atm_.lookups[0].Get());  // near set; render_sky_lookups swaps in far
+    ext_.set_texture(A, 0x58, atm_.lookups[2].Get());
+    ext_.set(A, 0x70, atm_.data.slice_coordinate(t));
+    ext_.set_texture(A, 0x80, atm_.density_lut.Get());
+    // t2 of the lookups: a paraboloid map multiplying the sun glow (cloud cover?); none found in
+    // the map data. White = no change, and its blend weight (+0x1F8) is 0.
+    ext_.estimate_texture(A, 0xC0, unshadowed_.Get(), "sky lookup paraboloid map (source not found): white");
+    for (uint32_t off : {0xC0u, 0xD0u, 0xE0u}) {
+        const float4 row{off == 0xC0u ? 1.0f : 0.0f, off == 0xD0u ? 1.0f : 0.0f, off == 0xE0u ? 1.0f : 0.0f, 0};
+        ext_.set(ext::Postprocess, off, row);
+    }
+    ext_.note_estimate("extern 38 +0xC0..+0xE0 = identity (sky paraboloid basis)", chosen);
+    ext_.set_texture(A, 0xE0, sky_far_rt_.Get());
+    ext_.set_texture(A, 0xF0, sky_near_rt_.Get());
+    // The lookups' phase is (1 + g^2 + 2 g dot(ray, +0x110))^-1.5: +0x110 points away from the sun.
+    const V3 sun = sun_toward(p);
+    ext_.estimate(A, 0x110, float4{-sun.x, -sun.y, -sun.z, 0}, "sun light direction (map sun path, time of day)");
+    ext_.estimate(A, 0x130, float4{0, 0, 1, 0}, "froxel volume parameters (atmosphere volume not rendered yet)");
+    ext_.set(A, 0x150, ch(0x0A));  // sun_glow_color
+    ext_.note_estimate("extern 7 +0x150 = sun_glow_color", copied);
+    auto glow_g = [](float shape) { return shape > 1 ? 1 - 1 / shape : 0.0f; };
+    est(0x160, glow_g(ch(0x0D)[0]), "sky_sun_glow_shape as g = 1 - 1/shape");
+    est(0x164, ch(0x0E)[0], copied);
+    est(0x170, 1.0f, chosen);  // in-scatter / sky scale
+    est(0x174, ch(0x0F)[0], copied);  // fog_density (per km)
+    const float lut_start = ch(0x10)[0], lut_end = ch(0x11)[0];
+    est(0x178, lut_start, copied);
+    est(0x17C, lut_end > lut_start ? lut_end : lut_start + 1, "fog_density_lookup_end (start + 1 when unset: avoids 0/0)");
+    est(0x188, ch(0x15)[0], copied);  // fog_height_falloff
+    est(0x18C, ch(0x14)[0], copied);  // fog_start_height
+    est(0x1A4, ch(0x18)[0], copied);  // layered_fog_density
+    est(0x1A8, ch(0x19)[0], copied);  // layered_fog_falloff
+    est(0x1AC, ch(0x1A)[0], copied);  // layered_fog_start_height
+    est(0x1C4, ch(0x2E)[0] / 360.0f, "sky_snapshot_rotation in turns");
+    est(0x1C8, ch(0x2F)[0], copied);  // sky_snapshot_intensity
+    est(0x1D0, 1.0f, chosen);  // sky: weight of the froxel in-scatter
+    ext_.set(A, 0x1E0, ch(0x2C));  // sky_color_override (w = weight)
+    ext_.note_estimate("extern 7 +0x1E0 = sky_color_override", copied);
+    est(0x1F0, glow_g(ch(0x0B)[0]), "sun_glow_shape as g = 1 - 1/shape");
+    est(0x1F4, ch(0x0C)[0], copied);  // sun_glow_intensity
+    est(0x1F8, 0.0f, chosen);  // paraboloid map weight
+}
+
+void GameLighting::render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes) {
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE near_rtv{base.ptr + 7 * inc}, far_rtv{base.ptr + 8 * inc};
+    Gpu::barrier(cl, sky_near_rt_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Gpu::barrier(cl, sky_far_rt_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Both passes read their lookup pair at +0x40 / +0x58 (the engine rebinds them in between).
+    ext_.set_texture(ext::Atmosphere, 0x40, atm_.lookups[0].Get());
+    ext_.set_texture(ext::Atmosphere, 0x58, atm_.lookups[2].Get());
+    cl->OMSetRenderTargets(1, &near_rtv, FALSE, nullptr);
+    sky_near_.draw(gpu, cl, ext_, scopes);
+    ext_.set_texture(ext::Atmosphere, 0x40, atm_.lookups[1].Get());
+    ext_.set_texture(ext::Atmosphere, 0x58, atm_.lookups[3].Get());
+    cl->OMSetRenderTargets(1, &far_rtv, FALSE, nullptr);
+    sky_far_.draw(gpu, cl, ext_, scopes);
+    Gpu::barrier(cl, sky_near_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, sky_far_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 // ---- SSAO (hdao) -------------------------------------------------------------------------------
