@@ -2401,11 +2401,20 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + inc}};  // light diffuse, specular IBL
     cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    constexpr float kHardEdge = 1e-3f;  // a face with no blend: fades over the last 0.1% of its half extent
     auto upload = [&](std::span<const float4> values) {
         auto a = gpu.dynamic(values.size() * sizeof(float4));
         std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
         return a.gpu;
     };
+    // The volume VS passes the vertex's view depth as dot(eye - vertex, cb12[6]) and the PS scales
+    // the eye-to-vertex ray by surface depth / that: the engine's cb12[6] is the camera's backward
+    // axis. nim's camera space looks along +z (cb12[6] = forward), which puts every reconstructed
+    // point behind the eye, so this pass gets the view scope with that row negated.
+    auto vs_view = evaluate_scope(view_scope_, ScopeStage::Vertex, ext_);
+    if (vs_view.size() > 6)
+        for (auto& x : vs_view[6]) x = -x;
+    const auto vs_view_cb = upload(vs_view);
     for (const auto& cv : cubemaps_) {
         const MapCubemap& m = cv.volume;
         if (off_screen(vm, m.lo, m.hi)) continue;
@@ -2424,10 +2433,13 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         vs[2] = {m.extents[0], m.extents[1], m.extents[2], 0};
         std::array<float4, 32> ps{};
         // Face fades: 1 - saturate(|x| * scale - offset) over the outer `blend` of each half extent.
+        // They are also the volume's only bound: the box is drawn by its far faces, so every pixel
+        // whose ray crosses it runs the PS, and a face without a blend must still cut off at |x| = 1
+        // (a hard edge), not leave the factor at 1 for the scene in front of and around the box.
         for (int a = 0; a < 3; ++a) {
-            const float bn = m.blend_neg[size_t(a)], bp = m.blend_pos[size_t(a)];
-            if (bn > 1e-4f) ps[0][size_t(a)] = 1.0f / bn, ps[2][size_t(a)] = (1.0f - bn) / bn;
-            if (bp > 1e-4f) ps[1][size_t(a)] = 1.0f / bp, ps[3][size_t(a)] = (1.0f - bp) / bp;
+            const float bn = std::max(m.blend_neg[size_t(a)], kHardEdge), bp = std::max(m.blend_pos[size_t(a)], kHardEdge);
+            ps[0][size_t(a)] = 1.0f / bn, ps[2][size_t(a)] = (1.0f - bn) / bn;
+            ps[1][size_t(a)] = 1.0f / bp, ps[3][size_t(a)] = (1.0f - bp) / bp;
         }
         ps[2][3] = m.unk30;
         ps[3][3] = cv.max_mip;
@@ -2441,6 +2453,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         const auto vs_cb = upload(vs), ps_cb = upload(ps);
         const ScopeBufferFn volume_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
             if (reg == 11) return stage == ShaderStage::Vertex ? vs_cb : ps_cb;
+            if (reg == 12 && stage == ShaderStage::Vertex) return vs_view_cb;
             return scopes(stage, reg);
         };
         // The VS places -position (the cube turned inside out); the far side is drawn as for lights.
