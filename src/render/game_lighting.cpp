@@ -1266,18 +1266,43 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     // GlobalLighting: a map's sun and hemisphere ambient. Without a map it is nim's light set-up
     // (the panel's sun / sky), laid out as the shading reads it: the sun is multiplied by
     // 1/(4 pi) and the ambient by 1/4 there, so nim's values are scaled to match.
-    constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
     const V3 sun_dir = sun_toward(p);
+    constexpr std::string_view chosen = "meaning reverse-engineered, value chosen (v0.3.1)";
+    ext_.estimate(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0}, chosen);  // hemisphere axis
+    ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, 1, 0, 0}, chosen);  // light-buffer occlusion
+    // The viewer overwrites some global channels below; start from the defaults and the weather.
+    auto restore_channel = [&](size_t i) {
+        if (i >= ext_.channels.size() || i >= globals_.channel_defaults.size()) return;
+        ext_.channels[i] = globals_.channel_defaults[i];
+        if (auto it = global_overrides_.find(uint32_t(i)); it != global_overrides_.end()) ext_.channels[i][0] = it->second;
+    };
+    if (atm_.valid && p.atmosphere) {
+        // A map: the sun and the hemisphere ambient are the global channels (sun_color x
+        // sun_intensity, up / down_ambient_color x intensity, their sharpness), in the order the
+        // shading reads GlobalLighting; the ambient is then scaled by global_ambient_intensity
+        // (ch 0x82) in the shading pass, and the map's diffuse probes (cubemap volumes) do the rest.
+        for (size_t i : {0x1Du, 0x1Eu, 0x21u, 0x22u, 0x23u, 0x24u, 0x82u}) restore_channel(i);
+        auto ch = [&](uint32_t i) { return i < ext_.channels.size() ? ext_.channels[i] : float4{}; };
+        auto scaled = [](float4 c, float k) { return float4{c[0] * k, c[1] * k, c[2] * k, 0}; };
+        constexpr std::string_view from_channels = "global channels copied into GlobalLighting (order matches; engine copy code not data)";
+        ext_.estimate(ext::GlobalLighting, 0x10, scaled(ch(0x09), ch(0x08)[0]), from_channels);  // sun_color x sun_intensity
+        ext_.estimate(ext::GlobalLighting, 0x30, v4(sun_dir, 0), "map sun path at the time of day");
+        ext_.estimate(ext::GlobalLighting, 0x70, scaled(ch(0x57), ch(0x58)[0]), from_channels);  // up_ambient
+        ext_.estimate(ext::GlobalLighting, 0x80, scaled(ch(0x5A), ch(0x5B)[0]), from_channels);  // down_ambient
+        ext_.estimate(ext::GlobalLighting, 0x90, float4{ch(0x59)[0], ch(0x5C)[0], 0, 0}, from_channels);  // sharpness
+        ext_.set_channel("sun_atmosphere_direction", v4(sun_dir, 0));
+        if (!ext_.zero_policy(ext::GlobalLighting))
+            ext_.zero_when_missing(ext::GlobalLighting, "global lighting value with no known meaning: zero");
+        return;
+    }
+    constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
     const V3 sun = p.sun_color * (p.sun_intensity * 4.0f);
     const float ka = 4.0f * p.sky_intensity;
     ext_.estimate(ext::GlobalLighting, 0x10, v4(sun, 0), viewer_light);
     ext_.estimate(ext::GlobalLighting, 0x30, v4(sun_dir, 0), viewer_light);
     ext_.estimate(ext::GlobalLighting, 0x70, v4(p.sky_top * ka, 0), viewer_light);
     ext_.estimate(ext::GlobalLighting, 0x80, v4(p.ground * ka, 0), viewer_light);
-    constexpr std::string_view chosen = "meaning reverse-engineered, value chosen (v0.3.1)";
-    ext_.estimate(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0}, chosen);  // hemisphere axis
     ext_.estimate(ext::GlobalLighting, 0x90, float4{0.35f, 0.35f, 0, 0}, chosen);  // up / down sharpness
-    ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, 1, 0, 0}, chosen);  // light-buffer occlusion
     ext_.set_channel("skybox_sun_color", v4(p.sun_color, 1));
     ext_.set_channel("skybox_sun_intensity", float4{p.sun_intensity * 4.0f, 0, 0, 0});
     ext_.set_channel("sun_atmosphere_direction", v4(sun_dir, 0));
@@ -1426,17 +1451,24 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         env_pass(env_ibl_pso_.Get(), env_rtv);
     }
     if (!lights_.empty() || !cubemaps_.empty()) {
-        // Light buffers: the local lights, occluded by SSAO (apply_ssao_to_light_buffers multiplies
-        // the buffers), then the cubemap volumes (diffuse probes + specular IBL over the sky's),
-        // which read the AO themselves (extern 93) and so come after the multiply.
+        // Light buffers: first the cubemap volumes (diffuse probes + specular IBL over the sky's).
+        // Their PS writes alpha = 1 - volume weight for a src + dst * src.a blend, so a volume
+        // replaces what is under it (nested volumes over the large ones): drawn after the local
+        // lights it would erase them. Then the local lights add on top, and
+        // apply_ssao_to_light_buffers multiplies both buffers.
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const float zero[4]{};
         cl->ClearRenderTargetView({hdr.ptr + 3 * inc}, zero, 0, nullptr);
         cl->ClearRenderTargetView({hdr.ptr + 4 * inc}, zero, 0, nullptr);
+        if (!cubemaps_.empty() && own_env) {
+            draw_cubemaps(gpu, cl, vm, scopes);
+            ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
+                               "engine pass order not in game data; the cubemap alpha replaces what is under it");
+        }
         if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
-        if (!lights_.empty() && p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
+        if ((!lights_.empty() || !cubemaps_.empty()) && p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
             constexpr uint8_t kApply = 0x26;
             // Extern 38 is the full-screen input shared with final_combine: its own store here.
             hdao_ext_.set_texture(kApply, 0x00, ao_.Get());
@@ -1447,7 +1479,6 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             cl->OMSetRenderTargets(2, bufs, FALSE, nullptr);
             apply_ssao_.draw(gpu, cl, hdao_ext_, scopes);
         }
-        if (!cubemaps_.empty() && own_env) draw_cubemaps(gpu, cl, vm, scopes);
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }

@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-17 (ボリューメトリクスの実装コミット)
+最終更新: 2026-10-17 (拡散プローブ / マップのライティングのコミット)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -16,9 +16,9 @@
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
 | 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
-| 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 「Volumetrics」コミット | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
-| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | **次** | — | キューブマップボリュームは 666fc85 で実装済み |
-| 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, vignette, final_combine) | 未着手 | — | final_combine だけは既に描画 |
+| 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
+| 5 | 拡散プローブ (light_sample_local_cubemaps_diffuse_probes / sky hemisphere) | 完了 (不透明物) | 「Diffuse probes」コミット | §3.4。light_sample_* は透明物/パーティクル用で未 |
+| 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, vignette, final_combine) | **次** | — | final_combine だけは既に描画 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
 
 後回し (ユーザー指示で保留): マップのギミック (エンティティの GUI 統合、アニメーション、状態変化)。
@@ -52,7 +52,7 @@
 - hdao_ps (80A74652): extern 0x21 が入力。t0 = デバイス深度、t1 = ビュー深度で **R と G の両方を
   Gather する** (R32 だと G=0 で全サンプル棄却 → AO=1 になる罠)。nim は R32G32 の線形深度を作る。
 - 出力は extern 93 +0x00 (cubemap_apply_* が読む) と apply_ssao_to_light_buffers
-  (blend state 3 = DEST_COLOR 乗算) でローカルライトのバッファに掛ける。順序: lights → apply_ssao → cubemaps。
+  (blend state 3 = DEST_COLOR 乗算) でライトバッファに掛ける。順序は §3.4 (cubemaps → lights → apply_ssao)。
 - extern 0x26 は final_combine など全画面パス共通の入力スロット。別パスで使うときは別 ExternStore に入れる。
 - 調整値 (半径 10px 等) はエンジン側の値で推定。
 
@@ -137,6 +137,22 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   volumetrics_upres_1 (双方向アップサンプル: t0/t1 = 低解像度 min/max 深度の結果, t2 = 低解像度
   (min,max) 線形深度, t3 = フル解像度深度 (R,G 平均)) → HDR に合成 (ブレンドは未確認)。
 - 霧密度スライス (extern 0x58) の生成元は未特定 (マップのフォグボリューム系エンティティと推測)。
+
+### 3.4 拡散プローブ + マップのライティング (実装済み)
+- 不透明物の拡散プローブ = キューブマップボリューム (cubemap_apply_*_probes_on, PS 例 80A74B26)。
+  プローブは R8G8B8A8_UNORM の 3D テクスチャ (x 方向に 7 枚: 平均 + ±X/±Y/±Z)。PS の出力
+  o0 (拡散 → Deferred +0xC0) = 露出 cb13[1].x × global_cubemap_intensity (ch 0x83) × probe × (1 + k·probe)
+  × AO^(2·ao_ambient_weight ch 0x54) × 強度 (+0x30) × フェード, o0.w = 1 - 重み。o1 (鏡面 IBL → +0xD0) も同様。
+  alpha = 1 - 重み + blend 23 (src + dst·src.a) は「下にあるものを置き換える」合成なので、ボリュームは
+  ライトより先に描く (後だとローカルライトを消す)。順序: cubemaps → lights → apply_ssao (推定。プローブは
+  AO を自前でも読むので二重に掛かる)。cb0[14] = (ch 0x80, ch 0x81 - ch 0x80), cb0[16] = ch 0x8B。
+- light_sample_local_cubemaps_diffuse_probes / light_sample_sky_hemisphere は CS (extern 0x44 の UAV) で
+  透明物・パーティクルのライト用。不透明物には効かないので透明物の移植時に一緒にやる。
+- GlobalLighting (extern 42) はマップの大気があるときマップのチャンネルから作る: +0x10 = sun_color (0x09) ×
+  sun_intensity (0x08), +0x30 = 太陽の経路方向, +0x70 = up_ambient_color × intensity (0x57×0x58),
+  +0x80 = down (0x5A×0x5B), +0x90 = (up_sharpness 0x59, down_sharpness 0x5C)。シェーディングは半球
+  アンビエントに global_ambient_intensity (0x82, 既定 0) を掛けるので、マップでは拡散アンビエントは
+  ほぼプローブだけ。+0x50 / +0xD0 は意味だけ読めていて値は推定。大気が無い (ビューア) ときは従来の設定。
 
 ## 4. 既知の未解決・注意
 - `docs/RENDERING.md` の冒頭 (「未実装」「代替描画を削除」) は古い。現状はこの表が正。
