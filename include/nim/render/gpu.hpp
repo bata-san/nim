@@ -114,7 +114,8 @@ public:
     // Records a copy of `data` into dst at dst_offset on the immediate list (staged in a shared
     // upload ring that is recycled by flush()).
     void stage_copy(ID3D12Resource* dst, uint64_t dst_offset, const void* data, size_t size);
-    ComPtr<ID3D12Resource> texture(const Texture& t);  // records the copy on the immediate list
+    // volume=true preserves the original Texture3D shader contract even with a single Z slice.
+    ComPtr<ID3D12Resource> texture(const Texture& t, bool volume = false);  // records the copy on the immediate list
     ComPtr<ID3D12Resource> texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
                                      D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear);
     // Copies a 2D texture back to the CPU (tightly packed rows). Flushes.

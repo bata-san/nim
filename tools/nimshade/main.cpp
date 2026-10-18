@@ -14,6 +14,8 @@
 //            [--activity TAG --activity-map N] (DEIMOS ActivityTab selection)
 //            [--entity-range BEGIN:END] (diagnostic half-open indices in the region's model list)
 //            [--verify-static-motion] (16 frozen TAA frames must have < 0.1 px motion)
+//            [--no-froxel-noise] (compare the original uniform-density atmosphere permutation)
+//            [--dump-lighting] (light/depth/sky/froxel buffers and camera metadata)
 #include "nim/content/animation.hpp"
 #include "nim/content/object_channels.hpp"
 #include "nim/core/package_manager.hpp"
@@ -89,6 +91,7 @@ int run(int argc, char** argv) {
     bool dump_probe_mask = false;
     bool dump_lighting = false;
     bool no_froxels = false;
+    bool no_froxel_noise = false;
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
     std::optional<std::pair<size_t, size_t>> entity_range;
@@ -114,6 +117,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
         else if (args[i] == "--dump-lighting") dump_lighting = true;
         else if (args[i] == "--no-froxels") no_froxels = true;
+        else if (args[i] == "--no-froxel-noise") no_froxel_noise = true;
         else if (args[i] == "--verify-static-motion") verify_static_motion = true;
         else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
         else if (args[i] == "--entity-range" && i + 1 < args.size()) {
@@ -412,6 +416,9 @@ int run(int argc, char** argv) {
     lighting.init(gpu);
     std::println("bounds center ({:.3f},{:.3f},{:.3f}) radius {:.3f}", scene.center().x, scene.center().y, scene.center().z, scene.radius());
     View view = frame_sphere(scene.center(), scene.radius() * camera_scale, width, height);
+    // Match the interactive map camera: unlimited range must not move the near
+    // plane tens of metres away or clip the geometry around an explicit eye.
+    if (is_map) view.near_z = 0.05f;
     if (eye_arg) view.eye = *eye_arg;
     if (look_arg) view.target = *look_arg;
     ViewMatrices vm = make_view(view);
@@ -440,6 +447,7 @@ int run(int argc, char** argv) {
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
     lp.froxel_fog = !no_froxels;
+    lp.froxel_noise = !no_froxel_noise;
     lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
     lp.post = !no_post;
@@ -678,7 +686,9 @@ int run(int argc, char** argv) {
         std::ofstream f(out_dir / "lighting.json");
         f << std::format("{{\"width\":{},\"height\":{},\"vp\":[", width, height);
         for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) f << std::format("{}{:.9g}", c || r ? "," : "", vm.vp_abs.c[c][size_t(r)]);
-        f << "],\"probes\":[";
+        const auto fog_mapping = gl.externs().get_v(ext::Atmosphere, 0x130);
+        f << std::format("],\"view_depth_near\":{},\"froxel_mapping\":[{},{},{},{}],\"probes\":[",
+            vm.vp_rel.c[3][2], fog_mapping[0], fog_mapping[1], fog_mapping[2], fog_mapping[3]);
         for (size_t i = 0; i < region_cubemaps.size(); ++i) {
             const auto& p = *region_cubemaps[i];
             f << std::format("{}{{\"center\":[{},{},{}],\"extents\":[{},{},{}],\"rotation\":[{},{},{},{}]}}",
@@ -748,6 +758,7 @@ int run(int argc, char** argv) {
             return (v & 0x8000) ? -value : value;
         };
         auto verify_lut = [&](const ViewMatrices& camera) {
+            if (gl.cubemaps_failed()) throw std::runtime_error("Original cubemap volume draw failed");
             const auto& ext = gl.externs();
             if (lp.froxel_fog) {
                 auto* volume = ext.texture(ext::Atmosphere, 0x108).resource;

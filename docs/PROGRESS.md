@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (ゲーム比較画像: Outpostは夜。大気の未設定入力と屋内判定の誤流用を修正、最終画の一致は未達)
+最終更新: 2026-10-18 (1層プローブの脱落を修正、Frameテクスチャ配置を再調査、元の空間ノイズ霧を接続。ゲーム完成画への一致は未達)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -15,7 +15,7 @@
 |---|------|------|-----------------|------|
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
-| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 基本大気とフロクセルCSを接続 (カスケード・temporalは未) | §3.2〜3.2.1 | 原CS使用。格子・距離・遮蔽元などのエンジン入力は推定 |
+| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 基本大気・空間ノイズ付きフロクセルCSを接続 (カスケード・temporalは未) | §3.2〜3.2.3 | 原CS使用。ノイズの結線・変種選択・格子・距離等は推定 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
 | 5 | 拡散・反射プローブ (cubemap_apply / sky hemisphere) | 全域読込・距離フェード既定オフ、CSG は解析専用。ゲームとの完全一致は未検証 | §3.4〜3.4.2 | Outpost 313、外周 167 (空レコード含む原一覧169)、低温アーカイブ499。エンジンの順序等は未解明 |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
@@ -178,6 +178,46 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   新GUIは `out/night-inputs-bin/nim.exe` (コンパイル確認、今回のUI操作は未検証)。ゲーム完成画への一致は未達のため正式リリースなし。
 - 次: 夜のアクティビティ実行時環境入力、霧の距離変調と密度変種、未移植のグレーディング層を元データから追う。
   新しいCSが動作することとゲーム完成画への一致を区別する。夜でもかすみ・光の分離は未解決。
+
+### 3.2.3 空間ノイズとFrame入力の再調査、1層プローブの修正 (同日)
+- 700原技法・734シェーダーを `nimcli render-resources` で再索引。
+  参照ゲームのFrame配置をそのまま使うことはできない。
+  元uber-lightはFrame +0xC0をTexture3Dで読み、global shadingの+0xD0は薄膜/玉虫色のRGB表を読む。
+  ノイズ付き大気CSは **Frame +0xD8をTexture3D**で読むが、nimはここに2Dのiridescence表を入れていた。
+  C0=3D lobe、D0=iridescenceへ修正。B8=lobe/C8=tintの未使用スロットは配置からの推定として記録する。
+- 共通データ `render_globals.data +0x40 = 80A74EAC` は **48x48x48 BC4_UNORMのスカラーノイズ**。
+  これをFrame +0xD8へ接続。元のエンジン結線コードは未取得のため、**この結線の同定は推定**としてUI/logへ出す。
+  原BC4のままGPUへロードし、元CSが元サンプラーで読む。任意の生成ノイズ・色調変更・密度倍率は追加していない。
+- 原密度CSのnoise変種 `80A742E9 / CS80A742E5`、no_sun変種 `80A742FE / CS80A742FB` を実装。
+  元の均一変種はfog_density.xy / layered_fog_density.xyの平均値を使う。
+  noise変種は2スケールの3Dノイズ、元chBA/BBの移動・サイズ、chBC..BEの強さ/高さ、
+  密度チャンネルzwのリマップを使用。Outpostはfog_density=(3,20,0.45,0.6)なので平均密度とは異なる。
+  選択条件はエンジン側未特定の推定。既定でnoiseを使い、`nimshade --no-froxel-noise`で元の均一変種と比較できる。
+- 同一Outpostの夜=0、eye=(287,-40,21)、look=(145,15,-25)、640x360、固定露出1、テクスチャ上限128で比較。
+  表面位置でのフロクセル透過率 (解析フォグ・散乱色・ポストを含まない) の中央値 **0.2138→0.3012**。
+  透過率0.5未満の表面は100%→96.9%。均一なかすみは弱まるが、**依然大半の表面で半分以上減衰している**。
+  ゲーム完成画像との一致・実ゲームでnoise変種が選択されることの証明ではない。
+- `tools/re/analyze_atmosphere.py` を追加。`--dump-lighting`のRGBA16F体積を元PSの正規化Zで
+  trilinear/clampサンプルし、表面の透過率分布とPNGを出す。JSONに実near planeとfroxel_mappingを追加。
+  古いdumpへ0.05を仮定しない (比較時の旧headless nearは30mだったことをVP行列から確認)。
+  headlessのマップnearをGUIと同じ0.05mへ統一。全域の半径が近クリップ面を30mに動かす不具合を除去。
+- **プローブの描画脱落**: `Gpu::texture`がdepth>1だけをTexture3Dと判断していた。
+  diffuseプローブの原PSはZが1層でもTexture3Dを要求するため、元グリッドを保持して3Dで作る経路を追加。
+  Outpost: index90/91 (11x8x1、8x12x1)、Perimeter:111/112 (1x22x1、1x9x1)、
+  Cryo:250/251/370 (2x3x1、3x2x1、12x4x1)、**計7個の有効な原プローブ**が該当。
+  Outpostの上記画角で236→238個を描画、`missing t2`が消えた。全域の覆いが完成したという意味ではない。
+  `--verify-frame-inputs`はプローブ描画失敗も検出する。
+- 検証: Release nim/nimshade/nimcli/nim_tests/nim_render_tests、ctest 2/2。
+  Outpost全域のnoise/均一変種、Perimeter全域(影あり)、Cryo全域(影なし)で
+  全sliceのfinite/透過率単調性/屋内入力なしのy=1、TAA、大小リサイズを確認。D3D debugは全て0B。
+  最終Outpostはnear0.05、800x450→817x461→800x450でも成功。
+  三線形の端/クランプ/中心を既知の2x2x2データで確認。全域テクスチャ上限は128 (GPU原プローブ/ノイズはフルサイズ)。
+  GUIは `out/spatial-fog-bin/nim.exe`へビルド済み。今回のGUI実操作は未検証、正式リリースはしない。
+- 未解決: 実行時の夜/天候入力、noise変種の選択条件と元結線の確証、霧の距離変調・カスケード、
+  グレーディング層。ゲーム完成画の色/明暗への完全一致はまだ達成していない。
+- 解析上の注意: `inspect_tfx_bindings`は最後のtexview元を追う簡略解析。
+  80A7433Eのt4は実際には`push_extern_u32 05 20` (実行時ハンドル)なのにC0として表示される。
+  同一C0が2D/3Dを兼ねる根拠には使わない。実行時ハンドルの解決は別途必要。
 
 ### 3.3 ボリューメトリクス (実装済み)
 実装: `GameLighting::render_volumetrics` (src/render/game_lighting.cpp)。順序 (シェーディングと空の後):

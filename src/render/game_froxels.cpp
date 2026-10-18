@@ -15,7 +15,9 @@ void GameLighting::load_froxels(PackageManager& pm, Gpu& gpu, std::span<const Sc
     for (auto [pipeline, name] : {std::pair{&froxel_density_, "cascade_raymarch_atmosphere_volume"},
                                  std::pair{&froxel_inscatter_, "cascade_raymarch_atmosphere_volume_inscatter"},
                                  std::pair{&froxel_density_no_sun_, "cascade_raymarch_atmosphere_volume_no_sun"},
-                                 std::pair{&froxel_inscatter_no_sun_, "cascade_raymarch_atmosphere_volume_inscatter_no_sun"}}) {
+                                 std::pair{&froxel_inscatter_no_sun_, "cascade_raymarch_atmosphere_volume_inscatter_no_sun"},
+                                 std::pair{&froxel_density_noise_, "cascade_raymarch_atmosphere_volume_noise"},
+                                 std::pair{&froxel_density_noise_no_sun_, "cascade_raymarch_atmosphere_volume_noise_no_sun"}}) {
         const auto tag = globals_.pipeline(name);
         if (tag.is_none()) throw std::runtime_error(std::format("Missing original {}", name));
         pipeline->load(pm, gpu, tag, scopes, {});
@@ -27,6 +29,8 @@ void GameLighting::release_froxels(Gpu& gpu) {
     froxel_inscatter_.release(gpu);
     froxel_density_no_sun_.release(gpu);
     froxel_inscatter_no_sun_.release(gpu);
+    froxel_density_noise_.release(gpu);
+    froxel_density_noise_no_sun_.release(gpu);
     froxel_density_vol_.Reset();
     froxel_vol_.Reset();
     froxel_w_ = froxel_h_ = 0;
@@ -110,9 +114,11 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     };
     Gpu::barrier(cl, unshadowed_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     Gpu::barrier(cl, no_atmosphere_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
+    if (p.froxel_noise) Gpu::barrier(cl, atmosphere_noise_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
     Gpu::barrier(cl, froxel_density_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    auto& density = shadowed ? froxel_density_ : froxel_density_no_sun_;
+    auto& density = p.froxel_noise ? (shadowed ? froxel_density_noise_ : froxel_density_noise_no_sun_)
+                                  : (shadowed ? froxel_density_ : froxel_density_no_sun_);
     density.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, kFroxelDepth);
     finite_constants(density);
     Gpu::barrier(cl, froxel_density_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
@@ -124,9 +130,12 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     Gpu::barrier(cl, no_atmosphere_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (p.froxel_noise) Gpu::barrier(cl, atmosphere_noise_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, unshadowed_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ext_.set_texture(ext::Atmosphere, 0x108, froxel_vol_.Get(), kFormat);
     ext_.set_texture(ext::Transparent, 0x78, froxel_vol_.Get(), kFormat);
+    ext_.note_estimate(p.froxel_noise ? "froxel density: original spatial noise permutation" : "froxel density: original uniform permutation",
+                       "engine permutation selection unavailable; noise uses authored density ranges/remaps and game-time motion; uniform uses their midpoint");
     if (!shadowed) ext_.note_estimate("atmosphere froxels: original no_sun permutation",
                                     "sun-shadow producer unavailable: original no_sun CS, no sun in-scatter");
     ext_.note_estimate(std::format("atmosphere froxels {}x{}x{}: one cascade, {}..{}m, curve {}, no temporal history",

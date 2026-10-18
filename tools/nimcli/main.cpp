@@ -1461,6 +1461,7 @@ int cmd_globals(PackageManager& pm) {
                  g.pipelines.size(), g.channel_ids.size());
     std::println("lookup textures: tint {} lobe {} lobe3d {} iridescence {}", g.specular_tint_lookup.str(),
                  g.specular_lobe_lookup.str(), g.specular_lobe_3d_lookup.str(), g.iridescence_lookup.str());
+    std::println("3D noise candidate: {} (render globals +0x40; Frame +0xD8 binding inferred)", g.atmosphere_noise.str());
     for (const auto& [n, t] : g.scopes) {
         Scope s = load_scope(pm, t);
         std::string slots;

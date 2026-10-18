@@ -434,6 +434,7 @@ struct LightingParams {
     // fog and the sky background with the engine's pipelines. time_of_day in days (0..1), < 0 =
     // the map's own; the sun then follows the map's sun path instead of sun_azimuth/elevation.
     bool atmosphere = true;
+    bool froxel_noise = true;  // original spatial density-noise permutation; source/selection are estimates
     float time_of_day = -1.0f;
     // The map environment (its global channel expressions: sun, ambient, fog over the day) with the atmosphere.
     bool environment = true;

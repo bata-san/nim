@@ -334,10 +334,11 @@ ComPtr<ID3D12Resource> Gpu::texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format
     return r;
 }
 
-ComPtr<ID3D12Resource> Gpu::texture(const Texture& t) {
+ComPtr<ID3D12Resource> Gpu::texture(const Texture& t, bool volume) {
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
-    const bool is3d = t.depth > 1;
+    const bool is3d = volume || t.depth > 1;
+    if (is3d && t.array_size > 1) throw std::invalid_argument("Texture3D cannot have array layers");
     rd.Dimension = is3d ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = t.width;
     rd.Height = t.height;

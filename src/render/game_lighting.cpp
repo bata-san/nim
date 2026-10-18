@@ -1061,6 +1061,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     lobe_lookup_ = lookup(globals_.specular_lobe_lookup);
     lobe3d_lookup_ = lookup(globals_.specular_lobe_3d_lookup);
     iridescence_lookup_ = lookup(globals_.iridescence_lookup);
+    atmosphere_noise_ = lookup(globals_.atmosphere_noise);
     {
         Texture white;
         white.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1389,10 +1390,18 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     if (p.ssao && hdao_.loaded()) ext_.set_texture(93, 0x00, ao_.Get());
     else ext_.estimate_texture(93, 0x00, unshadowed_.Get(), p.ssao ? "SSAO pipeline not loaded: unoccluded (white)" : "SSAO off: unoccluded (white)");
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "no volumetric fog pass yet: zero");
-    ext_.set_texture(ext::Frame, 0xC0, lobe_lookup_.Get());
-    ext_.set_texture(ext::Frame, 0xC8, lobe3d_lookup_.Get());
-    ext_.set_texture(ext::Frame, 0xD0, tint_lookup_.Get());
-    ext_.set_texture(ext::Frame, 0xD8, iridescence_lookup_.Get());
+    // Marathon's original consumers differ from the reference game's frame layout:
+    // uber light C0 is Texture3D; shading D0 is the thin-film/iridescence table;
+    // atmosphere D8 is Texture3D noise. Never bind the D2 table shifted by 8 bytes.
+    ext_.set_texture(ext::Frame, 0xB8, lobe_lookup_.Get());
+    ext_.set_texture(ext::Frame, 0xC0, lobe3d_lookup_.Get());
+    ext_.set_texture(ext::Frame, 0xC8, tint_lookup_.Get());
+    ext_.set_texture(ext::Frame, 0xD0, iridescence_lookup_.Get());
+    ext_.set_texture(ext::Frame, 0xD8, atmosphere_noise_.Get());
+    ext_.note_estimate("Frame BRDF textures: B8 lobe, C0 3D lobe, C8 tint, D0 iridescence",
+                       "Marathon shader C0 requires Texture3D and D0 reads thin-film colour; reference game's offsets differ; unused B8/C8 roles inferred");
+    ext_.note_estimate("Frame +0xD8 = render globals +0x40 3D scalar noise",
+                       "original atmosphere noise CS requires Texture3D; matching scalar 48^3 game resource, engine binding code unavailable");
 
     // GlobalLighting: a map's sun and hemisphere ambient. Without a map it is nim's light set-up
     // (the panel's sun / sky), laid out as the shading reads it: the sun is multiplied by
@@ -1626,7 +1635,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
     if ((p.ssao && hdao_.loaded()) || volumetrics || transparents) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
-    lights_drawn_ = cubemaps_drawn_ = 0;
+    lights_drawn_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
     vol_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2357,10 +2366,12 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
     make_cube(gpu);
     const Scope* scopes[] = {&frame_scope_, &view_scope_};
     std::map<std::string, size_t> failures;
-    auto texture = [&](TagHash t) -> ComPtr<ID3D12Resource> {
+    auto texture = [&](TagHash t, bool volume = false) -> ComPtr<ID3D12Resource> {
         if (t.is_none()) return nullptr;
         auto& slot = probe_textures_[t.value];
-        if (!slot) slot = gpu.texture(load_texture(pm, t));
+        if (!slot) slot = gpu.texture(load_texture(pm, t), volume);
+        if (volume && slot->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            throw std::runtime_error("Diffuse probe texture was cached with the wrong dimension");
         return slot;
     };
     if (diagnostic_csg && !cubemap_stencil_) {
@@ -2415,7 +2426,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             const auto filtered = filtered_cubes_.find(m->specular.value);
             v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;
             v.alpha = texture(m->alpha);
-            v.diffuse = texture(m->diffuse);
+            v.diffuse = texture(m->diffuse, true);
             if (diagnostic_csg && !m->shape_vertices.is_none()) {
                 auto& shape = probe_shapes_[m->shape_vertices.value];
                 if (!shape) {
@@ -2700,6 +2711,7 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
             gp.draw_volume(gpu, cl, ext_, volume_scopes, nullptr, cube_vbv_, cube_ibv_, 36, textures);
             ++cubemaps_drawn_;
         } catch (const std::exception& ex) {
+            ++cubemaps_failed_;
             if (cubemap_notes_.size() < 32) cubemap_notes_.push_back(std::format("cubemap {}: {}", m.specular.str(), ex.what()));
         }
     }

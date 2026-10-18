@@ -227,6 +227,7 @@ public:
     size_t filtered_cube_count() const { return filtered_cubes_.size(); }
     size_t cubemap_count() const { return cubemaps_.size(); }
     size_t cubemaps_drawn() const { return cubemaps_drawn_; }
+    size_t cubemaps_failed() const { return cubemaps_failed_; }
     const std::vector<std::string>& cubemap_notes() const { return cubemap_notes_; }
 
     // Weather: global channel values by index (world channel controllers), over the defaults.
@@ -306,7 +307,7 @@ private:
     ComPtr<ID3D12Resource> vol_minmax_, vol_layer_[4], vol_blurred_[2];
     ComPtr<ID3D12DescriptorHeap> vol_rtv_heap_;
     uint32_t vw_ = 0, vh_ = 0;
-    ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_;
+    ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_, atmosphere_noise_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded
     struct Atmosphere {
         MapAtmosphere data;
@@ -374,6 +375,7 @@ private:
     std::vector<CubemapVolume> cubemaps_;
     std::vector<std::string> cubemap_notes_;
     size_t cubemaps_drawn_ = 0;
+    size_t cubemaps_failed_ = 0;
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // by tag, kept across maps
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_shapes_;    // keep in-flight boundary buffers alive across map changes
 
@@ -441,6 +443,7 @@ private:
     void render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const LightingParams& p, const SunShadow* shadow);
     GamePipeline froxel_density_, froxel_inscatter_;
     GamePipeline froxel_density_no_sun_, froxel_inscatter_no_sun_;
+    GamePipeline froxel_density_noise_, froxel_density_noise_no_sun_;
     ComPtr<ID3D12Resource> froxel_density_vol_, froxel_vol_;  // RGBA16F 3D
     uint32_t froxel_w_ = 0, froxel_h_ = 0;
     // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice

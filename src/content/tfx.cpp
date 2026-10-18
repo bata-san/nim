@@ -458,6 +458,7 @@ RenderGlobals load_render_globals(PackageManager& pm) {
     };
     named(0x10, g.scopes);
     named(0x20, g.pipelines);
+    g.atmosphere_noise = r.tag_at(0x40);
     if (TagHash lut = r.tag_at(0x30); !lut.is_none()) {
         auto lb = pm.read(lut);
         TagReader l(lb);

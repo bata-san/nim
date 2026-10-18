@@ -165,6 +165,7 @@ struct RenderGlobals {
     std::vector<std::pair<std::string, TagHash>> pipelines;  // name -> technique
     std::vector<std::pair<std::string, TagHash>> scopes;     // name -> scope
     TagHash specular_tint_lookup, specular_lobe_lookup, specular_lobe_3d_lookup, iridescence_lookup;
+    TagHash atmosphere_noise;  // render globals data +0x40, 3D scalar noise (inferred from original CS)
     std::vector<uint32_t> channel_ids;
     std::vector<std::array<float, 4>> channel_defaults;
     TagHash pipeline(std::string_view name) const;
