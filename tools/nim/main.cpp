@@ -606,6 +606,8 @@ public:
         bool done = false;
         std::array<float, 3> center{};
         float extent = 0;  // farthest loaded placement from the centre (m)
+        float typical = 0;  // 80th percentile placement distance (framing; ignores far-off outliers)
+        std::optional<MapStart> start;  // the first player start (estimate), the initial camera
         std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
         std::shared_ptr<const std::vector<MapCubemap>> cubemaps;  // the region's reflection / ambient volumes
         std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
@@ -723,6 +725,7 @@ private:
         std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> entity_materials;
         std::optional<MapEntities> entities;
         TagHash entities_bubble;
+        std::vector<MapStart> starts;
         for (;;) {
             Request req;
             bool list = false;
@@ -764,6 +767,7 @@ private:
                     layout_activity = req.activity;
                     layout_activity_map = req.activity_map;
                     entities.reset();
+                    starts = find_map_starts(*pm, *layout);
                 }
                 if (!cache || cache->max_texture_dim != req.texture_cap) {
                     cache.emplace();
@@ -771,7 +775,7 @@ private:
                     cache->gbuffer_only = true;
                     cache->all_lods = true;
                 }
-                const auto center = req.center ? *req.center : map_focus(*layout);
+                const auto center = req.center ? *req.center : !starts.empty() ? starts.front().position : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
                 const size_t static_count = region.size();
                 const auto terrain = map_terrain_region(*layout, center, req.radius);
@@ -783,9 +787,18 @@ private:
                 auto entity_region = map_region(entities->models, center, req.radius);
                 for (auto& model : entity_region) region.push_back(std::move(model));
                 float extent = 1;
+                std::vector<float> distances;
                 for (const auto& st : region)
-                    for (const auto& r : st.rows)
-                        extent = std::max(extent, std::hypot(r[3] - center[0], r[7] - center[1], r[11] - center[2]));
+                    for (const auto& r : st.rows) {
+                        distances.push_back(std::hypot(r[3] - center[0], r[7] - center[1], r[11] - center[2]));
+                        extent = std::max(extent, distances.back());
+                    }
+                float typical = extent;
+                if (!distances.empty()) {
+                    const auto k = distances.begin() + std::ptrdiff_t(distances.size() * 8 / 10);
+                    std::nth_element(distances.begin(), k, distances.end());
+                    typical = std::max(1.0f, *k);
+                }
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
                     const auto all = load_map_lights(*pm, *layout);
@@ -818,6 +831,8 @@ private:
                     progress_.total = region.size() + terrain.size();
                     progress_.center = center;
                     progress_.extent = extent;
+                    progress_.typical = typical;
+                    progress_.start = starts.empty() || req.center ? std::nullopt : std::optional<MapStart>(starts.front());
                     progress_.lights = std::move(lights);
                     progress_.cubemaps = std::move(cubemaps);
                 }
@@ -1038,6 +1053,8 @@ public:
         TagHash activity;
         uint32_t activity_map = 0;
         std::array<float, 3> center{};
+        float typical = 0;              // Progress::typical
+        std::optional<MapStart> start;  // Progress::start
     };
     MapView map;
     bool map_scene = false;  // the live scene is a map region
@@ -1391,6 +1408,8 @@ public:
         const auto pr = map_worker.progress();
         if (pr.generation != map.generation) return;
         map.center = pr.center;
+        map.typical = pr.typical;
+        map.start = pr.start;
         if (pr.weather && map_weather != pr.weather) {
             map_weather = pr.weather;
             weather_states.assign(map_weather->controllers.size(), -1);
@@ -1427,6 +1446,9 @@ public:
             scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
             if (!map.framed && scene.loaded()) {
                 frame_scene();
+                if (map.start)
+                    info(std::format("カメラ: プレイヤー開始地点 (推定, 80802D32) ({:.1f}, {:.1f}, {:.1f}) + 目の高さ {:.1f} m (推定)", map.start->position[0],
+                                     map.start->position[1], map.start->position[2], kStartEyeHeight));
                 map.framed = true;
             }
         }
@@ -2409,6 +2431,27 @@ public:
 
     void frame_scene() {
         if (!scene.loaded()) return;
+        if (map_scene && map.start) {
+            // Standing at the player start, looking along its facing (eye height: estimate).
+            const auto f = map.start->forward();
+            const V3 eye{map.start->position[0], map.start->position[1], map.start->position[2] + kStartEyeHeight};
+            cam.radius = std::max(10.0f, map.typical);
+            cam.distance = cam.radius * 0.02f;
+            cam.yaw = std::atan2(-f[1], -f[0]);
+            cam.pitch = 0;
+            const V3 dir{std::cos(cam.yaw), std::sin(cam.yaw), 0};
+            cam.target = eye - dir * cam.distance;
+            cam.fly_speed = 8;
+            return;
+        }
+        if (map_scene && map.typical > 0) {
+            // A map without starts: around its geometry, not the far-off outliers (skyboxes).
+            cam.target = V3{map.center[0], map.center[1], map.center[2]};
+            cam.radius = map.typical;
+            cam.distance = map.typical * 1.2f;
+            cam.fly_speed = std::max(0.05f, map.typical * 0.3f);
+            return;
+        }
         cam.target = scene.center();
         cam.radius = scene.radius();
         cam.distance = scene.radius() / std::sin(20.0f * 3.14159265f / 180.0f) * 0.9f;

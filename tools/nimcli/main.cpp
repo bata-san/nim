@@ -823,8 +823,12 @@ int cmd_weather(PackageManager& pm, TagHash bubble) {
 
 // Node-table components of a map: by component type, how many, their payload sizes and the
 // classes of the tags they reference (survey for entities / gimmicks).
-int cmd_map_components(PackageManager& pm, TagHash bubble, uint32_t detail_type) {
-    const MapLayout map = load_map_layout(pm, bubble);
+int cmd_map_components(PackageManager& pm, TagHash bubble, uint32_t detail_type, TagHash activity = {}) {
+    std::vector<TagHash> extra;
+    if (!activity.is_none())
+        for (const auto& m : list_activity_maps(pm))
+            if (m.activity == activity && m.bubble == bubble) extra = load_activity_node_tables(pm, activity, m.bubble_name, m.activity_map);
+    const MapLayout map = load_map_layout(pm, bubble, extra);
     struct Stat { size_t n = 0; std::map<uint32_t, size_t> classes; std::vector<std::string> samples; };
     std::map<uint32_t, Stat> types;
     size_t nodes_total = 0;
@@ -1696,6 +1700,12 @@ int main(int argc, char** argv) {
                     std::println("  verified: {} phase/ambient tables, {} combined tables, {} instances, {} probes",
                                  tables.size(), layout.node_tables.size(), layout.instances, probes.size());
                 }
+                if (args.size() >= 2 && args[1] == "--starts") {
+                    const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+                    for (const auto& s : load_map_starts(pm, layout))
+                        std::println("  start {:08X} ({:.1f} {:.1f} {:.1f}) facing ({:.2f} {:.2f} {:.2f})", s.name, s.position[0], s.position[1],
+                                     s.position[2], s.forward()[0], s.forward()[1], s.forward()[2]);
+                }
             }
             return 0;
         }
@@ -1703,7 +1713,8 @@ int main(int argc, char** argv) {
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-components" && args.size() >= 2)
-            return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
+            return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0,
+                                      args.size() >= 4 ? TagHash(parse_hex(args[3])) : TagHash{});
         if (cmd == "map-shaders" && args.size() >= 2) return cmd_map_shaders(pm, TagHash(parse_hex(args[1])));
         if (cmd == "weather" && args.size() >= 2) return cmd_weather(pm, TagHash(parse_hex(args[1])));
         if (cmd == "texraw" && args.size() >= 2) return cmd_texraw(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);

@@ -535,6 +535,61 @@ std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>&
     return out;
 }
 
+std::vector<MapStart> load_map_starts(PackageManager& pm, const MapLayout& map) {
+    std::vector<MapStart> out;
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(t);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                if (r.u32_at(p - 4) == kClassStartComponent) {
+                    MapStart s;
+                    for (size_t k = 0; k < 4; ++k) s.rotation[k] = r.f32_at(e + k * 4);
+                    for (size_t k = 0; k < 3; ++k) s.position[k] = r.f32_at(e + 0x10 + k * 4);
+                    s.name = r.u32_at(p + 0x10);
+                    out.push_back(s);
+                    break;
+                }
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<MapStart> find_map_starts(PackageManager& pm, const MapLayout& map) {
+    auto out = load_map_starts(pm, map);
+    if (!out.empty()) return out;
+    // A bubble view has none of its own: the first activity on this bubble that has some.
+    for (const auto& m : list_activity_maps(pm)) {
+        if (m.bubble != map.bubble) continue;
+        try {
+            out = load_map_starts(pm, load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map)));
+        } catch (...) {
+            continue;
+        }
+        if (!out.empty()) return out;
+    }
+    return out;
+}
+
+std::array<float, 3> MapStart::forward() const {
+    // The node's local +X through its quaternion (x, y, z, w).
+    const float x = rotation[0], y = rotation[1], z = rotation[2], w = rotation[3];
+    return {1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)};
+}
+
 std::vector<const Terrain*> map_terrain_region(const MapLayout& map, std::array<float, 3> center, float radius) {
     std::vector<std::pair<float, const Terrain*>> found;
     for (const auto& t : map.terrains) {

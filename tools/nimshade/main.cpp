@@ -220,6 +220,17 @@ int run(int argc, char** argv) {
         } else std::println("map_view: bubble node tables only");
         MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
         is_map = true;
+        // Without --eye / --look, the camera stands at the activity's first player start (estimate).
+        const auto starts = find_map_starts(pm, map);
+        for (const auto& s : starts)
+            std::println("player start {:08X} at ({:.1f}, {:.1f}, {:.1f}) facing ({:.2f}, {:.2f}, {:.2f})", s.name, s.position[0], s.position[1],
+                         s.position[2], s.forward()[0], s.forward()[1], s.forward()[2]);
+        if (!starts.empty() && !eye_arg && !look_arg) {
+            const auto& s = starts.front();
+            const auto f = s.forward();
+            eye_arg = V3{s.position[0], s.position[1], s.position[2] + kStartEyeHeight};
+            look_arg = V3{eye_arg->x + f[0] * 10, eye_arg->y + f[1] * 10, eye_arg->z + f[2] * 10};
+        }
         if (heat_cascade || !weather_args.empty()) {
             const MapWeather weather = load_map_weather(pm, mesh_tag);
             std::println("weather: {} controller(s)", weather.controllers.size());

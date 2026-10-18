@@ -133,6 +133,21 @@ struct MapCubemap {
 std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& map);
 std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>& cubemaps, std::array<float, 3> center, float radius);
 
+// A player start of an activity (estimate): the nodes of component 80802D32, present only in the
+// activity node tables (Outpost: four nodes a few metres apart at (148, 52, -4.7), next to the two
+// 808035B8 nodes). Payload +0x00: a name hash. The node transform gives position and facing.
+inline constexpr uint32_t kClassStartComponent = 0x80802D32;
+inline constexpr float kStartEyeHeight = 1.7f;  // viewer eye above a start (estimate, not engine data)
+struct MapStart {
+    std::array<float, 3> position{};
+    std::array<float, 4> rotation{0, 0, 0, 1};  // quaternion x, y, z, w
+    uint32_t name = 0;
+    std::array<float, 3> forward() const;      // the node's +X in world space
+};
+std::vector<MapStart> load_map_starts(PackageManager& pm, const MapLayout& map);
+// The map's own starts, else those of the first activity on the same bubble that has some.
+std::vector<MapStart> find_map_starts(PackageManager& pm, const MapLayout& map);
+
 // ---- atmosphere ----------------------------------------------------------------------------
 // A map's sky / atmosphere: the node component 808084A0 (D2 SAtmosphereDataComponent layout,
 // payload = record + 0x10) and the sun path component 80808346. See docs/PROGRESS.md 3.2.

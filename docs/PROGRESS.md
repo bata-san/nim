@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (頭上の遮蔽、全域プローブの距離棄却修正、CSG 制限の撤回、エンティティのモーション、map/activity 選択)
+最終更新: 2026-10-18 (初期カメラ = 開始地点、頭上の遮蔽、全域プローブの距離棄却修正、CSG 制限の撤回、エンティティのモーション、map/activity 選択)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -22,6 +22,7 @@
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
 | 6c2 | 頭上の遮蔽 (cubemap_apply_sky_copy_ao_with_overhead_occlusion + 分散マップ) | 完了 (頭上深度は nim の描画 = 推定) | 「Overhead occlusion」コミット | §3.7.1。プローブ箱の外 (表面の約 78%) の空の光を屋根・船体の下で弱める |
+| 6c3 | 初期カメラをプレイヤー開始地点 (80802D32) に | 完了 (開始地点の同定と目の高さ = 推定) | 「Start the camera at the player start」コミット | §3.7.2。開始地点の無いマップは外れ値を除いて枠取り |
 | 6d | GUI マップのエンティティ表示・クラッシュ対策 | 完了 (UI 操作の実機検証は一部未) | 「GUI crash fixes and entities」コミット | §4。MapWorker に nimshade と同じモデル経路を追加 |
 | 6e | 透明描画の大気透過 LUT・当該フレーム入力・モーション | 実装済み (空オブジェクトの合成は未完) | §3.9 | 原シェーダーの LUT とリサイズの GPU 検証を追加。雲等の GUI 読込は未統合 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
@@ -380,8 +381,18 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
     render globals の全技法でバッファを読むのはスキニング・CMAA・SSR・SDSM・visibility_test・cubemap_dilate・sky irradiance だけで、該当なし。
   - 8080876A (80A79954) は照明ではない。生バッファ 80A7994A/4B (37/31 MB) の先頭はマジック 0xD6000012、格子幅 4.0、マップ AABB (−208,−384,−144)〜(720,512,384)。
     中身は 0x00/0xFF が約 45% を占める。524,288 スロットのハッシュ表と 28 個の AABB、8080876D の 17,258 個の AABB を伴う。
-    **4 m ボクセルの空間データ** (可視性・経路・音響などの CPU 側データと推測) で、GPU パスの入力にはならない。
+    **4 m ボクセルの空間データ** (可視性・経路・音響などの CPU 側データと推測。Alkahest の SUmbraTomeComponent に当たる Umbra tome の可能性) で、GPU パスの入力にはならない。
 - GUI「頭上の遮蔽」、nimshade `--no-overhead-occlusion`。
+
+### 3.7.2 初期カメラ = プレイヤー開始地点 (推定, 2026-10-18)
+- ノードコンポーネント **80802D32** (`kClassStartComponent`、`load_map_starts` / `find_map_starts`) はアクティビティのノード表にだけあり、
+  ペイロード +0x00 が名前ハッシュ、ノード変換 (+0x00 quat、+0x10 位置) がヨーだけの向きを持つ。
+  Marathon Deck (exp) は 3 点ずつの 2 群 (3 人クルー)、Outpost は (148, 52, −4.7) 付近の 4 点、Marsh は 7 点、Perimeter intro は 6 名前 × 2 群。
+  スポーン地点と推定 (Marathon のクラス名は未確認。Alkahest SRespawnPoints 80808CB7 は Marathon では globals に 1 件だけ)。
+- GUI はマップ読込時 (と F キー) に最初の開始地点の目の高さ 1.7 m (推定) から向き (+X) を見る。範囲を絞った読込もそこを中心にする。
+  バブル単体の選択では同じバブルのアクティビティの開始地点を借りる。開始地点が無いマップは配置距離の 80 パーセンタイルで枠取りする
+  (以前は最遠の配置 = スカイボックスまでの距離で、全域読込だと数 km 先に飛ばされた)。
+- nimshade は `--eye` / `--look` が無いときに同じ開始地点から描画する。`nimcli activities --starts` で一覧。
 
 ### 3.8 TAA (実装済み, `src/render/game_post.cpp`)
 - `resolve_taa_use_clipping_use_ycocg` (80A74DA3, PS 80A74DA0, VS 80A7430D 全画面)。extern 0x6A: +0x00..+0x0C = cb0[3..6] 履歴の重み、
