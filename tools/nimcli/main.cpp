@@ -870,6 +870,44 @@ int cmd_map_components(PackageManager& pm, TagHash bubble, uint32_t detail_type)
     return 0;
 }
 
+// The shaders a map's statics and terrain draw with: per shader, the techniques using it and its
+// SRV bindings (which per-vertex / per-instance buffers the game feeds them).
+int cmd_map_shaders(PackageManager& pm, TagHash bubble) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    std::map<uint32_t, size_t> techniques;  // technique -> parts
+    for (const auto& st : map.statics) {
+        try {
+            const StaticMesh mesh = load_static_mesh(pm, st.mesh);
+            for (TagHash t : mesh.techniques) if (!t.is_none()) techniques[t.value] += st.rows.size();
+        } catch (...) {}
+    }
+    for (const auto& tr : map.terrains)
+        for (const auto& p : tr.parts) if (!p.technique.is_none()) techniques[p.technique.value] += 1;
+    struct Use { size_t techniques = 0, weight = 0; std::string bindings; };
+    std::map<std::pair<int, uint32_t>, Use> shaders;
+    for (const auto& [tv, weight] : techniques) {
+        Technique t;
+        try { t = load_technique(pm, TagHash(tv)); } catch (...) { continue; }
+        for (ShaderStage s : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+            const TagHash sh = t.stage(s).shader;
+            if (sh.is_none()) continue;
+            auto& u = shaders[{int(s), sh.value}];
+            if (!u.techniques++) {
+                try {
+                    for (const auto& b : shader_bindings(load_shader_bytecode(pm, sh)))
+                        if (b.type == BindingType::Srv || b.type == BindingType::Uav)
+                            u.bindings += std::format(" {}{}-{}:k{}", b.type == BindingType::Srv ? "t" : "u", b.lower, b.upper, int(b.kind));
+                } catch (const std::exception& ex) { u.bindings = std::string(" error ") + ex.what(); }
+            }
+            u.weight += weight;
+        }
+    }
+    std::println("{} statics, {} terrain patches, {} techniques, {} shaders", map.statics.size(), map.terrains.size(), techniques.size(), shaders.size());
+    for (const auto& [key, u] : shaders)
+        std::println("{} {:08X} techniques {:>4} instances {:>7}{}", key.first == int(ShaderStage::Vertex) ? "VS" : "PS", key.second, u.techniques, u.weight, u.bindings);
+    return 0;
+}
+
 // Script instances (8080BADB) of a map's package family: the classes they reference, and the
 // ones that place a dynamic model (survey for entities / gimmicks).
 int cmd_map_entities(PackageManager& pm, TagHash bubble) {
@@ -1666,6 +1704,7 @@ int main(int argc, char** argv) {
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-components" && args.size() >= 2)
             return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
+        if (cmd == "map-shaders" && args.size() >= 2) return cmd_map_shaders(pm, TagHash(parse_hex(args[1])));
         if (cmd == "weather" && args.size() >= 2) return cmd_weather(pm, TagHash(parse_hex(args[1])));
         if (cmd == "texraw" && args.size() >= 2) return cmd_texraw(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
