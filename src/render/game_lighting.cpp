@@ -1789,8 +1789,11 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     // The lookups' phase is (1 + g^2 + 2 g dot(ray, +0x110))^-1.5: +0x110 points away from the sun.
     const V3 sun = sun_toward(p);
     ext_.estimate(A, 0x110, float4{-sun.x, -sun.y, -sun.z, 0}, "sun light direction (map sun path, time of day)");
-    ext_.estimate(A, 0x130, froxels_on(p) ? float4{kFroxelNear, 0, kFroxelCurve, 1 / (kFroxelFar - kFroxelNear)} : float4{0, 0, 1, 0},
-                  "single estimated froxel depth mapping (engine cascades unknown)");
+    // The original shading PS subtracts .y before applying the analytic distance fog.
+    // The volume has already integrated that fog over its depth range: starting the
+    // analytic term at zero applies it a second time in front of the volume's end.
+    ext_.estimate(A, 0x130, froxels_on(p) ? float4{kFroxelNear, kFroxelFar, kFroxelCurve, 1 / (kFroxelFar - kFroxelNear)} : float4{0, 0, 1, 0},
+                  "single estimated froxel depth mapping; analytic fog starts beyond volume (engine cascades unknown)");
     ext_.set(A, 0x150, ch(0x0A));  // sun_glow_color
     ext_.note_estimate("extern 7 +0x150 = sun_glow_color", copied);
     auto glow_g = [](float shape) { return shape > 1 ? 1 - 1 / shape : 0.0f; };
@@ -1804,6 +1807,13 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     constexpr std::string_view km = "fog_density_lookup_start / _end in km, the pass reads metres";
     est(0x178, lut_start * 1000.0f, km);
     est(0x17C, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f, "fog_density_lookup_end in km (start + 1 when unset: avoids 0/0)");
+    // The inscatter CS also normalizes its second density ramp with these two
+    // bounds. A missing block used to supply (0,0), causing a 1/0 and 0/0 in TFX.
+    // Additional modulation is disabled in extern 0x65; use the same finite range
+    // until the engine's second ramp producer is identified.
+    est(0x180, lut_start * 1000.0f, "second froxel density ramp: same finite lookup range (engine source unknown)");
+    est(0x184, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f,
+        "second froxel density ramp end (engine source unknown; avoids zero denominator)");
     ext_.set(A, 0x190, ch(0x16));  // fog_decay_color for transparent spectral attenuation
     ext_.note_estimate("extern 7 +0x190 = fog_decay_color", copied);
     est(0x1A0, 1.0f, "fog decay color multiplier (engine value unknown)");

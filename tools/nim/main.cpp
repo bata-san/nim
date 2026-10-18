@@ -2361,7 +2361,8 @@ public:
             ImGui::SetItemTooltip("既定では全域の原プローブ照明を描画。オンでカメラ距離によるフェードを使用 (エンジンの判定条件は未解明)。各プローブの空間範囲・色・強度は元データのまま");
             {
                 bool own = light.time_of_day < 0;
-                if (ImGui::Checkbox("マップの時刻", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
+                if (ImGui::Checkbox("初期時刻を使う (推定)", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
+                ImGui::SetItemTooltip("太陽パス成分 +0x08 の値を時刻と仮定。アクティビティ実行時の開始時刻は未特定のため、ゲーム本来の時刻を保証しない");
                 ImGui::BeginDisabled(own);
                 float t = own ? game_lighting.default_time_of_day() : light.time_of_day;
                 const int minutes = int(t * 24 * 60 + 0.5f);

@@ -1,6 +1,7 @@
 // Original density and front-to-back atmosphere integration CS. Runtime grid/cascade
 // parameters are explicit estimates; the shaders and channel expressions are unchanged.
 #include "nim/render/game_lighting.hpp"
+#include <cmath>
 #include <cstring>
 #include <format>
 
@@ -77,10 +78,14 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     ext_.set(S, 0x30, float4{shadowed ? -size : 0, 0, 0, 0});
     ext_.set_texture(S, 0x00, shadowed ? shadow->depth.Get() : unshadowed_.Get(),
                      shadowed ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UNORM);
-    const bool covered = overhead_ && overhead_->valid && overhead_->mask;
-    ext_.set_texture(I, 0x00, covered ? overhead_->mask.Get() : unshadowed_.Get());
-    ext_.set(I, 0x10, covered ? overhead_->scale : float4{});
-    ext_.set(I, 0x20, covered ? overhead_->offset : float4{});
+    // Interior (extern 81) and general overhead occlusion (extern 82) are
+    // distinct engine inputs: render_overhead_visibility_map_* has separate
+    // main/interior/occlusion variants. Rain depth is not an interior map.
+    // Feeding it here classifies every ray below any outdoor geometry as indoor
+    // and integrates the much denser indoor fog across the courtyard.
+    ext_.estimate_texture(I, 0x00, unshadowed_.Get(), "interior height map producer unknown: no authored interior classification");
+    ext_.estimate(I, 0x10, float4{}, "interior height map unavailable: world depth 0 compares in front of clear depth 1");
+    ext_.set(I, 0x20, float4{});
     const V3 sun = sun_toward(p);
     ext_.set_channel("sun_light_direction", float4{sun.x, sun.y, sun.z, 0});
 
@@ -95,18 +100,28 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     };
     const auto cb12 = upload(view), cb13 = upload(frame);
     const ScopeBufferFn scopes = [&](ShaderStage, uint32_t reg) { return reg == 12 ? cb12 : reg == 13 ? cb13 : 0; };
+    auto finite_constants = [](const GamePipeline& pipeline) {
+        const auto& values = pipeline.stage_constants(0);
+        for (size_t row = 0; row < values.size(); ++row)
+            for (size_t component = 0; component < 4; ++component)
+                if (!std::isfinite(values[row][component]))
+                    throw std::runtime_error(std::format("Atmosphere {}: non-finite TFX cb0[{}][{}]",
+                                                         pipeline.tag().str(), row, component));
+    };
     Gpu::barrier(cl, unshadowed_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     Gpu::barrier(cl, no_atmosphere_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
-    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     Gpu::barrier(cl, froxel_density_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    (shadowed ? froxel_density_ : froxel_density_no_sun_).dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, kFroxelDepth);
+    auto& density = shadowed ? froxel_density_ : froxel_density_no_sun_;
+    density.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, kFroxelDepth);
+    finite_constants(density);
     Gpu::barrier(cl, froxel_density_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     Gpu::barrier(cl, froxel_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // One xy thread walks the complete depth column in increasing z.
-    (shadowed ? froxel_inscatter_ : froxel_inscatter_no_sun_).dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
+    auto& inscatter = shadowed ? froxel_inscatter_ : froxel_inscatter_no_sun_;
+    inscatter.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
+    finite_constants(inscatter);
     Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
-    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     Gpu::barrier(cl, no_atmosphere_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, unshadowed_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -116,6 +131,6 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
                                     "sun-shadow producer unavailable: original no_sun CS, no sun in-scatter");
     ext_.note_estimate(std::format("atmosphere froxels {}x{}x{}: one cascade, {}..{}m, curve {}, no temporal history",
                                   width, height, kFroxelDepth, kFroxelNear, kFroxelFar, kFroxelCurve),
-                       "original density/inscatter CS; engine cascade size, range, history, density modulation and shadow filter unknown; nim sun/overhead depth");
+                       "original density/inscatter CS; engine cascade size, range, history, density modulation and shadow filter unknown; nim sun depth; interior map unavailable");
 }
 } // namespace nim

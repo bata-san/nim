@@ -685,6 +685,21 @@ int run(int argc, char** argv) {
                 i ? "," : "", p.center[0], p.center[1], p.center[2], p.extents[0], p.extents[1], p.extents[2],
                 p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3]);
         }
+        f << "],\"atmosphere\":[";
+        bool first_atmosphere = true;
+        for (auto [offset, name] : {std::pair{0xE0u, "lighting-sky-far.bin"},
+                                   std::pair{0xF0u, "lighting-sky-near.bin"},
+                                   std::pair{0x108u, "lighting-froxels.bin"}}) {
+            auto* resource = gl.externs().texture(ext::Atmosphere, offset).resource;
+            if (!resource || !lp.atmosphere || (offset == 0x108 && !lp.froxel_fog)) continue;
+            const auto desc = resource->GetDesc();
+            const auto state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON);
+            save(name, gpu.read_texture(resource, state, 8));
+            f << std::format("{}{{\"file\":\"{}\",\"width\":{},\"height\":{},\"depth\":{},\"format\":{}}}",
+                first_atmosphere ? "" : ",", name, desc.Width, desc.Height, desc.DepthOrArraySize, int(desc.Format));
+            first_atmosphere = false;
+        }
         f << "]}";
         if (!f) throw std::runtime_error("lighting metadata failed");
     }
@@ -745,6 +760,7 @@ int run(int argc, char** argv) {
                 if (pixels.size() != plane * vd.DepthOrArraySize * 8) throw std::runtime_error("Incomplete froxel volume readback");
                 const auto* data = reinterpret_cast<const uint16_t*>(pixels.data());
                 float previous_min = 1;
+                const bool no_interior = ext.get_v(81, 0x10) == float4{};
                 for (uint32_t z = 0; z < vd.DepthOrArraySize; ++z) {
                     float slice_min = 1;
                     for (size_t xy = 0; xy < plane; ++xy) {
@@ -753,6 +769,8 @@ int run(int argc, char** argv) {
                             const float v = half(data[n+c]);
                             if (!std::isfinite(v) || v < 0 || (c < 2 && v > 1.002f))
                                 throw std::runtime_error("Invalid froxel transmittance / in-scatter");
+                            if (no_interior && c == 1 && std::abs(v - 1) > 0.002f)
+                                throw std::runtime_error("Indoor fog was integrated without an interior height map");
                         }
                         const float transmittance = half(data[n]);
                         if (z && transmittance > half(data[n-plane*4]) + 0.002f)
