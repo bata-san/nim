@@ -74,7 +74,7 @@ int run(int argc, char** argv) {
     bool warp = false, game = false;
     float time_of_day = -1;
     bool verify_frame_inputs = false;
-    bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, print_channels = false;
+    bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     float clip_frame = 0;
     float material_time = 0;
@@ -87,6 +87,7 @@ int run(int argc, char** argv) {
     bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false;
     std::optional<size_t> probe_index;
     bool dump_probe_mask = false;
+    bool dump_lighting = false;
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
     std::optional<std::pair<size_t, size_t>> entity_range;
@@ -110,6 +111,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
+        else if (args[i] == "--dump-lighting") dump_lighting = true;
         else if (args[i] == "--verify-static-motion") verify_static_motion = true;
         else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
         else if (args[i] == "--entity-range" && i + 1 < args.size()) {
@@ -152,6 +154,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-atmosphere") no_atmosphere = true;
         else if (args[i] == "--no-environment") no_environment = true;
         else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
+        else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
@@ -171,7 +174,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
         return 2;
     }
     if (install.empty()) {
@@ -422,6 +425,7 @@ int run(int argc, char** argv) {
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
+    lp.overhead_occlusion = !no_overhead_occlusion;
     lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
     lp.post = !no_post;
@@ -457,6 +461,7 @@ int run(int argc, char** argv) {
     };
     if (game) {
         gl.init(pm, gpu);
+        if (rain.valid) gl.set_overhead_occlusion(&rain);
         if (!weather_channels.empty()) gl.set_global_channels(weather_channels);
         std::println("game shading: technique {}", gl.shading_technique().str());
         if (atmosphere.valid()) {
@@ -536,6 +541,7 @@ int run(int argc, char** argv) {
             throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
+        std::println("view tables: {} unique, {} reused", gpu.transient_table_count(), gpu.transient_table_hits());
         if (lp.post && gl.post_ready())
             std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
         if (lp.ssao && gl.ambient_occlusion()) {
@@ -644,6 +650,28 @@ int run(int argc, char** argv) {
 
     // Coverage: depth > 0 where something was drawn (reversed-Z, cleared to 0).
     auto depth = gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
+    if (dump_lighting) {
+        auto save = [&](const char* name, const std::vector<uint8_t>& bytes) {
+            std::ofstream f(out_dir / name, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            if (!f) throw std::runtime_error("lighting dump failed");
+        };
+        save("lighting-depth.bin", depth);
+        save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        std::ofstream f(out_dir / "lighting.json");
+        f << std::format("{{\"width\":{},\"height\":{},\"vp\":[", width, height);
+        for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) f << std::format("{}{:.9g}", c || r ? "," : "", vm.vp_abs.c[c][size_t(r)]);
+        f << "],\"probes\":[";
+        for (size_t i = 0; i < region_cubemaps.size(); ++i) {
+            const auto& p = *region_cubemaps[i];
+            f << std::format("{}{{\"center\":[{},{},{}],\"extents\":[{},{},{}],\"rotation\":[{},{},{},{}]}}",
+                i ? "," : "", p.center[0], p.center[1], p.center[2], p.extents[0], p.extents[1], p.extents[2],
+                p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3]);
+        }
+        f << "]}";
+        if (!f) throw std::runtime_error("lighting metadata failed");
+    }
     if (dump_probe_mask) {
         if (!probe_index || region_cubemaps.size() != 1) throw std::runtime_error("--dump-probe-mask requires one --probe-index");
         const auto& m = *region_cubemaps[0];

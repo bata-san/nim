@@ -6,6 +6,9 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <array>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,12 +95,18 @@ public:
     // `n` consecutive shader-visible descriptors (srv() indices), valid for the current frame:
     // per-draw tables, so draws recorded into one list never overwrite each other's views.
     uint32_t transient_descriptors(uint32_t n);
+    // Immutable view tables can be shared by draws with identical resolved resources/views.
+    // Entries belong to a fence-protected frame region, never an in-flight mutable table.
+    std::optional<uint32_t> find_transient_table(const std::vector<uint64_t>& key);
+    void cache_transient_table(std::vector<uint64_t> key, uint32_t first, std::span<ID3D12Resource* const> resources);
+    size_t transient_table_hits() const { return table_hits_; }
+    size_t transient_table_count() const { return table_cache_[table_frame_].size(); }
     // This frame's use of the per-frame regions (descriptors, upload bytes).
     uint32_t transient_used() const { return transient_offset_ - (transient_end_ - kTransientPerFrame); }
     size_t dynamic_used() const { return dynamic_offset_ - (dynamic_end_ - kDynamicPerFrame); }
     // Work recorded on the immediate list only and flushed can hand its descriptors back.
     uint32_t transient_mark() const { return transient_offset_; }
-    void transient_rewind(uint32_t mark) { transient_offset_ = mark; }
+    void transient_rewind(uint32_t mark);
 
     ComPtr<ID3D12Resource> buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);
@@ -135,6 +144,10 @@ private:
     uint8_t* dynamic_cpu_ = nullptr;
     size_t dynamic_offset_ = 0, dynamic_end_ = 0;
     uint32_t transient_first_ = 0, transient_offset_ = 0, transient_end_ = 0;
+    struct CachedTable { uint32_t first; std::vector<ComPtr<ID3D12Resource>> resources; };
+    std::array<std::map<std::vector<uint64_t>, CachedTable>, kFramesInFlight> table_cache_;
+    uint32_t table_frame_ = 0;
+    size_t table_hits_ = 0;
     static constexpr uint32_t kTransientPerFrame = 1 << 17;  // a map frame with ~1300 lights uses ~16k
     std::string adapter_;
     static constexpr size_t kDynamicPerFrame = 128 << 20;  // ~12 MB for the same frame

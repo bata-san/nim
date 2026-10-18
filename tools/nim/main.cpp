@@ -1028,7 +1028,7 @@ public:
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
-        float radius = 50;  // start with a local region; the whole map can exhaust GPU and system memory
+        float radius = kUnlimited;  // default to the user's whole-world workflow
         bool lights_set = false;
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
@@ -1855,6 +1855,7 @@ public:
                 scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
             }
             scene.set_rain_occlusion(map_scene && rain.valid ? &rain : nullptr);
+            game_lighting.set_overhead_occlusion(map_scene && rain.valid ? &rain : nullptr);
             scene.render_gbuffer(gpu, cl, gb, vm);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
@@ -2323,6 +2324,8 @@ public:
             ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
             ImGui::Checkbox("空の環境光", &light.sky_ambient);
             ImGui::SetItemTooltip("ゲームの空半球マップ (hemisphere_sky_color_generate ほか) と cubemap_apply_sky_copy_ao。日陰の環境光");
+            ImGui::Checkbox("頭上の遮蔽", &light.overhead_occlusion);
+            ImGui::SetItemTooltip("cubemap_apply_sky_copy_ao_with_overhead_occlusion: 屋根の下などで空の環境光を弱める。真上からの深度は nim の描画 (推定)、分散マップはゲームの sample_and_blur_variance_map_9x9");
             ImGui::Checkbox("プローブの距離フェード (推定)", &light.probe_distance_fade);
             ImGui::SetItemTooltip("既定では全域の原プローブ照明を描画。オンでカメラ距離によるフェードを使用 (エンジンの判定条件は未解明)。各プローブの空間範囲・色・強度は元データのまま");
             {

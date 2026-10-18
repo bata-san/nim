@@ -182,7 +182,6 @@ private:
     std::vector<Stage> stages_;
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3D12PipelineState> pso_;
-    uint32_t srv_total_ = 0;  // descriptors per draw (every stage)
 };
 
 // Runs a scope's bytecode for one stage into a cbuffer (cbuffer_init patched by the program).
@@ -238,6 +237,9 @@ public:
     // shading pass fogs with them and the `sky` pipeline draws the background. nullptr clears.
     void set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* atmosphere);
     void clear_atmosphere() { atm_ = {}; atm_notes_.clear(); }
+    // The map seen from straight above (StaticMeshScene::render_rain_occlusion) for the sky
+    // ambient's overhead occlusion; must outlive the frames rendered with it. nullptr clears.
+    void set_overhead_occlusion(const RainOcclusion* top) { overhead_ = top; }
     bool has_atmosphere() const { return atm_.valid; }
     const std::vector<std::string>& atmosphere_notes() const { return atm_notes_; }
     float default_time_of_day() const { return atm_.valid ? atm_.data.default_time : 0.5f; }
@@ -419,6 +421,16 @@ private:
     bool sky_ambient_on(const LightingParams& p) const;
     void render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl);
     GamePipeline hemi_sky_, hemi_copy_, hemi_down_, sky_apply_;
+    // Overhead occlusion: extern 82 +0x08, the variance map of the top-down depth
+    // (sample_and_blur_variance_map_9x9), read by cubemap_apply_sky_copy_ao_with_overhead_occlusion.
+    bool overhead_occlusion_on(const LightingParams& p) const;
+    void prepare_overhead_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl);
+    GamePipeline sky_apply_overhead_, overhead_vsm_;
+    ExternStore overhead_ext_;
+    ComPtr<ID3D12Resource> overhead_vsm_tex_;  // R32G32F (mean depth, mean depth^2), 1/4 of the source
+    const RainOcclusion* overhead_ = nullptr;
+    size_t overhead_items_ = 0;
+    float4 overhead_scale_{}, overhead_offset_{};
     static constexpr uint32_t kHemiSize = 256, kHemiMips = 9, kHemiFace = 128;
     ComPtr<ID3D12Resource> hemi_, hemi_face_;  // RGBA16F: the mirror-ball map (9 mips), one cube face
     ComPtr<ID3D12DescriptorHeap> hemi_rtv_heap_;  // hemisphere mips 0..8, then the face

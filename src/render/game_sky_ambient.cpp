@@ -56,7 +56,9 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
         GamePipeline::Options opt{kF16, false, {kF16}};
         opt.drop_extra_targets = true;
         load(sky_apply_, "cubemap_apply_sky_copy_ao", opt);
+        load(sky_apply_overhead_, "cubemap_apply_sky_copy_ao_with_overhead_occlusion", opt);
     }
+    load(overhead_vsm_, "sample_and_blur_variance_map_9x9", {});
     ID3D12Device* dev = gpu.device();
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
@@ -86,7 +88,8 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
 }
 
 void GameLighting::release_sky_ambient(Gpu& gpu) {
-    for (GamePipeline* gp : {&hemi_sky_, &hemi_copy_, &hemi_down_, &sky_apply_}) gp->release(gpu);
+    for (GamePipeline* gp : {&hemi_sky_, &hemi_copy_, &hemi_down_, &sky_apply_, &sky_apply_overhead_, &overhead_vsm_}) gp->release(gpu);
+    overhead_vsm_tex_.Reset();
     hemi_.Reset();
     hemi_face_.Reset();
     hemi_rtv_heap_.Reset();
@@ -95,6 +98,57 @@ void GameLighting::release_sky_ambient(Gpu& gpu) {
 bool GameLighting::sky_ambient_on(const LightingParams& p) const {
     return atm_.valid && p.atmosphere && p.sky_ambient && hemi_ && hemi_sky_.loaded() && hemi_copy_.loaded() && hemi_down_.loaded() &&
            sky_apply_.loaded();
+}
+
+// Overhead occlusion. cubemap_apply_sky_copy_ao_with_overhead_occlusion fades the sky's light under
+// cover: it reconstructs the pixel's position from the device depth (Deferred +0x98, View +0x2A0),
+// moves it along the normal and compares its top-down depth (extern 82 +0x10 / +0x20 xyz:
+// world -> (u, v, standard depth), lower = higher up) with a variance map (extern 82 +0x08: mean
+// depth and mean depth^2, Chebyshev's bound). Covered, its AO term becomes AO^2 (1 - 0.5 ch 0xB7)
+// (ch 0xB7 = 1.7 by default, so 15 % of the sky light). The .w of +0x10 / +0x20 are the uv the
+// edge fade ends at. The engine's variance map comes from sample_and_blur_variance_map_9x9:
+// 4x4 source texels per output (mean, mean square) then a 9x9 binomial blur (extern 38 t0 +0x00,
+// +0xD0 = (source offset, source size) with wrap-around, u0 +0x30), 8x8 groups.
+bool GameLighting::overhead_occlusion_on(const LightingParams& p) const {
+    return p.overhead_occlusion && overhead_ && overhead_->valid && overhead_->mask && overhead_->top.size >= 32 &&
+           sky_apply_overhead_.loaded() && overhead_vsm_.loaded();
+}
+
+void GameLighting::prepare_overhead_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
+    const RainOcclusion& top = *overhead_;
+    const uint32_t source = top.top.size, size = source / 4;
+    constexpr auto kVsm = DXGI_FORMAT_R32G32_FLOAT;
+    const bool fresh = !overhead_vsm_tex_ || overhead_vsm_tex_->GetDesc().Width != size;
+    if (fresh)
+        overhead_vsm_tex_ = gpu.texture2d(size, size, kVsm, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+    const bool same = !fresh && overhead_items_ == top.items && overhead_scale_ == top.scale && overhead_offset_ == top.offset;
+    if (!same) {
+        constexpr uint8_t kInput = 0x26;
+        constexpr auto kPs = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        constexpr auto kAll = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        overhead_ext_.set_texture(kInput, 0x00, top.mask.Get(), DXGI_FORMAT_R32_FLOAT);
+        overhead_ext_.set(kInput, 0xD0, float4{0, 0, float(source), float(source)});
+        overhead_ext_.set_texture(kInput, 0x30, overhead_vsm_tex_.Get(), kVsm);
+        Gpu::barrier(cl, top.mask.Get(), kPs, kAll);
+        Gpu::barrier(cl, overhead_vsm_tex_.Get(), kPs, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const ScopeBufferFn none = [](ShaderStage, uint32_t) -> D3D12_GPU_VIRTUAL_ADDRESS { return 0; };
+        overhead_vsm_.dispatch(gpu, cl, overhead_ext_, none, (size + 7) / 8, (size + 7) / 8, 1);
+        Gpu::barrier(cl, overhead_vsm_tex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kPs);
+        Gpu::barrier(cl, top.mask.Get(), kAll, kPs);
+        overhead_items_ = top.items;
+        overhead_scale_ = top.scale;
+        overhead_offset_ = top.offset;
+    }
+    constexpr uint8_t kOverhead = 82;
+    ext_.set_texture(kOverhead, 0x00, top.mask.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set_texture(kOverhead, 0x08, overhead_vsm_tex_.Get(), kVsm);
+    ext_.set(kOverhead, 0x10, float4{top.scale[0], top.scale[1], top.scale[2], 1});
+    ext_.set(kOverhead, 0x20, float4{top.offset[0], top.offset[1], top.offset[2], 1});
+    ext_.note_estimate(std::format("overhead occlusion: nim's {}^2 top-down depth of the loaded scene as extern 82 +0x00, "
+                                   "its {}^2 variance map (the engine's sample_and_blur_variance_map_9x9) as +0x08, edge fade at uv 1",
+                                   source, size),
+                       "the engine's overhead occlusion render (its extent, resolution and geometry) is not in game data");
 }
 
 // Runs after render_sky_lookups (extern 7 +0x40 / +0x58 hold the far lookup set, as the sky

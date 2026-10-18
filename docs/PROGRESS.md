@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (全域プローブの距離棄却修正、CSG 制限の撤回、エンティティのモーション、map/activity 選択)
+最終更新: 2026-10-18 (頭上の遮蔽、全域プローブの距離棄却修正、CSG 制限の撤回、エンティティのモーション、map/activity 選択)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -21,6 +21,7 @@
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
 | 6b | マップ環境 (太陽・環境光・霧の時刻カーブ = グローバルチャンネル式) | 完了 | 同上 | §3.6 |
 | 6c | 空の環境光 (sky hemisphere + cubemap_apply_sky_copy_ao) = 日陰が黒い問題の修正 | 完了 (地面の照り返し・半球の霧/色調は未) | 「Sky ambient」「Cubemap volume bounds」コミット | §3.7 (箱の境界も修正) |
+| 6c2 | 頭上の遮蔽 (cubemap_apply_sky_copy_ao_with_overhead_occlusion + 分散マップ) | 完了 (頭上深度は nim の描画 = 推定) | 「Overhead occlusion」コミット | §3.7.1。プローブ箱の外 (表面の約 78%) の空の光を屋根・船体の下で弱める |
 | 6d | GUI マップのエンティティ表示・クラッシュ対策 | 完了 (UI 操作の実機検証は一部未) | 「GUI crash fixes and entities」コミット | §4。MapWorker に nimshade と同じモデル経路を追加 |
 | 6e | 透明描画の大気透過 LUT・当該フレーム入力・モーション | 実装済み (空オブジェクトの合成は未完) | §3.9 | 原シェーダーの LUT とリサイズの GPU 検証を追加。雲等の GUI 読込は未統合 |
 | 7 | 検証 (nimshade レンダー比較, テスト), コミット, push, リリース v0.4.0 | 各段で随時 | — | リリース zip は exe と README のみ |
@@ -351,6 +352,29 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - 残り: CTRL 建物の外壁の一部は屋内用ボリューム (中心 131.7, −38.1, −24.0、プローブ 18×18×8) の内側にあり、焼き込み値が
   0.01〜0.03 (端の列も暗い) なのでそこだけ暗い。データ通りの結果だが、ゲームでそう見えるかは未確認。
 
+### 3.7.1 頭上の遮蔽 (overhead occlusion, 2026-10-18)
+ユーザー指示 (原文):「composit_game.pngの壁の一部が暗いけど、この暗さがゲーム本来の色合いだから、こういうライトプローブを探して全部使えるようにして」
+- 調査: `nimshade --dump-lighting` + `analyze_probe_coverage.py` で、Outpost の CTRL 視点の表面のうち 313 個の原プローブ箱に入るのは約 22%。
+  プローブ箱は総体積 0.69M m³ で建物内・地表付近だけ (最大 97×61×15 グリッド)。2,441 ノードテーブル全 31 コンポーネント型も確認したが、拡散プローブの追加クラスは無い。
+  箱の外の拡散光は空の環境光だけで、nim は遮蔽なしの `cubemap_apply_sky_copy_ao` を使っていたため、庇や船体の下でも空の光が全量入り明るすぎた。
+- エンジンの変種 **`cubemap_apply_sky_copy_ao_with_overhead_occlusion`** (80A74C5E, PS 80A74C5A) を実装。
+  - 入力: Deferred +0x98 (デバイス深度) と View +0x2A0 で画素位置を復元し、法線方向へずらす。それを extern 82 +0x10/+0x20 (xyz: ワールド → (u, v, 標準深度)。permute 1A) で真上からの座標にする。
+  - 判定: **extern 82 +0x08 = 分散マップ** (平均深度, 平均深度²) とチェビシェフ不等式で比べる。
+  - 遮蔽時: AO 項が AO²·(1 − 0.5·ch 0xB7) になる。**ch 0xB7 の既定値は 1.7** なので、屋根の下では空の光が 15%。
+  - 縁: +0x10/+0x20 の .w は縁フェードの uv 上限で、cb0[30] = 0.9·w + 0.05。拡散 o0・鏡面 o1 の両方に掛かる。
+- 分散マップはエンジンの **`sample_and_blur_variance_map_9x9`** (CS 80A746EA) をそのまま使う。
+  - 処理: 4×4 テクセル → 1 テクセルの (平均, 二乗平均) に縮め、9×9 二項ブラーを掛ける。8×8 グループ。
+  - 入力: extern 38 t0 +0x00、+0xD0 = (オフセット, ソースサイズ)・端は折り返し。出力は u0 +0x30。
+- ソースの真上からの深度は nim の雨遮蔽マップ (`render_rain_occlusion`: 4096²・標準深度、extern 80 と同じ規約) を流用する。分散マップは 1024² R32G32F。
+  - extern 82 +0x00 にマスク、+0x08 に分散マップ、.w = 1 を入れる。エンジン側の頭上遮蔽描画 (範囲・解像度・対象形状) は推定として一覧に出す。
+  - シーンの item 数か変換が変わったときだけ作り直す。
+- 他の頭上系パイプライン (`render_overhead_visibility_map_*_for_screen`、`copy_texture_compute_overhead_visibility_merge`、extern 81 interior) は未使用。
+- 結果 (outpost 標準視点 1280×720): 船体・庇の下の壁と地面が暗くなり、屋根上と日向は不変。シーン輝度は 0.121 → 0.105 (AE が補正)。広域俯瞰 (半径 250 m) でも境界の破綻は無し。
+- 未解明: 静的インスタンス変換 (0x60 バイト) +0x4C の単調増加オフセット (例: 801 頂点 × 4 B 刻み、最大 98 MB)。
+  これは 8080876A (80A79954: 生バッファ 37/31/0.3 MB + 524,288 スロットのハッシュ表 + 28 個の AABB) と対応する頂点単位の焼き込みデータと推測。
+  ただし通常の静的 VS (例 80AE8039) は t2 しか読まず未使用。D2 の SStaticAmbientOcclusion 相当かは未確認。
+- GUI「頭上の遮蔽」、nimshade `--no-overhead-occlusion`。
+
 ### 3.8 TAA (実装済み, `src/render/game_post.cpp`)
 - `resolve_taa_use_clipping_use_ycocg` (80A74DA3, PS 80A74DA0, VS 80A7430D 全画面)。extern 0x6A: +0x00..+0x0C = cb0[3..6] 履歴の重み、
   +0x10 = cb0[7] 輝度差の閾値、+0x18/+0x1C 入力サイズ (cb0[9])、+0x20/+0x24 解像度 (cb0[14] = これ / View サイズ)、
@@ -382,6 +406,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 
 ## 4. 既知の未解決・注意
 - README と `docs/RENDERING.md` 冒頭を現状に更新済み。RENDERING の後半には過去の解析メモが残るため、状態はこの表を優先する。
+- 同一フレーム内で解決済みのビューが完全一致する GamePipeline の SRV/UAV テーブルは共有する (`Gpu::find_transient_table`。キー = スロット・種別・リソース・形式・要素範囲)。フレーム領域の再利用と `transient_rewind` でキャッシュは破棄。nimshade は `view tables: N unique, M reused` を表示。`--dump-lighting` はライトバッファ・深度・プローブ箱を `out/` に出し、`tools/re/analyze_probe_coverage.py` が表面のプローブ箱カバー率を出す (Outpost CTRL 視点で表面の約 22%)。GUI のマップ範囲の既定は「全域」。
 - 1 フレームの一時領域 (gpu.hpp): ディスクリプタ 131072 個 / アップロード 128 MB。outpost 全体 (ライト 1300 個描画) で 16k 個 / 12 MB。旧 32768 個では GUI で「per-frame descriptor space exhausted」で描画停止していた。`nimshade` は `frame use` を表示。
 - エンティティ (2c12304): GUI の MapWorker でも材質索引・配置を読み、nimshade と同じ dynamic model 準備経路で表示する。配置なしや描画不可のモデルは明示的にスキップ。
 - GUI クラッシュ (2026-10-17): outpost `80AF9550` の旧既定「全域」起動は約 31 秒後に `nvwgf2umx.dll` 内の 0xc0000005 で終了した (Windows Application Error 1000)。範囲 50 m の outpost と小さい `80A76433` でも同じアドレスで 4〜7 秒後に再現。ダンプとシンボルで `shading_.draw` の D3D12 SRV 作成と特定し、診断ログで最後の SRV が t12 = Deferred +0xD0 と判明した。ビューポートが 665 px から 1364 px に変わった後も旧サイズの環境テクスチャを指す生ポインターが ExternStore に残っていた。GUI の `gb.resize` 時に Deferred +0xC0/+0xC8/+0xD0 と ShadowMask +0x00/+0x08/+0x10 の参照を無効化して次の描画で再結合する。静的メッシュの extern SRV はフレームごとのリングに変更。既定範囲は 50 m (全域時は約 8 GB の private memory を確認)。修正後の `80A76433` と `80AF9550` は D3D12 デバッグレイヤー付きでそれぞれ 40 秒・50 秒以上継続し、ログは空だった。

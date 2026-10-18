@@ -407,7 +407,6 @@ TfxEnvironment ExternStore::environment() const {
 
 // ---- GamePipeline -----------------------------------------------------------------------------------
 void GamePipeline::release(Gpu& gpu) {
-    srv_total_ = 0;
     stages_.clear();
     pso_.Reset();
     root_sig_.Reset();
@@ -594,7 +593,6 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
 
     }
-    for (const auto& st : stages_) srv_total_ += st.srv_count + st.uav_count;
 }
 
 void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -630,9 +628,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
     const TfxEnvironment env = ext.environment();
-    // Fresh views per draw: a list holds many draws of one pipeline (light and cubemap volumes),
-    // and every draw must keep its own textures until the GPU has run it.
-    const uint32_t base = srv_total_ ? gpu.transient_descriptors(srv_total_) : 0;
+    // Identical resolved views share an immutable table for this frame. Per-light constants
+    // still change independently; different cubemap textures never alias a mutable table.
 
     if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
     else cl->SetGraphicsRootSignature(root_sig_.Get());
@@ -647,7 +644,6 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     }
 
-    uint32_t off = 0;
     for (auto& st : stages_) {
         const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
         auto& cb = st.constants;
@@ -662,6 +658,16 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
+        struct PendingView { uint32_t slot; BindingKind kind; ExternStore::Tex view; bool uav = false; };
+        std::vector<PendingView> views;
+        std::vector<uint64_t> view_key{st.srv_count, st.uav_count};
+        std::vector<ID3D12Resource*> view_resources;
+        auto remember = [&](uint32_t slot, BindingKind kind, ExternStore::Tex view, bool uav = false) {
+            views.push_back({slot, kind, view, uav});
+            view_key.insert(view_key.end(), {slot, uint64_t(kind), uint64_t(reinterpret_cast<uintptr_t>(view.resource)),
+                uint64_t(view.format), view.stride, view.elements, view.first_element, uint64_t(uav)});
+            view_resources.push_back(view.resource);
+        };
         for (const auto& [s, kind] : st.srv_kinds) {
             ID3D12Resource* r = nullptr;
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -688,27 +694,41 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 for (const auto& et : textures)
                     if (et.slot == s && ext.estimate_null_texture(et.extern_id, uint32_t(et.offset) * 8)) null_view = true;
             if (null_view) {
-                write_null_srv(dev, kind, gpu.srv().cpu(base + off + s));
+                remember(s, kind, {});
                 continue;
             }
             if (!r) throw std::runtime_error(std::format("{}: missing t{}; no replacement is permitted", st.tfx.shader.str(), s));
-            write_game_srv(dev, {r, fmt, stride, elements, first_element}, kind, gpu.srv().cpu(base + off + s));
-        }
-        if (st.table_param >= 0) {
-            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
-            else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base + off));
+            remember(s, kind, {r, fmt, stride, elements, first_element});
         }
         for (const auto& [slot, kind] : st.uav_kinds) {
             const auto& source = st.sources.extern_uavs.at(slot);
-            auto view = ext.texture(source.extern_id, uint32_t(source.offset) * 8);
-            write_uav(dev, view, kind, gpu.srv().cpu(base + off + st.srv_count + slot));
+            remember(st.srv_count + slot, kind, ext.texture(source.extern_id, uint32_t(source.offset) * 8), true);
+        }
+        uint32_t base = 0;
+        if (st.srv_count || st.uav_count) {
+            if (const auto cached = gpu.find_transient_table(view_key)) base = *cached;
+            else {
+                base = gpu.transient_descriptors(st.srv_count + st.uav_count);
+                for (const auto& view : views) {
+                    const auto handle = gpu.srv().cpu(base + view.slot);
+                    if (view.uav) write_uav(dev, view.view, view.kind, handle);
+                    else if (!view.view.resource) write_null_srv(dev, view.kind, handle);
+                    else write_game_srv(dev, view.view, view.kind, handle);
+                }
+                // Publish only after every descriptor is valid; a failed strict binding cannot
+                // leave a partially initialized table in the cache.
+                gpu.cache_transient_table(std::move(view_key), base, view_resources);
+            }
+        }
+        if (st.table_param >= 0) {
+            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base));
+            else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base));
         }
         if (st.uav_table_param >= 0) {
-            const auto handle = gpu.srv().gpu(base + off + st.srv_count);
+            const auto handle = gpu.srv().gpu(base + st.srv_count);
             if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.uav_table_param), handle);
             else cl->SetGraphicsRootDescriptorTable(UINT(st.uav_table_param), handle);
         }
-        off += st.srv_count + st.uav_count;
     }
     if (compute_) cl->Dispatch(x, y, z);
     else if (geometry && geometry->vbv && geometry->ibv && geometry->ibv->BufferLocation) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
@@ -1624,9 +1644,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         if (sky_ambient) {
             // The sky everywhere first (diffuse light buffer, specular IBL); the cubemap volumes
             // then replace it where they are.
+            const bool overhead = overhead_occlusion_on(p);
+            if (overhead) prepare_overhead_occlusion(gpu, cl);
             const D3D12_CPU_DESCRIPTOR_HANDLE bufs[] = {{hdr.ptr + 3 * inc}, env_rtv};
             cl->OMSetRenderTargets(2, bufs, FALSE, nullptr);
-            sky_apply_.draw(gpu, cl, ext_, scopes);
+            (overhead ? sky_apply_overhead_ : sky_apply_).draw(gpu, cl, ext_, scopes);
         }
         if (!cubemaps_.empty() && own_env) {
             draw_cubemaps(gpu, cl, gb, vm, scopes, p.probe_distance_fade);

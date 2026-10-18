@@ -190,14 +190,42 @@ uint64_t Gpu::vram_budget() const {
 }
 
 void Gpu::begin_frame(uint32_t frame_index) {
+    table_frame_ = frame_index % kFramesInFlight;
+    table_cache_[table_frame_].clear();
+    table_hits_ = 0;
     dynamic_offset_ = size_t(frame_index % kFramesInFlight) * kDynamicPerFrame;
     dynamic_end_ = dynamic_offset_ + kDynamicPerFrame;
     transient_offset_ = transient_first_ + (frame_index % kFramesInFlight) * kTransientPerFrame;
     transient_end_ = transient_offset_ + kTransientPerFrame;
 }
 
+std::optional<uint32_t> Gpu::find_transient_table(const std::vector<uint64_t>& key) {
+    const auto& cache = table_cache_[table_frame_];
+    if (auto it = cache.find(key); it != cache.end()) {
+        ++table_hits_;
+        return it->second.first;
+    }
+    return std::nullopt;
+}
+
+void Gpu::cache_transient_table(std::vector<uint64_t> key, uint32_t first, std::span<ID3D12Resource* const> resources) {
+    CachedTable value{first, {}};
+    // Keep resource identities valid even if their owner replaces a texture during this frame.
+    for (auto* resource : resources) if (resource) value.resources.emplace_back(resource);
+    table_cache_[table_frame_].emplace(std::move(key), std::move(value));
+}
+
+void Gpu::transient_rewind(uint32_t mark) {
+    transient_offset_ = mark;
+    // Only permitted after flushing immediate work. Rewound descriptors may be overwritten.
+    auto& cache = table_cache_[table_frame_];
+    std::erase_if(cache, [mark](const auto& entry) { return entry.second.first >= mark; });
+}
+
 uint32_t Gpu::transient_descriptors(uint32_t n) {
-    if (transient_offset_ + n > transient_end_) throw std::runtime_error("per-frame descriptor space exhausted");
+    if (n > transient_end_ - transient_offset_)
+        throw std::runtime_error(std::format("per-frame descriptor space exhausted: {} used + {} requested / {}",
+                                            transient_used(), n, kTransientPerFrame));
     const uint32_t first = transient_offset_;
     transient_offset_ += n;
     return first;

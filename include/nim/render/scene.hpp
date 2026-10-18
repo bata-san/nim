@@ -439,6 +439,9 @@ struct LightingParams {
     bool environment = true;
     // Sky ambient with the atmosphere: the sky hemisphere map and cubemap_apply_sky_copy_ao.
     bool sky_ambient = true;
+    // With the sky ambient: cubemap_apply_sky_copy_ao_with_overhead_occlusion, the sky's light
+    // faded under cover (GameLighting::set_overhead_occlusion supplies the top-down map).
+    bool overhead_occlusion = true;
     // Full-map viewing keeps every authored probe active at its own spatial bounds. The
     // optional camera-distance fade is an unverified interpretation of +0x3C/+0x40.
     bool probe_distance_fade = false;

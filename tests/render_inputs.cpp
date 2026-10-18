@@ -7,6 +7,24 @@ using namespace nim;
 int main() {
     int failures = 0;
     auto check = [&](bool ok, const char* what) { if (!ok) { std::fprintf(stderr, "%s\n", what); ++failures; } };
+    // Descriptor identities survive all draws in one frame, but never cross a recycled
+    // frame region or an immediate-list rewind (which would alias overwritten views).
+    Gpu tables;
+    const std::vector<uint64_t> table_key{12, 0, 3, 42};
+    tables.begin_frame(0);
+    const auto table0 = tables.transient_descriptors(12);
+    tables.cache_transient_table(table_key, table0, {});
+    check(tables.find_transient_table(table_key) == table0, "identical view table was not shared");
+    check(!tables.find_transient_table({12, 0, 3, 43}), "different view metadata aliased a table");
+    tables.begin_frame(1);
+    check(!tables.find_transient_table(table_key), "previous frame table leaked into new frame");
+    const auto table1 = tables.transient_descriptors(12);
+    tables.cache_transient_table(table_key, table1, {});
+    check(table0 != table1, "in-flight frames share mutable descriptors");
+    tables.transient_rewind(table1);
+    check(!tables.find_transient_table(table_key), "rewound table survived in cache");
+    tables.begin_frame(0);
+    check(!tables.find_transient_table(table_key), "recycled frame retained stale views");
     ExternStore scene, frame;
     int token = 0;  // opaque identity only: the CPU store never dereferences texture pointers
     auto* texture = reinterpret_cast<ID3D12Resource*>(&token);
