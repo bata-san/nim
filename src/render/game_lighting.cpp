@@ -967,6 +967,7 @@ void GameLighting::release(Gpu& gpu) {
     final_combine_.release(gpu);
     release_post(gpu);
     release_sky_ambient(gpu);
+    release_froxels(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
@@ -1140,6 +1141,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
+    load_froxels(pm, gpu, scopes);
     gpu.flush();
 }
 
@@ -1352,9 +1354,9 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     }
     update_global_channels(p);
     fill_atmosphere(p);
-    if (!ext_.texture(ext::Atmosphere, 0x108).resource)
+    if (!froxels_on(p) || !froxel_vol_)
         ext_.estimate_texture(ext::Atmosphere, 0x108, no_atmosphere_.Get(),
-                              "atmosphere froxel volume (cascade_raymarch_atmosphere_volume) not ported: transmittance 1, in-scatter 0");
+                              "atmosphere froxel volume disabled or not generated yet: transmittance 1, in-scatter 0");
     for (uint8_t id : {ext::Atmosphere, uint8_t(80), uint8_t(81), uint8_t(82)})
         if (!ext_.zero_policy(id)) ext_.zero_when_missing(id, "world state from a map (not loaded): zero");
     if (!lights_.empty() || !cubemaps_.empty() || sky_ambient_on(p)) {
@@ -1603,6 +1605,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (atmosphere) {
         render_sky_lookups(gpu, cl, scopes);
         render_atmosphere_density(gpu, cl);
+        render_froxels(gpu, cl, vm, p, shadow);
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
@@ -1610,8 +1613,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(ext::Transparent, 0x00, atmosphere ? sky_near_rt_.Get() : nullptr);
     ext_.set_texture(ext::Transparent, 0x10, atmosphere ? sky_far_rt_.Get() : nullptr);
     ext_.set_texture(ext::Transparent, 0x20, atmosphere ? atmo_density_rt_.Get() : nullptr);
-    ext_.estimate_texture(ext::Transparent, 0x78, no_atmosphere_.Get(),
-        "transparent atmosphere froxels not reconstructed: clear air (1,1,0,0)");
+    if (!froxels_on(p))
+        ext_.estimate_texture(ext::Transparent, 0x78, no_atmosphere_.Get(), "atmosphere froxels disabled: clear air (1,1,0,0)");
     ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
@@ -1786,7 +1789,8 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     // The lookups' phase is (1 + g^2 + 2 g dot(ray, +0x110))^-1.5: +0x110 points away from the sun.
     const V3 sun = sun_toward(p);
     ext_.estimate(A, 0x110, float4{-sun.x, -sun.y, -sun.z, 0}, "sun light direction (map sun path, time of day)");
-    ext_.estimate(A, 0x130, float4{0, 0, 1, 0}, "froxel volume parameters (atmosphere volume not rendered yet)");
+    ext_.estimate(A, 0x130, froxels_on(p) ? float4{kFroxelNear, 0, kFroxelCurve, 1 / (kFroxelFar - kFroxelNear)} : float4{0, 0, 1, 0},
+                  "single estimated froxel depth mapping (engine cascades unknown)");
     ext_.set(A, 0x150, ch(0x0A));  // sun_glow_color
     ext_.note_estimate("extern 7 +0x150 = sun_glow_color", copied);
     auto glow_g = [](float shape) { return shape > 1 ? 1 - 1 / shape : 0.0f; };

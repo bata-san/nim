@@ -431,6 +431,22 @@ private:
     const RainOcclusion* overhead_ = nullptr;
     size_t overhead_items_ = 0;
     float4 overhead_scale_{}, overhead_offset_{};
+    // Froxel atmosphere volume (docs/PROGRESS.md 3.2.1, src/render/game_froxels.cpp):
+    // cascade_raymarch_atmosphere_volume writes per froxel (density, 0.5, sun visibility, covered)
+    // and cascade_raymarch_atmosphere_volume_inscatter integrates it front to back into
+    // (transmittance, fog transmittance, in-scatter): extern 7 +0x108 / extern 40 +0x78.
+    void load_froxels(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void release_froxels(Gpu& gpu);
+    bool froxels_on(const LightingParams& p) const;
+    void render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const LightingParams& p, const SunShadow* shadow);
+    GamePipeline froxel_density_, froxel_inscatter_;
+    GamePipeline froxel_density_no_sun_, froxel_inscatter_no_sun_;
+    ComPtr<ID3D12Resource> froxel_density_vol_, froxel_vol_;  // RGBA16F 3D
+    uint32_t froxel_w_ = 0, froxel_h_ = 0;
+    // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice
+    // depth = near + (far - near) t^(1 / curve).
+    static constexpr uint32_t kFroxelDepth = 64, kFroxelTile = 8;
+    static constexpr float kFroxelNear = 0.5f, kFroxelFar = 256.0f, kFroxelCurve = 0.5f;
     static constexpr uint32_t kHemiSize = 256, kHemiMips = 9, kHemiFace = 128;
     ComPtr<ID3D12Resource> hemi_, hemi_face_;  // RGBA16F: the mirror-ball map (9 mips), one cube face
     ComPtr<ID3D12DescriptorHeap> hemi_rtv_heap_;  // hemisphere mips 0..8, then the face

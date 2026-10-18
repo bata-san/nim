@@ -442,6 +442,9 @@ struct LightingParams {
     // With the sky ambient: cubemap_apply_sky_copy_ao_with_overhead_occlusion, the sky's light
     // faded under cover (GameLighting::set_overhead_occlusion supplies the top-down map).
     bool overhead_occlusion = true;
+    // With the atmosphere: the engine's froxel volume (cascade_raymarch_atmosphere_volume and
+    // its _inscatter pass) for the height fog's density, sun shadowing and in-scatter.
+    bool froxel_fog = true;
     // Full-map viewing keeps every authored probe active at its own spatial bounds. The
     // optional camera-distance fade is an unverified interpretation of +0x3C/+0x40.
     bool probe_distance_fade = false;

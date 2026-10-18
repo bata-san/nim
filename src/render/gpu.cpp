@@ -152,6 +152,7 @@ void Gpu::check_device() {
     const HRESULT hr = device_->GetDeviceRemovedReason();
     if (SUCCEEDED(hr)) return;
     if (g_debug_log) {
+        std::fprintf(g_debug_log, "Device removed reason: 0x%08X\n", unsigned(hr));
         ComPtr<ID3D12DeviceRemovedExtendedData> dred;
         D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
         if (SUCCEEDED(device_.As(&dred)) && SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
@@ -326,8 +327,9 @@ ComPtr<ID3D12Resource> Gpu::texture2d(uint32_t w, uint32_t h, DXGI_FORMAT format
     rd.SampleDesc.Count = 1;
     rd.Flags = flags;
     ComPtr<ID3D12Resource> r;
-    check_hr(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r)),
-             "CreateCommittedResource(texture2d)");
+    const auto hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, clear, IID_PPV_ARGS(&r));
+    if (FAILED(hr)) check_device();  // preserve the device-removal reason and DRED breadcrumbs
+    check_hr(hr, "CreateCommittedResource(texture2d)");
     debug_name(r.Get(), "tex2d", w, h);
     return r;
 }
@@ -397,12 +399,14 @@ std::vector<uint8_t> Gpu::read_texture(ID3D12Resource* tex, D3D12_RESOURCE_STATE
     list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     barrier(list_.Get(), tex, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     flush();
-    const auto width = fp.Footprint.Width, height = fp.Footprint.Height;
-    std::vector<uint8_t> out(size_t(width) * height * bpp);
+    const auto width = fp.Footprint.Width, height = fp.Footprint.Height, depth = fp.Footprint.Depth;
+    std::vector<uint8_t> out(size_t(width) * height * depth * bpp);
     uint8_t* p = nullptr;
     check_hr(rb->Map(0, nullptr, reinterpret_cast<void**>(&p)), "Map(readback)");
-    for (uint32_t y = 0; y < height; ++y)
-        std::memcpy(out.data() + size_t(y) * width * bpp, p + size_t(y) * fp.Footprint.RowPitch, size_t(width) * bpp);
+    for (uint32_t z = 0; z < depth; ++z) for (uint32_t y = 0; y < height; ++y) {
+        const size_t row = size_t(z) * height + y;
+        std::memcpy(out.data() + row * width * bpp, p + row * fp.Footprint.RowPitch, size_t(width) * bpp);
+    }
     rb->Unmap(0, nullptr);
     return out;
 }

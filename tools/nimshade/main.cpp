@@ -88,6 +88,7 @@ int run(int argc, char** argv) {
     std::optional<size_t> probe_index;
     bool dump_probe_mask = false;
     bool dump_lighting = false;
+    bool no_froxels = false;
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
     std::optional<std::pair<size_t, size_t>> entity_range;
@@ -112,6 +113,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
         else if (args[i] == "--dump-lighting") dump_lighting = true;
+        else if (args[i] == "--no-froxels") no_froxels = true;
         else if (args[i] == "--verify-static-motion") verify_static_motion = true;
         else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
         else if (args[i] == "--entity-range" && i + 1 < args.size()) {
@@ -437,6 +439,7 @@ int run(int argc, char** argv) {
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
+    lp.froxel_fog = !no_froxels;
     lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
     lp.post = !no_post;
@@ -510,6 +513,8 @@ int run(int argc, char** argv) {
                 std::println("  channel {:02X} {:08X} = ({:.4g}, {:.4g}, {:.4g}, {:.4g})", i, i < ids.size() ? ids[i] : 0u,
                              ch[i][0], ch[i][1], ch[i][2], ch[i][3]);
         }
+        std::println("GPU memory before lighting: {:.1f} MiB used / {:.1f} MiB budget",
+                     double(gpu.vram_usage()) / (1 << 20), double(gpu.vram_budget()) / (1 << 20));
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
         // Auto exposure is read back from the previous frame: render again until it has settled
@@ -729,6 +734,38 @@ int run(int argc, char** argv) {
         };
         auto verify_lut = [&](const ViewMatrices& camera) {
             const auto& ext = gl.externs();
+            if (lp.froxel_fog) {
+                auto* volume = ext.texture(ext::Atmosphere, 0x108).resource;
+                if (!volume || volume->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || volume->GetDesc().DepthOrArraySize <= 1)
+                    throw std::runtime_error("Original atmosphere froxel volume was not produced");
+                const auto vd = volume->GetDesc();
+                const auto pixels = gpu.read_texture(volume,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 8);
+                const size_t plane = size_t(vd.Width) * vd.Height;
+                if (pixels.size() != plane * vd.DepthOrArraySize * 8) throw std::runtime_error("Incomplete froxel volume readback");
+                const auto* data = reinterpret_cast<const uint16_t*>(pixels.data());
+                float previous_min = 1;
+                for (uint32_t z = 0; z < vd.DepthOrArraySize; ++z) {
+                    float slice_min = 1;
+                    for (size_t xy = 0; xy < plane; ++xy) {
+                        const size_t n = (size_t(z) * plane + xy) * 4;
+                        for (size_t c = 0; c < 4; ++c) {
+                            const float v = half(data[n+c]);
+                            if (!std::isfinite(v) || v < 0 || (c < 2 && v > 1.002f))
+                                throw std::runtime_error("Invalid froxel transmittance / in-scatter");
+                        }
+                        const float transmittance = half(data[n]);
+                        if (z && transmittance > half(data[n-plane*4]) + 0.002f)
+                            throw std::runtime_error("Froxel transmittance increases with distance");
+                        slice_min = std::min(slice_min, transmittance);
+                    }
+                    previous_min = slice_min;
+                }
+                if (ext.texture(ext::Transparent, 0x78).resource != volume)
+                    throw std::runtime_error("Opaque and transparent passes have different froxel volumes");
+                std::println("verified froxels: {}x{}x{}, all slices finite, transmittance monotonic (far minimum {})",
+                             vd.Width, vd.Height, vd.DepthOrArraySize, previous_min);
+            }
             auto* texture = ext.texture(ext::Transparent, 0x20).resource;
             if (!texture) throw std::runtime_error("Missing transparent atmosphere LUT");
             const auto desc = texture->GetDesc();
@@ -787,7 +824,7 @@ int run(int argc, char** argv) {
                 if (!std::isfinite(x) || !std::isfinite(y)) throw std::runtime_error("Non-finite motion vectors after camera rotation");
                 moving += std::abs(x) + std::abs(y) > 1e-5f;
             }
-            if (!pass && !moving) throw std::runtime_error("Camera rotation did not produce motion vectors");
+            if (!pass && !moving && gl.temporal_aa_on(lp)) throw std::runtime_error("Camera rotation did not produce motion vectors");
             std::println("verified resized frame {}x{}: current depth / sky, finite motion ({} moving pixels)", w, h, moving);
         }
     }

@@ -886,6 +886,13 @@ private:
                 for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
                 work(*pm);
                 for (auto& t : threads) t.join();
+                // All prepares have finished. Queued pieces keep their own shared references;
+                // uploaded textures live on the GPU. Retaining every CPU mip in this cache
+                // needlessly keeps several GB resident after a whole-map load.
+                {
+                    std::unique_lock texture_lock(*cache->texture_mutex);
+                    cache->textures.clear();
+                }
             } catch (const std::exception& ex) {
                 std::lock_guard lk(m_);
                 if (generation_ == req.generation) {
@@ -2342,6 +2349,8 @@ public:
             ImGui::BeginDisabled(!game_lighting.has_atmosphere());
             ImGui::Checkbox("大気", &light.atmosphere);
             ImGui::SetItemTooltip("ゲームの sky_lookup_generate_near/far と sky。フォグ値はグローバルチャンネルの写し (推定)");
+            ImGui::Checkbox("フロクセル大気", &light.froxel_fog);
+            ImGui::SetItemTooltip("ゲームの密度計算・散乱積分CS。格子の解像度・距離・時間履歴は推定");
             ImGui::Checkbox(std::format("マップ環境 ({} チャンネル)", game_lighting.environment_channels()).c_str(), &light.environment);
             ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
             ImGui::Checkbox("空の環境光", &light.sky_ambient);

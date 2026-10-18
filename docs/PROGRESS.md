@@ -4,7 +4,7 @@
 コメントと食い違ったら、まずこの表を見て、どちらが新しいかを `git log` で確かめてから直すこと。
 作業を進めたら、コミットと同時にこの表を更新する。
 
-最終更新: 2026-10-18 (初期カメラ = 開始地点、頭上の遮蔽、全域プローブの距離棄却修正、CSG 制限の撤回、エンティティのモーション、map/activity 選択)
+最終更新: 2026-10-18 (Claude 更新を継承: 開始地点・頭上遮蔽・入力調査。未完フロクセルのCS接続と全域最適化検証)
 
 ## 1. 現在のタスク: ゲームのレンダーパイプラインの移植
 
@@ -15,7 +15,7 @@
 |---|------|------|-----------------|------|
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
 | 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
-| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 完了 (フロクセルは未) | 13540ca | §3.2。フロクセル (cascade_raymarch_atmosphere_volume) は後段 |
+| 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 基本大気とフロクセルCSを接続 (カスケード・temporalは未) | §3.2〜3.2.1 | 原CS使用。格子・距離・遮蔽元などのエンジン入力は推定 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライス・temporal は未) | 142beb4 | §3.3。霧密度スライス (extern 88) の生成元が未特定なので基礎密度のみ = かなり淡い |
 | 5 | 拡散・反射プローブ (cubemap_apply / sky hemisphere) | 全域読込・距離フェード既定オフ、CSG は解析専用。ゲームとの完全一致は未検証 | §3.4〜3.4.2 | Outpost 313、外周 167 (空レコード含む原一覧169)、低温アーカイブ499。エンジンの順序等は未解明 |
 | 6 | ポストプロセス (autoexposure, bloom, LUT/color grading, FXAA, TAA) | 完了 (グレーディング層・vignette は未) | 「Map environment」「TAA」コミット | §3.5, §3.8。AE / bloom / トーンマップ / TAA の設定値は推定 |
@@ -104,7 +104,7 @@ GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」
 - `sky` パイプライン (80A7439F, PS 80A7439A): 背景 = (t20.rgb + (cb0[25]·froxel.z + t20.w)·cb0[4]) ·
   cb0[9]·露出。t20 = ext7 +0xE0 (far 出力)、cb0[4] = +0x150 (太陽グロー色)、cb0[9] = +0x170。
   SV_Target4 = モーションベクトル (§3.9 で TAA に接続)。深度 = cb12[13].x → 深度テスト GREATER_EQUAL で空だけに描く。
-- フロクセル (t14) は `cascade_raymarch_atmosphere_volume*` (CS, extern 0x65) が作る。後段の課題。
+- フロクセル (t14) は `cascade_raymarch_atmosphere_volume*` (CS, extern 0x65) が作る。§3.2.1で接続。
 - 霧の検証 (2026-10-17, outpost 80AF9550): 霧のスケールは正しい。距離 m × 0.001 = km、密度 /km、
   密度 LUT (80AF8EA8, 16x1024 RGBA8) は全面 1.0、cb0[42] = (0, 1/(end−start), ext1 +0x10, −start/(end−start))
   で LUT の v は m 単位の距離。40 m で T ≈ 0.79。霧密度を 0 にしても壁は暗いまま。
@@ -118,6 +118,40 @@ GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」
 → 毎フレーム 時刻→スライス座標・太陽方向 (表0) → near/far を全画面 RT に描画 → ext7 +0xE0/+0xF0 →
 シェーディング → `sky` を env_bg の代わりに描画。GamePipeline に深度テストのオプションを足す。
 GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no-atmosphere`。
+
+### 3.2.1 フロクセル大気 (2026-10-18、Claude の未完差分を継承)
+- Claude 側 HEAD `2ee5a6a` は頭上遮蔽・開始地点・入力調査までコミット済み。その後の未完変更は
+  CMakeの新ファイル参照、GameLightingのメソッド/リソース宣言、LightingParams.froxel_fog の3ファイル。
+  `game_froxels.cpp` が存在せず、ビルド設定だけではコンパイルできない状態だったため実装を継承した。
+- 原パイプライン `cascade_raymarch_atmosphere_volume` (80A742DE / CS80A742DA) と
+  `cascade_raymarch_atmosphere_volume_inscatter` (80A742F4 / CS80A742F0) を使用。
+  前者は密度/太陽可視性/屋内判定をRGBA16F 3D UAVへ、後者は同じxyの深さ列を前から積分して
+  (透過率、屋内フォグ透過率、散乱、0) をRGBA16F 3Dへ出す。シェーダーの変更はない。
+- extern0x65: +00=(W,H,D,先頭slice)、+10=(1/fx,1/fy,射影A,B)、+20=(near,far,curve,履歴重み0)、
+  +30=0 (ジッター/追加の太陽減衰なし)、+40=0 (追加の距離変調なし)、+50=現在のVP (履歴未使用)、
+  +90=clear-air体積 (履歴分岐は通らない)、+98/+A0=密度SRV/UAV、+A8=積分出力UAV。
+- 推定: 1カスケード、画面8pxごとの格子を8の倍数へ丸める、64slice、0.5..256m、curve0.5、時間履歴なし。
+  元CSは両方numthreads(8,8,1)。密度はDispatch(W/8,H/8,64)、積分は(W/8,H/8,1)。
+  物理サイズと正規化を一緒に丸め、境界の余剰スレッドが有効セルを飛ばさない。
+- cb12 は元 compute view scope。ただし元CSのカメラZが後ろ向きなので行6=-fwd。
+  extern6+0/+C0 はnimの太陽影とカメラ空間→影clip。逆Zを使うため原CSの比較傾きは負 (推定)。
+  extern81はnimの頭上深度を屋内判定として使用 (推定)。影を生成しない場合は原 no_sun 変種 (80A742F9 / 80A74303) を使い、太陽散乱を含めない。屋内データなしは非屋内。
+  ch0x64はsun_light_direction (FNV1=5C579DFA) で、マップの時刻に対応する太陽方向を渡す。
+- 非ゼロの原データの密度/高度減衰/散乱チャンネルはそのまま。extern7+130は深度を格子Zへ戻す
+  (near,0,curve,1/(far-near))。出力は同一フレームのextern7+108とextern40+78へ接続。
+  GUI「フロクセル大気」、nimshade `--no-froxels` で無効化可能。
+- GPU read_texture は3Dの全深度スライスを行ピッチに沿って読み戻すよう修正 (従来は先頭sliceだけ)。
+  `--verify-frame-inputs` に全sliceのfinite/非負、透過率0..1、深さ方向の単調減少、
+  不透明/透明パスのリソース一致を追加。Outpost320×180→337×191→320×180で成功、D3D debug0B。
+- 影なしで通常の太陽影つきCSへ白テクスチャを渡す経路は device removed を再現したため使用しない。
+  元の no_sun 変種への切替後、Outpostの影なし描画・全slice検証が成功。`--no-taa` で
+  前フレーム行列を更新しない場合はリサイズ検証で回転モーションを要求しないよう修正。
+- 最終検証: Release nim/nimshade/nim_render_tests、ctest 2/2。Outpost影あり/なし、低温アーカイブ全域
+  (249,991静的配置、4,656エンティティ配置、7369ライト、499プローブ) の影あり/なしで
+  TAA16フレームと320×180→337×191→320×180を実行。低温全域はテクスチャ上限128で検証。
+  全64sliceのfinite/非負/透過率0..1/距離方向の単調性、不透明・透明の同一volume接続を確認、D3D debug0B。
+  GUI更新版は `out/continued-bin/nim.exe`。本ターンで正式リリースはしない。
+- 未検証: ゲームの実カスケード構成、時系列再投影、距離変調・影の調整値。ゲーム最終画像との一致の証明ではない。
 
 ### 3.3 ボリューメトリクス (実装済み)
 実装: `GameLighting::render_volumetrics` (src/render/game_lighting.cpp)。順序 (シェーディングと空の後):
@@ -425,9 +459,15 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 
 ## 4. 既知の未解決・注意
 - README と `docs/RENDERING.md` 冒頭を現状に更新済み。RENDERING の後半には過去の解析メモが残るため、状態はこの表を優先する。
+- 全域の軽量化検証 (Codex): 低温アーカイブ全域 (249,991静的配置、全ライト7369、全原プローブ499) の同一条件で
+  一時ディスクリプタ **118,197→2,928 (97.5%減)**、497 unique / 10,538 reused。
+  変更前後の320×180画像は全画素一致 (最大差0)。実行全体の所要時間はロードを含むためFPS改善値とは扱わない。
+- GUI全域ロードのprepare全スレッドが完了したら、共有CPUテクスチャキャッシュを解放する。キュー済みの
+  PreparedMeshは自身のshared_ptrを保持し、アップロード済みGPUテクスチャは残る。全ミップのCPUコピーを
+  次のロードまで残していた不要な常駐分を削除 (保持バイト数の実測は未実施)。
 - 同一フレーム内で解決済みのビューが完全一致する GamePipeline の SRV/UAV テーブルは共有する (`Gpu::find_transient_table`。キー = スロット・種別・リソース・形式・要素範囲)。フレーム領域の再利用と `transient_rewind` でキャッシュは破棄。nimshade は `view tables: N unique, M reused` を表示。`--dump-lighting` はライトバッファ・深度・プローブ箱を `out/` に出し、`tools/re/analyze_probe_coverage.py` が表面のプローブ箱カバー率を出す (Outpost CTRL 視点で表面の約 22%)。GUI のマップ範囲の既定は「全域」。
 - 1 フレームの一時領域 (gpu.hpp): ディスクリプタ 131072 個 / アップロード 128 MB。outpost 全体 (ライト 1300 個描画) で 16k 個 / 12 MB。旧 32768 個では GUI で「per-frame descriptor space exhausted」で描画停止していた。`nimshade` は `frame use` を表示。
 - エンティティ (2c12304): GUI の MapWorker でも材質索引・配置を読み、nimshade と同じ dynamic model 準備経路で表示する。配置なしや描画不可のモデルは明示的にスキップ。
-- GUI クラッシュ (2026-10-17): outpost `80AF9550` の旧既定「全域」起動は約 31 秒後に `nvwgf2umx.dll` 内の 0xc0000005 で終了した (Windows Application Error 1000)。範囲 50 m の outpost と小さい `80A76433` でも同じアドレスで 4〜7 秒後に再現。ダンプとシンボルで `shading_.draw` の D3D12 SRV 作成と特定し、診断ログで最後の SRV が t12 = Deferred +0xD0 と判明した。ビューポートが 665 px から 1364 px に変わった後も旧サイズの環境テクスチャを指す生ポインターが ExternStore に残っていた。GUI の `gb.resize` 時に Deferred +0xC0/+0xC8/+0xD0 と ShadowMask +0x00/+0x08/+0x10 の参照を無効化して次の描画で再結合する。静的メッシュの extern SRV はフレームごとのリングに変更。既定範囲は 50 m (全域時は約 8 GB の private memory を確認)。修正後の `80A76433` と `80AF9550` は D3D12 デバッグレイヤー付きでそれぞれ 40 秒・50 秒以上継続し、ログは空だった。
+- GUI クラッシュ (2026-10-17): outpost `80AF9550` の旧既定「全域」起動は約 31 秒後に `nvwgf2umx.dll` 内の 0xc0000005 で終了した (Windows Application Error 1000)。範囲 50 m の outpost と小さい `80A76433` でも同じアドレスで 4〜7 秒後に再現。ダンプとシンボルで `shading_.draw` の D3D12 SRV 作成と特定し、診断ログで最後の SRV が t12 = Deferred +0xD0 と判明した。ビューポートが 665 px から 1364 px に変わった後も旧サイズの環境テクスチャを指す生ポインターが ExternStore に残っていた。GUI の `gb.resize` 時に Deferred +0xC0/+0xC8/+0xD0 と ShadowMask +0x00/+0x08/+0x10 の参照を無効化して次の描画で再結合する。静的メッシュの extern SRV はフレームごとのリングに変更。当時の既定範囲は 50 m (現在はユーザー指定に従い全域。全域時は約 8 GB の private memory を確認)。修正後の `80A76433` と `80AF9550` は D3D12 デバッグレイヤー付きでそれぞれ 40 秒・50 秒以上継続し、ログは空だった。
 - MapWorker の最終キュー要素を完了判定で捨てる不具合を修正。レイアウト読込失敗が worker から未処理例外として出ないようにし、地図アップロード失敗は UI のエラー欄に表示してその読込を停止する。`80AF9550` と `80A76433` は nimshade でエンティティ入りの描画に成功。GUI のマップ切替・リサイズ・タブ閉じの操作検証は未実施。
 - 子セッション「Reverse-engineer animation clips and play them」は完了、f86350e で main にマージ済み。

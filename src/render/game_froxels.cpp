@@ -1,0 +1,121 @@
+// Original density and front-to-back atmosphere integration CS. Runtime grid/cascade
+// parameters are explicit estimates; the shaders and channel expressions are unchanged.
+#include "nim/render/game_lighting.hpp"
+#include <cstring>
+#include <format>
+
+namespace nim {
+namespace {
+constexpr auto kRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr auto kFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
+void GameLighting::load_froxels(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes) {
+    for (auto [pipeline, name] : {std::pair{&froxel_density_, "cascade_raymarch_atmosphere_volume"},
+                                 std::pair{&froxel_inscatter_, "cascade_raymarch_atmosphere_volume_inscatter"},
+                                 std::pair{&froxel_density_no_sun_, "cascade_raymarch_atmosphere_volume_no_sun"},
+                                 std::pair{&froxel_inscatter_no_sun_, "cascade_raymarch_atmosphere_volume_inscatter_no_sun"}}) {
+        const auto tag = globals_.pipeline(name);
+        if (tag.is_none()) throw std::runtime_error(std::format("Missing original {}", name));
+        pipeline->load(pm, gpu, tag, scopes, {});
+    }
+}
+
+void GameLighting::release_froxels(Gpu& gpu) {
+    froxel_density_.release(gpu);
+    froxel_inscatter_.release(gpu);
+    froxel_density_no_sun_.release(gpu);
+    froxel_inscatter_no_sun_.release(gpu);
+    froxel_density_vol_.Reset();
+    froxel_vol_.Reset();
+    froxel_w_ = froxel_h_ = 0;
+}
+
+bool GameLighting::froxels_on(const LightingParams& p) const {
+    return p.atmosphere && p.froxel_fog && atm_.valid && froxel_density_.loaded() && froxel_inscatter_.loaded();
+}
+
+void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
+                                 const LightingParams& p, const SunShadow* shadow) {
+    if (!froxels_on(p)) return;
+    // Both shaders use [numthreads(8,8,1)] without xy guards. Round the physical grid
+    // and its normalization together so every dispatched thread owns one valid texel.
+    const uint32_t width = ((w_ + kFroxelTile - 1) / kFroxelTile + 7) & ~7u;
+    const uint32_t height = ((h_ + kFroxelTile - 1) / kFroxelTile + 7) & ~7u;
+    if (!froxel_vol_ || width != froxel_w_ || height != froxel_h_) {
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        rd.Width = width; rd.Height = height; rd.DepthOrArraySize = kFroxelDepth;
+        rd.MipLevels = 1; rd.Format = kFormat; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        const D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        for (auto* resource : {std::addressof(froxel_density_vol_), std::addressof(froxel_vol_)})
+            check_hr(gpu.device()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, kRead, nullptr,
+                                                          IID_PPV_ARGS(resource->ReleaseAndGetAddressOf())), "atmosphere volume");
+        froxel_w_ = width; froxel_h_ = height;
+    }
+    constexpr uint8_t F = 0x65, S = 6, I = 81;
+    ext_.set(F, 0x00, float4{float(width), float(height), float(kFroxelDepth), 0});
+    ext_.set(F, 0x10, float4{1 / vm.fx, 1 / vm.fy, 0, vm.proj.c[3][2]});
+    ext_.set(F, 0x20, float4{kFroxelNear, kFroxelFar, kFroxelCurve, 0});
+    ext_.set(F, 0x30, float4{});  // no temporal jitter/history, additional sun attenuation 0
+    ext_.set(F, 0x40, float4{});  // additional depth-dependent density modulation off
+    ext_.set(F, 0x50, vm.vp_abs); // unused with history weight 0, finite original view matrix
+    ext_.set_texture(F, 0x90, no_atmosphere_.Get());
+    ext_.set_texture(F, 0x98, froxel_density_vol_.Get(), kFormat);
+    ext_.set_texture(F, 0xA0, froxel_density_vol_.Get(), kFormat);
+    ext_.set_texture(F, 0xA8, froxel_vol_.Get(), kFormat);
+    // The density shader reconstructs from (x,y,-viewDepth) in an engine camera
+    // whose third axis points backward. SunShadow stores reversed depth, hence a
+    // negative comparison slope with the original CS's (receiver - map) test.
+    M4 camera_to_world{{{vm.right.x, vm.right.y, vm.right.z, 0}, {vm.up.x, vm.up.y, vm.up.z, 0},
+                       {-vm.fwd.x, -vm.fwd.y, -vm.fwd.z, 0}, {vm.eye.x, vm.eye.y, vm.eye.z, 1}}};
+    const bool shadowed = shadow && shadow->valid && shadow->depth;
+    ext_.set(S, 0xC0, shadowed ? mul(shadow->vm.vp_abs, camera_to_world) : M4{});
+    const float size = shadowed ? float(shadow->size) : 1;
+    ext_.set(S, 0x18, size); ext_.set(S, 0x1C, size);
+    ext_.set(S, 0x30, float4{shadowed ? -size : 0, 0, 0, 0});
+    ext_.set_texture(S, 0x00, shadowed ? shadow->depth.Get() : unshadowed_.Get(),
+                     shadowed ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UNORM);
+    const bool covered = overhead_ && overhead_->valid && overhead_->mask;
+    ext_.set_texture(I, 0x00, covered ? overhead_->mask.Get() : unshadowed_.Get());
+    ext_.set(I, 0x10, covered ? overhead_->scale : float4{});
+    ext_.set(I, 0x20, covered ? overhead_->offset : float4{});
+    const V3 sun = sun_toward(p);
+    ext_.set_channel("sun_light_direction", float4{sun.x, sun.y, sun.z, 0});
+
+    auto view = evaluate_scope(view_scope_, ScopeStage::Compute, ext_);
+    if (view.size() < 8) throw std::runtime_error("Original froxel view scope is incomplete");
+    view[6] = {-vm.fwd.x, -vm.fwd.y, -vm.fwd.z, 0};
+    const auto frame = ext_.frame_constants();
+    auto upload = [&](const auto& values) {
+        auto a = gpu.dynamic(values.size() * sizeof(float4));
+        std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
+        return a.gpu;
+    };
+    const auto cb12 = upload(view), cb13 = upload(frame);
+    const ScopeBufferFn scopes = [&](ShaderStage, uint32_t reg) { return reg == 12 ? cb12 : reg == 13 ? cb13 : 0; };
+    Gpu::barrier(cl, unshadowed_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
+    Gpu::barrier(cl, no_atmosphere_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
+    if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
+    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
+    Gpu::barrier(cl, froxel_density_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    (shadowed ? froxel_density_ : froxel_density_no_sun_).dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, kFroxelDepth);
+    Gpu::barrier(cl, froxel_density_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    Gpu::barrier(cl, froxel_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // One xy thread walks the complete depth column in increasing z.
+    (shadowed ? froxel_inscatter_ : froxel_inscatter_no_sun_).dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
+    Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    Gpu::barrier(cl, no_atmosphere_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, unshadowed_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ext_.set_texture(ext::Atmosphere, 0x108, froxel_vol_.Get(), kFormat);
+    ext_.set_texture(ext::Transparent, 0x78, froxel_vol_.Get(), kFormat);
+    if (!shadowed) ext_.note_estimate("atmosphere froxels: original no_sun permutation",
+                                    "sun-shadow producer unavailable: original no_sun CS, no sun in-scatter");
+    ext_.note_estimate(std::format("atmosphere froxels {}x{}x{}: one cascade, {}..{}m, curve {}, no temporal history",
+                                  width, height, kFroxelDepth, kFroxelNear, kFroxelFar, kFroxelCurve),
+                       "original density/inscatter CS; engine cascade size, range, history, density modulation and shadow filter unknown; nim sun/overhead depth");
+}
+} // namespace nim
