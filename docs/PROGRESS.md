@@ -68,7 +68,7 @@
 全画面 RGBA16F に描き、シェーディング後に `sky` を深度テスト GREATER_EQUAL (gb.dsv_ro) で描く。
 太陽方向は表0 (`sun_direction(p, atmosphere)`) で GlobalLighting +0x30 と nim の影にも使う。
 GUI: 調整ポップアップの「大気」「マップの時刻」「時刻」。nimshade: `--time-of-day D`, `--no-atmosphere`。
-未: フロクセル t14 (no_atmosphere のまま)、t2 パラボロイド (白)、太陽強度の時刻変化 (ビューア値)。
+未: t2 パラボロイド (白)、太陽強度の時刻変化 (ビューア値)。
 以下は解析メモ。
 マップのコンポーネント (outpost のノードテーブル 80AF8EBF):
 - 型 **808084A0** (D2 の SAtmosphereDataComponent と同じ配置、ペイロード = レコード+0x10):
@@ -514,7 +514,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - PS の入力は SV_Position (TEXCOORD ではない)。extern 7 +0xD0.zw = 1/(サイズ−1)。D = ((pixel.x−0.5)/(W−1))²×50000 m、仰角 = 2×(pixel.y−0.5)/(H−1)−1、評価高さ = eye.z + D×仰角。VS の View +0x160 はこのパスだけ単位行列。既存の近・遠空パスの行列を変更しない。
 - フォグの減衰色 = extern 7 +0x190 に ch0x16、+0x1A0 に倍率 1 (推定)。密度・高さ・距離 LUT は不透明物と共通。距離ゼロは透過率 1。
 - 透明物の材質・共有定数・SRV は G-buffer 生成時に評価せず、GameLighting 内の透明描画コールバックで、そのフレームの大気 / Transparent / Deferred ブロックから評価。`ExternStore::copy_block_from` は古い参照・定数・ゼロ規則を置換する。G-buffer と影で使用中の材質ディスクリプタは透明物の更新で書き換えない。露出も照明側で更新した値を使い、cb13 は当該パスの共有定数として渡す (次フレームの scene の時計を固定しない)。
-- t10 = Deferred +0x98 は、この時点の R32G32 線形深度。SSAO と volumetrics が無効でも透明物には生成する。t25 = extern 40 +0x78 は未実装フロクセルの clear-air (1,1,0,0) を明示的な推定として渡す (null の全ゼロでは透過率も 0 になる)。ライトシャフトスライス等は未接続。
+- t10 = Deferred +0x98 は、この時点の R32G32 線形深度。SSAO と volumetrics が無効でも透明物には生成する。t25 = extern 40 +0x78 はフロクセル有効時に同一フレームの積分体積 (§3.2.1)、無効時は clear-air (1,1,0,0) を明示的な推定として渡す (null の全ゼロでは透過率も 0 になる)。ライトシャフトスライス等は未接続。
 - **モーションの実際のセマンティクスは SV_Target4**。逆コンパイル補助ツールの `o1` は出力リスト上の番号であり、SV_Target1 を意味しない。空と stage 8 の出力4を G-buffer RT3 に接続。中間の MRT 1..3 は null RTV・書込無効。透明物のモーション合成は元の blend state の RT4 を使う。出力4が無い PS は motion write mask 0。
 - 空の PS は View +0x1E0 で深度0の点を復元して再投影する。未設定のゼロ行列 / 無限遠射影の逆行列では 0/0 になるため、50km の有限点として復元 (距離は推定として一覧表示)。空・透明物のモーションを finite な値で TAA へ渡す。
 - リサイズ時の自前 light diffuse/specular、env、shadow mask の条件付き extern 参照の無効化を `GameLighting::resize` に集約。GUI 以外の呼出元にも適用。旧参照を保持する GPU 検証は対策前に 0xc0000005 で終了し、対策後は大小2回の変更で成功。
