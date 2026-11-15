@@ -41,6 +41,9 @@ M4 inverse4(const M4& m) {
     return out;
 }
 
+}
+M4 GameLighting::inverse_matrix(const M4& m) { return inverse4(m); }
+namespace {
 uint32_t groups(uint32_t n, uint32_t per) { return std::max(1u, (n + per - 1) / per); }
 
 ComPtr<ID3D12Resource> make_texture(Gpu& gpu, uint32_t w, uint32_t h, uint32_t mips, DXGI_FORMAT format,

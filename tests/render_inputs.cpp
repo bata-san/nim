@@ -47,6 +47,25 @@ int main() {
             const auto near_p = project(3.5f, 4, 5), far_p = project(53, 4, 5), edge_u = project(13, -6, 5), edge_v = project(13, 4, 15);
             check(std::abs(near_p[0]) < 1e-5f && std::abs(near_p[1]) < 1e-5f && std::abs(near_p[2] - 1) < 1e-4f, "light axis at the near plane is not the map centre at depth 1");
             check(std::abs(far_p[2]) < 1e-4f, "light far plane is not depth 0");
+            // SSR reprojection (ssr +0xD0): this frame's (ndc, depth, 1) -> last frame's clip.
+            {
+                View cur;
+                cur.eye = {3, -2, 1.5f}; cur.target = {10, 4, 0}; cur.width = 640; cur.height = 360;
+                View old = cur;
+                old.eye = {2.5f, -2.4f, 1.7f}; old.target = {10.5f, 3.5f, 0.2f};
+                const ViewMatrices c = make_view(cur), o = make_view(old);
+                const M4 m = mul(o.vp_abs, GameLighting::inverse_matrix(c.vp_abs));
+                const float4 world{8, 2, 0.5f, 1};
+                auto xf = [](const M4& a, float4 v) {
+                    float4 r{};
+                    for (int i = 0; i < 4; ++i) r[size_t(i)] = a.c[0][size_t(i)] * v[0] + a.c[1][size_t(i)] * v[1] + a.c[2][size_t(i)] * v[2] + a.c[3][size_t(i)] * v[3];
+                    return r;
+                };
+                const float4 cc = xf(c.vp_abs, world), oc = xf(o.vp_abs, world);
+                const float4 back = xf(m, float4{cc[0] / cc[3], cc[1] / cc[3], cc[2] / cc[3], 1});
+                check(std::abs(back[0] / back[3] - oc[0] / oc[3]) < 1e-3f && std::abs(back[1] / back[3] - oc[1] / oc[3]) < 1e-3f && back[3] > 0,
+                      "SSR reprojection does not land on the previous frame's pixel");
+            }
             // The +0xE0 shaft PS fixes the axes: NDC x = -Y / (x tan), NDC y = +Z / (x tan) of the light.
             check(std::abs(edge_u[0] - 1) < 1e-4f && std::abs(edge_u[1]) < 1e-4f, "light -Y side is not the map's +x edge");
             check(std::abs(edge_v[1] - 1) < 1e-4f && std::abs(edge_v[0]) < 1e-4f, "light +Z side is not the map's +y edge");

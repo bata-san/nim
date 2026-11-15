@@ -576,7 +576,13 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   (3 ch の適用先と代替色が同じ倍率で引かれること、シェーディングの前でないと反射が BRDF を通らないことから)。
 - 検証 (Outpost 検証視点 1600×1000、`--dump-lighting` の `lighting-ibl.bin` を `--no-ssr` と比較): 変化 543,612 画素 (34%)、NaN / Inf 0、
   空の画素の変化 0。最終画像の差は屋上機器・ルーバー・床の反射に限られる。Outpost / Deck の `--verify-frame-inputs` は exit 0、ctest 2/2。
-- 未確認: ゲーム画像との比較、カメラ移動中の再投影 (GUI)、距離 150 m 超のフェード (検証視点に該当画素なし)、`ssr_apply_reflection_full` と
+- 命中の確認 (`lighting-ssr-radiance.bin` の w と `lighting-ssr-distance.bin`、半解像度 40 万画素): レイ無し 250,696、代替 31,176、
+  **命中 118,128**。命中距離は 0.01..114 m、中央値 2.2 m (1 m 未満 44,793、1..5 m 38,877、5..20 m 23,266、20..50 m 10,447、50 m 超 745)。
+  命中画素の色は屋上・床など上向きの面に周囲の像が写ったもの。適用は IBL の .w にも赤を書くが、
+  global_lighting_and_shading の PS 80A74242 は t12 の xyz しか読まない。
+  再投影行列 (前フレーム VP × 現フレーム VP の逆) は `tests/render_inputs.cpp` でカメラを動かした 2 視点で検証。
+  SSR を切ったフレームとマップ切替で前フレーム像は無効になる。
+- 未確認: ゲーム画像との比較、GUI での操作、距離 150 m 超のフェード (検証視点に該当画素なし)、`ssr_apply_reflection_full` と
   `ssr_filter_downsample` の使い所、+0x48 のテクスチャ。
 
 ### 3.6.1 環境式の出力名表と入力表 (2026-11-15)

@@ -764,6 +764,10 @@ int run(int argc, char** argv) {
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-ibl.bin", gpu.read_texture(gl.specular_ibl(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        if (gl.ssr_drawn()) {
+            save("lighting-ssr-radiance.bin", gpu.read_texture(gl.ssr_radiance(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 8));
+            save("lighting-ssr-distance.bin", gpu.read_texture(gl.ssr_hit_distance(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 4));
+        }
         for (int k = 0; k < 2 && gl.volumetric_layer(k); ++k)
             save(k ? "lighting-shafts-near.bin" : "lighting-shafts-far.bin", gpu.read_texture(gl.volumetric_layer(k), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         std::ofstream f(out_dir / "lighting.json");

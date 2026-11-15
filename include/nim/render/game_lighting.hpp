@@ -244,6 +244,12 @@ public:
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
     bool ssr_drawn() const { return ssr_drawn_; }             // reflections were traced last frame
+    // Half-resolution SSR buffers (UNORDERED_ACCESS between frames): RGBA16F radiance (w: 0 no ray,
+    // 1 fallback, 2 hit) and R32 hit distance (float bits).
+    ID3D12Resource* ssr_radiance() const { return ssr_radiance_.Get(); }
+    ID3D12Resource* ssr_hit_distance() const { return ssr_dir_.Get(); }
+    static M4 inverse_matrix(const M4& m);  // general 4x4 inverse (the SSR pixel <-> world transforms)
+    void drop_ssr_history() { ssr_history_valid_ = false; }  // the next frame's image is unrelated (map switch)
     ID3D12Resource* specular_ibl() const { return env_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE between frames
     ID3D12Resource* volumetric_layer(int i) const { return vol_blurred_[i ? 1 : 0].Get(); }  // blurred far / near shafts: RGBA16F, quarter resolution, PIXEL_SHADER_RESOURCE
     size_t volumetric_shadows_used() const { return vol_shadows_used_; }  // shafts drawn with a shadow map last frame

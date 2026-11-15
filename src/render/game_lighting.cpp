@@ -1769,6 +1769,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
+    else ssr_history_valid_ = false;  // a later frame must not reflect an image this old
     if (post) {
         render_post(gpu, cl, gb, p, scopes);
     } else {
@@ -2149,6 +2150,7 @@ void GameLighting::clear_lights(Gpu& gpu) {
     lights_.clear();
     vol_lights_.clear();
     light_shadow_items_ = 0;
+    ssr_history_valid_ = false;  // another map's image
 }
 
 void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
