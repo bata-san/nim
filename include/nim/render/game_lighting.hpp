@@ -35,8 +35,9 @@ public:
     float get_f(uint8_t id, uint32_t byte_offset) const;
     float4 get_v(uint8_t id, uint32_t byte_offset) const;
 
-    struct Tex { ID3D12Resource* resource = nullptr; DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; uint32_t stride = 0, elements = 0; uint64_t first_element = 0; };
-    void set_texture(uint8_t id, uint32_t byte_offset, ID3D12Resource* r, DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN, uint32_t stride = 0, uint32_t elements = 0, uint64_t first_element = 0);
+    // `mip`: the mip a 2D UAV writes (SRVs see the whole chain).
+    struct Tex { ID3D12Resource* resource = nullptr; DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; uint32_t stride = 0, elements = 0; uint64_t first_element = 0; uint32_t mip = 0; };
+    void set_texture(uint8_t id, uint32_t byte_offset, ID3D12Resource* r, DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN, uint32_t stride = 0, uint32_t elements = 0, uint64_t first_element = 0, uint32_t mip = 0);
     Tex texture(uint8_t id, uint32_t byte_offset) const;
 
     std::vector<float4> channels;          // global channels by index (render-globals defaults)
@@ -162,6 +163,9 @@ public:
                      uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {});
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+    // The group counts come from the first three words of `args` (INDIRECT_ARGUMENT state).
+    void dispatch_indirect(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                           ID3D12CommandSignature* signature, ID3D12Resource* args);
 
     std::vector<std::string> notes;  // binding diagnostics, for the UI / nimshade
     const std::vector<float4>& stage_constants(size_t i) const { return stages_.at(i).constants; }  // last draw's cbuffer
@@ -191,6 +195,8 @@ private:
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
     bool compute_ = false;
+    ID3D12CommandSignature* indirect_signature_ = nullptr;  // set for the span of dispatch_indirect
+    ID3D12Resource* indirect_args_ = nullptr;
     uint32_t cbuffer_floor_ = 256;
     TagHash tag_;
     std::vector<Stage> stages_;
@@ -237,6 +243,8 @@ public:
     size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
+    bool ssr_drawn() const { return ssr_drawn_; }             // reflections were traced last frame
+    ID3D12Resource* specular_ibl() const { return env_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE between frames
     ID3D12Resource* volumetric_layer(int i) const { return vol_blurred_[i ? 1 : 0].Get(); }  // blurred far / near shafts: RGBA16F, quarter resolution, PIXEL_SHADER_RESOURCE
     size_t volumetric_shadows_used() const { return vol_shadows_used_; }  // shafts drawn with a shadow map last frame
     const std::vector<std::string>& light_notes() const { return light_notes_; }
@@ -480,6 +488,20 @@ private:
     // and cascade_raymarch_atmosphere_volume_inscatter integrates it front to back into
     // (transmittance, fog transmittance, in-scatter): extern 7 +0x108 / extern 40 +0x78.
     void load_froxels(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    // Screen-space reflections (game_ssr.cpp, docs/PROGRESS.md 3.12).
+    void load_ssr(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void release_ssr(Gpu& gpu);
+    void resize_ssr(Gpu& gpu);
+    bool render_ssr(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const LightingParams& p);
+    void keep_ssr_history(ID3D12GraphicsCommandList* cl, const ViewMatrices& vm);  // the lit image, for the next frame's rays
+    GamePipeline hiz_from_texture_, hiz_from_target_, ssr_source_gen_, ssr_init_, ssr_extract_, ssr_args_, ssr_trace_,
+        ssr_resolve_, ssr_hole_, ssr_hblur_down_, ssr_hblur_, ssr_vblur_, ssr_apply_;
+    ComPtr<ID3D12Resource> hiz_, ssr_source_, ssr_radiance_, ssr_dir_, ssr_color_, ssr_weight_, ssr_args_buf_, ssr_rays_buf_,
+        ssr_stencil_, ssr_history_;
+    ComPtr<ID3D12CommandSignature> dispatch_sig_;
+    uint32_t ssr_w_ = 0, ssr_h_ = 0, ssr_mips_ = 0, hiz_mips_ = 0;
+    bool ssr_loaded_ = false, ssr_history_valid_ = false, ssr_drawn_ = false;
+    M4 ssr_history_vp_;
     void release_froxels(Gpu& gpu);
     bool froxels_on(const LightingParams& p) const;
     void render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const LightingParams& p, const SunShadow* shadow);

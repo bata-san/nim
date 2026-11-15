@@ -146,8 +146,10 @@ void write_uav(ID3D12Device* dev, const ExternStore::Tex& view, BindingKind kind
     else if (kind == BindingKind::Texture1DArray) {
         desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
         desc.Texture1DArray.ArraySize = resource.DepthOrArraySize;
-    } else if (kind == BindingKind::Texture2D) desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    else if (kind == BindingKind::Texture3D) {
+    } else if (kind == BindingKind::Texture2D) {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        desc.Texture2D.MipSlice = view.mip;
+    } else if (kind == BindingKind::Texture3D) {
         desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
         desc.Texture3D.WSize = resource.DepthOrArraySize;
     } else if (kind == BindingKind::Texture2DArray) {
@@ -373,8 +375,8 @@ float4 ExternStore::get_v(uint8_t id, uint32_t off) const {
     std::memcpy(v.data(), data_.data() + size_t(id) * kBlockSize + off, 16);
     return v;
 }
-void ExternStore::set_texture(uint8_t id, uint32_t off, ID3D12Resource* r, DXGI_FORMAT f, uint32_t stride, uint32_t elements, uint64_t first_element) {
-    if (r) textures_[tex_key(id, off)] = {r, f, stride, elements, first_element};
+void ExternStore::set_texture(uint8_t id, uint32_t off, ID3D12Resource* r, DXGI_FORMAT f, uint32_t stride, uint32_t elements, uint64_t first_element, uint32_t mip) {
+    if (r) textures_[tex_key(id, off)] = {r, f, stride, elements, first_element, mip};
     else textures_.erase(tex_key(id, off));
 }
 ExternStore::Tex ExternStore::texture(uint8_t id, uint32_t off) const {
@@ -632,6 +634,20 @@ void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Exter
     execute(gpu, cl, ext, scopes, false, x, y, z);
 }
 
+void GamePipeline::dispatch_indirect(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                                     ID3D12CommandSignature* signature, ID3D12Resource* args) {
+    if (!compute_ || !signature || !args) throw std::invalid_argument("Invalid original indirect compute dispatch");
+    indirect_signature_ = signature;
+    indirect_args_ = args;
+    try {
+        execute(gpu, cl, ext, scopes, false, 1, 1, 1);
+    } catch (...) {
+        indirect_args_ = nullptr;
+        throw;
+    }
+    indirect_args_ = nullptr;
+}
+
 void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                            bool validated, uint32_t x, uint32_t y, uint32_t z, const Geometry* geometry) {
     if (!validated) validate(ext, scopes);
@@ -675,7 +691,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         auto remember = [&](uint32_t slot, BindingKind kind, ExternStore::Tex view, bool uav = false) {
             views.push_back({slot, kind, view, uav});
             view_key.insert(view_key.end(), {slot, uint64_t(kind), uint64_t(reinterpret_cast<uintptr_t>(view.resource)),
-                uint64_t(view.format), view.stride, view.elements, view.first_element, uint64_t(uav)});
+                uint64_t(view.format), view.stride, view.elements, view.first_element, uint64_t(uav), uint64_t(view.mip)});
             view_resources.push_back(view.resource);
         };
         for (const auto& [s, kind] : st.srv_kinds) {
@@ -740,7 +756,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             else cl->SetGraphicsRootDescriptorTable(UINT(st.uav_table_param), handle);
         }
     }
-    if (compute_) cl->Dispatch(x, y, z);
+    if (compute_ && indirect_args_) cl->ExecuteIndirect(indirect_signature_, 1, indirect_args_, 0, nullptr, 0);
+    else if (compute_) cl->Dispatch(x, y, z);
     else if (geometry && geometry->vbv && geometry->ibv && geometry->ibv->BufferLocation) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
     else if (geometry && geometry->vbv) cl->DrawInstanced(geometry->indices, 1, 0, 0);
     else cl->DrawInstanced(4, 1, 0, 0);
@@ -978,6 +995,7 @@ void GameLighting::release(Gpu& gpu) {
     release_post(gpu);
     release_sky_ambient(gpu);
     release_froxels(gpu);
+    release_ssr(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
@@ -1155,6 +1173,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
     load_froxels(pm, gpu, scopes);
+    load_ssr(pm, gpu, scopes);
     gpu.flush();
 }
 
@@ -1172,7 +1191,8 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     gpu.device()->CreateRenderTargetView(hdr_.Get(), nullptr, rtv_heap_->GetCPUDescriptorHandleForHeapStart());
-    env_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    // Also a UAV: ssr_apply_reflection blends the reflections into it.
+    env_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     gpu.device()->CreateRenderTargetView(env_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + inc});
@@ -1715,6 +1735,12 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    // Screen-space reflections replace the specular IBL where a ray hits what is on screen.
+    ssr_drawn_ = false;
+    if (own_env && render_ssr(gpu, cl, gb, vm, p)) {
+        cl->RSSetViewports(1, &vp);
+        cl->RSSetScissorRects(1, &sc);
+    }
     if (own_env) Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
@@ -1742,6 +1768,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
     if (post) {
         render_post(gpu, cl, gb, p, scopes);
     } else {

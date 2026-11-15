@@ -454,6 +454,8 @@ struct LightingParams {
     bool ssao = true;
     // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.
     bool volumetrics = true;
+    // Screen-space reflections: the engine's hi_z_generate_* / ssr_* compute passes (PROGRESS 3.12).
+    bool ssr = true;
     // Post-processing (game lighting only): bloom, auto exposure and the engine's tonemap /
     // grading pass (screen_area_global_lut3d) instead of final_combine. `exposure` then scales the
     // auto exposure (as a compensation); without auto exposure it is the exposure itself.

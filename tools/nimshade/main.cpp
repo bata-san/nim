@@ -100,7 +100,7 @@ int run(int argc, char** argv) {
     std::optional<std::pair<size_t, size_t>> entity_range;
     TagHash selected_activity;
     uint32_t selected_activity_map = 0;
-    bool no_ssao = false, no_volumetrics = false;
+    bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
     std::optional<V3> eye_arg, look_arg;
@@ -138,6 +138,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
+        else if (args[i] == "--no-ssr") no_ssr = true;
         else if (args[i] == "--no-post") no_post = true;
         else if (args[i] == "--no-auto-exposure") no_auto_exposure = true;
         else if (args[i] == "--no-bloom") no_bloom = true;
@@ -465,6 +466,7 @@ int run(int argc, char** argv) {
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
     lp.volumetrics = !no_volumetrics;
+    lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
@@ -594,6 +596,14 @@ int run(int argc, char** argv) {
         }
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
+        // Screen-space reflections trace the previous frame's image: one more frame gives them one.
+        if (lp.ssr && !gl.ssr_drawn()) {
+            gpu.begin_frame(1);
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gpu.flush();
+        }
+        std::println("screen-space reflections: {}", gl.ssr_drawn() ? "traced" : "not drawn");
         // Auto exposure is read back from the previous frame: render again until it has settled
         // (the first measurement is taken as is), with the materials at the same exposure.
         for (int k = 0; k < 3 && lp.post && lp.auto_exposure && gl.post_ready(); ++k) {
@@ -753,6 +763,7 @@ int run(int argc, char** argv) {
         save("lighting-depth.bin", depth);
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        save("lighting-ibl.bin", gpu.read_texture(gl.specular_ibl(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         for (int k = 0; k < 2 && gl.volumetric_layer(k); ++k)
             save(k ? "lighting-shafts-near.bin" : "lighting-shafts-far.bin", gpu.read_texture(gl.volumetric_layer(k), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         std::ofstream f(out_dir / "lighting.json");

@@ -2347,6 +2347,8 @@ public:
             ImGui::SetItemTooltip("nim のシャドウマップ (ゲームのカスケードは未解読のため推定)");
             ImGui::Checkbox("SSAO", &light.ssao);
             ImGui::SetItemTooltip("ゲームの hdao と apply_ssao_to_light_buffers (調整値は推定)");
+            ImGui::Checkbox("スクリーンスペース反射", &light.ssr);
+            ImGui::SetItemTooltip("ゲームの hi_z_generate_* / ssr_* コンピュートパス (設定値は推定)");
             ImGui::Checkbox("ライトシャフト", &light.volumetrics);
             ImGui::SetItemTooltip("ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)");
             ImGui::Checkbox("ポストプロセス", &light.post);
