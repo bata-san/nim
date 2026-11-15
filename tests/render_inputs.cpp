@@ -30,6 +30,30 @@ int main() {
         check(cubemap_alpha_exponent(0) == 0 && cubemap_alpha_exponent(0.5f) == 1 && std::abs(cubemap_alpha_exponent(1) - 61) < 1e-4f, "probe alpha exponent remap");
     }
     {
+        // A shadowing light's +0x60 matrix: forward +X, 45 degree half angles, 0.5 .. 50 m. The
+        // shadow view looks along the axis and stores reversed depth (near 1, far 0).
+        MapLight l;
+        l.node = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3, 4, 5, 1};
+        l.light_space = {0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -0.99f, 1, 0, 0, 1.01f};
+        const auto v = light_shadow_view(l);
+        check(v.has_value(), "spot light frustum not recognised");
+        if (v) {
+            auto project = [&](float x, float y, float z) {
+                std::array<float, 4> c{};
+                const float p[4] = {x, y, z, 1};
+                for (int col = 0; col < 4; ++col) for (int row = 0; row < 4; ++row) c[size_t(row)] += v->vp_abs.c[col][row] * p[col];
+                return std::array<float, 3>{c[0] / c[3], c[1] / c[3], c[2] / c[3]};
+            };
+            const auto near_p = project(3.5f, 4, 5), far_p = project(53, 4, 5), edge_u = project(13, -6, 5), edge_v = project(13, 4, 15);
+            check(std::abs(near_p[0]) < 1e-5f && std::abs(near_p[1]) < 1e-5f && std::abs(near_p[2] - 1) < 1e-4f, "light axis at the near plane is not the map centre at depth 1");
+            check(std::abs(far_p[2]) < 1e-4f, "light far plane is not depth 0");
+            check(std::abs(std::abs(edge_u[0]) - 1) < 1e-4f && std::abs(edge_u[1]) < 1e-4f, "light frustum side is not the map edge");
+            check(std::abs(std::abs(edge_v[1]) - 1) < 1e-4f && std::abs(edge_v[0]) < 1e-4f, "light frustum top is not the map edge");
+        }
+        l.light_space = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        check(!light_shadow_view(l).has_value(), "a box light was given a spot shadow frustum");
+    }
+    {
         ExternStore ext;
         ext.channels.resize(45);
         ext.channels[19] = {7, 8, 9, 10};

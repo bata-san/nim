@@ -76,6 +76,7 @@ int run(int argc, char** argv) {
     bool warp = false, game = false;
     float time_of_day = -1;
     float day_night_state = -1;
+    bool no_light_shadows = false;
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
@@ -113,6 +114,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--warp") warp = true;
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
+        else if (args[i] == "--no-light-shadows") no_light_shadows = true;
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
@@ -544,6 +546,33 @@ int run(int argc, char** argv) {
         }
         std::println("GPU memory before lighting: {:.1f} MiB used / {:.1f} MiB budget",
                      double(gpu.vram_usage()) / (1 << 20), double(gpu.vram_budget()) / (1 << 20));
+        if (no_light_shadows) gl.set_light_shadows(false);
+        {
+            int light_maps_reported = 0;
+            const auto maps = gl.light_shadows_to_render(gpu, gpu.immediate(), vm, scene.item_count(), SIZE_MAX);
+            for (SunShadow* s : maps) {
+                scene.render_shadow(gpu, gpu.immediate(), *s);
+                gpu.flush();
+                gpu.begin_frame(0);  // flushed: the transient space is free for the next map
+                if (s->valid && light_maps_reported++ < 4) {
+                    const auto d = gpu.read_texture(s->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
+                    const float* f = reinterpret_cast<const float*>(d.data());
+                    size_t n = d.size() / 4, covered = 0;
+                    float lo = 1e9f, hi = -1e9f;
+                    for (size_t i = 0; i < n; ++i) { lo = std::min(lo, f[i]); hi = std::max(hi, f[i]); covered += f[i] > 0; }
+                    std::println("  light shadow map at ({:.1f}, {:.1f}, {:.1f}): depth {}..{}, covered {:.1f}%", s->vm.eye.x, s->vm.eye.y, s->vm.eye.z, lo, hi,
+                                 100.0 * double(covered) / double(n));
+                } else if (!s->valid) {
+                    std::println("  light shadow map not drawn (no opaque scene items)");
+                }
+            }
+            if (!maps.empty()) {
+                std::println("light shadow maps: {} drawn", maps.size());
+                // The shadow passes moved the cull and material state of the scene to the light views.
+                gpu.begin_frame(0);
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            }
+        }
         gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
         gpu.flush();
         // Auto exposure is read back from the previous frame: render again until it has settled
@@ -603,6 +632,7 @@ int run(int argc, char** argv) {
         }
         if (gl.light_count() || gl.cubemap_count()) {
             std::println("local lights drawn: {}, light shafts {} of {}", gl.lights_drawn(), gl.volumetrics_drawn(), gl.volumetric_lights());
+            std::println("shadowed lights drawn: {}", gl.light_shadows_used());
             for (int b = 0; b < 2; ++b) {
                 auto px = gpu.read_texture(gl.light_buffer(b), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
                 const uint16_t* h = reinterpret_cast<const uint16_t*>(px.data());

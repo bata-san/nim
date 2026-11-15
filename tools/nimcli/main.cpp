@@ -1106,15 +1106,16 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     std::map<uint32_t, uint32_t> slot_hash;
     for (const auto& [hash, slot] : registry.slots) slot_hash[slot] = hash;
     std::map<uint8_t, size_t> world, global;
+    std::map<uint32_t, std::array<size_t, 2>> light_floats;  // deferred_light (extern 4) float offset -> lights reading it (all, shadowing)
     size_t failed = 0, shadow_world3 = 0;
     for (const auto& l : lights) {
         try {
             const Technique t = load_technique(pm, l.technique);
             const auto& ps = t.stage(ShaderStage::Pixel);
-            std::set<uint8_t> w, g;
+            std::set<uint8_t> w, g, f;
             TfxEnvironment env;
             env.extern_vec4 = [](uint8_t, uint8_t) { return float4{1, 1, 1, 1}; };
-            env.extern_float = [](uint8_t, uint8_t) { return 1.0f; };
+            env.extern_float = [&](uint8_t e, uint8_t i) { if (e == 4) f.insert(i); return 1.0f; };
             env.global_channel = [&](uint8_t c) { g.insert(c); return float4{1, 1, 1, 1}; };
             env.world_channel = [&](uint8_t c) { w.insert(c); return float4{1, 1, 1, 1}; };
             env.object_channel = [](uint32_t) { return float4{1, 1, 1, 1}; };
@@ -1122,6 +1123,7 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
             evaluate_tfx(ps.bytecode, ps.constants, ps.cbuffer_init, out, env);
             for (auto c : w) ++world[c];
             for (auto c : g) ++global[c];
+            for (auto i : f) { ++light_floats[uint32_t(i) * 4][0]; light_floats[uint32_t(i) * 4][1] += l.shadowing; }
             if (l.shadowing && w.contains(3)) ++shadow_world3;
         } catch (const std::exception&) { ++failed; }
     }
@@ -1132,6 +1134,7 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     }
     for (const auto& [c, n] : global) std::println("  render-global channel {:02X}: {} lights", c, n);
     std::println("  shadowing lights reading world channel 3: {}", shadow_world3);
+    for (const auto& [off, n] : light_floats) std::println("  deferred_light +0x{:X} (float): {} lights, {} of them shadowing", off, n[0], n[1]);
     return 0;
 }
 

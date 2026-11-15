@@ -104,6 +104,8 @@ struct MapLight {
     std::array<float, 20> params{};    // SLight +0x00..+0x4F: two clip planes, two more, plane exponents
     std::array<float, 3> lo{}, hi{};   // world bounds of the light volume
     bool shadowing = false;
+    TagHash shadow_technique;          // SShadowingLight +0xD8: lighting_apply with the shadow map
+    TagHash shadow_volumetrics;        // SShadowingLight +0xE0: light shafts with the shadow map
 };
 std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map);
 // The lights whose volume comes within `radius` of `center`.

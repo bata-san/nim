@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <unordered_map>
 
 namespace nim {
@@ -100,6 +101,10 @@ struct CubemapRelightingInputs {
 };
 std::array<float4, 2> cubemap_relighting(const MapCubemap& volume, const CubemapRelightingInputs& in);
 float cubemap_alpha_exponent(float z);
+// The depth view of a shadowing light, from its own projective matrix (+0x60: cube -> light
+// local, forward +X): reversed depth, 1 at the near plane and 0 at the far plane. nullopt when the
+// matrix is not a frustum along +X.
+std::optional<ViewMatrices> light_shadow_view(const MapLight& light);
 std::array<float4, 16> frame_constants(float time, float delta, const ExternStore& ext);
 // The engine's per-frame state that no file holds (exposure, wind, temporal seeds): cb13 and
 // the Frame extern, laid out per goriath's FrameScope with its defaults, recorded as estimates.
@@ -223,6 +228,13 @@ public:
     void clear_lights() { lights_.clear(); vol_lights_.clear(); }
     size_t light_count() const { return lights_.size(); }
     size_t lights_drawn() const { return lights_drawn_; }
+    // Shadowing lights (SShadowingLight) draw with their +0xD8 technique and a depth map of the
+    // scene from the light. Returns the maps still to draw for the lights on screen (at most
+    // `budget`), each with its view set: render them with StaticMeshScene::render_shadow before
+    // render(). `scene_items` changing (a map still loading) discards the maps drawn so far.
+    std::vector<SunShadow*> light_shadows_to_render(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, size_t scene_items, size_t budget);
+    void set_light_shadows(bool on) { light_shadows_ = on; }
+    size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
     const std::vector<std::string>& light_notes() const { return light_notes_; }
@@ -356,7 +368,14 @@ private:
         uint32_t pipeline = 0;
         std::shared_ptr<const Technique> technique;
         MapLight light;
+        // Shadowing lights: the +0xD8 technique and this light's depth map (drawn by the caller).
+        uint32_t shadow_pipeline = UINT32_MAX;
+        std::shared_ptr<const Technique> shadow_technique;
+        std::unique_ptr<SunShadow> shadow;
+        bool shadow_readable = false;  // depth map in PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
     };
+    size_t light_shadow_items_ = 0, light_shadows_used_ = 0;
+    bool light_shadows_ = true;
     std::vector<std::unique_ptr<GamePipeline>> light_pipelines_;  // two per shader pair: both windings
     std::vector<LocalLight> lights_;
     std::vector<std::string> light_notes_;

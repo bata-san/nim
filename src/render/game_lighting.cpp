@@ -2150,7 +2150,43 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                 }
                 it = keys.emplace(key, index).first;
             }
-            lights_.push_back({it->second, tech, *l});
+            LocalLight local{it->second, tech, *l};
+            if (l->shadowing && !l->shadow_technique.is_none() && light_shadow_view(*l)) {
+                // The +0xD8 technique: its own shaders, the same pipeline sharing.
+                try {
+                    auto& stech = techniques[l->shadow_technique.value];
+                    if (!stech) stech = std::make_shared<const Technique>(load_technique(pm, l->shadow_technique));
+                    std::string skey = "S";
+                    for (auto which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+                        const auto& st = stech->stage(which);
+                        skey += std::format("{:08X}:", st.shader.value);
+                        for (const auto& t : st.textures) skey += std::format("t{}={:08X},", t.slot, t.texture.value);
+                        for (const auto& sm : st.samplers) skey += std::format("s{:08X},", sm.value);
+                        skey += '|';
+                    }
+                    auto sit = keys.find(skey);
+                    if (sit == keys.end()) {
+                        const uint32_t index = uint32_t(light_pipelines_.size());
+                        for (bool front : {true, false}) {
+                            auto lp = std::make_unique<GamePipeline>();
+                            GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
+                            opt.volume = true;
+                            opt.cull_front = front;
+                            opt.cbuffer_floor = 64;
+                            lp->load(pm, gpu, l->shadow_technique, scopes, opt);
+                            light_pipelines_.push_back(std::move(lp));
+                        }
+                        sit = keys.emplace(skey, index).first;
+                    }
+                    local.shadow_pipeline = sit->second;
+                    local.shadow_technique = stech;
+                } catch (const std::exception& ex) {
+                    ++failures[std::format("shadowing technique: {}", std::string(ex.what()).substr(0, 100))];
+                }
+            } else if (l->shadowing) {
+                ++failures["shadowing light without a +0xD8 technique or a frustum along +X: drawn unshadowed"];
+            }
+            lights_.push_back(std::move(local));
         } catch (const std::exception& ex) {
             ++failures[std::string(ex.what()).substr(0, 120)];
         }
@@ -2198,8 +2234,89 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
     }
     for (const auto& [why, n] : vol_failures) light_notes_.push_back(std::format("{} light shafts left out: {}", n, why));
     if (!lights_.empty())
-        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1) (plane masks off), +0x150 = 1, +0x154 = 0, +0x158 = 1 (fade: fully on)",
-                           "goriath DeferredLight layout; +0x158 read from the light PS (output scale)");
+        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1) (plane masks off), +0x150 = 1, +0x160 = 1 (fade: fully on)",
+                           "goriath DeferredLight layout; +0x160 (float 0x58) is the output scale of the light PS (cb0[36], saturated), read by 458 of Outpost's 4236 lights");
+}
+
+std::optional<ViewMatrices> light_shadow_view(const MapLight& l) {
+    // +0x60 maps the cube (u, v, w) to light-local homogeneous coordinates. A spot light has
+    // x = c3.x, (y, z) = u * c0.yz + v * c1.yz, W = w * c2.w + c3.w: forward +X, u / v across, the
+    // near plane at w = -1 and the far plane at w = +1 (Outpost 80AF301F: tan 1.0355 = tan(+0xC4),
+    // 0.56 .. 55.9 m, +0xC0 = 56).
+    const auto& m = l.light_space;
+    auto at = [&](int col, int row) { return m[size_t(col * 4 + row)]; };
+    const float eps = 1e-4f;
+    if (std::fabs(at(0, 0)) > eps || std::fabs(at(1, 0)) > eps || std::fabs(at(0, 3)) > eps || std::fabs(at(1, 3)) > eps) return std::nullopt;
+    if (std::fabs(at(2, 0)) > eps || std::fabs(at(2, 1)) > eps || std::fabs(at(2, 2)) > eps) return std::nullopt;
+    if (std::fabs(at(3, 1)) > eps || std::fabs(at(3, 2)) > eps || at(3, 0) <= eps) return std::nullopt;
+    const float x = at(3, 0), w_near = at(3, 3) - at(2, 3), w_far = at(3, 3) + at(2, 3);
+    if (w_near <= eps || w_far <= eps || w_far >= w_near) return std::nullopt;
+    const float near_z = x / w_near, far_z = x / w_far;
+    const float tan_u = std::hypot(at(0, 1), at(0, 2)) / x, tan_v = std::hypot(at(1, 1), at(1, 2)) / x;
+    if (tan_u <= eps || tan_v <= eps) return std::nullopt;
+    const M4 node = m4(l.node);
+    auto dir = [&](float lx, float ly, float lz) {
+        return normalize(V3{node.c[0][0] * lx + node.c[1][0] * ly + node.c[2][0] * lz, node.c[0][1] * lx + node.c[1][1] * ly + node.c[2][1] * lz,
+                            node.c[0][2] * lx + node.c[1][2] * ly + node.c[2][2] * lz});
+    };
+    ViewMatrices v;
+    v.eye = {node.c[3][0], node.c[3][1], node.c[3][2]};
+    v.fwd = dir(1, 0, 0);
+    v.up = dir(0, at(1, 1), at(1, 2));
+    v.right = normalize(cross(v.fwd, v.up));  // the handedness of nim's camera; the lookup uses the same matrix
+    v.up = cross(v.right, v.fwd);
+    v.fx = 1 / tan_u;
+    v.fy = 1 / tan_v;
+    M4 rot;
+    rot.c[0] = {v.right.x, v.up.x, v.fwd.x, 0};
+    rot.c[1] = {v.right.y, v.up.y, v.fwd.y, 0};
+    rot.c[2] = {v.right.z, v.up.z, v.fwd.z, 0};
+    rot.c[3] = {0, 0, 0, 1};
+    M4 proj;  // reversed depth: near -> 1, far -> 0
+    proj.c[0] = {v.fx, 0, 0, 0};
+    proj.c[1] = {0, v.fy, 0, 0};
+    proj.c[2] = {0, 0, -near_z / (far_z - near_z), 1};
+    proj.c[3] = {0, 0, near_z * far_z / (far_z - near_z), 0};
+    v.proj = proj;
+    v.vp_rel = mul(proj, rot);
+    M4 tr;
+    tr.c[0] = {1, 0, 0, 0};
+    tr.c[1] = {0, 1, 0, 0};
+    tr.c[2] = {0, 0, 1, 0};
+    tr.c[3] = {-v.eye.x, -v.eye.y, -v.eye.z, 1};
+    v.vp_abs = mul(v.vp_rel, tr);
+    v.vp_prev = v.vp_abs;
+    return v;
+}
+
+std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, size_t scene_items,
+                                                              size_t budget) {
+    constexpr uint32_t kSize = 1024;
+    std::vector<SunShadow*> out;
+    if (!light_shadows_) return out;
+    if (scene_items != light_shadow_items_) {
+        for (auto& ll : lights_)
+            if (ll.shadow) ll.shadow->valid = false;
+        light_shadow_items_ = scene_items;
+    }
+    for (auto& ll : lights_) {
+        if (out.size() >= budget) break;
+        if (!ll.shadow_technique || (ll.shadow && ll.shadow->valid) || off_screen(vm, ll.light.lo, ll.light.hi)) continue;
+        const auto view = light_shadow_view(ll.light);
+        if (!view) continue;
+        if (!ll.shadow) ll.shadow = std::make_unique<SunShadow>();
+        ll.shadow->resize(gpu, kSize);
+        if (ll.shadow_readable) {
+            Gpu::barrier(cl, ll.shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            ll.shadow_readable = false;
+        }
+        ll.shadow->vm = *view;
+        out.push_back(ll.shadow.get());
+    }
+    if (!out.empty() || light_shadows_used_)
+        ext_.note_estimate("shadowing lights: 1024^2 depth map of the loaded scene per light (reversed depth, frustum of the light matrix), deferred_shadow +0x30.x = -7000, +0x180 = 2 (21 taps), deferred_light +0x154 = 1",
+                           "the engine shadow map render (resolution, atlas, caster set, bias, filter quality) is not in game data; slots read from the +0xD8 PS, -7000 is the D2 default (Alkahest)");
+    return out;
 }
 
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
@@ -2220,7 +2337,8 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
     M4 to_rel;  // world -> camera-relative world
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
-    for (const auto& ll : lights_) {
+    light_shadows_used_ = 0;
+    for (auto& ll : lights_) {
         const MapLight& l = ll.light;
         if (off_screen(vm, l.lo, l.hi)) continue;
         const M4 node = m4(l.node), space = m4(l.light_space);
@@ -2232,14 +2350,35 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
         ext_.set(ext::DeferredLight, 0xC0, node_rel);
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         ext_.set(ext::DeferredLight, 0x150, 1.0f);
-        ext_.set(ext::DeferredLight, 0x154, 0.0f);
-        ext_.set(ext::DeferredLight, 0x158, 1.0f);  // the PS multiplies both outputs by saturate(+0x158): light fade, fully on
+        // +0x154: weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
+        const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && ll.shadow_technique;
+        ext_.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+        if (shadowed) {
+            constexpr uint8_t kShadow = 6;  // deferred_shadow
+            if (!ext_.zero_policy(kShadow)) ext_.zero_when_missing(kShadow, "deferred shadow value with no known meaning: zero");
+            if (!ll.shadow_readable) {
+                Gpu::barrier(cl, ll.shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                ll.shadow_readable = true;
+            }
+            M4 from_rel;  // camera-relative world -> world
+            from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
+            from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
+            ext_.set_texture(kShadow, 0x00, ll.shadow->depth.Get(), DXGI_FORMAT_R32_FLOAT);
+            ext_.set(kShadow, 0x18, float(ll.shadow->size));
+            ext_.set(kShadow, 0x1C, float(ll.shadow->size));
+            ext_.set(kShadow, 0x30, float4{-7000, 0, 1, 0});  // .x: slope of the depth comparison (reversed depth)
+            ext_.set(kShadow, 0xB0, float4{0, 0, 1, 1});      // uv offset / scale: the whole map
+            ext_.set(kShadow, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
+            ext_.set(kShadow, 0x180, 2.0f);                   // > 1: the 21-tap filter of the PS
+            ++light_shadows_used_;
+        }
+        ext_.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
         // Only the far side of the volume is drawn (the camera may be inside it); the cube's
         // winding on screen flips with the handedness of its transform.
         const bool mirrored = det4(volume) > 0;  // the clip-space map flips handedness when its determinant is positive (D3D NDC is left-handed)
-        GamePipeline& gp = *light_pipelines_[ll.pipeline + (mirrored ? 1 : 0)];
+        GamePipeline& gp = *light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, scopes, ll.technique.get(), cube_vbv_, cube_ibv_, 36);
+            gp.draw_volume(gpu, cl, ext_, scopes, shadowed ? ll.shadow_technique.get() : ll.technique.get(), cube_vbv_, cube_ibv_, 36);
             if (std::getenv("NIM_LIGHT_DEBUG") && lights_drawn_ < 2) {
                 const auto& vs = gp.stage_constants(0);
                 const auto& ps = gp.stage_constants(1);
@@ -2353,7 +2492,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         ext_.set(ext::DeferredLight, 0x150, 1.0f);
         ext_.set(ext::DeferredLight, 0x154, 0.0f);
-        ext_.set(ext::DeferredLight, 0x158, 1.0f);
+        ext_.set(ext::DeferredLight, 0x160, 1.0f);
         ext_.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
         ext_.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
         ext_.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box

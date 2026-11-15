@@ -1899,6 +1899,11 @@ public:
                 scene.render_shadow(gpu, cl, sun_shadow);
                 shadow = &sun_shadow;
             }
+            // Shadowing local lights: a couple of depth maps per frame for the lights on screen,
+            // once the map is complete (a growing scene would discard them again).
+            game_lighting.set_light_shadows(shadows);
+            if (shadows && light.mode == ViewMode::Lit && game_ready && map_scene && !map.streaming && scene.loaded())
+                for (SunShadow* s : game_lighting.light_shadows_to_render(gpu, cl, vm, scene.item_count(), 2)) scene.render_shadow(gpu, cl, *s);
             if (map_scene && !map.streaming && scene.loaded() && (!rain.valid || rain.items != scene.item_count())) {
                 if (!rain.mask) rain.resize(gpu, 4096);
                 scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
