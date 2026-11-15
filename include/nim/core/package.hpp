@@ -91,6 +91,8 @@ public:
     std::shared_ptr<const std::vector<uint8_t>> cached_block(uint32_t index) const;
     // Reads one entry's bytes. Thread-safe.
     std::vector<uint8_t> read_entry(uint32_t index) const;
+    // Research scans release decoded blocks between packages; active readers retain ownership.
+    void clear_block_cache() const;
 
 private:
     const MappedFile& file_for_patch(uint16_t patch) const;

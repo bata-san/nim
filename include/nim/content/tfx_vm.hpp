@@ -15,6 +15,7 @@ struct TfxEnvironment {
     std::function<float4(uint8_t extern_id, uint8_t offset)> extern_vec4;  // offset in vec4 units
     std::function<float(uint8_t extern_id, uint8_t offset)> extern_float;  // offset in float units
     std::function<float4(uint8_t channel)> global_channel;
+    std::function<float4(uint8_t channel)> world_channel; // scalar registry (0x64), separate from 0x63 vectors
     std::function<float4(uint32_t hash)> object_channel;
     std::function<float4(uint8_t texture)> texture_tiling;  // push_tex_tiling (streaming state)
     std::function<float4(uint8_t texture)> texture_layer_count;  // push_tex_layer_count

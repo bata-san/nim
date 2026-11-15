@@ -7,6 +7,36 @@ using namespace nim;
 int main() {
     int failures = 0;
     auto check = [&](bool ok, const char* what) { if (!ok) { std::fprintf(stderr, "%s\n", what); ++failures; } };
+    {
+        // Original PS contract: relighting uses alpha*cb11[19]*probe+cb11[20];
+        // non-relighting uses 1+alpha*probe_params.x*original_boost*probe.
+        MapCubemap m;
+        m.probes = {2, 3, 1}; m.probe_params[0] = 0.4f;
+        const auto cb = cubemap_relighting_baseline(m, 0.75f);
+        for (float alpha : {0.0f, 0.2f, 1.0f}) for (float probe : {0.0f, 0.01f, 1.0f})
+            check(std::abs(alpha * cb[0][0] * probe + cb[1][0] - (1 + alpha * m.probe_params[0] * 0.75f * probe)) < 1e-6f,
+                "relighting baseline erased or recolored baked probe modulation");
+        m.probes = {1, 1, 1};
+        check(cubemap_relighting_baseline(m, 0.75f)[0] == float4{}, "cube-only probe acquired diffuse-grid boost");
+        check(cubemap_relighting_baseline(m, 0.75f)[1] == float4{1, 1, 1, 0}, "cube-only probe was extinguished");
+    }
+    {
+        ExternStore ext;
+        ext.channels.resize(45);
+        ext.channels[19] = {7, 8, 9, 10};
+        ext.channels[44] = {2, 3, 4, 5};
+        ext.world_channels[19] = 1;
+        const uint8_t program[] = {0x63, 19, 0x53, 0, 0x64, 19, 0x53, 1, 0x64, 44, 0x53, 2};
+        std::array<float4, 3> out{};
+        run_tfx(program, {}, out, ext.environment());
+        check(out[0] == ext.channels[19], "world weather overwrote a render-global vector");
+        check(out[1] == float4{1, 1, 1, 1}, "world scalar did not reach TFX 0x64");
+        check(out[2] == float4{}, "world scalar inherited an unrelated sky vector");
+        ext.world_channels.clear();
+        run_tfx(program, {}, out, ext.environment());
+        check(out[1] == float4{}, "disabling weather retained the previous state");
+        check(ext.channels[44] == float4{2, 3, 4, 5}, "weather changed sky defaults");
+    }
     // Descriptor identities survive all draws in one frame, but never cross a recycled
     // frame region or an immediate-list rewind (which would alias overwritten views).
     Gpu tables;

@@ -452,7 +452,8 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             vm.push(env.object_channel ? env.object_channel(h) : missing("object channel"));
             break;
         }
-        case 0x63: case 0x64: vm.push(env.global_channel ? env.global_channel(a1) : missing("global channel")); break;
+        case 0x63: vm.push(env.global_channel ? env.global_channel(a1) : missing("global channel")); break;
+        case 0x64: vm.push(env.world_channel ? env.world_channel(a1) : missing("world channel")); break;
         case 0x67: {
             // Texture streaming / tiling parameters of texture a1; the shaders seen use .w as the
             // minimum resident mip (an LOD clamp). Supplied by the environment, never invented here.

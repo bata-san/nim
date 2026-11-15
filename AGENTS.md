@@ -9,6 +9,7 @@
      listed estimates (`ExternStore::note_estimate` / `estimate*`), shown as 推定 in the UI.
    - Never touch the running game (BattlEye); the install is read-only; no GPU/memory capture.
    - Never commit or ship game data or `oo2core_9_win64.dll`. `out/` is gitignored scratch.
+   - User instruction: never use Computer Use. GUI interaction checks are not required; verify headlessly.
    - "Implement" means: build, test, commit, push, release when appropriate, then verify.
    - Reply to the user in Japanese.
 4. Build: `cmake --build build --config Release`; tests: `./build/Release/nim_tests.exe`;

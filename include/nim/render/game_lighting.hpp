@@ -40,6 +40,7 @@ public:
 
     std::vector<float4> channels;          // global channels by index (render-globals defaults)
     std::vector<uint32_t> channel_ids;     // fnv1 of the channel name, same order
+    std::map<uint32_t, float> world_channels; // script registry slots, never render-globals indices
     void set_channel(std::string_view name, float4 v);
     TfxEnvironment environment() const;
     // Engine-produced cb13, including its temporal seeds and exposure state.
@@ -91,6 +92,9 @@ void write_game_srv(ID3D12Device* device, const ExternStore::Tex& view, BindingK
 
 // Shared view inputs for model materials and the deferred lighting passes.
 void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm);
+// Explicit baseline for engine-produced cb11[19..20]. Algebraically preserves the
+// original non-relighting shader's modulation, instead of extinguishing authored probes.
+std::array<float4, 2> cubemap_relighting_baseline(const MapCubemap& volume, float original_boost);
 std::array<float4, 16> frame_constants(float time, float delta, const ExternStore& ext);
 // The engine's per-frame state that no file holds (exposure, wind, temporal seeds): cb13 and
 // the Frame extern, laid out per goriath's FrameScope with its defaults, recorded as estimates.
@@ -223,11 +227,14 @@ public:
     // engine's cubemap_apply pipelines into the diffuse light buffer and the specular IBL buffer,
     // before the local lights. Volumes that cannot be loaded are left out and listed.
     void set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg = false);
-    void clear_cubemaps() { cubemaps_.clear(); }
+    void clear_cubemaps(Gpu& gpu);
     size_t filtered_cube_count() const { return filtered_cubes_.size(); }
     size_t cubemap_count() const { return cubemaps_.size(); }
     size_t cubemaps_drawn() const { return cubemaps_drawn_; }
     size_t cubemaps_failed() const { return cubemaps_failed_; }
+    size_t cubemaps_requested() const { return cubemaps_requested_; }
+    size_t probe_texture_count() const { return probe_textures_.size(); }
+    size_t probe_shape_count() const { return probe_shapes_.size(); }
     const std::vector<std::string>& cubemap_notes() const { return cubemap_notes_; }
 
     // Weather: global channel values by index (world channel controllers), over the defaults.
@@ -376,7 +383,8 @@ private:
     std::vector<std::string> cubemap_notes_;
     size_t cubemaps_drawn_ = 0;
     size_t cubemaps_failed_ = 0;
-    std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // by tag, kept across maps
+    size_t cubemaps_requested_ = 0;
+    std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // current selection's resources only
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_shapes_;    // keep in-flight boundary buffers alive across map changes
 
     // Post-processing (docs/PROGRESS.md 3.5, src/render/game_post.cpp): the bloom pyramid

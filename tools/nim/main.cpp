@@ -710,6 +710,7 @@ private:
         TagHash layout_activity;
         uint32_t layout_activity_map = 0;
         std::optional<PrepareCache> cache;
+        std::optional<PrepareCache> sky_cache;
         std::vector<std::vector<InputElement>> layouts;
         try {
             layouts = load_input_layouts(*pm);
@@ -774,6 +775,10 @@ private:
                     cache->max_texture_dim = req.texture_cap;
                     cache->gbuffer_only = true;
                     cache->all_lods = true;
+                    sky_cache.emplace();
+                    sky_cache->max_texture_dim = req.texture_cap;
+                    sky_cache->gbuffer_only = false; // original sky meshes include stage 8
+                    sky_cache->all_lods = true;
                 }
                 const auto center = req.center ? *req.center : !starts.empty() ? starts.front().position : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
@@ -799,6 +804,11 @@ private:
                     std::nth_element(distances.begin(), k, distances.end());
                     typical = std::max(1.0f, *k);
                 }
+                // Authored sky collections are independent of the world streaming radius.
+                // Append after framing statistics so kilometre-distant scenery cannot move
+                // the user's initial camera. Only these models may load transparent parts.
+                const size_t sky_first = region.size();
+                for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
                     const auto all = load_map_lights(*pm, *layout);
@@ -863,7 +873,8 @@ private:
                                 auto& model = region[j - terrain.size()];
                                 const auto mat = entity_materials->find(model.mesh.value);
                                 piece.mesh = prepare_dynamic_model(wpm, model.mesh,
-                                    mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr, &*cache);
+                                    mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr,
+                                    j - terrain.size() >= sky_first ? &*sky_cache : &*cache);
                                 if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
                                 piece.rows = std::move(model.rows);
                             }
@@ -892,6 +903,10 @@ private:
                 {
                     std::unique_lock texture_lock(*cache->texture_mutex);
                     cache->textures.clear();
+                }
+                {
+                    std::unique_lock texture_lock(*sky_cache->texture_mutex);
+                    sky_cache->textures.clear();
                 }
             } catch (const std::exception& ex) {
                 std::lock_guard lk(m_);
@@ -1175,7 +1190,7 @@ public:
             map = MapView{};
             map_scene = false;
             game_lighting.clear_lights();
-            game_lighting.clear_cubemaps();
+            game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
             init_game_lighting();
             return true;
@@ -1318,7 +1333,7 @@ public:
                     stop_map();
                     map_scene = false;
                     game_lighting.clear_lights();
-                    game_lighting.clear_cubemaps();
+                    game_lighting.clear_cubemaps(g);
                     game_lighting.clear_atmosphere(), map_atmosphere.reset();
                     map_weather.reset();
                     weather_states.clear();
@@ -1385,7 +1400,7 @@ public:
         map.streaming = true;
         map_scene = true;
         game_lighting.clear_lights();
-        game_lighting.clear_cubemaps();
+        game_lighting.clear_cubemaps(gpu);
         game_lighting.clear_atmosphere(), map_atmosphere.reset();
         if (!same) map_weather.reset(), weather_states.clear();
         rain.valid = false;
@@ -1473,6 +1488,7 @@ public:
     // the render-globals defaults).
     std::shared_ptr<const MapWeather> map_weather;
     std::vector<int> weather_states;
+    bool heat_cascade_enabled = false; // keep the user's selection when changing maps/views
     RainOcclusion rain;
 
     void apply_weather() {
@@ -1483,6 +1499,9 @@ public:
                 if (weather_states[i] >= 0 && size_t(weather_states[i]) < c.states.size())
                     for (const auto& [slot, v] : weather_values(c.states[size_t(weather_states[i])])) channels[slot] = v;
             }
+        if (map_scene && map_weather && heat_cascade_enabled && map_weather->heat_cascade_controller)
+            if (const auto* on = map_weather->heat_cascade_controller->strongest_state())
+                for (const auto& [slot, v] : weather_values(*on)) channels[slot] = v;
         scene.set_global_channels(channels);
         game_lighting.set_global_channels(channels);
     }
@@ -1495,24 +1514,22 @@ public:
         return s;
     }
     void weather_ui() {
-        if (!map_weather || map_weather->controllers.empty()) return;
+        if (!map_weather) return;
         ImGui::Spacing();
         const auto& cs = map_weather->controllers;
-        for (size_t i = 0; i < cs.size(); ++i) {
-            if (!cs[i].heat_cascade()) continue;
-            const WeatherState* on = cs[i].strongest_state();
-            bool hc = on && weather_states[i] == int(on - cs[i].states.data());
-            if (ImGui::Checkbox("ヒートカスケード", &hc)) {
-                weather_states[i] = hc && on ? int(on - cs[i].states.data()) : -1;
-                apply_weather();
-            }
-            ImGui::SetItemTooltip("%s: 熱い雨 (global channel 19) と床の熱模様。値は状態の範囲の中央 (推定)", cs[i].name.c_str());
-            break;
-        }
+        ImGui::BeginDisabled(!map_weather->heat_cascade_controller);
+        if (ImGui::Checkbox("ヒートカスケード", &heat_cascade_enabled)) apply_weather();
+        ImGui::EndDisabled();
+        if (map_weather->heat_cascade_controller)
+            ImGui::SetItemTooltip("%s\n%s\n状態の値は範囲の中央 (推定)。対応する元のマテリアルに適用。",
+                map_weather->heat_cascade_controller->name.c_str(),
+                map_weather->heat_cascade_shared ? "Outpost の元の状態を共用 (他マップへの適用は推定)" : "このマップの元の状態");
+        else ImGui::SetItemTooltip("インストール内に元のヒートカスケード状態が見つかりません");
         if (ImGui::CollapsingHeader(std::format("天候とワールドチャンネル ({})###mapweather", cs.size()).c_str())) {
             const float w = ImGui::GetContentRegionAvail().x * 0.6f;
             for (size_t i = 0; i < cs.size(); ++i) {
                 const auto& c = cs[i];
+                if (c.heat_cascade()) continue; // controlled by the persistent toggle above
                 ImGui::PushID(int(i));
                 const int cur = weather_states[i];
                 const std::string preview = cur < 0 ? "既定" : weather_state_label(c.states[size_t(cur)]);

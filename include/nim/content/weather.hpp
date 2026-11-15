@@ -3,11 +3,11 @@
 // controller (c_script_world_global_channel_controller, e.g. Outpost's wgc_weather_controller
 // or the Heat Cascade's hz_emberwave) holds channel states; each state sets world global
 // channels (rain_amount, ...) to a value range. The world channel registry (class 8080A002)
-// gives each world channel a slot, which is the render-globals channel index the materials read
-// (rain_amount = 7: wet surfaces and ripples).
+// gives each scalar world channel a slot, separate from the render-globals vector channels.
 #include "nim/core/package_manager.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,7 +33,7 @@ struct WeatherController {
     TagHash tag;
     std::string name;  // the bundle path words that resolve (e.g. "exp_outpost/hz_emberwave/wgc_controller")
     std::vector<WeatherState> states;  // distinct states over all channel groups
-    bool heat_cascade() const { return name.find("emberwave") != std::string::npos; }
+    bool heat_cascade() const;
     // The state that sets its channels highest (the Heat Cascade's active state).
     const WeatherState* strongest_state() const;
 };
@@ -41,6 +41,8 @@ struct MapWeather {
     WorldChannelRegistry registry;
     std::vector<WeatherController> controllers;
     std::unordered_map<uint32_t, std::string> names;  // fnv1 -> script string, for display
+    std::optional<WeatherController> heat_cascade_controller;
+    bool heat_cascade_shared = false; // authored Outpost state reused on a different map (estimate)
     std::string name(uint32_t hash) const;
 };
 // The global channel values a state sets, by channel index: the middle of each value's range

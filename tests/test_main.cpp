@@ -145,8 +145,14 @@ int main() {
         // Weather: a state's channels at the middle of their range; unregistered channels skipped.
         WeatherController c;
         c.name = "exp_outpost/hz_emberwave";
-        c.states = {{1, {{0xA, 19, 0, 0}, {0xB, 17, 0, 0}}}, {2, {{0xA, 19, 1, 1}, {0xB, 17, 1, 1}, {0xC, -1, 5, 5}}}};
+        c.states = {{1, {{0x798A4399, 19, 0, 0}, {0xB, 17, 0, 0}}}, {2, {{0x798A4399, 19, 1, 1}, {0xB, 17, 1, 1}, {0xC, -1, 5, 5}}}};
         CHECK(c.heat_cascade());
+        c.name = "stripped-name";
+        CHECK(c.heat_cascade());
+        WeatherController unrelated;
+        unrelated.name = "emberwave-but-no-heat-channel";
+        unrelated.states = {{1, {{0xB60A35EC, 44, 1, 1}}}};
+        CHECK(!unrelated.heat_cascade());
         CHECK(c.strongest_state() == &c.states[1]);
         WeatherState rain{3, {{0xD, 7, 50, 100}}};
         const auto v = weather_values(rain);

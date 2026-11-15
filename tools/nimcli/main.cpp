@@ -16,6 +16,7 @@
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] probe-audit BUBBLE [OUT.tsv]  exhaustive map-family probe inventory and cross-check
+//   nimcli [--install DIR] probe-search OUT_DIR          install-wide texture/reference/layout/channel census
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
@@ -58,6 +59,9 @@
 
 using namespace nim;
 namespace fs = std::filesystem;
+int cmd_probe_search(PackageManager& pm, const std::string& output);
+int cmd_probe_gpu_audit(PackageManager& pm, const std::string& output);
+int cmd_world_channel_names(PackageManager& pm, const std::string& output);
 
 namespace {
 
@@ -810,6 +814,9 @@ int cmd_probe_audit(PackageManager& pm, TagHash bubble, const std::string& outpu
 int cmd_weather(PackageManager& pm, TagHash bubble) {
     const MapWeather w = load_map_weather(pm, bubble);
     std::println("world channel registry {}: {} channels", w.registry.tag.str(), w.registry.slots.size());
+    if (w.heat_cascade_controller)
+        std::println("Heat Cascade toggle: {} {} ({})", w.heat_cascade_controller->tag.str(),
+                     w.heat_cascade_controller->name, w.heat_cascade_shared ? "shared Outpost state; estimate" : "map-authored state");
     for (const auto& c : w.controllers) {
         std::println("controller {} {}{}", c.tag.str(), c.name, c.heat_cascade() ? "  (Heat Cascade)" : "");
         for (const auto& st : c.states) {
@@ -1722,6 +1729,9 @@ int main(int argc, char** argv) {
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
         if (cmd == "probe-audit" && args.size() >= 2) return cmd_probe_audit(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2] : "");
+        if (cmd == "probe-search" && args.size() >= 2) return cmd_probe_search(pm, args[1]);
+        if (cmd == "probe-gpu-audit" && args.size() >= 2) return cmd_probe_gpu_audit(pm, args[1]);
+        if (cmd == "world-channel-names" && args.size() >= 2) return cmd_world_channel_names(pm, args[1]);
         if (cmd == "nodes" && args.size() >= 2)
             return cmd_nodes(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));

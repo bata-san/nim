@@ -161,4 +161,9 @@ std::vector<uint8_t> Package::read_entry(uint32_t index) const {
     return out;
 }
 
+void Package::clear_block_cache() const {
+    std::unique_lock lock(cache_mutex_);
+    cache_.clear();
+}
+
 } // namespace nim

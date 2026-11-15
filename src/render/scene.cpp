@@ -1620,13 +1620,10 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     estimate_engine_frame(ext, material_time_, material_delta_);
     if (global_values_.size() == global_base_.size() && !global_values_.empty()) {
         ext.channels = global_values_;
-        for (const auto& [slot, v] : global_overrides_)
-            if (slot < ext.channels.size()) ext.channels[slot][0] = v;
-    } else if (!global_overrides_.empty() || ext.channels.size() != global_base_.size() || ext.channels != global_base_) {
+    } else if (ext.channels.size() != global_base_.size() || ext.channels != global_base_) {
         if (!global_base_.empty()) ext.channels = global_base_;
-        for (const auto& [slot, v] : global_overrides_)
-            if (slot < ext.channels.size()) ext.channels[slot][0] = v;
     }
+    ext.world_channels = global_overrides_;
     if (rain_ && rain_->valid) {
         ext.set_texture(80, 0x00, rain_->mask.Get(), DXGI_FORMAT_R32_FLOAT);
         ext.set(80, 0x10, rain_->scale);

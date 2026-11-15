@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <set>
 #include <stdexcept>
 
 namespace nim {
@@ -391,6 +392,14 @@ TfxEnvironment ExternStore::environment() const {
     env.global_channel = [this](uint8_t ch) {
         if (ch >= channels.size()) throw std::runtime_error(std::format("Missing game global channel {}", ch));
         return channels[ch];
+    };
+    env.world_channel = [this](uint8_t ch) {
+        note_estimate("TFX 0x64 = scalar world channel registry",
+                      "separate 52-slot script registry; engine opcode implementation is not available");
+        float v = 0;
+        if (const auto it = world_channels.find(ch); it != world_channels.end()) v = it->second;
+        else note_estimate(std::format("world channel {} = 0", ch), "no active script state supplied");
+        return float4{v, v, v, v};
     };
     // nim loads every mip of a texture: the streaming state is "fully resident" (min mip 0).
     env.texture_tiling = [this](uint8_t texture) {
@@ -1481,17 +1490,13 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
         if (input1)
             ext_.note_estimate("map environment sequencer input 1 = 0", "read by the fog density curves; its engine source is not found");
     }
-    for (const auto& [slot, v] : global_overrides_)
-        if (slot < ext_.channels.size()) ext_.channels[slot][0] = v;
+    ext_.world_channels = global_overrides_;
     return ext_.channels;
 }
 
 void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) {
-    for (const auto& [slot, v] : global_overrides_)
-        if (slot < ext_.channels.size() && slot < globals_.channel_defaults.size()) ext_.channels[slot] = globals_.channel_defaults[slot];
     global_overrides_ = values;
-    for (const auto& [slot, v] : global_overrides_)
-        if (slot < ext_.channels.size()) ext_.channels[slot][0] = v;
+    ext_.world_channels = values;
 }
 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
@@ -2359,8 +2364,40 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 }
 
 // ---- Cubemap volumes ---------------------------------------------------------------------------
-void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg) {
+std::array<float4, 2> cubemap_relighting_baseline(const MapCubemap& volume, float original_boost) {
+    const float scale = volume.use_probes() ? volume.probe_params[0] * original_boost : 0;
+    return {float4{scale, scale, scale, 0}, float4{1, 1, 1, 0}};
+}
+
+void GameLighting::clear_cubemaps(Gpu& gpu) {
+    // Old frames can still hold views of these resources. Retire them before freeing the
+    // cache, instead of retaining every previously visited map for the process lifetime.
+    if (!probe_textures_.empty() || !filtered_cubes_.empty() || !probe_shapes_.empty()) gpu.wait_idle();
     cubemaps_.clear();
+    probe_textures_.clear();
+    filtered_cubes_.clear();
+    probe_shapes_.clear();
+    cubemap_notes_.clear();
+    cubemaps_requested_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
+}
+
+void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg) {
+    std::set<uint32_t> required_textures, required_cubes, required_shapes;
+    for (const auto* m : cubemaps) {
+        for (const auto t : {m->specular, m->alpha, m->diffuse}) if (!t.is_none()) required_textures.insert(t.value);
+        if (!m->specular.is_none()) required_cubes.insert(m->specular.value);
+        if (diagnostic_csg && !m->shape_vertices.is_none()) required_shapes.insert(m->shape_vertices.value);
+    }
+    const bool retire = std::ranges::any_of(probe_textures_, [&](const auto& x) { return !required_textures.contains(x.first); }) ||
+        std::ranges::any_of(filtered_cubes_, [&](const auto& x) { return !required_cubes.contains(x.first); }) ||
+        std::ranges::any_of(probe_shapes_, [&](const auto& x) { return !required_shapes.contains(x.first); });
+    if (retire) gpu.wait_idle();
+    cubemaps_.clear();
+    std::erase_if(probe_textures_, [&](const auto& x) { return !required_textures.contains(x.first); });
+    std::erase_if(filtered_cubes_, [&](const auto& x) { return !required_cubes.contains(x.first); });
+    std::erase_if(probe_shapes_, [&](const auto& x) { return !required_shapes.contains(x.first); });
+    cubemaps_requested_ = cubemaps.size();
+    cubemaps_drawn_ = cubemaps_failed_ = 0;
     cubemap_csg_diagnostic_ = diagnostic_csg;
     cubemap_notes_.clear();
     make_cube(gpu);
@@ -2393,6 +2430,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             filter_specular_cubes(pm, gpu, wanted);
         } catch (const std::exception& ex) {
             cubemap_notes_.push_back(std::format("specular cube filtering failed: {}", ex.what()));
+            return; // never silently substitute the unfiltered chain for a failed original pass
         }
     }
     for (const MapCubemap* m : cubemaps) {
@@ -2427,6 +2465,12 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;
             v.alpha = texture(m->alpha);
             v.diffuse = texture(m->diffuse, true);
+            if (v.diffuse) {
+                const auto d = v.diffuse->GetDesc();
+                if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || d.Width != uint64_t(m->probes[0]) * 7 ||
+                    d.Height != m->probes[1] || d.DepthOrArraySize != m->probes[2])
+                    throw std::runtime_error("Original diffuse grid / Texture3D dimensions do not match");
+            }
             if (diagnostic_csg && !m->shape_vertices.is_none()) {
                 auto& shape = probe_shapes_[m->shape_vertices.value];
                 if (!shape) {
@@ -2681,6 +2725,14 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         ps[14] = {1.0f / float(m.probes[0]), 1.0f / float(m.probes[1]), 1.0f / float(m.probes[2]), fade};
         ps[15] = {m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3]};
         ps[18][3] = cv.squared ? 0.0f : 1.0f;  // zero: square the samples
+        if (m.use_relighting()) {
+            if (ext_.channels.size() <= 0x8B) throw std::runtime_error("Missing original cubemap boost channel");
+            const auto baseline = cubemap_relighting_baseline(m, ext_.channels[0x8B][0]);
+            ps[19] = baseline[0];
+            ps[20] = baseline[1];
+            ext_.note_estimate("cubemap relighting cb11[19..20] = original non-relighting modulation",
+                "engine-produced dynamic relighting coefficients are unresolved; zero coefficients erased both baked light buffers");
+        }
         const auto vs_cb = upload(vs), ps_cb = upload(ps);
         const ScopeBufferFn volume_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
             if (reg == 11) return stage == ShaderStage::Vertex ? vs_cb : ps_cb;

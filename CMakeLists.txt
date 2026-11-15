@@ -37,7 +37,7 @@ target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)
 
 # ---- nimcli: headless inspection / extraction --------------------------------
-add_executable(nimcli tools/nimcli/main.cpp)
+add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp)
 target_link_libraries(nimcli PRIVATE nim_core)
 
 # ---- nim_render: D3D12 renderer running the game's own shaders --------------

@@ -167,7 +167,12 @@ int run(int argc, char** argv) {
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
         else if (args[i] == "--benchmark" && i + 1 < args.size()) benchmark_frames = std::stoul(args[++i]);
         else if (args[i] == "--camera-scale" && i + 1 < args.size()) camera_scale = std::stof(args[++i]);
-        else if (args[i] == "--map-radius" && i + 1 < args.size()) map_radius = std::stof(args[++i]);
+        else if (args[i] == "--map-radius" && i + 1 < args.size()) {
+            const auto value = args[++i];
+            map_radius = value == "unlimited" ? 1e9f : std::stof(value);
+            if (!std::isfinite(map_radius) || map_radius < 0) throw std::runtime_error("--map-radius expects a nonnegative distance or unlimited");
+            if (map_radius == 0) map_radius = 1e9f;
+        }
         else if (args[i] == "--map-textures" && i + 1 < args.size()) map_texture_cap = std::stoul(args[++i]);
         else if (args[i] == "--channel" && i + 1 < args.size()) {
             const auto value = args[++i];
@@ -245,13 +250,17 @@ int run(int argc, char** argv) {
                 for (const auto& v : weather_values(st)) weather_channels[v.first] = v.second;
             };
             for (const auto& c : weather.controllers) {
-                if (heat_cascade && c.heat_cascade())
-                    if (const WeatherState* st = c.strongest_state()) apply(c, *st);
                 for (const auto& [part, state] : weather_args) {
                     if (c.name.find(part) == std::string::npos && c.tag.str().find(part) == std::string::npos) continue;
                     for (const auto& st : c.states)
                         if (st.name == state) apply(c, st);
                 }
+            }
+            if (heat_cascade) {
+                if (!weather.heat_cascade_controller) throw std::runtime_error("original Heat Cascade controller not found");
+                const auto& c = *weather.heat_cascade_controller;
+                if (const WeatherState* st = c.strongest_state()) apply(c, *st);
+                if (weather.heat_cascade_shared) std::println("  estimate: shared Outpost Heat Cascade state on this map");
             }
             for (const auto& [slot, v] : weather_channels) std::println("  global channel {} = {:.3g}", slot, v);
         }
@@ -283,6 +292,10 @@ int run(int argc, char** argv) {
             }
         }
         // The sky objects (distant scenery kilometres out): all of them, whatever the radius.
+        const size_t sky_first = region.size();
+        float geometry_extent = 1;
+        for (const auto& m : region) for (const auto& r : m.rows)
+            geometry_extent = std::max(geometry_extent, std::hypot(r[3] - focus[0], r[7] - focus[1], r[11] - focus[2]));
         if (!no_sky_objects) {
             auto sky = load_map_sky_objects(pm, map);
             size_t n = 0;
@@ -292,8 +305,12 @@ int run(int argc, char** argv) {
         }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;
-        cache.gbuffer_only = no_sky_objects;  // the transparents (stage 8) carry the sky objects
+        cache.gbuffer_only = true; // keep malformed entity FX out even when the sky is enabled
         cache.all_lods = true;
+        PrepareCache sky_cache;
+        sky_cache.max_texture_dim = map_texture_cap;
+        sky_cache.gbuffer_only = false;
+        sky_cache.all_lods = true;
         scene.begin(gpu);
         std::map<std::string, size_t> failures;
         double prep_s = 0, add_s = 0;
@@ -332,7 +349,7 @@ int run(int argc, char** argv) {
                         else {
                             const auto mat = entity_materials.find(region[r].mesh.value);
                             prepared[j] = prepare_dynamic_model(wpm, region[r].mesh, mat == entity_materials.end() ? nullptr : &mat->second, -1,
-                                                                nullptr, &cache);
+                                                                nullptr, r >= sky_first ? &sky_cache : &cache);
                             if (prepared[j]->no_drawable) prepared[j].reset(), errors[j] = "entity model with no drawable parts";
                         }
                     } catch (const std::exception& ex) {
@@ -368,7 +385,7 @@ int run(int argc, char** argv) {
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
         std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
-        scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, map_radius * 0.6f);
+        scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, std::min(map_radius, geometry_extent) * 0.6f);
         std::println("loaded {} meshes / {} instances in {:.1f}s", scene.mesh_count(), scene.instance_count(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         std::println("  prepare {:.1f}s, add {:.1f}s", prep_s, add_s);
@@ -710,6 +727,23 @@ int run(int argc, char** argv) {
                 first_atmosphere ? "" : ",", name, desc.Width, desc.Height, desc.DepthOrArraySize, int(desc.Format));
             first_atmosphere = false;
         }
+        f << "],\"environment\":[";
+        if (auto* hemi = gl.externs().texture(ext::Deferred, 0xF8).resource) {
+            const auto desc = hemi->GetDesc();
+            bool first = true;
+            for (uint32_t mip : {0u, 6u, 8u}) {
+                if (mip >= desc.MipLevels) continue;
+                const auto name = std::format("lighting-hemisphere-mip{}.bin", mip);
+                save(name.c_str(), gpu.read_texture(hemi, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8, mip));
+                f << std::format("{}{{\"file\":\"{}\",\"width\":{},\"height\":{},\"depth\":1,\"format\":{},\"mip\":{}}}",
+                    first ? "" : ",", name, std::max<uint64_t>(1, desc.Width >> mip), std::max(1u, desc.Height >> mip), int(desc.Format), mip);
+                first = false;
+            }
+        }
+        f << "],\"global_channels\":[";
+        const auto& globals = gl.externs().channels;
+        for (size_t i = 0; i < globals.size(); ++i)
+            f << std::format("{}[{},{},{},{}]", i ? "," : "", globals[i][0], globals[i][1], globals[i][2], globals[i][3]);
         f << "]}";
         if (!f) throw std::runtime_error("lighting metadata failed");
     }
@@ -758,8 +792,23 @@ int run(int argc, char** argv) {
             return (v & 0x8000) ? -value : value;
         };
         auto verify_lut = [&](const ViewMatrices& camera) {
+            if (gl.cubemap_count() != gl.cubemaps_requested()) throw std::runtime_error("Original cubemap preparation omitted volumes");
             if (gl.cubemaps_failed()) throw std::runtime_error("Original cubemap volume draw failed");
             const auto& ext = gl.externs();
+            if (lp.sky_ambient && gl.has_atmosphere()) {
+                auto* hemisphere = ext.texture(ext::Deferred, 0xF8).resource;
+                if (!hemisphere) throw std::runtime_error("Original sky environment was not produced");
+                const auto desc = hemisphere->GetDesc();
+                for (uint32_t mip : {0u, uint32_t(desc.MipLevels - 1)}) {
+                    const auto data = gpu.read_texture(hemisphere, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8, mip);
+                    for (size_t o = 0; o < data.size(); o += 2) {
+                        uint16_t value;
+                        std::memcpy(&value, data.data() + o, 2);
+                        if (!std::isfinite(half(value))) throw std::runtime_error("Non-finite original sky environment mip");
+                    }
+                }
+                std::println("verified sky environment: {}x{}, {} mips, finite base and diffuse tail", desc.Width, desc.Height, desc.MipLevels);
+            }
             if (lp.froxel_fog) {
                 auto* volume = ext.texture(ext::Atmosphere, 0x108).resource;
                 if (!volume || volume->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || volume->GetDesc().DepthOrArraySize <= 1)

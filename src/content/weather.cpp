@@ -83,6 +83,13 @@ const WeatherState* WeatherController::strongest_state() const {
     return best;
 }
 
+bool WeatherController::heat_cascade() const {
+    // Authored exp_outpost/hz_emberwave channel. Names are often stripped in other packages.
+    return std::ranges::any_of(states, [](const WeatherState& st) {
+        return std::ranges::any_of(st.values, [](const WeatherValue& v) { return v.channel == 0x798A4399; });
+    });
+}
+
 std::vector<std::pair<uint32_t, float>> weather_values(const WeatherState& state) {
     std::vector<std::pair<uint32_t, float>> out;
     for (const auto& v : state.values)
@@ -90,7 +97,7 @@ std::vector<std::pair<uint32_t, float>> weather_values(const WeatherState& state
     return out;
 }
 
-MapWeather load_map_weather(PackageManager& pm, TagHash bubble) {
+static MapWeather load_map_weather_family(PackageManager& pm, TagHash bubble) {
     MapWeather w;
     w.registry = load_world_channel_registry(pm);
     const PackageInfo* home = pm.info(bubble.pkg_id());
@@ -187,6 +194,31 @@ MapWeather load_map_weather(PackageManager& pm, TagHash bubble) {
             if (!seen && !st.values.empty()) wc.states.push_back(std::move(st));
         }
         if (!wc.states.empty()) w.controllers.push_back(std::move(wc));
+    }
+    return w;
+}
+
+MapWeather load_map_weather(PackageManager& pm, TagHash bubble) {
+    auto w = load_map_weather_family(pm, bubble);
+    for (const auto& c : w.controllers)
+        if (c.heat_cascade()) { w.heat_cascade_controller = c; return w; }
+    // The installed Outpost scripts provide the original on/off values. Reuse those values,
+    // with the current registry's slots, instead of inventing a heat material or new lighting.
+    for (const auto& info : pm.packages()) {
+        if (info.language != 0 || !info.name.starts_with("w64_outpost_")) continue;
+        const auto shared = load_map_weather_family(pm, TagHash::make(info.pkg_id, 0));
+        for (const auto& c : shared.controllers) {
+            if (!c.heat_cascade()) continue;
+            w.heat_cascade_controller = c;
+            w.heat_cascade_shared = true;
+            for (auto& st : w.heat_cascade_controller->states)
+                for (auto& v : st.values) {
+                    const auto it = w.registry.slots.find(v.channel);
+                    v.slot = it == w.registry.slots.end() ? -1 : int(it->second);
+                }
+            return w;
+        }
+        break; // all packages of that family were searched together
     }
     return w;
 }
