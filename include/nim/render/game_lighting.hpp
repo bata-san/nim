@@ -225,7 +225,7 @@ public:
     // techniques into the light buffers the shading pass reads. Lights whose technique cannot be
     // loaded are left out and listed in light_notes().
     void set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights);
-    void clear_lights() { lights_.clear(); vol_lights_.clear(); }
+    void clear_lights(Gpu& gpu);  // waits for the GPU first when light shadow maps are freed
     size_t light_count() const { return lights_.size(); }
     size_t lights_drawn() const { return lights_drawn_; }
     // Shadowing lights (SShadowingLight) draw with their +0xD8 technique and a depth map of the
@@ -237,6 +237,7 @@ public:
     size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
+    ID3D12Resource* volumetric_layer(int i) const { return vol_blurred_[i ? 1 : 0].Get(); }  // blurred far / near shafts: RGBA16F, quarter resolution, PIXEL_SHADER_RESOURCE
     size_t volumetric_shadows_used() const { return vol_shadows_used_; }  // shafts drawn with a shadow map last frame
     const std::vector<std::string>& light_notes() const { return light_notes_; }
     ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE

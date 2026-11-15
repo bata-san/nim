@@ -1189,7 +1189,7 @@ public:
             map_worker.start(dir);
             map = MapView{};
             map_scene = false;
-            game_lighting.clear_lights();
+            game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
             init_game_lighting();
@@ -1332,7 +1332,7 @@ public:
                     const TagHash prev = map_scene ? TagHash{} : scene.tag();
                     stop_map();
                     map_scene = false;
-                    game_lighting.clear_lights();
+                    game_lighting.clear_lights(g);
                     game_lighting.clear_cubemaps(g);
                     game_lighting.clear_atmosphere(), map_atmosphere.reset();
                     map_weather.reset();
@@ -1399,7 +1399,7 @@ public:
         map.selected = index;
         map.streaming = true;
         map_scene = true;
-        game_lighting.clear_lights();
+        game_lighting.clear_lights(gpu);
         game_lighting.clear_cubemaps(gpu);
         game_lighting.clear_atmosphere(), map_atmosphere.reset();
         if (!same) map_weather.reset(), weather_states.clear();

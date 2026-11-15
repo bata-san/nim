@@ -2115,8 +2115,17 @@ void GameLighting::make_cube(Gpu& gpu) {
     cube_ibv_ = {cube_->GetGPUVirtualAddress() + sizeof(v), UINT(sizeof(idx)), DXGI_FORMAT_R16_UINT};
 }
 
-void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
+void GameLighting::clear_lights(Gpu& gpu) {
+    // Frames in flight can still read the lights' shadow maps.
+    for (const auto& ll : lights_)
+        if (ll.shadow) { gpu.wait_idle(); break; }
     lights_.clear();
+    vol_lights_.clear();
+    light_shadow_items_ = 0;
+}
+
+void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
+    clear_lights(gpu);
     light_notes_.clear();
     make_cube(gpu);
     // One pipeline pair per (shaders, textures, samplers); techniques are cached by tag.

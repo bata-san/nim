@@ -77,6 +77,7 @@ int run(int argc, char** argv) {
     float time_of_day = -1;
     float day_night_state = -1;
     bool no_light_shadows = false;
+    size_t frame_light_shadows = 0;  // > 0: draw the light maps as the GUI does, this many per whole frame
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
@@ -115,6 +116,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-light-shadows") no_light_shadows = true;
+        else if (args[i] == "--frame-light-shadows" && i + 1 < args.size()) frame_light_shadows = size_t(std::stoul(args[++i]));
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
         else if (args[i] == "--dump-probe-mask") dump_probe_mask = true;
@@ -547,7 +549,24 @@ int run(int argc, char** argv) {
         std::println("GPU memory before lighting: {:.1f} MiB used / {:.1f} MiB budget",
                      double(gpu.vram_usage()) / (1 << 20), double(gpu.vram_budget()) / (1 << 20));
         if (no_light_shadows) gl.set_light_shadows(false);
-        {
+        if (frame_light_shadows && !no_light_shadows) {
+            // The GUI's frame: sun shadow, a few light maps, G-buffer and lighting in one frame's
+            // upload space, repeated until every light on screen has its map.
+            size_t frames = 0, drawn = 0;
+            for (;; ++frames) {
+                gpu.begin_frame(uint32_t(frames));
+                shadow_pass(gpu.immediate(), lp);
+                const auto maps = gl.light_shadows_to_render(gpu, gpu.immediate(), vm, scene.item_count(), frame_light_shadows);
+                for (SunShadow* s : maps) scene.render_shadow(gpu, gpu.immediate(), *s);
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+                gpu.flush();
+                drawn += maps.size();
+                if (maps.empty()) break;
+            }
+            std::println("light shadow maps: {} drawn over {} frames of {} per frame", drawn, frames, frame_light_shadows);
+            gpu.begin_frame(0);
+        } else {
             int light_maps_reported = 0;
             const auto maps = gl.light_shadows_to_render(gpu, gpu.immediate(), vm, scene.item_count(), SIZE_MAX);
             for (SunShadow* s : maps) {
@@ -734,6 +753,8 @@ int run(int argc, char** argv) {
         save("lighting-depth.bin", depth);
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        for (int k = 0; k < 2 && gl.volumetric_layer(k); ++k)
+            save(k ? "lighting-shafts-near.bin" : "lighting-shafts-far.bin", gpu.read_texture(gl.volumetric_layer(k), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         std::ofstream f(out_dir / "lighting.json");
         f << std::format("{{\"width\":{},\"height\":{},\"vp\":[", width, height);
         for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) f << std::format("{}{:.9g}", c || r ? "," : "", vm.vp_abs.c[c][size_t(r)]);
