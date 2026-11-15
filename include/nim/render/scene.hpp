@@ -313,6 +313,10 @@ private:
         std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
         std::vector<float4> vs_constants, ps_constants;
         D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
+        // Stages that read the object's own position (object channel interpolated_world_position):
+        // their constants differ per placement. -1 = not scanned yet.
+        int8_t vs_reads_position = -1, ps_reads_position = -1;
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vs_placement_addresses, ps_placement_addresses;  // this frame's, per placement
         TagHash technique;
         bool vs_live = false, ps_live = false;
         bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items

@@ -600,7 +600,15 @@ struct ChannelContext {
     std::map<uint32_t, ChannelUse>* uses = nullptr;
     const ChannelValues* defaults = nullptr;
     const ExternStore* estimates = nullptr;  // where an unauthored channel's estimate is reported
+    // The object's world position (its placement's translation), for interpolated_world_position.
+    const float4* world_position = nullptr;
 };
+// fnv1("interpolated_world_position"): where the object is. Materials rotate / scale their
+// vertices about it; unset, the pivot is somewhere else and the object swings around it.
+constexpr uint32_t kInterpolatedWorldPosition = 0xA7A7FE43;
+bool reads_object_position(const TechniqueStage& stage) {
+    return disassemble_tfx(stage.bytecode).find("push_object_channel A7 A7 FE 43") != std::string::npos;
+}
 TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& cc, bool vs) {
     TfxEnvironment env = base;
     env.object_channel = [cc, vs](uint32_t h) {
@@ -610,6 +618,7 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
         if (cc.overrides)
             if (auto it = cc.overrides->find(h); it != cc.overrides->end()) value = &it->second;
         static const float4 unset{1, 1, 1, 1};
+        if (!value && h == kInterpolatedWorldPosition && cc.world_position) value = cc.world_position;
         if (!value) {
             // No component default and no override: the channel is set at run time by gameplay.
             if (!cc.estimates) throw std::runtime_error(std::format("Missing engine object channel {:08X}", h));
@@ -1745,7 +1754,11 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             const uint64_t key = (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, cc, vs));
+            // A placed object's position is filled in per placement below: not reported as unset here.
+            static const float4 origin{0, 0, 0, 1};
+            ChannelContext ec = cc;
+            if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || sets_[it.buffers].dynamic)) ec.world_position = &origin;
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, ec, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             material_addresses_.emplace(key, a.gpu);
@@ -1776,8 +1789,35 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         };
         bind_shared(it.vs_sources, it.vs_kinds, true);
         bind_shared(it.ps_sources, it.ps_kinds, false);
+        if (it.vs_reads_position < 0) it.vs_reads_position = reads_object_position(it.vs_material);
+        if (it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
         it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0, true);
         it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
+        // The object's position is per placement: one set of constants for each.
+        it.vs_placement_addresses.clear();
+        it.ps_placement_addresses.clear();
+        if (it.vs_reads_position || it.ps_reads_position) {
+            const auto& set = sets_[it.buffers];
+            auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
+                ChannelContext pc = cc;
+                pc.world_position = &position;
+                evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, pc, vs));
+                const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+                std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+                return a.gpu;
+            };
+            if (set.dynamic) {
+                for (const auto& p : set.placements) {
+                    const float4 position{p[3], p[7], p[11], 1};
+                    if (it.vs_reads_position) it.vs_placement_addresses.push_back(at(it.vs_material, it.vs_constants, position, true));
+                    if (it.ps_reads_position) it.ps_placement_addresses.push_back(at(it.ps_material, it.ps_constants, position, false));
+                }
+            } else if (dynamic_) {
+                const float4 position{model_cb_[3][0], model_cb_[3][1], model_cb_[3][2], 1};
+                if (it.vs_reads_position) it.vs_address = at(it.vs_material, it.vs_constants, position, true);
+                if (it.ps_reads_position) it.ps_address = at(it.ps_material, it.ps_constants, position, false);
+            }
+        }
       } catch (const std::exception& ex) {
         // One part without its game inputs is left out (never drawn with invented values);
         // the rest of the scene still draws.
@@ -1842,6 +1882,8 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         if (it.dynamic) {
             for (size_t p = 0; p < set.object_cb.size(); ++p) {
                 for (uint32_t param : it.object_params) set_cbv(param, set.object_cb[p]);
+                if (p < it.ps_placement_addresses.size()) set_cbv(0, it.ps_placement_addresses[p]);
+                if (p < it.vs_placement_addresses.size()) set_cbv(6, it.vs_placement_addresses[p]);
                 cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
             }
         } else if (!cg) cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, 0);
