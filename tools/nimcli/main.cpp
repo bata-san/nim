@@ -16,6 +16,7 @@
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] probe-audit BUBBLE [OUT.tsv]  exhaustive map-family probe inventory and cross-check
+//   nimcli [--install DIR] environment BUBBLE [ACTIVITY] [-v]  every global channel expression, by entity
 //   nimcli [--install DIR] probe-search OUT_DIR          install-wide texture/reference/layout/channel census
 //   nimcli [--install DIR] lookup HEX...                what a 32-bit value is: TagHash, string hash, audio event id
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
@@ -62,6 +63,7 @@ namespace fs = std::filesystem;
 int cmd_probe_search(PackageManager& pm, const std::string& output);
 int cmd_probe_gpu_audit(PackageManager& pm, const std::string& output);
 int cmd_world_channel_names(PackageManager& pm, const std::string& output);
+int cmd_environment(PackageManager& pm, TagHash bubble, TagHash activity, bool verbose);
 
 namespace {
 
@@ -1729,6 +1731,8 @@ int main(int argc, char** argv) {
         if (cmd == "lights" && args.size() >= 2) return cmd_lights(pm, TagHash(parse_hex(args[1])));
         if (cmd == "cubemaps" && args.size() >= 2) return cmd_cubemaps(pm, TagHash(parse_hex(args[1])));
         if (cmd == "probe-audit" && args.size() >= 2) return cmd_probe_audit(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? args[2] : "");
+        if (cmd == "environment" && args.size() >= 2)
+            return cmd_environment(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] != "-v" ? TagHash(parse_hex(args[2])) : TagHash{}, args.back() == "-v");
         if (cmd == "probe-search" && args.size() >= 2) return cmd_probe_search(pm, args[1]);
         if (cmd == "probe-gpu-audit" && args.size() >= 2) return cmd_probe_gpu_audit(pm, args[1]);
         if (cmd == "world-channel-names" && args.size() >= 2) return cmd_world_channel_names(pm, args[1]);

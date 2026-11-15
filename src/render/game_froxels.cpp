@@ -64,7 +64,13 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     ext_.set(F, 0x10, float4{1 / vm.fx, 1 / vm.fy, 0, vm.proj.c[3][2]});
     ext_.set(F, 0x20, float4{kFroxelNear, kFroxelFar, kFroxelCurve, 0});
     ext_.set(F, 0x30, float4{});  // no temporal jitter/history, additional sun attenuation 0
-    ext_.set(F, 0x40, float4{});  // additional depth-dependent density modulation off
+    // +0x40.y blends the extinction and the sun in-scatter toward their distance lookups
+    // (extern 7 +0x178.. / +0x180..): on. The maps author those ranges (Outpost 5..10 m,
+    // Perimeter 50..100 m, Marathon Deck 10..10000 m), and they have no other reader in the
+    // volume passes; the engine's value is not in game data.
+    ext_.set(F, 0x40, float4{0, 1, 0, 0});
+    ext_.note_estimate("extern 0x65 +0x40.y = 1 (froxel fog follows the authored distance lookups)",
+                       "engine value unknown; the lookup ranges are authored per map and only this factor applies them");
     ext_.set(F, 0x50, vm.vp_abs); // unused with history weight 0, finite original view matrix
     ext_.set_texture(F, 0x90, no_atmosphere_.Get());
     ext_.set_texture(F, 0x98, froxel_density_vol_.Get(), kFormat);

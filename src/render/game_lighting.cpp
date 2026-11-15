@@ -1466,29 +1466,45 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
     ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
     env_channels_ = 0;
     if (atm_.valid && p.atmosphere && p.environment && !atm_.data.channel_expressions.empty()) {
-        // The sequencer inputs: 0 is the time of day (0..1, Alkahest: time_of_day / 3600); 1 is
-        // read by the fog density and a few weather-like channels, source unknown.
+        // The sequencer inputs (docs/PROGRESS.md 3.6.1): the sequence component's slot table
+        // names them. A sequence parameter (input 0) is the time of day; the others are world
+        // global channels (rain_amount, sky_transition_weather, fog_amount), whose values the
+        // active script state sets.
         const float t = p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time;
-        bool input1 = false;
+        const std::vector<SequencerInput>* current = nullptr;
+        static const std::vector<SequencerInput> none;
         TfxEnvironment env;
         env.sequencer_input = [&](uint8_t i) -> float4 {
-            if (i == 0) return {t, t, t, t};
-            if (i == 1) {
-                input1 = true;
-                return {};
+            const auto& inputs = current ? *current : none;
+            if (inputs.empty()) {
+                // No slot table in this map's data: the layout seen everywhere else.
+                ext_.note_estimate("map environment sequencer inputs: 0 = time of day, others 0", "sequence slot table not found in this map");
+                const float v = i == 0 ? t : 0;
+                return {v, v, v, v};
             }
-            throw std::runtime_error(std::format("sequencer input {} has no known source", i));
+            if (i >= inputs.size()) throw std::runtime_error(std::format("sequencer input {} is not in the sequence's slot table", i));
+            const auto& in = inputs[i];
+            if (!in.world()) {
+                if (i != 0) throw std::runtime_error(std::format("sequence parameter {:08X} (input {}) has no known source", in.name, i));
+                return {t, t, t, t};
+            }
+            float v = 0;
+            if (const auto it = in.world_slot >= 0 ? global_overrides_.find(uint32_t(in.world_slot)) : global_overrides_.end(); it != global_overrides_.end())
+                v = it->second;
+            else
+                ext_.note_estimate(std::format("map environment input {} (world channel {:08X}, slot {}) = 0", i, in.name, in.world_slot),
+                                   "no active script state supplied for this world channel");
+            return {v, v, v, v};
         };
         for (const auto& x : atm_.data.channel_expressions) {
             const auto it = std::find(ext_.channel_ids.begin(), ext_.channel_ids.end(), x.channel);
             if (it == ext_.channel_ids.end()) continue;  // not a render-globals channel (object / unnamed)
             const size_t slot = size_t(it - ext_.channel_ids.begin());
             if (slot >= ext_.channels.size()) continue;
+            current = x.inputs.get();
             run_tfx(x.bytecode, x.constants, std::span(ext_.channels).subspan(slot), env);
             ++env_channels_;
         }
-        if (input1)
-            ext_.note_estimate("map environment sequencer input 1 = 0", "read by the fog density curves; its engine source is not found");
     }
     ext_.world_channels = global_overrides_;
     return ext_.channels;
@@ -1813,24 +1829,33 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     auto glow_g = [](float shape) { return shape > 1 ? 1 - 1 / shape : 0.0f; };
     est(0x160, glow_g(ch(0x0D)[0]), "sky_sun_glow_shape as g = 1 - 1/shape");
     est(0x164, ch(0x0E)[0], copied);
-    est(0x170, 1.0f, chosen);  // in-scatter / sky scale
+    // +0x170 scales the in-scatter and the sky (cb0[8] / cb0[9] of the shading and sky PS):
+    // inscatter_intensity (ch 0x1C, name by FNV-1), which the map environments drive.
+    est(0x170, ch(0x1C)[0], "inscatter_intensity: the only in-scatter scale among the channels (extern slot by shader use)");
     est(0x174, ch(0x0F)[0], copied);  // fog_density (per km)
-    const float lut_start = ch(0x10)[0], lut_end = ch(0x11)[0];
-    // The lookup range is in km (the shading pass scales metres: its fog colour blend runs over
-    // ch 0x27 = 10000 m, and a 5..10 m range would put the far end of the LUT 10 m away).
-    constexpr std::string_view km = "fog_density_lookup_start / _end in km, the pass reads metres";
-    est(0x178, lut_start * 1000.0f, km);
-    est(0x17C, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f, "fog_density_lookup_end in km (start + 1 when unset: avoids 0/0)");
-    // The inscatter CS also normalizes its second density ramp with these two
-    // bounds. A missing block used to supply (0,0), causing a 1/0 and 0/0 in TFX.
-    // Additional modulation is disabled in extern 0x65; use the same finite range
-    // until the engine's second ramp producer is identified.
-    est(0x180, lut_start * 1000.0f, "second froxel density ramp: same finite lookup range (engine source unknown)");
-    est(0x184, (lut_end > lut_start ? lut_end : lut_start + 1) * 1000.0f,
-        "second froxel density ramp end (engine source unknown; avoids zero denominator)");
+    // fog_density_lookup_start / _end (ch 0x10 / 0x11) and fog_inscatter_lookup_start / _end
+    // (ch 0x12 / 0x13, names by FNV-1) are distances in metres: the TFX of the shading pass and
+    // of the froxel in-scatter CS use them unscaled against view distances in metres, and the
+    // ship interior (Marathon Deck) authors 10 .. 10000, which only reads as metres. The
+    // in-scatter CS scales the extinction by saturate((d - start) / (end - start)) and the sun
+    // in-scatter by the second pair (docs/PROGRESS.md 3.2.4).
+    // An unset pair (0, 0) is 1/0 and 0/0 in that TFX; the engine's guard is not in game data:
+    // a zero-width range is passed as a step at `start` (full strength beyond it).
+    auto range = [&](uint32_t off, float start, float end, std::string_view name) {
+        ext_.set(A, off, start);
+        if (end > start) {
+            ext_.set(A, off + 4, end);
+        } else {
+            ext_.set(A, off + 4, start + 1e-3f);
+            ext_.note_estimate(std::format("extern 7 +0x{:X} / +0x{:X} = {:g} m step ({} unset)", off, off + 4, start, name),
+                               "zero-width lookup range: full strength beyond the start (engine guard unknown)");
+        }
+    };
+    range(0x178, ch(0x10)[0], ch(0x11)[0], "fog_density_lookup_start / _end");
+    range(0x180, ch(0x12)[0], ch(0x13)[0], "fog_inscatter_lookup_start / _end");
     ext_.set(A, 0x190, ch(0x16));  // fog_decay_color for transparent spectral attenuation
     ext_.note_estimate("extern 7 +0x190 = fog_decay_color", copied);
-    est(0x1A0, 1.0f, "fog decay color multiplier (engine value unknown)");
+    est(0x1A0, ch(0x17)[0], "fog_decay_scale: the channel after fog_decay_color (+0x190)");
     est(0x188, ch(0x15)[0], copied);  // fog_height_falloff
     est(0x18C, ch(0x14)[0], copied);  // fog_start_height
     est(0x1A4, ch(0x18)[0], copied);  // layered_fog_density

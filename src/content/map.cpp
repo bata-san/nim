@@ -1,11 +1,14 @@
 #include "nim/content/map.hpp"
 
 #include "nim/content/tfx.hpp"
+#include "nim/content/weather.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <optional>
 #include <set>
 #include <unordered_map>
 
@@ -335,19 +338,35 @@ void read_channel_expressions(PackageManager& pm, TagHash entity, std::set<uint3
     const Entry* ee = pm.entry(entity);
     if (!ee || ee->type != 8 || ee->reference != 0x8080BAAD) return;
     const auto ed = pm.read(entity);
+    // The entity's components, read once: the expressions are in one, the name table of the
+    // sequencer's slots (outputs, then inputs) in its companion.
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> components;
+    std::set<uint32_t> listed;
     for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
         uint32_t v;
         std::memcpy(&v, ed.data() + o, 4);
-        if (v < 0x80800000u || v == 0xFFFFFFFFu) continue;
+        if (v < 0x80800000u || v == 0xFFFFFFFFu || !listed.insert(v).second) continue;
         const Entry* ce = pm.entry(TagHash(v));
-        if (!ce || ce->type != 8 || ce->reference != kClassComponent || !seen_components.insert(v).second) continue;
-        const auto cd = pm.read(TagHash(v));
+        if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
+        components.emplace_back(v, pm.read(TagHash(v)));
+    }
+    constexpr uint32_t kClassOutputName = 0x80809F46, kClassSlotNames = 0x8080AF85, kEmptyName = 0x811C9DC5;
+    const size_t first_new = out.size();
+    for (const auto& [v, cd] : components) {
+        if (!seen_components.insert(v).second) continue;
         TagReader r(cd);
+        // The output names in index order: {self, 80809F46, ..., +0x30 name}.
+        std::vector<uint32_t> names;
+        for (size_t c = 0; c + 0x38 <= cd.size(); c += 4)
+            if (r.u32_at(c) == v && r.u32_at(c + 4) == kClassOutputName) names.push_back(r.u32_at(c + 0x30));
         for (size_t c = 0; c + 0x50 <= cd.size(); c += 4) {
             if (r.u32_at(c) != kClassSequenceGlobalChannel) continue;
             const size_t p = c + 4;
             MapChannelExpression x;
-            x.channel = r.u32_at(p);
+            x.record_id = r.u32_at(p);
+            x.index = r.u32_at(p + 0x28);
+            // Without a name table the record's own word is all there is (most outputs match it).
+            x.channel = x.index < names.size() ? names[x.index] : x.record_id;
             x.start = r.f32_at(p + 0x14);
             x.cycle = r.f32_at(p + 0x18);
             x.component = TagHash(v);
@@ -361,6 +380,32 @@ void read_channel_expressions(PackageManager& pm, TagHash entity, std::set<uint3
             out.push_back(std::move(x));
         }
     }
+    if (out.size() == first_new) return;
+    // Slot names: Vec<8080AF85> of {namespace, name, slot}. The slots past the outputs are the
+    // inputs, in order.
+    const size_t outputs = out.size() - first_new;
+    std::map<uint32_t, SequencerInput> by_slot;
+    for (const auto& [v, cd] : components) {
+        TagReader r(cd);
+        for (size_t c = 8; c + 8 <= cd.size(); c += 4) {
+            if (r.u32_at(c) != kClassSlotNames) continue;
+            const uint64_t n = r.u64_at(c - 8);
+            if (n == 0 || n > 4096 || c + 8 + n * 12 > cd.size()) continue;
+            for (uint64_t i = 0; i < n; ++i) {
+                const size_t e = c + 8 + size_t(i) * 12;
+                const uint32_t slot = r.u32_at(e + 8);
+                if (slot < outputs) continue;
+                SequencerInput in;
+                in.name_space = r.u32_at(e);
+                in.name = r.u32_at(e + 4);
+                if (in.name_space != kEmptyName || !by_slot.contains(slot)) by_slot[slot] = in;
+            }
+        }
+    }
+    if (by_slot.empty()) return;
+    auto inputs = std::make_shared<std::vector<SequencerInput>>();
+    for (uint32_t slot = uint32_t(outputs); by_slot.contains(slot); ++slot) inputs->push_back(by_slot[slot]);
+    for (size_t i = first_new; i < out.size(); ++i) out[i].inputs = inputs;
 }
 }  // namespace
 
@@ -421,6 +466,17 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
                 if (!next) break;
                 p += size_t(next);
             }
+        }
+    }
+    // The world channels the inputs name: their slots in the world channel registry.
+    std::set<const std::vector<SequencerInput>*> resolved;
+    std::optional<WorldChannelRegistry> registry;
+    for (auto& x : out.channel_expressions) {
+        if (!x.inputs || !resolved.insert(x.inputs.get()).second) continue;
+        for (auto& in : const_cast<std::vector<SequencerInput>&>(*x.inputs)) {
+            if (!in.world()) continue;
+            if (!registry) registry = load_world_channel_registry(pm);
+            if (const auto it = registry->slots.find(in.name); it != registry->slots.end()) in.world_slot = int(it->second);
         }
     }
     return out;

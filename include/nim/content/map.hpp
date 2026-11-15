@@ -12,6 +12,7 @@
 #include "nim/core/package_manager.hpp"
 
 #include <array>
+#include <memory>
 #include <string>
 #include <span>
 #include <unordered_map>
@@ -159,12 +160,30 @@ inline constexpr uint32_t kClassSunPathComponent = 0x80808346;
 // of day. Record (payload = class + 4): +0x00 channel hash, +0x14 / +0x18 start / cycle seconds
 // (3600: the day), +0x30 bytecode vector, +0x40 constant vector. See docs/PROGRESS.md 3.2.
 inline constexpr uint32_t kClassSequenceGlobalChannel = 0x8080B64E;
+// A sequencer input (opcode 0x4A n), from the name table of the entity's sequence component
+// (8080AF85 entries: namespace, name, slot; input n is slot `outputs + n`). Namespace "" is a
+// sequence parameter (input 0, the time of day); 005921DB names a world global channel
+// (rain_amount, sky_transition_weather, fog_amount), `world_slot` its slot in the world channel
+// registry (-1: not registered).
+struct SequencerInput {
+    uint32_t name = 0, name_space = 0;
+    int world_slot = -1;
+    bool world() const { return name_space != 0x811C9DC5u; }
+};
 struct MapChannelExpression {
+    // The channel the output is written to: the name at the record's index (+0x28) in the
+    // component's output table (80809F46 structs, +0x30 the FNV-1 name). The record's own first
+    // word (`record_id`) equals it for most outputs but not all (sun_intensity, sun_glow_color,
+    // sky_color_override ... carry another hash there), so it is never used as the name.
     uint32_t channel = 0;
+    uint32_t record_id = 0;
+    uint32_t index = 0;
     float start = 0, cycle = 0;
     std::vector<uint8_t> bytecode;
     std::vector<std::array<float, 4>> constants;
     TagHash component;
+    // The inputs of this expression's own sequence, by input number; null: no slot table found.
+    std::shared_ptr<const std::vector<SequencerInput>> inputs;
 };
 struct MapAtmosphere {
     // +0x80..+0xBF: the sky lookups (3D, one slice per time-of-day key): near0, far0, near1, far1.
