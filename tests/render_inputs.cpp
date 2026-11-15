@@ -12,13 +12,22 @@ int main() {
         // non-relighting uses 1+alpha*probe_params.x*original_boost*probe.
         MapCubemap m;
         m.probes = {2, 3, 1}; m.probe_params[0] = 0.4f;
-        const auto cb = cubemap_relighting_baseline(m, 0.75f);
+        CubemapRelightingInputs in;
+        in.bounce_scale = 0.75f;
+        in.sky_intensity = 0;
+        auto cb = cubemap_relighting(m, in);
         for (float alpha : {0.0f, 0.2f, 1.0f}) for (float probe : {0.0f, 0.01f, 1.0f})
             check(std::abs(alpha * cb[0][0] * probe + cb[1][0] - (1 + alpha * m.probe_params[0] * 0.75f * probe)) < 1e-6f,
-                "relighting baseline erased or recolored baked probe modulation");
-        m.probes = {1, 1, 1};
-        check(cubemap_relighting_baseline(m, 0.75f)[0] == float4{}, "cube-only probe acquired diffuse-grid boost");
-        check(cubemap_relighting_baseline(m, 0.75f)[1] == float4{1, 1, 1, 0}, "cube-only probe was extinguished");
+                "relighting without sun or sky terms differs from the non-relighting modulation");
+        m.flags = {1, 0.5f, 0, 0};
+        in.sky_intensity = 2;
+        in.sun_intensity = 20;
+        in.sun_color = {0.5f, 1, 2, 1};
+        in.sun_light_direction = {0, 0, 0.25f, 0};  // clamped to 0.5: sun scale 0.5 * 1 * 2 = 1
+        cb = cubemap_relighting(m, in);
+        check(std::abs(cb[0][0] - 0.75f * 0.4f * 0.5f) < 1e-6f && std::abs(cb[0][2] - 0.75f * 0.4f * 2) < 1e-6f, "relighting bounce term");
+        check(std::abs(cb[1][1] - (2 * 0.5f + 1)) < 1e-6f && std::abs(cb[1][0] - (1 + 0.5f)) < 1e-6f, "relighting sky term");
+        check(cubemap_alpha_exponent(0) == 0 && cubemap_alpha_exponent(0.5f) == 1 && std::abs(cubemap_alpha_exponent(1) - 61) < 1e-4f, "probe alpha exponent remap");
     }
     {
         ExternStore ext;

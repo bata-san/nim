@@ -276,6 +276,8 @@ std::vector<MapCubemap> load_map_cubemaps(PackageManager& pm, const MapLayout& m
                         m.rotation[size_t(k)] = r.f32_at(c + 0x100 + size_t(k) * 4);
                         m.probe_params[size_t(k)] = r.f32_at(c + 0x170 + size_t(k) * 4);
                         m.flags[size_t(k)] = r.f32_at(c + 0x180 + size_t(k) * 4);
+                        m.shape[size_t(k)] = r.f32_at(c + 0x70 + size_t(k) * 4);
+                        m.unk80[size_t(k)] = r.f32_at(c + 0x80 + size_t(k) * 4);
                     }
                     for (int k = 0; k < 16; ++k) {
                         m.local_to_world[size_t(k)] = r.f32_at(c + 0xC0 + size_t(k) * 4);

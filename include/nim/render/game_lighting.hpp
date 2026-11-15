@@ -92,9 +92,14 @@ void write_game_srv(ID3D12Device* device, const ExternStore::Tex& view, BindingK
 
 // Shared view inputs for model materials and the deferred lighting passes.
 void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm);
-// Explicit baseline for engine-produced cb11[19..20]. Algebraically preserves the
-// original non-relighting shader's modulation, instead of extinguishing authored probes.
-std::array<float4, 2> cubemap_relighting_baseline(const MapCubemap& volume, float original_boost);
+// cb11[19..20] of the relighting cubemap variants and the probe alpha exponent cb11[15].z, by the
+// D2 engine's formula (see game_lighting.cpp). Channels: 0x8B, 0x8A, 0x89, 0x08, 0x09, 0x64.
+struct CubemapRelightingInputs {
+    float bounce_scale = 1, sky_intensity = 1, sun_scale = 1, sun_intensity = 10;
+    float4 sun_color{1, 1, 1, 1}, sun_light_direction{0, 0, 1, 0};
+};
+std::array<float4, 2> cubemap_relighting(const MapCubemap& volume, const CubemapRelightingInputs& in);
+float cubemap_alpha_exponent(float z);
 std::array<float4, 16> frame_constants(float time, float delta, const ExternStore& ext);
 // The engine's per-frame state that no file holds (exposure, wind, temporal seeds): cb13 and
 // the Frame extern, laid out per goriath's FrameScope with its defaults, recorded as estimates.

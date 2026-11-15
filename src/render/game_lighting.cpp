@@ -2389,9 +2389,23 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 }
 
 // ---- Cubemap volumes ---------------------------------------------------------------------------
-std::array<float4, 2> cubemap_relighting_baseline(const MapCubemap& volume, float original_boost) {
-    const float scale = volume.use_probes() ? volume.probe_params[0] * original_boost : 0;
-    return {float4{scale, scale, scale, 0}, float4{1, 1, 1, 0}};
+// cb11[19..20] of the relighting variants and cb11[15].z, as the D2 engine fills them (Alkahest's
+// CubemapRenderer, taken from the engine's decompiled function; the Marathon PS reads the same slots).
+// The PS scales the probe by (alpha^cb15.z * cb19 * probe + cb20); the non-relighting variant is
+// the case cb19 = cubemap_bounce_scale * params.x, cb20 = 1.
+std::array<float4, 2> cubemap_relighting(const MapCubemap& volume, const CubemapRelightingInputs& in) {
+    const float sun = std::max(in.sun_light_direction[2], 0.5f) * in.sun_scale * (in.sun_intensity / 10.0f);
+    std::array<float4, 2> out{};
+    for (size_t c = 0; c < 3; ++c) {
+        const float relit = (sun * in.sun_color[c] - 1.0f) * volume.flags[0] + 1.0f;
+        out[0][c] = in.bounce_scale * volume.probe_params[0] * relit;
+        out[1][c] = in.sky_intensity * volume.flags[1] + relit;
+    }
+    return out;
+}
+
+float cubemap_alpha_exponent(float z) {
+    return z > 0.5f ? std::pow((z - 0.5f) * 2.0f, 4.0f) * 60.0f + 1.0f : z * 2.0f;
 }
 
 void GameLighting::clear_cubemaps(Gpu& gpu) {
@@ -2538,7 +2552,8 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         constexpr std::string_view layout = "cubemap_volume scope (cb11) has no bytecode: filled from the SCubemapComponent";
         ext_.note_estimate("cubemaps: cb11 face fades from component +0x50 / +0x60 as fractions of the half extent", layout);
         ext_.note_estimate("cubemaps: cb11 [2].w intensity = component +0x30", layout);
-        ext_.note_estimate("cubemaps: cb11 [15] = component +0x170, [18].w = 0 for UNORM (gamma-2) cubes (the PS squares them)", layout);
+        ext_.note_estimate("cubemaps: cb11 [0] VS = +0x110 (the matrix +0xC0 translation), not +0x20", layout);
+        ext_.note_estimate("cubemaps: cb11 [15] = component +0x170 (z remapped), [18].w = 0 for UNORM (gamma-2) cubes (the PS squares them)", layout);
         ext_.note_estimate("cubemaps: GGX filter roughness = mip / last mip, chain down to 4x4",
                            "cubemap_face_filter_ggx inputs (extern 84) are engine-set");
         ext_.note_estimate("cubemaps: draw order largest volume first", "engine sort order not decoded");
@@ -2727,7 +2742,11 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         const float fade = distance_fade && m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
         if (fade <= 0) continue;
         std::array<float4, 4> vs{};
-        const auto& center = cubemap_csg_diagnostic_ ? m.origin : m.center;
+        // The box is the unit cube through the matrix +0xC0: its translation is +0x110, and
+        // quaternion +0x100 x half extents +0x10 equal its columns to 1e-5 on every volume. +0x20 is
+        // a different point (266 of Outpost's 313 volumes, metres away); placing the grid there made
+        // overlapping volumes disagree (probe luminance correlation 0.34, against 0.82 at +0x110).
+        const auto& center = m.origin;
         vs[0] = {center[0], center[1], center[2], 1};
         vs[1] = {m.rotation[0], m.rotation[1], m.rotation[2], m.rotation[3]};
         vs[2] = {m.extents[0], m.extents[1], m.extents[2], 0};
@@ -2748,15 +2767,16 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
                                  m.local_to_world[size_t(c * 4 + 3)]};
         for (int c = 0; c < 3; ++c) ps[size_t(9 + c)] = {m.axes[size_t(c * 4)], m.axes[size_t(c * 4 + 1)], m.axes[size_t(c * 4 + 2)], 0};
         ps[14] = {1.0f / float(m.probes[0]), 1.0f / float(m.probes[1]), 1.0f / float(m.probes[2]), fade};
-        ps[15] = {m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3]};
+        ps[15] = {m.probe_params[0], m.probe_params[1], cubemap_alpha_exponent(m.probe_params[2]), m.probe_params[3]};
         ps[18][3] = cv.squared ? 0.0f : 1.0f;  // zero: square the samples
         if (m.use_relighting()) {
-            if (ext_.channels.size() <= 0x8B) throw std::runtime_error("Missing original cubemap boost channel");
-            const auto baseline = cubemap_relighting_baseline(m, ext_.channels[0x8B][0]);
-            ps[19] = baseline[0];
-            ps[20] = baseline[1];
-            ext_.note_estimate("cubemap relighting cb11[19..20] = original non-relighting modulation",
-                "engine-produced dynamic relighting coefficients are unresolved; zero coefficients erased both baked light buffers");
+            if (ext_.channels.size() <= 0x8B) throw std::runtime_error("Missing original cubemap relighting channels");
+            const auto& ch = ext_.channels;
+            const auto relit = cubemap_relighting(m, {ch[0x8B][0], ch[0x8A][0], ch[0x89][0], ch[0x08][0], ch[0x09], ch[0x64]});
+            ps[19] = relit[0];
+            ps[20] = relit[1];
+            ext_.note_estimate("cubemap relighting cb11[19..20] from cubemap_bounce_scale, cubemap_relighting_sky_intensity, channel 8F552B79, sun_intensity / 10, sun_color and sun_light_direction; cb11[15].z = 2z, or 60 (2z - 1)^4 + 1 above 0.5",
+                "formula of the D2 engine's cubemap constant function (Alkahest); the Marathon PS reads the same slots, its engine code is not in game data. sun_light_direction is the channel's value (nim does not write the sun into it)");
         }
         const auto vs_cb = upload(vs), ps_cb = upload(ps);
         const ScopeBufferFn volume_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {

@@ -639,6 +639,13 @@ int cmd_cubemaps(PackageManager& pm, TagHash bubble) {
     for (size_t i = 0; i < cubemaps.size(); ++i) {
         const auto& m = cubemaps[i];
         variants[std::format("alpha {} probes {} relighting {}", m.use_alpha(), m.use_probes(), m.use_relighting())]++;
+        std::println("#{} centre ({:.1f} {:.1f} {:.1f}) extents ({:.1f} {:.1f} {:.1f}) probes {}x{}x{} +30 {:.3g} fade {:.0f}..{:.0f} params ({:.3g} {:.3g} {:.3g} {:.3g}) flags ({:.3g} {:.3g} {:.3g} {:.3g})",
+                     i, m.center[0], m.center[1], m.center[2], m.extents[0], m.extents[1], m.extents[2], m.probes[0], m.probes[1], m.probes[2],
+                     m.unk30, m.fade_start, m.fade_end, m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3],
+                     m.flags[0], m.flags[1], m.flags[2], m.flags[3]);
+        std::println("    blend -({:.3g} {:.3g} {:.3g}) +({:.3g} {:.3g} {:.3g}) shape ({:.3g} {:.3g} {:.3g} {:.3g}) +80 ({:.3g} {:.3g} {:.3g} {:.3g})",
+                     m.blend_neg[0], m.blend_neg[1], m.blend_neg[2], m.blend_pos[0], m.blend_pos[1], m.blend_pos[2],
+                     m.shape[0], m.shape[1], m.shape[2], m.shape[3], m.unk80[0], m.unk80[1], m.unk80[2], m.unk80[3]);
         if (i >= 12) continue;
         auto fmt = [&](TagHash t) -> std::string {
             if (t.is_none()) return "-";
@@ -647,12 +654,31 @@ int cmd_cubemaps(PackageManager& pm, TagHash bubble) {
                 return std::format("{} {}x{}x{} a{} m{} f{}", t.str(), tx.width, tx.height, tx.depth, tx.array_size, tx.mip_count, tx.dxgi_format);
             } catch (const std::exception& ex) { return std::format("{} ({})", t.str(), ex.what()); }
         };
-        std::println("#{} centre ({:.1f} {:.1f} {:.1f}) extents ({:.1f} {:.1f} {:.1f}) probes {}x{}x{} +30 {:.3g} fade {:.0f}..{:.0f} params ({:.3g} {:.3g} {:.3g} {:.3g}) flags ({:.3g} {:.3g} {:.3g} {:.3g})",
-                     i, m.center[0], m.center[1], m.center[2], m.extents[0], m.extents[1], m.extents[2], m.probes[0], m.probes[1], m.probes[2],
-                     m.unk30, m.fade_start, m.fade_end, m.probe_params[0], m.probe_params[1], m.probe_params[2], m.probe_params[3],
-                     m.flags[0], m.flags[1], m.flags[2], m.flags[3]);
         std::println("    specular {}  alpha {}  diffuse {}", fmt(m.specular), fmt(m.alpha), fmt(m.diffuse));
     }
+    // Does quaternion +0x100 with half extents +0x10 reproduce the matrix +0xC0 (whose translation is +0x110)?
+    float worst = 0, worst_origin = 0;
+    size_t moved = 0;
+    for (const auto& m : cubemaps) {
+        const auto& q = m.rotation;
+        for (int a = 0; a < 3; ++a) {
+            std::array<float, 3> v{};
+            v[size_t(a)] = m.extents[size_t(a)];
+            const float dot = q[0] * v[0] + q[1] * v[1] + q[2] * v[2], norm = q[3] * q[3] - q[0] * q[0] - q[1] * q[1] - q[2] * q[2];
+            for (size_t k = 0; k < 3; ++k) {
+                const size_t b = (k + 1) % 3, c = (k + 2) % 3;
+                const float w = norm * v[k] + 2 * q[k] * dot + 2 * q[3] * (q[b] * v[c] - q[c] * v[b]);
+                worst = std::max(worst, std::fabs(w - m.local_to_world[size_t(a) * 4 + k]));
+            }
+        }
+        float d2 = 0;
+        for (size_t k = 0; k < 3; ++k) {
+            worst_origin = std::max(worst_origin, std::fabs(m.origin[k] - m.local_to_world[12 + k]));
+            d2 += (m.origin[k] - m.center[k]) * (m.origin[k] - m.center[k]);
+        }
+        if (d2 > 1e-4f) ++moved;
+    }
+    std::println("quaternion x extents vs matrix +0xC0: max |difference| {:.3g}; +0x110 vs matrix translation: {:.3g}; {} volumes with +0x20 != +0x110", worst, worst_origin, moved);
     std::println("{} cubemap volumes", cubemaps.size());
     for (const auto& [k, n] : variants) std::println("  {:5}  {}", n, k);
     return 0;

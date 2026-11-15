@@ -122,6 +122,8 @@ struct MapCubemap {
     std::array<float, 4> probe_params{};         // +0x170
     std::array<float, 4> flags{};                // +0x180 (.y > 0 relighting, .z > 0 && .w != 0 alpha)
     float unk30 = 0, fade_start = 0, fade_end = 0;  // +0x30, +0x3C, +0x40
+    std::array<float, 4> shape{};                // +0x70 (D2 +0x60): xyz > 0 rounds that axis pair, .w > 0 = cube_sphere variant
+    std::array<float, 4> unk80{};                // +0x80 (D2 +0x70)
     std::array<float, 3> blend_neg{}, blend_pos{};  // +0x50 / +0x60: per-face blend widths (fraction of the half extent)
     TagHash specular, alpha, diffuse;            // +0x1B8 cube, +0x1BC cube, +0x1C0 3D probe volume
     TagHash shape_vertices;                     // +0x1C4: authored CSG boundary, float3 triangle list
