@@ -2227,7 +2227,37 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                 }
                 it = vol_keys.emplace(key, index).first;
             }
-            vol_lights_.push_back({it->second, tech, i});
+            VolumetricLight vl{it->second, tech, i};
+            if (lights_[i].shadow_technique && !l.shadow_volumetrics.is_none()) {
+                auto& stech = techniques[l.shadow_volumetrics.value];
+                if (!stech) stech = std::make_shared<const Technique>(load_technique(pm, l.shadow_volumetrics));
+                std::string skey = "S";
+                for (auto which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+                    const auto& st = stech->stage(which);
+                    skey += std::format("{:08X}:", st.shader.value);
+                    for (const auto& t : st.textures) skey += std::format("t{}={:08X},", t.slot, t.texture.value);
+                    for (const auto& sm : st.samplers) skey += std::format("s{:08X},", sm.value);
+                    skey += '|';
+                }
+                auto sit = vol_keys.find(skey);
+                if (sit == vol_keys.end()) {
+                    const uint32_t index = uint32_t(vol_pipelines_.size());
+                    for (bool front : {true, false}) {
+                        auto vp = std::make_unique<GamePipeline>();
+                        GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true,
+                                                  {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT}};
+                        opt.volume = true;
+                        opt.cull_front = front;
+                        opt.cbuffer_floor = 80;
+                        vp->load(pm, gpu, l.shadow_volumetrics, scopes, opt);
+                        vol_pipelines_.push_back(std::move(vp));
+                    }
+                    sit = vol_keys.emplace(skey, index).first;
+                }
+                vl.shadow_pipeline = sit->second;
+                vl.shadow_technique = stech;
+            }
+            vol_lights_.push_back(std::move(vl));
         } catch (const std::exception& ex) {
             ++vol_failures[std::string(ex.what()).substr(0, 120)];
         }
@@ -2252,7 +2282,11 @@ std::optional<ViewMatrices> light_shadow_view(const MapLight& l) {
     const float x = at(3, 0), w_near = at(3, 3) - at(2, 3), w_far = at(3, 3) + at(2, 3);
     if (w_near <= eps || w_far <= eps || w_far >= w_near) return std::nullopt;
     const float near_z = x / w_near, far_z = x / w_far;
-    const float tan_u = std::hypot(at(0, 1), at(0, 2)) / x, tan_v = std::hypot(at(1, 1), at(1, 2)) / x;
+    // The map's axes are those of the light box (light_box_to_world): the +0xE0 shaft PS looks
+    // its box-space samples up at u = 0.5 - (box.y - 0.5) * far / x, v = 0.5 - (box.x - 0.5) * far / x
+    // (box.y along local Y, box.x along local Z), so NDC x = -Y / (x tan), NDC y = Z / (x tan), with
+    // the box's half extents at the far plane as the tangents.
+    const float tan_u = (std::fabs(at(0, 1)) + std::fabs(at(1, 1))) / x, tan_v = (std::fabs(at(0, 2)) + std::fabs(at(1, 2))) / x;
     if (tan_u <= eps || tan_v <= eps) return std::nullopt;
     const M4 node = m4(l.node);
     auto dir = [&](float lx, float ly, float lz) {
@@ -2262,8 +2296,8 @@ std::optional<ViewMatrices> light_shadow_view(const MapLight& l) {
     ViewMatrices v;
     v.eye = {node.c[3][0], node.c[3][1], node.c[3][2]};
     v.fwd = dir(1, 0, 0);
-    v.up = dir(0, at(1, 1), at(1, 2));
-    v.right = normalize(cross(v.fwd, v.up));  // the handedness of nim's camera; the lookup uses the same matrix
+    v.up = dir(0, 0, 1);
+    v.right = normalize(cross(v.fwd, v.up));  // -Y of the light
     v.up = cross(v.right, v.fwd);
     v.fx = 1 / tan_u;
     v.fy = 1 / tan_v;
@@ -2319,6 +2353,25 @@ std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12Gr
     return out;
 }
 
+void GameLighting::bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& ll, const ViewMatrices& vm) {
+    constexpr uint8_t kShadow = 6;  // deferred_shadow
+    if (!ext_.zero_policy(kShadow)) ext_.zero_when_missing(kShadow, "deferred shadow value with no known meaning: zero");
+    if (!ll.shadow_readable) {
+        Gpu::barrier(cl, ll.shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ll.shadow_readable = true;
+    }
+    M4 from_rel;  // camera-relative world -> world
+    from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
+    from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
+    ext_.set_texture(kShadow, 0x00, ll.shadow->depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    ext_.set(kShadow, 0x18, float(ll.shadow->size));
+    ext_.set(kShadow, 0x1C, float(ll.shadow->size));
+    ext_.set(kShadow, 0x30, float4{-7000, 0, 1, 0});  // .x: slope of the depth comparison (reversed depth)
+    ext_.set(kShadow, 0xB0, float4{0, 0, 1, 1});      // uv offset / scale: the whole map
+    ext_.set(kShadow, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
+    ext_.set(kShadow, 0x180, 2.0f);                   // > 1: the 21-tap filter of the PS
+}
+
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -2354,22 +2407,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && ll.shadow_technique;
         ext_.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
         if (shadowed) {
-            constexpr uint8_t kShadow = 6;  // deferred_shadow
-            if (!ext_.zero_policy(kShadow)) ext_.zero_when_missing(kShadow, "deferred shadow value with no known meaning: zero");
-            if (!ll.shadow_readable) {
-                Gpu::barrier(cl, ll.shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                ll.shadow_readable = true;
-            }
-            M4 from_rel;  // camera-relative world -> world
-            from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
-            from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
-            ext_.set_texture(kShadow, 0x00, ll.shadow->depth.Get(), DXGI_FORMAT_R32_FLOAT);
-            ext_.set(kShadow, 0x18, float(ll.shadow->size));
-            ext_.set(kShadow, 0x1C, float(ll.shadow->size));
-            ext_.set(kShadow, 0x30, float4{-7000, 0, 1, 0});  // .x: slope of the depth comparison (reversed depth)
-            ext_.set(kShadow, 0xB0, float4{0, 0, 1, 1});      // uv offset / scale: the whole map
-            ext_.set(kShadow, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
-            ext_.set(kShadow, 0x180, 2.0f);                   // > 1: the 21-tap filter of the PS
+            bind_light_shadow(cl, ll, vm);
             ++light_shadows_used_;
         }
         ext_.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
@@ -2477,9 +2515,14 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     M4 to_rel;  // world -> camera-relative world
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    vol_shadows_used_ = 0;
     for (const auto& vl : vol_lights_) {
-        const MapLight& l = lights_[vl.light].light;
+        LocalLight& ll = lights_[vl.light];
+        const MapLight& l = ll.light;
         if (off_screen(vm, l.lo, l.hi)) continue;
+        // +0xE0: each march sample is looked up in the light's depth map (t2) through the light
+        // box, weighted by +0x154 (cb0[41]).
+        const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
         const M4 node = m4(l.node), space = m4(l.light_space);
         const M4 node_rel = mul(to_rel, node);
         const M4 volume = mul(node_rel, space);
@@ -2491,15 +2534,19 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         ext_.set(ext::DeferredLight, 0xC0, node_rel);
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         ext_.set(ext::DeferredLight, 0x150, 1.0f);
-        ext_.set(ext::DeferredLight, 0x154, 0.0f);
+        ext_.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
         ext_.set(ext::DeferredLight, 0x160, 1.0f);
+        if (shadowed) {
+            bind_light_shadow(cl, ll, vm);
+            ++vol_shadows_used_;
+        }
         ext_.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
         ext_.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
         ext_.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
         const bool mirrored = det4(volume) > 0;
-        GamePipeline& gp = *vol_pipelines_[vl.pipeline + (mirrored ? 1 : 0)];
+        GamePipeline& gp = *vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, qscopes, vl.technique.get(), cube_vbv_, cube_ibv_, 36);
+            gp.draw_volume(gpu, cl, ext_, qscopes, shadowed ? vl.shadow_technique.get() : vl.technique.get(), cube_vbv_, cube_ibv_, 36);
             ++vol_drawn_;
         } catch (const std::exception& ex) {
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));

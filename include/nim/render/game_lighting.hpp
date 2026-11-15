@@ -237,6 +237,7 @@ public:
     size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
+    size_t volumetric_shadows_used() const { return vol_shadows_used_; }  // shafts drawn with a shadow map last frame
     const std::vector<std::string>& light_notes() const { return light_notes_; }
     ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE
 
@@ -325,10 +326,13 @@ private:
         uint32_t pipeline = 0;  // pair: both windings
         std::shared_ptr<const Technique> technique;
         size_t light = 0;       // index into lights_
+        // Shadowing lights: the +0xE0 technique, which looks the march samples up in the light's depth map.
+        uint32_t shadow_pipeline = UINT32_MAX;
+        std::shared_ptr<const Technique> shadow_technique;
     };
     std::vector<std::unique_ptr<GamePipeline>> vol_pipelines_;
     std::vector<VolumetricLight> vol_lights_;
-    size_t vol_drawn_ = 0;
+    size_t vol_drawn_ = 0, vol_shadows_used_ = 0;
     // Quarter resolution: min/max depth, the light pass targets (far, near, slices 0-3, 4-7), the
     // blurred far / near layers.
     ComPtr<ID3D12Resource> vol_minmax_, vol_layer_[4], vol_blurred_[2];
@@ -375,6 +379,8 @@ private:
         bool shadow_readable = false;  // depth map in PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
     };
     size_t light_shadow_items_ = 0, light_shadows_used_ = 0;
+    // Hands a light's depth map to the deferred_shadow extern (6) for its +0xD8 / +0xE0 technique.
+    void bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& ll, const ViewMatrices& vm);
     bool light_shadows_ = true;
     std::vector<std::unique_ptr<GamePipeline>> light_pipelines_;  // two per shader pair: both windings
     std::vector<LocalLight> lights_;

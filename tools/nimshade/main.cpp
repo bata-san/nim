@@ -632,7 +632,7 @@ int run(int argc, char** argv) {
         }
         if (gl.light_count() || gl.cubemap_count()) {
             std::println("local lights drawn: {}, light shafts {} of {}", gl.lights_drawn(), gl.volumetrics_drawn(), gl.volumetric_lights());
-            std::println("shadowed lights drawn: {}", gl.light_shadows_used());
+            std::println("shadowed lights drawn: {}, shadowed light shafts: {}", gl.light_shadows_used(), gl.volumetric_shadows_used());
             for (int b = 0; b < 2; ++b) {
                 auto px = gpu.read_texture(gl.light_buffer(b), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
                 const uint16_t* h = reinterpret_cast<const uint16_t*>(px.data());

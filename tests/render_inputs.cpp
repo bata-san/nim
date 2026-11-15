@@ -47,8 +47,9 @@ int main() {
             const auto near_p = project(3.5f, 4, 5), far_p = project(53, 4, 5), edge_u = project(13, -6, 5), edge_v = project(13, 4, 15);
             check(std::abs(near_p[0]) < 1e-5f && std::abs(near_p[1]) < 1e-5f && std::abs(near_p[2] - 1) < 1e-4f, "light axis at the near plane is not the map centre at depth 1");
             check(std::abs(far_p[2]) < 1e-4f, "light far plane is not depth 0");
-            check(std::abs(std::abs(edge_u[0]) - 1) < 1e-4f && std::abs(edge_u[1]) < 1e-4f, "light frustum side is not the map edge");
-            check(std::abs(std::abs(edge_v[1]) - 1) < 1e-4f && std::abs(edge_v[0]) < 1e-4f, "light frustum top is not the map edge");
+            // The +0xE0 shaft PS fixes the axes: NDC x = -Y / (x tan), NDC y = +Z / (x tan) of the light.
+            check(std::abs(edge_u[0] - 1) < 1e-4f && std::abs(edge_u[1]) < 1e-4f, "light -Y side is not the map's +x edge");
+            check(std::abs(edge_v[1] - 1) < 1e-4f && std::abs(edge_v[0]) < 1e-4f, "light +Z side is not the map's +y edge");
         }
         l.light_space = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
         check(!light_shadow_view(l).has_value(), "a box light was given a spot shadow frustum");
