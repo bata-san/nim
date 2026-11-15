@@ -260,6 +260,8 @@ public:
     // atmosphere on) the map environment's channel expressions at the time of day, then the
     // weather. Runs every frame in render(); call it first to give the materials the same values.
     const std::vector<float4>& update_global_channels(const LightingParams& p);
+    // The world (script) channels of the last update_global_channels, for the materials.
+    const std::map<uint32_t, float>& world_channels() const { return ext_.world_channels; }
     size_t environment_channels() const { return env_channels_; }  // channels the map environment set
     // The sun direction (toward the sun) for these parameters: the map's sun path with an atmosphere.
     V3 sun_toward(const LightingParams& p) const { return sun_direction(p, atm_.valid ? &atm_.data : nullptr); }
@@ -290,6 +292,7 @@ private:
     ExternStore ext_;
     std::map<uint32_t, float> global_overrides_;
     size_t env_channels_ = 0;
+    int day_night_slot_ = -1;  // world channel registry slot of day_night_state
     GamePipeline shading_, final_combine_;
     // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
     GamePipeline hdao_, apply_ssao_;

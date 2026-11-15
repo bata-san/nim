@@ -1886,7 +1886,10 @@ public:
         if (game_ready) scene.set_exposure(game_lighting.exposure());
         light.time = material_time;
         light.delta_time = material_dt;
-        if (game_ready) scene.set_global_channel_values(game_lighting.update_global_channels(light));
+        if (game_ready) {
+            scene.set_global_channel_values(game_lighting.update_global_channels(light));
+            scene.set_global_channels(game_lighting.world_channels());
+        }
         ViewMatrices vm = game_ready && light.mode == ViewMode::Lit ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
         try {
             SunShadow* shadow = nullptr;

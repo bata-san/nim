@@ -1,4 +1,5 @@
 #include "nim/render/game_lighting.hpp"
+#include "nim/content/weather.hpp"
 
 #include <d3dcompiler.h>
 
@@ -1005,6 +1006,8 @@ void GameLighting::release(Gpu& gpu) {
 
 void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     globals_ = load_render_globals(pm);
+    if (const auto reg = load_world_channel_registry(pm); reg.slots.contains(kWorldDayNightState))
+        day_night_slot_ = int(reg.slots.at(kWorldDayNightState));
     frame_scope_ = load_scope(pm, globals_.scope("frame"));
     view_scope_ = load_scope(pm, globals_.scope("view"));
     ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
@@ -1507,6 +1510,15 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
         }
     }
     ext_.world_channels = global_overrides_;
+    // day_night_state (world channel A12171A8): 217 of Outpost's lights, eight of its shadowing key
+    // lights among them, scale their colour by it (colour x 19 x state). No script of the map sets it
+    // and the engine's rule is not in game data: 1 while the map's sun is below the horizon, else 0.
+    if (day_night_slot_ >= 0 && atm_.valid && p.atmosphere && !ext_.world_channels.contains(uint32_t(day_night_slot_))) {
+        const float night = p.day_night_state >= 0 ? p.day_night_state : sun_toward(p).z < 0 ? 1.0f : 0.0f;
+        ext_.world_channels[uint32_t(day_night_slot_)] = night;
+        ext_.note_estimate(std::format("world channel day_night_state = {:g}", night),
+                           p.day_night_state >= 0 ? "set by the viewer" : "no script state supplies it; 1 while the map's sun is below the horizon");
+    }
     return ext_.channels;
 }
 

@@ -1100,6 +1100,38 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
         std::println("  {} {} tech {} pos ({:.1f} {:.1f} {:.1f}) bounds ({:.1f} {:.1f} {:.1f})-({:.1f} {:.1f} {:.1f})", l.source.str(),
                      l.shadowing ? "S" : "C", l.technique.str(), l.node[12], l.node[13], l.node[14], l.lo[0], l.lo[1], l.lo[2], l.hi[0], l.hi[1], l.hi[2]);
     }
+    // Which run-time channels the lights' own expressions read (their colour and intensity
+    // follow these): world channels (TFX 0x64) and render-global channels (0x63), in lights.
+    const auto registry = load_world_channel_registry(pm);
+    std::map<uint32_t, uint32_t> slot_hash;
+    for (const auto& [hash, slot] : registry.slots) slot_hash[slot] = hash;
+    std::map<uint8_t, size_t> world, global;
+    size_t failed = 0, shadow_world3 = 0;
+    for (const auto& l : lights) {
+        try {
+            const Technique t = load_technique(pm, l.technique);
+            const auto& ps = t.stage(ShaderStage::Pixel);
+            std::set<uint8_t> w, g;
+            TfxEnvironment env;
+            env.extern_vec4 = [](uint8_t, uint8_t) { return float4{1, 1, 1, 1}; };
+            env.extern_float = [](uint8_t, uint8_t) { return 1.0f; };
+            env.global_channel = [&](uint8_t c) { g.insert(c); return float4{1, 1, 1, 1}; };
+            env.world_channel = [&](uint8_t c) { w.insert(c); return float4{1, 1, 1, 1}; };
+            env.object_channel = [](uint32_t) { return float4{1, 1, 1, 1}; };
+            std::vector<float4> out;
+            evaluate_tfx(ps.bytecode, ps.constants, ps.cbuffer_init, out, env);
+            for (auto c : w) ++world[c];
+            for (auto c : g) ++global[c];
+            if (l.shadowing && w.contains(3)) ++shadow_world3;
+        } catch (const std::exception&) { ++failed; }
+    }
+    std::println("channels read by the lights' pixel expressions ({} lights failed):", failed);
+    for (const auto& [c, n] : world) {
+        const auto it = slot_hash.find(c);
+        std::println("  world channel {:2} ({:08X}): {} lights", c, it == slot_hash.end() ? 0u : it->second, n);
+    }
+    for (const auto& [c, n] : global) std::println("  render-global channel {:02X}: {} lights", c, n);
+    std::println("  shadowing lights reading world channel 3: {}", shadow_world3);
     return 0;
 }
 

@@ -436,6 +436,7 @@ struct LightingParams {
     bool atmosphere = true;
     bool froxel_noise = true;  // original spatial density-noise permutation; source/selection are estimates
     float time_of_day = -1.0f;
+    float day_night_state = -1.0f;  // world channel day_night_state; < 0: 1 while the sun is below the horizon (estimate)
     // The map environment (its global channel expressions: sun, ambient, fog over the day) with the atmosphere.
     bool environment = true;
     // Sky ambient with the atmosphere: the sky hemisphere map and cubemap_apply_sky_copy_ao.

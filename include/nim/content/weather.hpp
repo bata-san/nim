@@ -14,6 +14,7 @@
 
 namespace nim {
 
+inline constexpr uint32_t kWorldDayNightState = 0xA12171A8;  // fnv1("day_night_state")
 struct WorldChannelRegistry {
     TagHash tag;
     std::unordered_map<uint32_t, uint32_t> slots;  // fnv1(world channel name) -> global channel index

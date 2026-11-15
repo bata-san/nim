@@ -75,6 +75,7 @@ int run(int argc, char** argv) {
     uint32_t width = 1600, height = 1000;
     bool warp = false, game = false;
     float time_of_day = -1;
+    float day_night_state = -1;
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
@@ -157,6 +158,7 @@ int run(int argc, char** argv) {
         }
         else if (args[i] == "--reference") reference = true;
         else if (args[i] == "--time-of-day" && i + 1 < args.size()) time_of_day = std::stof(args[++i]);
+        else if (args[i] == "--day-night-state" && i + 1 < args.size()) day_night_state = std::stof(args[++i]);
         else if (args[i] == "--no-atmosphere") no_atmosphere = true;
         else if (args[i] == "--no-environment") no_environment = true;
         else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
@@ -467,6 +469,7 @@ int run(int argc, char** argv) {
     lp.froxel_noise = !no_froxel_noise;
     lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
+    lp.day_night_state = day_night_state;
     lp.post = !no_post;
     lp.auto_exposure = !no_auto_exposure;
     lp.bloom = !no_bloom;
@@ -526,6 +529,7 @@ int run(int argc, char** argv) {
         for (const auto& n : gl.notes()) std::println("  {}", n);
         // The materials read the same global channels as the lighting (the map environment).
         scene.set_global_channel_values(gl.update_global_channels(lp));
+        scene.set_global_channels(gl.world_channels());
         if (gl.environment_channels()) {
             std::println("map environment: {} global channels at time of day {:.3f}", gl.environment_channels(),
                          lp.time_of_day >= 0 ? lp.time_of_day : gl.default_time_of_day());
