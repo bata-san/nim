@@ -200,6 +200,10 @@ private:
     uint32_t cbuffer_floor_ = 256;
     TagHash tag_;
     std::vector<Stage> stages_;
+    struct PendingView { uint32_t slot; BindingKind kind; ExternStore::Tex view; bool uav; };
+    std::vector<PendingView> pending_views_;
+    std::vector<uint64_t> view_key_;
+    std::vector<ID3D12Resource*> view_resources_;
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3D12PipelineState> pso_;
 };
@@ -323,6 +327,7 @@ private:
     std::map<uint32_t, float> global_overrides_;
     size_t env_channels_ = 0;
     int day_night_slot_ = -1;  // world channel registry slot of day_night_state
+    int time_of_day_slot_ = -1;
     GamePipeline shading_, final_combine_;
     // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
     GamePipeline hdao_, apply_ssao_;
@@ -358,6 +363,7 @@ private:
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_, atmosphere_noise_;
     ComPtr<ID3D12Resource> no_atmosphere_;  // 1x1x2 (1, 1, 0, 0): clear air while no map atmosphere is loaded
     struct Atmosphere {
+        GamePipeline lens_glare, lens_upsample;
         MapAtmosphere data;
         std::array<ComPtr<ID3D12Resource>, 4> lookups;
         ComPtr<ID3D12Resource> density_lut;
@@ -446,15 +452,15 @@ private:
     void release_post(Gpu& gpu);
     void update_exposure(Gpu& gpu, const LightingParams& p);
     void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes);
-    GamePipeline post_tonemap_, post_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_blur_h_, bloom_blur_v_, bloom_add_, bloom_copy_, ae_columns_;
-    static constexpr int kBloomLevels = 4;  // 1/2, 1/4, 1/8, 1/16
+    GamePipeline post_tonemap_, post_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
+    static constexpr int kBloomLevels = 4;  // 1/3, 1/6, 1/12, 1/24
     struct BloomLevel {
         ComPtr<ID3D12Resource> down, blur, sum;  // downsampled, horizontal pass, result
         uint32_t w = 0, h = 0;
     };
     std::array<BloomLevel, kBloomLevels> bloom_;
     ComPtr<ID3D12Resource> post_ldr_;  // the tonemapped colour with its luma in alpha (the fxaa input)
-    ComPtr<ID3D12Resource> bloom_final_, ae_columns_rt_, grading_lut_, black_;
+    ComPtr<ID3D12Resource> ae_columns_rt_, grading_lut_, black_, lens_blur_;
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     // resolve_taa: two RGBA16F history targets (written / read alternately); copy_texture_bilinear
     // puts the resolved frame into the 8-bit output.
@@ -480,7 +486,7 @@ private:
     void release_sky_ambient(Gpu& gpu);
     bool sky_ambient_on(const LightingParams& p) const;
     void render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl);
-    GamePipeline hemi_sky_, hemi_copy_, hemi_down_, sky_apply_;
+    GamePipeline hemi_sky_, hemi_copy_, hemi_tint_, hemi_down_, sky_apply_;
     // Overhead occlusion: extern 82 +0x08, the variance map of the top-down depth
     // (sample_and_blur_variance_map_9x9), read by cubemap_apply_sky_copy_ao_with_overhead_occlusion.
     bool overhead_occlusion_on(const LightingParams& p) const;
@@ -523,7 +529,8 @@ private:
     static constexpr uint32_t kFroxelDepth = 64, kFroxelTile = 8;
     static constexpr float kFroxelNear = 0.5f, kFroxelFar = 256.0f, kFroxelCurve = 0.5f;
     static constexpr uint32_t kHemiSize = 256, kHemiMips = 9, kHemiFace = 128;
-    ComPtr<ID3D12Resource> hemi_, hemi_face_;  // RGBA16F: the mirror-ball map (9 mips), one cube face
+    ComPtr<ID3D12Resource> hemi_, hemi_face_, hemi_untinted_;
+    std::optional<std::array<float4, 7>> hemi_inputs_;
     ComPtr<ID3D12DescriptorHeap> hemi_rtv_heap_;  // hemisphere mips 0..8, then the face
 };
 

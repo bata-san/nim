@@ -2,7 +2,7 @@
 
 > Rendering sections below contain historical descriptions of the approximate renderer.
 > Those substitutions have been removed. Current behavior, missing producers and limitations
-> are documented in [RENDERING.md](RENDERING.md). Complete game reproduction remains unfinished.
+> are documented in [PROGRESS.md](PROGRESS.md). Complete game reproduction remains unfinished.
 
 
 対象: Bungie『Marathon』(2026, PC/Steam 版, Tiger エンジン系。tiger-pkg 内のコード名は "Goliath")

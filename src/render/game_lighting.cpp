@@ -112,7 +112,7 @@ void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKin
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         // A first mip selects that one mip (a mip chain's source while the next is written).
         sd.Texture2D.MostDetailedMip = UINT(first);
-        sd.Texture2D.MipLevels = first ? 1 : UINT(-1);
+        sd.Texture2D.MipLevels = elements ? elements : first ? 1 : UINT(-1);
         break;
     }
     dev->CreateShaderResourceView(r, &sd, h);
@@ -675,24 +675,28 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         auto& cb = st.constants;
         cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
         cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
-        std::vector<TfxExternTexture> textures = st.extern_textures;
+        const auto& textures = st.extern_textures;
         if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env);
-        DynamicAlloc a = gpu.dynamic(cb.size() * sizeof(float4));
-        std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+        D3D12_GPU_VIRTUAL_ADDRESS own_cb = 0;
         for (auto [reg, param] : st.cbvs) {
-            D3D12_GPU_VIRTUAL_ADDRESS va = int32_t(reg) == tfx.cbuffer_slot ? a.gpu : scopes ? scopes(st.which, reg) : 0;
+            if (int32_t(reg) == tfx.cbuffer_slot && !own_cb) {
+                const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+                std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+                own_cb = a.gpu;
+            }
+            const auto va = int32_t(reg) == tfx.cbuffer_slot ? own_cb : scopes ? scopes(st.which, reg) : 0;
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
-        struct PendingView { uint32_t slot; BindingKind kind; ExternStore::Tex view; bool uav = false; };
-        std::vector<PendingView> views;
-        std::vector<uint64_t> view_key{st.srv_count, st.uav_count};
-        std::vector<ID3D12Resource*> view_resources;
+        if (!st.srv_count && !st.uav_count) continue;
+        pending_views_.clear();
+        view_resources_.clear();
+        view_key_.assign({st.srv_count, st.uav_count});
         auto remember = [&](uint32_t slot, BindingKind kind, ExternStore::Tex view, bool uav = false) {
-            views.push_back({slot, kind, view, uav});
-            view_key.insert(view_key.end(), {slot, uint64_t(kind), uint64_t(reinterpret_cast<uintptr_t>(view.resource)),
+            pending_views_.push_back({slot, kind, view, uav});
+            view_key_.insert(view_key_.end(), {slot, uint64_t(kind), uint64_t(reinterpret_cast<uintptr_t>(view.resource)),
                 uint64_t(view.format), view.stride, view.elements, view.first_element, uint64_t(uav), uint64_t(view.mip)});
-            view_resources.push_back(view.resource);
+            view_resources_.push_back(view.resource);
         };
         for (const auto& [s, kind] : st.srv_kinds) {
             ID3D12Resource* r = nullptr;
@@ -732,10 +736,10 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         }
         uint32_t base = 0;
         if (st.srv_count || st.uav_count) {
-            if (const auto cached = gpu.find_transient_table(view_key)) base = *cached;
+            if (const auto cached = gpu.find_transient_table(view_key_)) base = *cached;
             else {
                 base = gpu.transient_descriptors(st.srv_count + st.uav_count);
-                for (const auto& view : views) {
+                for (const auto& view : pending_views_) {
                     const auto handle = gpu.srv().cpu(base + view.slot);
                     if (view.uav) write_uav(dev, view.view, view.kind, handle);
                     else if (!view.view.resource) write_null_srv(dev, view.kind, handle);
@@ -743,7 +747,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 }
                 // Publish only after every descriptor is valid; a failed strict binding cannot
                 // leave a partially initialized table in the cache.
-                gpu.cache_transient_table(std::move(view_key), base, view_resources);
+                gpu.cache_transient_table(view_key_, base, view_resources_);
             }
         }
         if (st.table_param >= 0) {
@@ -1025,8 +1029,11 @@ void GameLighting::release(Gpu& gpu) {
 
 void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     globals_ = load_render_globals(pm);
-    if (const auto reg = load_world_channel_registry(pm); reg.slots.contains(kWorldDayNightState))
-        day_night_slot_ = int(reg.slots.at(kWorldDayNightState));
+    const auto registry = load_world_channel_registry(pm);
+    if (const auto it = registry.slots.find(kWorldDayNightState); it != registry.slots.end())
+        day_night_slot_ = int(it->second);
+    if (const auto it = registry.slots.find(fnv1("time_of_day")); it != registry.slots.end())
+        time_of_day_slot_ = int(it->second);
     frame_scope_ = load_scope(pm, globals_.scope("frame"));
     view_scope_ = load_scope(pm, globals_.scope("view"));
     ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
@@ -1462,7 +1469,6 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.estimate(ext::GlobalLighting, 0x70, scaled(ch(0x57), ch(0x58)[0]), from_channels);  // up_ambient
         ext_.estimate(ext::GlobalLighting, 0x80, scaled(ch(0x5A), ch(0x5B)[0]), from_channels);  // down_ambient
         ext_.estimate(ext::GlobalLighting, 0x90, float4{ch(0x59)[0], ch(0x5C)[0], 0, 0}, from_channels);  // sharpness
-        ext_.set_channel("sun_atmosphere_direction", v4(sun_dir, 0));
         if (!ext_.zero_policy(ext::GlobalLighting))
             ext_.zero_when_missing(ext::GlobalLighting, "global lighting value with no known meaning: zero");
         return;
@@ -1536,6 +1542,11 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
         }
     }
     ext_.world_channels = global_overrides_;
+    if (atm_.valid) {
+        if (time_of_day_slot_ >= 0)
+            ext_.world_channels.try_emplace(uint32_t(time_of_day_slot_), time_of_day(p));
+        if (p.atmosphere) ext_.set_channel("sun_atmosphere_direction", v4(sun_toward(p), 0));
+    }
     // day_night_state (world channel A12171A8): 217 of Outpost's lights, eight of its shadowing key
     // lights among them, scale their colour by it (colour x 19 x state). No script of the map sets it
     // and the engine's rule is not in game data: 1 while the map's sun is below the horizon, else 0.
@@ -1799,6 +1810,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
 // the density LUT and the sun path; the remaining extern 7 values are the global fog / sky
 // channels copied in their own order (estimate), the engine code that copies them is not data.
 void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* a) {
+    if (atm_.valid) gpu.wait_idle();
+    hemi_inputs_.reset();
     atm_ = {};
     atm_notes_.clear();
     if (!a) return;
@@ -1811,12 +1824,14 @@ void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosph
         return;
     }
     try {
+        std::map<uint32_t, ComPtr<ID3D12Resource>> lookups;
         for (size_t k = 0; k < 4; ++k) {
             // A map without the second lookup set reads the first (the sets blend by channel 0x2D).
             const TagHash tag = !a->lookups[k].is_none() ? a->lookups[k] : a->lookups[k & 1];
             if (tag.is_none()) throw std::runtime_error(std::format("sky lookup {} missing", k));
-            if (k >= 2 && tag == a->lookups[k & 1]) atm_.lookups[k] = atm_.lookups[k & 1];
-            else atm_.lookups[k] = gpu.texture(load_texture(pm, tag));
+            auto& lookup = lookups[tag.value];
+            if (!lookup) lookup = gpu.texture(load_texture(pm, tag));
+            atm_.lookups[k] = lookup;
         }
         if (a->density_lut.is_none()) throw std::runtime_error("density LUT missing");
         atm_.density_lut = gpu.texture(load_texture(pm, a->density_lut));
@@ -1826,6 +1841,15 @@ void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosph
     } catch (const std::exception& ex) {
         atm_ = {};
         atm_notes_.push_back(std::format("atmosphere not loaded: {}", ex.what()));
+    }
+    if (atm_.valid && !a->lens_glare.is_none() && !a->lens_upsample.is_none()) {
+        try {
+            const Scope* scopes[] = {&frame_scope_, &view_scope_};
+            atm_.lens_glare.load(pm, gpu, a->lens_glare, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, true});
+            atm_.lens_upsample.load(pm, gpu, a->lens_upsample, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+        } catch (const std::exception& ex) {
+            atm_notes_.push_back(std::format("map lens glare not loaded: {}", ex.what()));
+        }
     }
     gpu.flush();
 }
@@ -2938,7 +2962,7 @@ void GameLighting::filter_specular_cubes(PackageManager& pm, Gpu& gpu, std::span
 }
 
 void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes, bool distance_fade) {
-    ext_.note_estimate(distance_fade ? "cubemaps: cb11 [14].w = camera distance fade (+0x3C..+0x40)" :
+    ext_.note_estimate(distance_fade ? "cubemaps: cb11 [14].w = camera distance fade starting at 250 m or farther" :
                                      "cubemaps: cb11 [14].w = 1 (full-map probe viewing)",
                        "engine distance fade semantics unverified; full-map mode preserves authored spatial bounds, samples and intensities");
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -2964,25 +2988,23 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         std::memcpy(a.cpu, values.data(), values.size() * sizeof(float4));
         return a.gpu;
     };
-    // The volume VS passes the vertex's view depth as dot(eye - vertex, cb12[6]) and the PS scales
-    // the eye-to-vertex ray by surface depth / that: the engine's cb12[6] is the camera's backward
-    // axis. nim's camera space looks along +z (cb12[6] = forward), which puts every reconstructed
-    // point behind the eye, so this pass gets the view scope with that row negated.
-    auto vs_view = evaluate_scope(view_scope_, ScopeStage::Vertex, ext_);
-    if (vs_view.size() > 6)
-        for (auto& x : vs_view[6]) x = -x;
-    const auto vs_view_cb = upload(vs_view);
+    // The volume VS expects the same backward camera axis as the transparent PS.
+    // Reuse the frame's view scope; negating cb12[6] again places receivers behind the camera.
     for (const auto& cv : cubemaps_) {
         const MapCubemap& m = cv.volume;
         if (off_screen(vm, m.lo, m.hi)) continue;
-        float d2 = 0;  // camera to the volume's box
-        for (int a = 0; a < 3; ++a) {
-            const float e = (&vm.eye.x)[a];
-            const float d = e < m.lo[size_t(a)] ? m.lo[size_t(a)] - e : e > m.hi[size_t(a)] ? e - m.hi[size_t(a)] : 0;
-            d2 += d * d;
+        float fade = 1.0f;
+        if (distance_fade && m.fade_end > m.fade_start) {
+            const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};
+            float d2 = 0;  // distance to the volume's box, not to its center
+            for (size_t a = 0; a < 3; ++a) {
+                const float d = eye[a] - std::clamp(eye[a], m.lo[a], m.hi[a]);
+                d2 += d * d;
+            }
+            const float start = std::max(250.0f, m.fade_start);
+            const float width = std::max(50.0f, m.fade_end - m.fade_start);
+            fade = std::clamp(1.0f - (std::sqrt(d2) - start) / width, 0.0f, 1.0f);
         }
-        const float dist = std::sqrt(d2);
-        const float fade = distance_fade && m.fade_end > m.fade_start ? std::clamp((m.fade_end - dist) / (m.fade_end - m.fade_start), 0.0f, 1.0f) : 1.0f;
         if (fade <= 0) continue;
         std::array<float4, 4> vs{};
         // The box is the unit cube through the matrix +0xC0: its translation is +0x110, and
@@ -3024,7 +3046,6 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
         const auto vs_cb = upload(vs), ps_cb = upload(ps);
         const ScopeBufferFn volume_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
             if (reg == 11) return stage == ShaderStage::Vertex ? vs_cb : ps_cb;
-            if (reg == 12 && stage == ShaderStage::Vertex) return vs_view_cb;
             return scopes(stage, reg);
         };
         // The VS places -position (the cube turned inside out); the far side is drawn as for lights.

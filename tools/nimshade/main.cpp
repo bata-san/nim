@@ -299,7 +299,6 @@ int run(int argc, char** argv) {
             }
         }
         // The sky objects (distant scenery kilometres out): all of them, whatever the radius.
-        const size_t sky_first = region.size();
         float geometry_extent = 1;
         for (const auto& m : region) for (const auto& r : m.rows)
             geometry_extent = std::max(geometry_extent, std::hypot(r[3] - focus[0], r[7] - focus[1], r[11] - focus[2]));
@@ -312,12 +311,7 @@ int run(int argc, char** argv) {
         }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;
-        cache.gbuffer_only = true; // keep malformed entity FX out even when the sky is enabled
         cache.all_lods = true;
-        PrepareCache sky_cache;
-        sky_cache.max_texture_dim = map_texture_cap;
-        sky_cache.gbuffer_only = false;
-        sky_cache.all_lods = true;
         scene.begin(gpu);
         std::map<std::string, size_t> failures;
         double prep_s = 0, add_s = 0;
@@ -356,7 +350,7 @@ int run(int argc, char** argv) {
                         else {
                             const auto mat = entity_materials.find(region[r].mesh.value);
                             prepared[j] = prepare_dynamic_model(wpm, region[r].mesh, mat == entity_materials.end() ? nullptr : &mat->second, -1,
-                                                                nullptr, r >= sky_first ? &sky_cache : &cache);
+                                                                nullptr, &cache);
                             if (prepared[j]->no_drawable) prepared[j].reset(), errors[j] = "entity model with no drawable parts";
                         }
                     } catch (const std::exception& ex) {
@@ -374,7 +368,7 @@ int run(int argc, char** argv) {
             for (auto& t : threads) t.join();
             prep_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
         }
-        size_t terrain_ok = 0;
+        size_t terrain_ok = 0, entity_models_loaded = 0;
         const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         auto tb = std::chrono::steady_clock::now();
         for (size_t j = 0; j < jobs; ++j) {
@@ -386,6 +380,7 @@ int run(int argc, char** argv) {
                 else {
                     const auto& model = region[j - terrain.size()];
                     scene.add_mesh(gpu, std::move(*prepared[j]), layouts, model.rows, model.sky_order);
+                    if (j - terrain.size() >= static_count && model.sky_order.empty()) ++entity_models_loaded;
                 }
                 prepared[j].reset();
                 terrain_ok += is_terrain;
@@ -395,6 +390,7 @@ int run(int argc, char** argv) {
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
         std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
+        std::println("placed entity models added: {}", entity_models_loaded);
         scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, std::min(map_radius, geometry_extent) * 0.6f);
         std::println("loaded {} meshes / {} instances in {:.1f}s", scene.mesh_count(), scene.instance_count(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -426,9 +422,9 @@ int run(int argc, char** argv) {
     } else {
         scene.load(pm, gpu, mesh_tag, layouts);
     }
-    std::println("mesh {}: {} G-buffer group(s) at lod {}, radius {:.2f}", mesh_tag.str(), scene.groups().size(),
+    std::println("mesh {}: {} material group(s) at lod {}, radius {:.2f}", mesh_tag.str(), scene.groups().size(),
                  scene.lod(), scene.radius());
-    for (const auto& g : scene.groups()) {
+    if (!is_map) for (const auto& g : scene.groups()) {
         std::println("  part {}: technique {} VS {} PS {}  cb0 {} regs, vm {} instr", g.part, g.technique.str(),
                      g.vs.str(), g.ps.str(), g.cbuffer_regs, g.vm_instructions);
         for (const auto& t : g.textures)
@@ -487,7 +483,7 @@ int run(int argc, char** argv) {
     lp.exposure = exposure_arg;
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
         if (!shadows) return;
-        shadow.fit_view(sun_direction(p, atmosphere.valid() ? &atmosphere : nullptr), vm.eye, scene.center(), scene.center(), scene.radius());
+        shadow.fit_view(sun_direction(p, atmosphere.valid() ? &atmosphere : nullptr), vm.eye, view.target, scene.center(), scene.radius(), is_map);
         scene.render_shadow(gpu, list, shadow);
     };
     shadow_pass(cl, lp);
@@ -655,6 +651,7 @@ int run(int argc, char** argv) {
         }
         if (verify_static_motion && (!gl.temporal_aa_on(lp) || stationary_motion_max > 0.1f))
             throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
+        std::println("world transparent draws: {}", scene.world_transparent_draws());
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         std::println("view tables: {} unique, {} reused", gpu.transient_table_count(), gpu.transient_table_hits());

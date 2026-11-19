@@ -51,6 +51,7 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
         load(hemi_copy_, "sky_hemisphere_copy_frustum", opt);
     }
     load(hemi_down_, "sky_hemisphere_downsample_filter_ggx", {kF16, false});
+    load(hemi_tint_, "sky_hemisphere_copy_and_tint", {kF16, false});
     {
         // SV_Target0 diffuse, 1 specular, 2 the G-buffer AO (for passes nim does not run).
         GamePipeline::Options opt{kF16, false, {kF16}};
@@ -73,7 +74,8 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
              "CreateCommittedResource (sky hemisphere)");
     D3D12_CLEAR_VALUE cv{kF16, {0, 0, 0, 0}};
     hemi_face_ = gpu.texture2d(kHemiFace, kHemiFace, kF16, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kHemiMips + 1};
+    hemi_untinted_ = gpu.texture2d(kHemiSize, kHemiSize, kF16, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kHemiMips + 2};
     check_hr(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&hemi_rtv_heap_)), "sky hemisphere RTV heap");
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = hemi_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -85,13 +87,16 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
         dev->CreateRenderTargetView(hemi_.Get(), &d, {base.ptr + size_t(m) * inc});
     }
     dev->CreateRenderTargetView(hemi_face_.Get(), nullptr, {base.ptr + size_t(kHemiMips) * inc});
+    dev->CreateRenderTargetView(hemi_untinted_.Get(), nullptr, {base.ptr + size_t(kHemiMips + 1) * inc});
 }
 
 void GameLighting::release_sky_ambient(Gpu& gpu) {
-    for (GamePipeline* gp : {&hemi_sky_, &hemi_copy_, &hemi_down_, &sky_apply_, &sky_apply_overhead_, &overhead_vsm_}) gp->release(gpu);
+    for (GamePipeline* gp : {&hemi_sky_, &hemi_copy_, &hemi_tint_, &hemi_down_, &sky_apply_, &sky_apply_overhead_, &overhead_vsm_}) gp->release(gpu);
     overhead_vsm_tex_.Reset();
     hemi_.Reset();
     hemi_face_.Reset();
+    hemi_untinted_.Reset();
+    hemi_inputs_.reset();
     hemi_rtv_heap_.Reset();
 }
 
@@ -154,6 +159,19 @@ void GameLighting::prepare_overhead_occlusion(Gpu& gpu, ID3D12GraphicsCommandLis
 // Runs after render_sky_lookups (extern 7 +0x40 / +0x58 hold the far lookup set, as the sky
 // pipeline reads them). Leaves Deferred +0xF8 = the hemisphere and restores the externs it borrows.
 void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
+    // The fixed-face shaders read these sky parameters, not camera position, frame time or exposure.
+    // The source textures are retained by the current atmosphere and invalidate the key on map change.
+    constexpr auto A = ext::Atmosphere;
+    const auto& channels = ext_.channels;
+    const float tint = hemi_tint_.loaded() && channels.size() > 0x87 ? channels[0x87][0] : 0;
+    const std::array<float4, 7> inputs{
+        ext_.get_v(A, 0x150), ext_.get_v(A, 0x110), ext_.get_v(A, 0x1E0),
+        float4{ext_.get_f(A, 0x160), ext_.get_f(A, 0x164), ext_.get_f(A, 0x1C4), ext_.get_f(A, 0x1C8)},
+        float4{ext_.get_f(A, 0x70), channels[0x2D][0], 0, 0},
+        tint != 0 ? channels[0x57] : float4{}, float4{tint, 0, 0, 0}};
+    ext_.set_texture(ext::Deferred, 0xF8, hemi_.Get());
+    if (hemi_inputs_ == inputs) return;
+    hemi_inputs_.reset();
     ID3D12Device* dev = gpu.device();
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = hemi_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -184,6 +202,8 @@ void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl
     static const V3 kRight[6] = {{0, 0, 1}, {0, 0, -1}, {-1, 0, 0}, {-1, 0, 0}, {-1, 0, 0}, {1, 0, 0}};
     static const V3 kUp[6] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
     Gpu::barrier(cl, hemi_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (tint != 0)
+        Gpu::barrier(cl, hemi_untinted_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     for (int f = 0; f < 6; ++f) {
         const V3 r = kRight[f], u = kUp[f], fw = kForward[f];
         // The face: direction = right * clip.x + up * clip.y + forward (rows 4..7, clip.w = 1).
@@ -225,7 +245,7 @@ void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl
             return 0;
         };
         ext_.set_texture(pp, 0x00, hemi_face_.Get());
-        const auto mip0 = rtv(0);
+        const auto mip0 = rtv(tint != 0 ? kHemiMips + 1 : 0);
         cl->OMSetRenderTargets(1, &mip0, FALSE, nullptr);
         viewport(cl, kHemiSize, kHemiSize);
         hemi_copy_.draw(gpu, cl, ext_, copy_scopes);
@@ -239,11 +259,19 @@ void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl
         if (reg == 12) return stage == ShaderStage::Vertex ? cb_vs : cb_ps;
         return 0;
     };
+    if (tint != 0) {
+        Gpu::barrier(cl, hemi_untinted_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ext_.set_texture(pp, 0x00, hemi_untinted_.Get());
+        const auto mip0 = rtv(0);
+        cl->OMSetRenderTargets(1, &mip0, FALSE, nullptr);
+        viewport(cl, kHemiSize, kHemiSize);
+        hemi_tint_.draw(gpu, cl, ext_, scopes);
+    }
     for (uint32_t m = 1; m < kHemiMips; ++m) {
         subresource_barrier(cl, hemi_.Get(), m - 1, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         const uint32_t size = std::max(1u, kHemiSize >> m);
         const float offset = 0.5f / float(size * 2);
-        ext_.set_texture(pp, 0x00, hemi_.Get(), DXGI_FORMAT_UNKNOWN, 0, 0, m - 1);  // that mip alone: sampled as mip 0
+        ext_.set_texture(pp, 0x00, hemi_.Get(), DXGI_FORMAT_UNKNOWN, 0, 1, m - 1);  // one source mip, sampled as mip 0
         ext_.set(pp, 0xC0, float4{0, offset, offset, 0});
         const auto h = rtv(m);
         cl->OMSetRenderTargets(1, &h, FALSE, nullptr);
@@ -251,13 +279,13 @@ void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl
         hemi_down_.draw(gpu, cl, ext_, scopes);
     }
     subresource_barrier(cl, hemi_.Get(), kHemiMips - 1, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ext_.set_texture(pp, 0x00, pp_tex.resource, pp_tex.format, pp_tex.stride, pp_tex.elements, pp_tex.first_element);
+    ext_.set_texture(pp, 0x00, pp_tex.resource, pp_tex.format, pp_tex.stride, pp_tex.elements, pp_tex.first_element, pp_tex.mip);
     ext_.set(pp, 0xC0, pp_c0);
-    ext_.set_texture(ext::Deferred, 0xF8, hemi_.Get());
+    hemi_inputs_ = inputs;
     ext_.note_estimate(std::format("sky hemisphere: six {}^2 views of the far sky lookups into a {}^2 mirror ball, {} mips of 2x2 boxes",
                                    kHemiFace, kHemiSize, kHemiMips),
                        "engine view sizes and the downsample offsets (extern 38 +0xC0) are not data; the map's frame copy "
-                       "(ground bounce) and the hemisphere fog / tint passes are not run");
+                       "(ground bounce) and the hemisphere fog pass are not run");
 }
 
 } // namespace nim

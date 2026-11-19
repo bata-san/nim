@@ -10,7 +10,12 @@ The normal build is `build/Release/nim.exe`.
 A fast, faithful asset viewer for Bungie's *Marathon* (2026, Tiger engine).
 Goal: every line of text and dialogue, every model, map, texture and sound — rendered with the game's own shaders.
 
-Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+## Project layout
+
+- `src/`, `include/` and `third_party/` build the viewer and its libraries.
+- `tools/` contains the viewer, CLI, headless renderer and the shader dump script. `tests/` contains the CTest targets.
+- `docs/` contains [current progress](docs/PROGRESS.md), [architecture](docs/ARCHITECTURE.md), [shader resource bindings](docs/GAME_RESOURCES.md) and the [entity survey](docs/ENTITY_SURVEY.md).
+- `build/` is the local CMake build. The headless commands below use the ignored `out/` directory for their outputs.
 
 ## Build
 
@@ -54,8 +59,7 @@ Material animation is evaluated every frame in both vertex and pixel shaders, us
 clock and the installed global-channel defaults. The inspector provides play/pause, time,
 speed, and live object-channel controls; changing a channel does not reload the model.
 Entity channel initial constants and large material-variant tables are also read.
-Rendering changes, validation commands, and remaining special-shader limitations:
-[docs/RENDERING.md](docs/RENDERING.md).
+See [current progress](docs/PROGRESS.md) for rendering changes, validation commands and remaining shader limitations.
 
 ## Command line
 

@@ -711,7 +711,6 @@ private:
         TagHash layout_activity;
         uint32_t layout_activity_map = 0;
         std::optional<PrepareCache> cache;
-        std::optional<PrepareCache> sky_cache;
         std::vector<std::vector<InputElement>> layouts;
         try {
             layouts = load_input_layouts(*pm);
@@ -774,12 +773,7 @@ private:
                 if (!cache || cache->max_texture_dim != req.texture_cap) {
                     cache.emplace();
                     cache->max_texture_dim = req.texture_cap;
-                    cache->gbuffer_only = true;
                     cache->all_lods = true;
-                    sky_cache.emplace();
-                    sky_cache->max_texture_dim = req.texture_cap;
-                    sky_cache->gbuffer_only = false; // original sky meshes include stage 8
-                    sky_cache->all_lods = true;
                 }
                 const auto center = req.center ? *req.center : !starts.empty() ? starts.front().position : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
@@ -807,8 +801,7 @@ private:
                 }
                 // Authored sky collections are independent of the world streaming radius.
                 // Append after framing statistics so kilometre-distant scenery cannot move
-                // the user's initial camera. Only these models may load transparent parts.
-                const size_t sky_first = region.size();
+                // the user's initial camera.
                 for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
@@ -875,7 +868,7 @@ private:
                                 const auto mat = entity_materials->find(model.mesh.value);
                                 piece.mesh = prepare_dynamic_model(wpm, model.mesh,
                                     mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr,
-                                    j - terrain.size() >= sky_first ? &*sky_cache : &*cache);
+                                    &*cache);
                                 if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
                                 piece.rows = std::move(model.rows);
                                 piece.sky_order = std::move(model.sky_order);
@@ -905,10 +898,6 @@ private:
                 {
                     std::unique_lock texture_lock(*cache->texture_mutex);
                     cache->textures.clear();
-                }
-                {
-                    std::unique_lock texture_lock(*sky_cache->texture_mutex);
-                    sky_cache->textures.clear();
                 }
             } catch (const std::exception& ex) {
                 std::lock_guard lk(m_);
@@ -1898,7 +1887,7 @@ public:
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
-                sun_shadow.fit_view(game_lighting.sun_toward(light), vm.eye, cam.target, scene.center(), scene.radius());
+                sun_shadow.fit_view(game_lighting.sun_toward(light), vm.eye, cam.target, scene.center(), scene.radius(), map_scene);
                 scene.render_shadow(gpu, cl, sun_shadow);
                 shadow = &sun_shadow;
             }

@@ -198,6 +198,7 @@ struct MapAtmosphere {
     // 80808346 +0x00 -> 80808349: four 8080ACD3 direction tables (table 0 = the moving sun), one
     // entry per 1/1800 of the day; +0x08 the map's time of day (estimate).
     std::array<std::vector<std::array<float, 3>>, 4> paths;
+    TagHash lens_glare, lens_upsample;      // techniques from the atmosphere's 80808351 tag
     float default_time = 0.5f;
     std::vector<MapChannelExpression> channel_expressions;  // the map environment, in data order
     bool valid() const { return !lookups[1].is_none(); }

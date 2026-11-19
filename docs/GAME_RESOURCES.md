@@ -46,8 +46,8 @@ The 198 unresolved rows comprise 180 SRVs and 18 cbuffers. They remain explicitl
 the index is not proof that those producers have been implemented. Nor is it a GPU capture.
 
 ```powershell
-build-strict/Release/nimcli.exe render-resources > out/native-render-resources.tsv
-build-strict/Release/nimcli.exe render-resources 80A4852F > out/80A4852F-native-resources.tsv
+build/Release/nimcli.exe render-resources > out/native-render-resources.tsv
+build/Release/nimcli.exe render-resources 80A4852F > out/80A4852F-native-resources.tsv
 ```
 
 ## 80A48549 translucent material
@@ -76,11 +76,8 @@ reconstruction; assigning arbitrary white volumes or extra targets would not sol
 
 ## Build and remaining work
 
-The source is compiled into build-strict/Release; the running build-rel executable was not
-terminated or overwritten. Compilation is not GPU validation. No rendering or regression tests
-were run for this change. No claim of complete rendering, performance gain or visual parity
-with the game is made.
+Use `build/Release` for the current executables and [PROGRESS.md](PROGRESS.md) for headless validation results.
 
 The main remaining work is the game's frame graph and its engine-generated scene inputs:
 lighting volumes/probes, shadows, sky/atmosphere, transparent scattering and auxiliary targets,
-object state, exposure, grading, bloom and temporal histories. See RENDERING.md.
+object state, exposure, grading, bloom and temporal histories. See [PROGRESS.md](PROGRESS.md).

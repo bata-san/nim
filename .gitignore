@@ -6,4 +6,5 @@ extracted/
 keys.txt
 build-*/
 nim_layout.ini
+nim_d3d.log
 captures/

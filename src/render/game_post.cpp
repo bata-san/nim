@@ -72,12 +72,11 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         load(taa_, "resolve_taa_use_clipping_use_ycocg", {f16, false});
         load(taa_copy_, "copy_texture_bilinear", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
     }
-    load(bloom_initial_, "bloom_initial_downsample_block_2x2", {f16, false});
+    load(bloom_initial_, "bloom_initial_downsample_block_3x3", {f16, false});
     load(bloom_down_, "downsample_block_2x2", {f16, false});
     load(bloom_blur_h_, "gaussian_10_horz", {f16, false});
     load(bloom_blur_v_, "gaussian_10_vert", {f16, false});
     load(bloom_add_, "weighted_add", {f16, false});
-    load(bloom_copy_, "copy_texture_bilinear", {f16, false});
     load(ae_columns_, "autoexposure_sample_columns", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
 
     // The grading LUT (32^3, sampled with the tonemapped colour). The engine fills it with the
@@ -109,12 +108,12 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
 
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &bloom_copy_, &ae_columns_})
+    lens_blur_.Reset();
+    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_})
         gp->release(gpu);
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
     for (auto& l : bloom_) l = {};
-    bloom_final_.Reset();
     ae_columns_rt_.Reset();
     grading_lut_.Reset();
     black_.Reset();
@@ -138,8 +137,9 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
     };
     uint32_t lw = w, lh = h;
     for (int i = 0; i < kBloomLevels; ++i) {
-        lw = std::max(1u, (lw + 1) / 2);
-        lh = std::max(1u, (lh + 1) / 2);
+        const uint32_t divisor = i == 0 ? 3 : 2;
+        lw = (lw + divisor - 1) / divisor;
+        lh = (lh + divisor - 1) / divisor;
         auto& l = bloom_[size_t(i)];
         l.w = lw;
         l.h = lh;
@@ -147,18 +147,18 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         l.blur = target(lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, uint32_t(3 * i + 1));
         l.sum = target(lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, uint32_t(3 * i + 2));
     }
-    bloom_final_ = target(bloom_[0].w, bloom_[0].h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels);
     const uint32_t columns = bloom_[kBloomLevels - 1].w;
-    ae_columns_rt_ = target(columns, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 3 * kBloomLevels + 1);
-    post_ldr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 2);
-    for (uint32_t i = 0; i < 2; ++i) taa_history_[i] = target(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 3 + i);
+    ae_columns_rt_ = target(columns, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 3 * kBloomLevels);
+    post_ldr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 1);
+    for (uint32_t i = 0; i < 2; ++i) taa_history_[i] = target(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 2 + i);
+    lens_blur_ = target((w + 3) / 4, (h + 3) / 4, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 4);
     taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ae_fence_ = {};
 }
 
-// Auto exposure: autoexposure_sample_columns writes, per column of the 1/16 bloom level, the
+// Auto exposure: autoexposure_sample_columns writes, per column of the smallest bloom level, the
 // centre-weighted sums of log2 luminance, luminance and weight over 22 rows; the engine reduces
 // them on the CPU. The columns were sampled with 1 / exposure (extern 38 +0xC0.z), so the average
 // is the scene's luminance before exposure. Read back a frame or two late (the oldest finished copy).
@@ -233,14 +233,15 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     constexpr std::string_view engine = "engine post setting (not in game data)";
 
     const bool pyramid = bloom_initial_.loaded() && bloom_down_.loaded();
-    const bool bloom = p.bloom && pyramid && bloom_blur_h_.loaded() && bloom_blur_v_.loaded() && bloom_add_.loaded() && bloom_copy_.loaded();
+    const bool bloom = p.bloom && pyramid && bloom_blur_h_.loaded() && bloom_blur_v_.loaded() && bloom_add_.loaded();
     const bool automatic = p.auto_exposure && pyramid && ae_columns_.loaded();
     if (bloom || automatic) {
-        // bloom_initial_downsample: a 2x2 box of the HDR at half resolution, scaled by the
+        // bloom_initial_downsample: a 3x3 filter of HDR at third resolution, scaled by the
         // luminance curve x L^2 + y L + z (extern 38 +0xC0) with the luminance in .w; motion
         // offsets (extern 0x38) off.
         const auto& l0 = bloom_[0];
         e.set_texture(pp, 0x00, hdr_.Get());
+        e.set(pp, 0x50, size4(l0.w, l0.h));
         e.set(pp, 0x60, size4(w_, h_));
         e.set(pp, 0xC0, float4{0, 0, 1, 0});
         ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1 (no threshold)", engine);
@@ -264,7 +265,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(pp, 0x00, last.down.Get());
         e.set(pp, 0x50, size4(last.w, 1));
         e.set(pp, 0xC0, float4{0, 0, 1.0f / std::max(exposure_, 1e-6f), 0});
-        begin(ae_columns_rt_.Get(), 3 * kBloomLevels + 1, last.w, 1);
+        begin(ae_columns_rt_.Get(), 3 * kBloomLevels, last.w, 1);
         ae_columns_.draw(gpu, cl, e, scopes);
         end(ae_columns_rt_.Get());
         const size_t slot = size_t(ae_frame_ % ae_readback_.size());
@@ -286,15 +287,18 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     if (bloom) {
         // Up the pyramid: blur the smallest level, then at each finer level weighted_add the
         // blurred coarser result to it and blur again (gaussian_10 with the engine's cb11 kernel).
-        auto blur = [&](const BloomLevel& l, uint32_t level) {
+        constexpr float strength = 0.06f;
+        auto blur = [&](uint32_t level, ID3D12Resource* horizontal_source) {
+            const auto& l = bloom_[level];
             for (bool vertical : {false, true}) {
-                const auto cb = blur_scope(l.w, l.h, vertical, 2.0f);
+                auto cb = blur_scope(l.w, l.h, vertical, 2.0f);
+                if (vertical && level == 0) cb[6] = {strength, strength, strength, strength};
                 auto a = gpu.dynamic(cb.size() * sizeof(float4));
                 std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
                 const ScopeBufferFn blur_scopes = [&, va = a.gpu](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
                     return reg == 11 ? va : scopes(stage, reg);
                 };
-                ID3D12Resource* src = vertical ? l.blur.Get() : l.sum.Get();
+                ID3D12Resource* src = vertical ? l.blur.Get() : horizontal_source;
                 ID3D12Resource* dst = vertical ? l.sum.Get() : l.blur.Get();
                 const std::pair<uint32_t, ID3D12Resource*> tex[] = {{0, src}};
                 begin(dst, 3 * level + (vertical ? 2 : 1), l.w, l.h);
@@ -302,17 +306,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                 end(dst);
             }
         };
-        // The smallest level's sum starts as its downsample.
-        {
-            const auto& l = bloom_[kBloomLevels - 1];
-            e.set_texture(pp, 0x00, l.down.Get());
-            e.set(pp, 0x50, size4(l.w, l.h));
-            e.set(pp, 0xC0, float4{1, 1, 1, 1});
-            begin(l.sum.Get(), 3 * (kBloomLevels - 1) + 2, l.w, l.h);
-            bloom_copy_.draw(gpu, cl, e, scopes);
-            end(l.sum.Get());
-            blur(l, kBloomLevels - 1);
-        }
+        blur(kBloomLevels - 1, bloom_.back().down.Get());
         for (int i = kBloomLevels - 2; i >= 0; --i) {
             const auto& l = bloom_[size_t(i)];
             e.set_texture(pp, 0x00, bloom_[size_t(i + 1)].sum.Get());
@@ -325,20 +319,33 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             begin(l.sum.Get(), uint32_t(3 * i + 2), l.w, l.h);
             bloom_add_.draw(gpu, cl, e, scopes);
             end(l.sum.Get());
-            blur(l, uint32_t(i));
+            blur(uint32_t(i), l.sum.Get());
         }
-        // The final bloom buffer: copy_texture_bilinear with the bloom strength.
-        constexpr float strength = 0.04f;
-        const auto& l0 = bloom_[0];
-        e.set_texture(pp, 0x00, l0.sum.Get());
-        e.set(pp, 0x50, size4(l0.w, l0.h));
-        e.set(pp, 0xC0, float4{strength, strength, strength, strength});
-        begin(bloom_final_.Get(), 3 * kBloomLevels, l0.w, l0.h);
-        bloom_copy_.draw(gpu, cl, e, scopes);
-        end(bloom_final_.Get());
-        bloom_tex = bloom_final_.Get();
-        ext_.note_estimate("bloom: 4 levels (1/2..1/16), gaussian sigma 2 texels, weighted_add 0.5 / 0.5, strength 0.04 added after the tonemap",
-                           "engine bloom settings and kernel (postprocess scope cb11) not in game data; structure from a Destiny 2 frame");
+        bloom_tex = bloom_.front().sum.Get();
+        if (p.atmosphere && atm_.lens_upsample.loaded() && atm_.lens_glare.loaded()) {
+            // The map's fullscreen lens technique multiplies its authored texture by a broad
+            // bloom input. Its companion pass uses quarter-resolution SV_Position.
+            constexpr float4 identity_uv{1, 1, 0, 0};
+            e.set(pp, 0xC0, identity_uv);
+            e.set_texture(pp, 0x00, bloom_.back().sum.Get());
+            begin(lens_blur_.Get(), 3 * kBloomLevels + 4, (w_ + 3) / 4, (h_ + 3) / 4);
+            atm_.lens_upsample.draw(gpu, cl, e, scopes);
+            end(lens_blur_.Get());
+            e.set_texture(pp, 0x00, lens_blur_.Get());
+            const float prior = e.has(ext::Frame, 0x24, 4) ? e.get_f(ext::Frame, 0x24) : 0.0f;
+            e.set(ext::Frame, 0x24, 1.0f);
+            Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const auto hdr_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+            cl->OMSetRenderTargets(1, &hdr_rtv, FALSE, nullptr);
+            viewport(cl, w_, h_);
+            atm_.lens_glare.draw(gpu, cl, e, scopes);
+            end(hdr_.Get());
+            e.set(ext::Frame, 0x24, prior);
+            ext_.note_estimate("lens glare: coarsest blurred bloom level, quarter-resolution upsample, Frame +0x24 = 1",
+                               "map-authored optics techniques and texture; original broad filter and brightness are unknown");
+        }
+        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, weighted_add 0.5 / 0.5, strength 0.06",
+                           "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
@@ -365,7 +372,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     if (taa) {
         // Tonemap into the resolve's input, resolve it against the history into the other history
         // target, then copy that into lit.
-        const auto ldr_rtv = rtv(3 * kBloomLevels + 2);
+        const auto ldr_rtv = rtv(3 * kBloomLevels + 1);
         Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
         viewport(cl, w_, h_);
@@ -396,7 +403,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(kTaa, 0x60, gb.depth.Get(), GBuffer::kDepthSrvFormat);
         ext_.note_estimate("taa: history weight 0.92 (0.75 .. 0.5 by motion when the clip rejects it), luma rejection 0.1, Halton 2,3 jitter over 8 frames",
                            "engine TAA settings and jitter sequence not in game data");
-        begin(taa_history_[cur].Get(), 3 * kBloomLevels + 3 + cur, w_, h_);
+        begin(taa_history_[cur].Get(), 3 * kBloomLevels + 2 + cur, w_, h_);
         taa_.draw(gpu, cl, e, scopes);
         end(taa_history_[cur].Get());
         taa_current_ = cur;
@@ -413,7 +420,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         post_tonemap_.draw(gpu, cl, e, scopes);
     } else {
         // Tonemap into the fxaa input (colour, then its luma into alpha), then fxaa into lit.
-        const auto ldr_rtv = rtv(3 * kBloomLevels + 2);
+        const auto ldr_rtv = rtv(3 * kBloomLevels + 1);
         Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
         viewport(cl, w_, h_);

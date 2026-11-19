@@ -130,11 +130,16 @@ void SunShadow::fit(V3 sun_dir, V3 center, float radius) {
     vm.vp_abs = mul(vm.vp_rel, tr);
 }
 
-void SunShadow::fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius) {
+void SunShadow::fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius, bool map) {
     const V3 d = focus - eye;
-    const float reach = std::clamp(std::sqrt(dot(d, d)) * 0.9f, 40.0f, 300.0f);
+    const float reach = std::clamp(std::sqrt(dot(d, d)) * 0.9f, map ? 160.0f : 40.0f, 300.0f);
     if (scene_radius <= reach) fit(sun_dir, scene_center, scene_radius * 1.05f);
-    else fit(sun_dir, focus, reach);
+    else {
+        const float distance = std::sqrt(dot(d, d));
+        const V3 center = map && distance > 1e-3f && distance < reach * 0.45f
+            ? eye + d * (reach * 0.45f / distance) : focus;
+        fit(sun_dir, center, reach);
+    }
 }
 
 void RainOcclusion::resize(Gpu& gpu, uint32_t n) {
@@ -494,16 +499,8 @@ D3D12_RENDER_TARGET_BLEND_DESC blend_desc(int index, int rt = 0) {
 
 // A texture SRV matching what the shader declares at that register.
 void create_texture_srv(ID3D12Device* dev, ID3D12Resource* r, BindingKind kind, D3D12_CPU_DESCRIPTOR_HANDLE h) {
-    if (!r) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = 1;
-        dev->CreateShaderResourceView(nullptr, &sd, h);
-        return;
-    }
-    write_game_srv(dev, {r}, kind, h);
+    if (r) write_game_srv(dev, {r}, kind, h);
+    else write_null_srv(dev, kind, h);
 }
 
 std::map<uint32_t, BindingKind> srv_kinds(std::span<const uint8_t> code) {
@@ -566,6 +563,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     for (auto& it : items_)
         if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
     items_.clear();
+    transparent_items_.clear();
     table_cache_.clear();
     scopes_resolved_ = false;
     scope_defs_.clear();
@@ -575,7 +573,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     root_cache_.clear();
     pipeline_cache_.clear();
     info_.clear();
-    transparent_count_ = 0;
+    world_transparent_draws_ = 0;
     channels_.clear();
     channel_overrides_.clear();
     channel_defaults_.clear();
@@ -678,7 +676,8 @@ std::shared_ptr<const Texture> cached_texture(PackageManager& pm, TagHash tag, T
 
 PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const StaticMeshPart& part,
                                 uint16_t part_index, uint8_t input_layout,
-                                TextureCache& texture_cache, std::shared_ptr<const std::vector<Scope>> available_scopes) {
+                                TextureCache& texture_cache, std::shared_ptr<const std::vector<Scope>> available_scopes,
+                                bool validate_entity_resources = false) {
     PreparedMesh::Group g;
     g.part = part;
     g.input_layout = input_layout;
@@ -707,6 +706,14 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     info.ps = ps_stage.shader;
     g.vs = load_shader_bytecode(pm, vs_stage.shader);
     g.ps = load_shader_bytecode(pm, ps_stage.shader);
+    if (validate_entity_resources) {
+        for (const auto& b : shader_bindings(g.ps)) {
+            if (b.type != BindingType::Srv) continue;
+            for (uint32_t slot = b.lower; slot <= b.upper; ++slot)
+                if (!g.ps_sources.textures.contains(slot) && !g.ps_sources.extern_textures.contains(slot))
+                    throw std::runtime_error(std::format("{}: missing original PS t{}", tech.tag.str(), slot));
+        }
+    }
 
     g.cb0.assign(ps_stage.cbuffer_init.begin(), ps_stage.cbuffer_init.end());
     info.cbuffer_regs = g.cb0.size();
@@ -821,6 +828,10 @@ bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vect
 // Render stages nim draws: 0 GenerateGbuffer, 8 Transparents.
 constexpr uint8_t kDrawnStages[] = {0, 8};
 constexpr uint8_t kStageTransparent = 8;
+class UnsupportedMeshPart : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 bool vs_reads_typed_buffers(const std::vector<uint8_t>& vs) {
     for (const auto& b : shader_bindings(vs))
@@ -868,14 +879,10 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
     uint8_t lod = 0xFF;
     bool has_gbuffer_parts = false;
-    // Use the same selected render stages as static meshes. In particular the map's
-    // opaque path must not accidentally enable entity death/spawn/energy FX.
-    const bool gbuffer_only = cache && cache->gbuffer_only;
-    auto drawn = [gbuffer_only](uint8_t st) { return st == 0 || (!gbuffer_only && st == kStageTransparent); };
     for (size_t mi = 0; mi < model.meshes.size(); ++mi) {
         const DynamicMesh& mesh = model.meshes[mi];
         bool any_stage = false;
-        for (uint8_t st : kDrawnStages) if (drawn(st)) any_stage |= mesh.part_range[st] < std::min<size_t>(mesh.part_range[st + 1], mesh.parts.size());
+        for (uint8_t st : kDrawnStages) any_stage |= mesh.part_range[st] < std::min<size_t>(mesh.part_range[st + 1], mesh.parts.size());
         if (!any_stage) continue;
         has_gbuffer_parts = true;
         PreparedMesh::Buffers bufs;
@@ -906,7 +913,6 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         const uint32_t set = uint32_t(out.buffers.size());
         bool used = false;
         for (uint8_t stage : kDrawnStages) {
-        if (!drawn(stage)) continue;
         const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
         // Highest detail: lod_category bit 0 (goriath); fall back to every part when none has it.
         bool any_high = false;
@@ -929,7 +935,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
             try {
                 Technique t = load_technique(pm, tech);
                 if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
-                PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes);
+                PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes, true);
                 g.stage = stage;
                 if (vs_reads_typed_buffers(g.vs) && !packed) {
                     out.notes.push_back(std::format("mesh {} part {}: skinning shader, but no 24-byte vertex stream to pack", mi, k));
@@ -952,7 +958,6 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         out.notes.push_back("no G-buffer or transparent parts; other render stages are not drawable in this viewer");
         return out;
     }
-    if (!out.notes.empty()) throw std::runtime_error(out.notes.front());
     if (out.groups.empty())
         throw std::runtime_error(out.notes.empty() ? "dynamic model has no G-buffer or transparent parts (only FX / shadow / other stages)"
                                                    : out.notes.front());
@@ -1010,8 +1015,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     texture_cache.shared = cache;
 
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
-    const bool gbuffer_only = cache && cache->gbuffer_only;
-    auto drawn = [gbuffer_only](uint8_t st) { return st == 0 || (!gbuffer_only && st == kStageTransparent); };
+    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent; };
     std::vector<Pending> pending;
     uint8_t lod = 0xFF;
     for (const auto& g : mesh.groups)
@@ -1019,16 +1023,13 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     // lod_category is a mask of LOD levels (1 = LOD0, 2 = LOD1, 4 = LOD2 ...). Every level shares
     // the mesh's buffers; with all_lods each part keeps its mask.
     const bool all_lods = cache && cache->all_lods;
-    int buffer = -1;
     for (size_t g = 0; g < mesh.groups.size(); ++g) {
         const auto& gr = mesh.groups[g];
         if (!drawn(gr.render_stage) || g >= mesh.techniques.size()) continue;
         const auto& part = mesh.parts.at(gr.part_index);
         if (all_lods ? (part.lod_category & 0x0F) == 0 : part.lod_category != lod) continue;
-        if (buffer >= 0 && part.buffer_index != buffer) continue;
         Technique t = load_technique(pm, mesh.techniques[g]);
         if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
-        buffer = part.buffer_index;
         pending.push_back({gr, part, std::move(t)});
     }
     if (pending.empty()) throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
@@ -1036,38 +1037,27 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     if (all_lods) out.lod_levels = 0;
 
     ProfileScope profile_buffers("prepare.static.buffers_bounds");
-    const auto& bufs = mesh.buffers.at(pending[0].part.buffer_index);
-    out.buffers.emplace_back();
-    auto& set = out.buffers.back();
-    set.ib = load_index_buffer(pm, bufs.index);
-    set.vb0 = load_vertex_buffer(pm, bufs.vertex0);
-    if (!bufs.vertex1.is_none()) set.vb1 = load_vertex_buffer(pm, bufs.vertex1);
-    if (!bufs.color.is_none()) set.color = load_vertex_buffer(pm, bufs.color).data;  // per-vertex RGBA8 (VS t0)
-    const IndexBuffer& ib = set.ib;
-    const VertexBuffer& vb0 = set.vb0;
-
-    // Bounds of the drawn geometry, in the space the VS produces (pos * scale + offset).
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
-    const uint8_t detail = all_lods ? uint8_t(pending[0].part.lod_category & 0x0F) : 0;
+    const V3 scale{mesh.mesh_scale, mesh.mesh_scale, mesh.mesh_scale};
+    const V3 offset{mesh.mesh_offset[0], mesh.mesh_offset[1], mesh.mesh_offset[2]};
     uint8_t lowest = 0x0F;
     for (const auto& it : pending) lowest = std::min<uint8_t>(lowest, it.part.lod_category & 0x0F);
     const uint8_t lowest_bit = uint8_t(lowest & (~lowest + 1));
-    (void)detail;
-    for (const auto& it : pending)
-        if (!all_lods || (it.part.lod_category & lowest_bit))
-        for (uint32_t i = 0; i < it.part.index_count; ++i) {
-            size_t ii = it.part.index_start + i;
-            if ((ii + 1) * (ib.is_32bit ? 4 : 2) > ib.data.size()) break;
-            uint32_t v = ib.is_32bit ? reinterpret_cast<const uint32_t*>(ib.data.data())[ii]
-                                     : reinterpret_cast<const uint16_t*>(ib.data.data())[ii];
-            if (!ib.is_32bit && v == 0xFFFF) continue;
-            if ((size_t(v) + 1) * vb0.stride > vb0.data.size()) continue;
-            const uint8_t* p = vb0.data.data() + size_t(v) * vb0.stride;
-            V3 q{snorm16(p) * mesh.mesh_scale + mesh.mesh_offset[0], snorm16(p + 2) * mesh.mesh_scale + mesh.mesh_offset[1],
-                 snorm16(p + 4) * mesh.mesh_scale + mesh.mesh_offset[2]};
-            lo = {std::min(lo.x, q.x), std::min(lo.y, q.y), std::min(lo.z, q.z)};
-            hi = {std::max(hi.x, q.x), std::max(hi.y, q.y), std::max(hi.z, q.z)};
+    std::map<uint8_t, uint32_t> buffer_sets;
+    for (const auto& it : pending) {
+        const auto [entry, inserted] = buffer_sets.try_emplace(it.part.buffer_index, uint32_t(out.buffers.size()));
+        if (inserted) {
+            const auto& bufs = mesh.buffers.at(it.part.buffer_index);
+            auto& set = out.buffers.emplace_back();
+            set.ib = load_index_buffer(pm, bufs.index);
+            set.vb0 = load_vertex_buffer(pm, bufs.vertex0);
+            if (!bufs.vertex1.is_none()) set.vb1 = load_vertex_buffer(pm, bufs.vertex1);
+            if (!bufs.color.is_none()) set.color = load_vertex_buffer(pm, bufs.color).data;
         }
+        const auto& set = out.buffers[entry->second];
+        if (!all_lods || (it.part.lod_category & lowest_bit))
+            grow_bounds(set.ib, set.vb0, it.part, scale, offset, lo, hi);
+    }
     out.center = (lo + hi) * 0.5f;
     out.radius = std::max(0.01f, std::sqrt(dot(hi - lo, hi - lo)) * 0.5f);
 
@@ -1085,11 +1075,19 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     profile_buffers.stop();
     ProfileScope profile_groups("prepare.static.build_groups");
     for (auto& p : pending) {
-        out.groups.push_back(build_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes));
-        out.groups.back().stage = p.group.render_stage;
-        out.groups.back().lod_mask = all_lods ? uint8_t(p.part.lod_category & 0x0F) : 1;
-        if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
+        try {
+            out.groups.push_back(build_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes,
+                                             p.group.render_stage == kStageTransparent));
+            out.groups.back().stage = p.group.render_stage;
+            out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
+            out.groups.back().lod_mask = all_lods ? uint8_t(p.part.lod_category & 0x0F) : 1;
+            if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
+        } catch (const std::exception& ex) {
+            if (p.group.render_stage != kStageTransparent) throw;
+            out.notes.push_back(std::format("{} part {}: {}", tag.str(), p.group.part_index, ex.what()));
+        }
     }
+    if (out.groups.empty()) throw std::runtime_error(out.notes.front());
     return out;
 }
 
@@ -1168,6 +1166,7 @@ PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const s
 
 void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts) {
     begin(gpu);
+    dynamic_ = mesh.dynamic;
     const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     const TagHash tag = mesh.tag;
     const V3 center = mesh.center;
@@ -1196,7 +1195,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         throw std::invalid_argument("Sky order requires one key per dynamic placement");
     scopes_resolved_ = false;
     // All or nothing: a mesh that fails validation leaves no partial parts behind.
-    const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count_;
+    const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count();
     const size_t instances = instance_total_, culls = cull_groups_.size();
     try {
         add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
@@ -1208,9 +1207,9 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
             std::erase_if(table_cache_, [&](const auto& e) { return e.second == items_[k].srv_first; });
         }
         items_.resize(items);
+        transparent_items_.resize(transparent);
         sets_.resize(sets);
         info_.resize(infos);
-        transparent_count_ = transparent;
         instance_total_ = instances;
         cull_groups_.resize(culls);
         throw;
@@ -1223,14 +1222,14 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     ID3D12Device* dev = gpu.device();
     const bool first_mesh = sets_.empty();
     if (dynamic_ && !first_mesh) throw std::runtime_error("a dynamic model scene holds that model alone");
-    if (mesh.dynamic && first_mesh && placements.size() != 1) throw std::runtime_error("a dynamic model view places it once");
+    if (dynamic_ && placements.size() != 1) throw std::runtime_error("a dynamic model view places it once");
     if (placements.empty()) throw std::runtime_error("mesh has no placements");
     const uint32_t set_base = uint32_t(sets_.size());
     if (first_mesh) {
         center_ = mesh.center;
         radius_ = mesh.radius;
         lod_ = mesh.lod;
-        dynamic_ = mesh.dynamic;
+        dynamic_parts_ = mesh.dynamic && !dynamic_;
         model_cb_ = mesh.model_cb;
         skin_scale_ = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
         skin_offset_ = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
@@ -1286,6 +1285,22 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         cull = uint32_t(cull_groups_.size());
         cull_groups_.push_back(std::move(group));
     }
+    // All vertex streams of this model use the same immutable object cbuffer per placement.
+    GpuBuffer placement_constants;
+    if (mesh.dynamic) {
+        std::vector<PlacementConstants> constants(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto& p = placements[i];
+            auto& cb = constants[i].values;
+            std::copy(mesh.model_cb.begin(), mesh.model_cb.end(), cb.begin());
+            cb[0] = {p[0], p[4], p[8], 0};
+            cb[1] = {p[1], p[5], p[9], 0};
+            cb[2] = {p[2], p[6], p[10], 0};
+            cb[3] = {p[3], p[7], p[11], 1};
+            for (size_t c = 0; c < 4; ++c) cb[8 + c] = cb[c];  // previous world transform
+        }
+        placement_constants = arena_.upload(gpu, constants.data(), constants.size() * sizeof(PlacementConstants));
+    }
     instance_total_ += n;
     for (const auto& b : mesh.buffers) {
         BufferSet set;
@@ -1302,7 +1317,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         set.vbv[2] = {inst.gpu, n * 4, 4};
         set.dynamic = mesh.dynamic;
         if (mesh.dynamic) {
-            set.model_cb = mesh.model_cb;
+            set.object_cb = placement_constants;
             set.model_center = mesh.center;
             set.placements.assign(placements.begin(), placements.end());
             set.sky_order.assign(sky_order.begin(), sky_order.end());
@@ -1311,7 +1326,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
                 return v.empty() ? ComPtr<ID3D12Resource>{} : gpu.upload(v.data(), v.size() * 4);
             };
-            if (first_mesh && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
+            if (dynamic_ && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
                 // Posed on the CPU (update_skin); the first render uploads the bind pose.
                 const size_t bytes = b.skin_pos.size() * 4;
                 set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1345,19 +1360,26 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
         }
     };
+    const size_t first_item = items_.size();
+    std::string first_unsupported_part;
     for (auto& g : mesh.groups) {
+      try {
         Item item;
         // Finish recorded copies before a failed strict validation destroys this item's assets.
         struct FlushFailedUpload {
             Gpu& gpu;
             Item& item;
+            std::map<std::vector<uint64_t>, uint32_t>& cache;
             bool committed = false;
             ~FlushFailedUpload() {
                 if (committed) return;
                 try { gpu.flush(); } catch (...) {}
-                if (item.srv_first != UINT32_MAX && item.owns_srv) gpu.srv().free(item.srv_first, kItemSrvs * item.srv_copies);
+                if (item.srv_first != UINT32_MAX && item.owns_srv) {
+                    gpu.srv().free(item.srv_first, kItemSrvs * item.srv_copies);
+                    std::erase_if(cache, [&](const auto& entry) { return entry.second == item.srv_first; });
+                }
             }
-        } upload_guard{gpu, item};
+        } upload_guard{gpu, item, table_cache_};
         item.part = g.part;
         item.dynamic = mesh.dynamic;
         item.buffers = set_base + g.buffers;
@@ -1373,7 +1395,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             texture->second->tile_count > 1 && tfx_animated_atlas_operand(item.ps_material.bytecode)) {
             const auto& atlas = *texture->second;
             if (!std::all_of(atlas.tile_uv.begin(), atlas.tile_uv.end(), [](float v) { return v > 0 && v <= 1; }))
-                throw std::runtime_error("Invalid animated texture atlas UVs");
+                throw UnsupportedMeshPart("Invalid animated texture atlas UVs");
             item.ps_atlas = Item::AnimatedAtlas{atlas.tile_uv, atlas.tile_count};
         }
         item.vs_live = g.vs_live;
@@ -1393,9 +1415,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         upload_textures(g.vs_textures, item.vs_sources, item.vs_textures);
         for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}})
             for (const auto& binding : shader_bindings(*code)) {
-                if (binding.space != 0) throw std::runtime_error("Original material register space is unsupported");
+                if (binding.space != 0) throw UnsupportedMeshPart("Original material register space is unsupported");
                 if (binding.type == BindingType::Cbv) {
-                    if (binding.upper != binding.lower || binding.upper > 13) throw std::runtime_error("Original material cbuffer range is unsupported");
+                    if (binding.upper != binding.lower || binding.upper > 13) throw UnsupportedMeshPart("Original material cbuffer range is unsupported");
                     registers->push_back(binding.lower);
                 }
             }
@@ -1409,7 +1431,17 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         // Reject missing resources before allocating per-draw descriptor rings.
         for (const auto& [slot, kind] : ps_kinds)
             if (!item.textures.contains(slot) && !item.ps_sources.extern_textures.contains(slot))
-                throw std::runtime_error(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), slot));
+                throw UnsupportedMeshPart(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), slot));
+        for (auto [stage, sources, registers] : {std::tuple{ShaderStage::Vertex, &item.vs_sources, &item.vs_cbvs},
+                                               std::tuple{ShaderStage::Pixel, &item.ps_sources, &item.ps_cbvs}}) {
+            for (const auto reg : *registers) {
+                if (reg == 0 || item.own_regs.contains({stage, reg})) continue;
+                const auto source = sources->cbuffer_scopes.find(reg);
+                if (source == sources->cbuffer_scopes.end() || !item.scopes ||
+                    std::none_of(item.scopes->begin(), item.scopes->end(), [&](const Scope& scope) { return scope.tag == source->second; }))
+                    throw UnsupportedMeshPart(std::format("{}: no original shared scope b{}", item.technique.str(), reg));
+            }
+        }
         const auto& source_buffers = sets_.at(item.buffers);
         for (const auto& [slot, kind] : vs_kinds) {
             const bool color = (slot == 0 || slot == 1) && (source_buffers.color || !mesh.dynamic);
@@ -1417,7 +1449,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             const bool instance_data = !mesh.dynamic && slot == 2;  // the mesh's own t2, a root SRV
             if (!item.vs_textures.contains(slot) && !item.vs_sources.extern_textures.contains(slot) && !color && !skin &&
                 !instance_data)
-                throw std::runtime_error(std::format("{}: missing original VS resource t{}", item.technique.str(), slot));
+                throw UnsupportedMeshPart(std::format("{}: missing original VS resource t{}", item.technique.str(), slot));
         }
         // A descriptor referenced by an in-flight command list must not be rewritten.
         const bool rebinds = std::any_of(item.ps_sources.extern_textures.begin(), item.ps_sources.extern_textures.end(),
@@ -1459,7 +1491,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 auto f = item.textures.find(s);
                 const BindingKind k = kind_of(ps_kinds, s);
                 if (f == item.textures.end() && ps_kinds.contains(s) && !item.ps_sources.extern_textures.contains(s))
-                    throw std::runtime_error(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), s));
+                    throw UnsupportedMeshPart(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), s));
                 create_texture_srv(dev, f != item.textures.end() ? f->second.Get() : nullptr, k, gpu.srv().cpu(srv_first + s));
             }
             // VS t0-t15: the stage's own textures, else (dynamic models) t0 vertex colour and t2-t4 the
@@ -1488,7 +1520,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                     create_buffer_srv(dev, r, DXGI_FORMAT_R32_UINT, UINT(r->GetDesc().Width / 4), h);
                 } else {
                     if (vs_kinds.contains(s) && !item.vs_sources.extern_textures.contains(s) && (mesh.dynamic || s != 2))
-                        throw std::runtime_error(std::format("{}: missing original VS resource t{}", item.technique.str(), s));
+                        throw UnsupportedMeshPart(std::format("{}: missing original VS resource t{}", item.technique.str(), s));
                     create_texture_srv(dev, nullptr, k, h);
                 }
             }
@@ -1502,7 +1534,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
             if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0)
-                throw std::runtime_error(std::format("{}: missing original vertex stream {}", item.technique.str(), e.buffer));
+                throw UnsupportedMeshPart(std::format("{}: missing original vertex stream {}", item.technique.str(), e.buffer));
             d.SemanticName = e.semantic;
             d.SemanticIndex = e.semantic_index;
             d.Format = DXGI_FORMAT(e.dxgi_format);
@@ -1516,7 +1548,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             const bool found = std::any_of(ied.begin(), ied.end(), [&](const auto& desc) {
                 return desc.SemanticIndex == input.index && _stricmp(desc.SemanticName, input.semantic.c_str()) == 0;
             });
-            if (!found) throw std::runtime_error(std::format("{}: original vertex layout {} lacks {}{}; no zero stream is substituted",
+            if (!found) throw UnsupportedMeshPart(std::format("{}: original vertex layout {} lacks {}{}; no zero stream is substituted",
                 item.technique.str(), g.input_layout, input.semantic, input.index));
         }
         item.stage = g.stage;
@@ -1533,6 +1565,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         // G-buffer decals blend into some targets and leave the others alone (their state masks them).
         bool blended = false;
         if (transparent) {
+            if (g.blend < 0 || g.blend >= int(std::size(kBlendStates)))
+                throw UnsupportedMeshPart(std::format("Missing original transparent blend state {}", g.blend));
             pd.BlendState.IndependentBlendEnable = TRUE;
             pd.BlendState.RenderTarget[0] = blend_desc(g.blend);
             pd.BlendState.RenderTarget[4] = blend_desc(g.blend, 4);  // original motion blend / coverage
@@ -1564,7 +1598,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : GBuffer::kFormats[r];
         for (const auto& output : outputs)
             if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
-                throw std::runtime_error(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
+                throw UnsupportedMeshPart(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
         pd.DSVFormat = GBuffer::kDepthFormat;
         pd.SampleDesc.Count = 1;
@@ -1588,8 +1622,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 return o;
             };
             layout += "; VS binds" + binds(g.vs) + "; PS binds" + binds(g.ps);
-            throw std::runtime_error(std::format("CreateGraphicsPipelineState (game DXIL) failed (hr=0x{:08X}); VS in:{}; layout {}:{}",
+            if (hr == E_INVALIDARG) throw UnsupportedMeshPart(std::format("CreateGraphicsPipelineState (game DXIL) failed (hr=0x{:08X}); VS in:{}; layout {}:{}",
                                                  uint32_t(hr), vs_in, g.input_layout, layout));
+            check_hr(hr, "CreateGraphicsPipelineState (game DXIL)");
         }
         profile_pso.stop();
 
@@ -1612,12 +1647,19 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                     shared_pipelines.emplace(shadow_key, item.shadow_pso);
             }
         }
-        transparent_count_ += transparent;
         if (transparent && cull != UINT32_MAX) cull_groups_[cull].has_transparency = true;
         items_.push_back(std::move(item));
         upload_guard.committed = true;
+        if (transparent) transparent_items_.push_back(items_.size() - 1);
         info_.push_back(std::move(g.info));
+      } catch (const UnsupportedMeshPart& ex) {
+        if (!mesh.dynamic && g.stage != kStageTransparent) throw;
+        if (first_unsupported_part.empty()) first_unsupported_part = ex.what();
+        notes_.push_back(std::format("{} part {}: {}", mesh.tag.str(), g.info.part, ex.what()));
+      }
     }
+    if (items_.size() == first_item)
+        throw std::runtime_error(first_unsupported_part.empty() ? "mesh has no drawable parts" : first_unsupported_part);
 }
 
 void StaticMeshScene::bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices&,
@@ -1683,6 +1725,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         std::map<std::tuple<uint32_t, ShaderStage, uint32_t>, uint32_t> slots;
         for (auto& it : items_) {
             it.scope_slots.clear();
+            it.object_params.clear();
             for (auto [stage, sources, required] : {std::tuple{ShaderStage::Vertex, &it.vs_sources, &it.vs_cbvs},
                                                     std::tuple{ShaderStage::Pixel, &it.ps_sources, &it.ps_cbvs}})
                 for (const auto reg : *required) {
@@ -1741,26 +1784,10 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         std::memcpy(upload.cpu, constants.data(), constants.size() * sizeof(float4));
         return scope_frame_[slot] = upload.gpu;
     };
-    // Dynamic models: the object constants of every placement (local_to_world = the placement).
-    for (auto& set : sets_) {
-        if (!set.dynamic) continue;
-        set.object_cb.clear();
-        for (const auto& p : set.placements) {
-            auto cb = set.model_cb;
-            // Column-major: the translation is the fourth row.
-            cb[0] = {p[0], p[4], p[8], 0};
-            cb[1] = {p[1], p[5], p[9], 0};
-            cb[2] = {p[2], p[6], p[10], 0};
-            cb[3] = {p[3], p[7], p[11], 1};
-            // Original rigid/skinned VS emit previous world positions through c8..c11.
-            // Map placements are static: previous placement equals current placement.
-            for (size_t c = 0; c < 4; ++c) cb[8 + c] = cb[c];
-            const auto upload = gpu.dynamic(cb.size() * sizeof(float4));
-            std::memcpy(upload.cpu, cb.data(), cb.size() * sizeof(float4));
-            set.object_cb.push_back(upload.gpu);
-        }
-    }
-    for (auto& it : items_) {
+    const bool transparent = render_stage == kStageTransparent;
+    const size_t candidates = transparent ? transparent_items_.size() : items_.size();
+    for (size_t i = 0; i < candidates; ++i) {
+        auto& it = items_[transparent ? transparent_items_[i] : i];
         if (it.stage != render_stage) continue;  // transparent inputs are produced after the G-buffer
         if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
       try {
@@ -1902,7 +1929,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         if (bound_topology != topology) cl->IASetPrimitiveTopology(bound_topology = topology);
         if (it.dynamic) {
             for (size_t p = first_instance; p < size_t(first_instance) + instances; ++p) {
-                for (uint32_t param : it.object_params) set_cbv(param, set.object_cb[p]);
+                for (uint32_t param : it.object_params) set_cbv(param, set.object_cb.gpu + p * sizeof(PlacementConstants));
                 if (p < it.ps_placement_addresses.size()) set_cbv(0, it.ps_placement_addresses[p]);
                 if (p < it.vs_placement_addresses.size()) set_cbv(6, it.vs_placement_addresses[p]);
                 cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
@@ -1915,8 +1942,9 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         auto enqueue = [&](const Item& item, uint32_t instance, float depth, bool sky = false) {
             ordered.push_back({&item, instance, std::isfinite(depth) ? depth : 0, sky});
         };
-        for (const auto& it : items_) {
-            if (it.stage != stage || !item_instances(it)) continue;
+        for (const auto index : transparent_items_) {
+            const auto& it = items_[index];
+            if (!item_instances(it)) continue;
             const auto& set = sets_[it.buffers];
             if (it.dynamic) {
                 const auto c = set.model_center;
@@ -1945,7 +1973,11 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             if (a.sky != b.sky) return a.sky;
             return a.sky ? a.depth < b.depth : a.depth > b.depth;
         });
-        for (const auto& entry : ordered) draw(*entry.item, 1, entry.instance);
+        world_transparent_draws_ = 0;
+        for (const auto& entry : ordered) {
+            draw(*entry.item, 1, entry.instance);
+            if (!entry.sky) ++world_transparent_draws_;
+        }
         return;
     }
     // Blended G-buffer items (decals) go over opaque surfaces.
@@ -2113,14 +2145,14 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     const float clear[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) cl->ClearRenderTargetView(gb.rtv[i], clear, 0, nullptr);
     cl->ClearDepthStencilView(gb.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
-    if (items_.size() == transparent_count_) return;
+    if (items_.size() == transparent_count()) return;
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
     draw_items(gpu, cl, 0, gb.width(), gb.height(), vm);
 }
 
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {
     shadow.valid = false;
-    if (!shadow.depth || items_.size() == transparent_count_) return;
+    if (!shadow.depth || items_.size() == transparent_count()) return;
     cull(gpu, shadow.vm, shadow.size);
     update_materials(gpu, shadow.size, shadow.size, shadow.vm);
     cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
@@ -2148,7 +2180,7 @@ void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList*
 
 void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                                          const ViewMatrices& vm, const ExternStore& inputs) {
-    if (!transparent_count_) return;
+    if (!has_transparent()) return;
     auto& ext = *material_externs_;
     ext.note_estimate("transparent pass order: authored sky order, then object placement depth",
                       "sky collections are stored in ascending order; engine interleaving and ties are unknown");

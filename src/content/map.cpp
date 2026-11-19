@@ -468,6 +468,18 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
                     } catch (...) {
                         // Without a sun path the viewer sun direction is used.
                     }
+                    try {
+                        const TagHash optics = r.tag_at(c + 0x0C);
+                        const Entry* entry = pm.entry(optics);
+                        if (entry && entry->reference == 0x80808351) {
+                            const auto bytes = pm.read(optics);
+                            const TagReader lenses(bytes);
+                            out.lens_glare = lenses.tag_at(0);
+                            out.lens_upsample = lenses.tag_at(4);
+                        }
+                    } catch (...) {
+                        // Some maps have no lens glare techniques.
+                    }
                 }
                 const uint64_t next = r.u64_at(p);
                 if (!next) break;

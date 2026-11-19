@@ -68,7 +68,7 @@ struct SunShadow {
     // snapped to whole texels so the map does not shimmer as the camera moves.
     void fit(V3 sun_dir, V3 center, float radius);
     // A small scene whole; a large one (a map) around the camera's focus, sized by its distance.
-    void fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius);
+    void fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float scene_radius, bool map = false);
 };
 
 // ---- rain occlusion ------------------------------------------------------------------------------
@@ -200,7 +200,6 @@ struct PreparedMesh {
 // textures shared by tag and capped at max_texture_dim (0 = full size), G-buffer parts only.
 struct PrepareCache {
     uint32_t max_texture_dim = 0;
-    bool gbuffer_only = false;
     bool all_lods = false;  // every LOD level (maps pick one per instance by screen size)
     bool ready = false;
     std::shared_ptr<const std::vector<float4>> global_channels;
@@ -267,12 +266,13 @@ public:
     // Call from GameLighting's callback: inputs belong to this frame, after its atmosphere passes.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                             const ViewMatrices& vm, const ExternStore& inputs);
-    bool has_transparent() const { return transparent_count_ > 0; }
+    bool has_transparent() const { return !transparent_items_.empty(); }
     // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
     // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
     bool skinned() const { return skinned_; }
     void set_skin_pose(std::vector<BoneTransform> bones);
-    size_t transparent_count() const { return transparent_count_; }
+    size_t transparent_count() const { return transparent_items_.size(); }
+    size_t world_transparent_draws() const { return world_transparent_draws_; }
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
     void set_material_time_of_day(float day_fraction) { material_time_of_day_ = day_fraction; }
@@ -354,11 +354,13 @@ private:
     float material_time_of_day_ = 0.5f;
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
-    size_t transparent_count_ = 0;
+    size_t world_transparent_draws_ = 0;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
+    std::vector<size_t> transparent_items_;
     std::vector<SceneGroupInfo> info_;
     ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
+    struct PlacementConstants { std::array<float4, 32> values; };
     struct BufferSet {
         GpuBuffer ib, vb0, vb1, color;
         ComPtr<ID3D12Resource> skin_pos, skin_normal;
@@ -376,11 +378,10 @@ private:
         // Dynamic models: the object constants (rigid_model / skinning scope, local_to_world in
         // rows 0-3) and the placements; this frame's constants per placement.
         bool dynamic = false;
-        std::array<float4, 20> model_cb{};
         V3 model_center{};
         std::vector<std::array<float, 12>> placements;
         std::vector<float> sky_order;
-        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> object_cb;
+        GpuBuffer object_cb;
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
