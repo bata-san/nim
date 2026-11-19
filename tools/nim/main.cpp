@@ -599,6 +599,7 @@ public:
         uint64_t generation = 0;
         PreparedMesh mesh;
         std::vector<std::array<float, 12>> rows;
+        std::vector<float> sky_order;
     };
     struct Progress {
         uint64_t generation = 0;
@@ -877,6 +878,7 @@ private:
                                     j - terrain.size() >= sky_first ? &*sky_cache : &*cache);
                                 if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
                                 piece.rows = std::move(model.rows);
+                                piece.sky_order = std::move(model.sky_order);
                             }
                         } catch (const std::exception& ex) {
                             failure = (j < terrain.size() ? "terrain: " : j - terrain.size() >= static_count ? "entity: " : "")
@@ -1421,7 +1423,7 @@ public:
             if (!piece) break;
             added = true;
             try {
-                scene.add_mesh(g, std::move(piece->mesh), layouts, piece->rows);
+                scene.add_mesh(g, std::move(piece->mesh), layouts, piece->rows, piece->sky_order);
             } catch (const std::exception& ex) {
                 // add_mesh rolled the mesh back; counted with the worker's failures below.
                 ++map_add_failures[std::string(ex.what()).substr(0, 120)];
@@ -1889,6 +1891,7 @@ public:
         if (game_ready) {
             scene.set_global_channel_values(game_lighting.update_global_channels(light));
             scene.set_global_channels(game_lighting.world_channels());
+            scene.set_material_time_of_day(game_lighting.time_of_day(light));
         }
         ViewMatrices vm = game_ready && light.mode == ViewMode::Lit ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
         try {

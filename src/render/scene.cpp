@@ -546,6 +546,7 @@ void StaticMeshScene::set_render_inputs(const ExternStore& inputs) {
     if (!material_externs_) throw std::runtime_error("No scene is loaded");
     *material_externs_ = inputs;
     global_base_ = inputs.channels;
+    if (inputs.has(ext::Frame, 0x10, 4)) material_time_of_day_ = inputs.get_f(ext::Frame, 0x10);
 }
 
 void StaticMeshScene::set_material_frame(float seconds, float delta_seconds) {
@@ -580,6 +581,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     channel_defaults_.clear();
     material_addresses_.clear();
     material_time_ = material_delta_ = 0;
+    material_time_of_day_ = 0.5f;
     white_color_ = {};
     arena_.reset();
     material_externs_.reset();
@@ -1189,13 +1191,15 @@ void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
 }
 
 void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
-                               std::span<const std::array<float, 12>> placements) {
+                               std::span<const std::array<float, 12>> placements, std::span<const float> sky_order) {
+    if (!sky_order.empty() && (!mesh.dynamic || sky_order.size() != placements.size()))
+        throw std::invalid_argument("Sky order requires one key per dynamic placement");
     scopes_resolved_ = false;
     // All or nothing: a mesh that fails validation leaves no partial parts behind.
     const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count_;
     const size_t instances = instance_total_, culls = cull_groups_.size();
     try {
-        add_mesh_parts(gpu, std::move(mesh), layouts, placements);
+        add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
     } catch (...) {
         try { gpu.flush(); } catch (...) {}
         for (size_t k = items; k < items_.size(); ++k) {
@@ -1214,7 +1218,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
 }
 
 void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
-                                     std::span<const std::array<float, 12>> placements) {
+                                     std::span<const std::array<float, 12>> placements, std::span<const float> sky_order) {
     ProfileScope profile_total("add.mesh_parts.total");
     ID3D12Device* dev = gpu.device();
     const bool first_mesh = sets_.empty();
@@ -1299,7 +1303,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         set.dynamic = mesh.dynamic;
         if (mesh.dynamic) {
             set.model_cb = mesh.model_cb;
+            set.model_center = mesh.center;
             set.placements.assign(placements.begin(), placements.end());
+            set.sky_order.assign(sky_order.begin(), sky_order.end());
         }
         if (mesh.dynamic) {
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
@@ -1363,6 +1369,13 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.vs_cb0 = arena_.upload(gpu, g.vs_cb0.data(), g.vs_cb0.size() * sizeof(float4));
         item.vs_material = std::move(g.vs_material);
         item.ps_material = std::move(g.ps_material);
+        if (const auto texture = g.textures.find(0); texture != g.textures.end() &&
+            texture->second->tile_count > 1 && tfx_animated_atlas_operand(item.ps_material.bytecode)) {
+            const auto& atlas = *texture->second;
+            if (!std::all_of(atlas.tile_uv.begin(), atlas.tile_uv.end(), [](float v) { return v > 0 && v <= 1; }))
+                throw std::runtime_error("Invalid animated texture atlas UVs");
+            item.ps_atlas = Item::AnimatedAtlas{atlas.tile_uv, atlas.tile_count};
+        }
         item.vs_live = g.vs_live;
         item.ps_live = g.ps_live;
         item.technique = g.info.technique;
@@ -1600,6 +1613,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
         }
         transparent_count_ += transparent;
+        if (transparent && cull != UINT32_MAX) cull_groups_[cull].has_transparency = true;
         items_.push_back(std::move(item));
         upload_guard.committed = true;
         info_.push_back(std::move(g.info));
@@ -1624,6 +1638,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     fill_view_externs(ext, w, h, vm);
     ext.set(ext::Frame, 0x00, material_time_);
     ext.set(ext::Frame, 0x04, material_time_);
+    // Map materials (including sky layers) evaluate authored day/night curves from Frame +0x10.
+    ext.set(ext::Frame, 0x10, frame_inputs ? frame_inputs->get_f(ext::Frame, 0x10) : material_time_of_day_);
     ext.set(ext::Frame, 0x14, material_delta_);
     ext.set(ext::Frame, 0x1C, material_exposure_);
     estimate_engine_frame(ext, material_time_, material_delta_);
@@ -1645,7 +1661,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         if (!ext.zero_policy(id)) ext.zero_when_missing(id, "world state from a map (not loaded): zero");
     // PatternBlending (97): an engine-produced pattern texture whose producer is not decoded.
     if (!ext.zero_policy(97)) ext.zero_when_missing(97, "pattern-blending engine input (producer not decoded): zero");
-    ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
+    if (!frame_inputs)
+        ext.set(ext::Deferred, 0x00, float4{0, 1.0f / vm.vp_rel.c[3][2], 0, 0});
     if (dynamic_parts_ && !ext.zero_policy(ext::RigidModel))
         ext.zero_when_missing(ext::RigidModel, "per-object engine value of a placed entity (object lighting / SH) not produced: zero");
     if (dynamic_) {
@@ -1750,6 +1767,17 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         it.scope_addresses.resize(it.scope_slots.size());
         for (size_t k = 0; k < it.scope_slots.size(); ++k)
             it.scope_addresses[k] = {it.scope_slots[k].first, scope_address(it.scope_slots[k].second)};
+        auto material_env = [&](const ChannelContext& channels, bool vs) {
+            auto env = with_channels(base, channels, vs);
+            if (!vs && it.ps_atlas) {
+                const auto& atlas = *it.ps_atlas;
+                env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
+                env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
+                ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
+                                  "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
+            }
+            return env;
+        };
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
             const uint64_t key = (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
@@ -1758,7 +1786,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             static const float4 origin{0, 0, 0, 1};
             ChannelContext ec = cc;
             if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || sets_[it.buffers].dynamic)) ec.world_position = &origin;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, ec, vs));
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(ec, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             material_addresses_.emplace(key, a.gpu);
@@ -1801,7 +1829,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
                 ChannelContext pc = cc;
                 pc.world_position = &position;
-                evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, with_channels(base, pc, vs));
+                evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(pc, vs));
                 const auto a = gpu.dynamic(cb.size() * sizeof(float4));
                 std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
                 return a.gpu;
@@ -1842,11 +1870,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         bound_cbv[param] = address;
         cl->SetGraphicsRootConstantBufferView(param, address);
     };
-    // Blended G-buffer items (decals) go over the opaque surfaces, so they are drawn after them.
-    for (int pass = 0; pass < 2; ++pass)
-    for (const auto& it : items_) {
-        if (it.stage != stage || it.blended != (pass == 1)) continue;
-        if (shadow && (!it.shadow_pso || it.blended)) continue;
+    auto draw = [&](const Item& it, uint32_t instances, uint32_t first_instance) {
         if (bound_root != it.root_sig.Get()) {
             bind_common(gpu, cl, w, h, vm, it.root_sig.Get());
             bound_root = it.root_sig.Get();
@@ -1855,9 +1879,6 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             bound_table = UINT32_MAX;
         }
         const auto& set = sets_[it.buffers];
-        const CullGroup* cg = set.cull == UINT32_MAX ? nullptr : &cull_groups_[set.cull];
-        const uint32_t instances = item_instances(it);
-        if (!instances) continue;
         if (it.buffers != bound || bound_root_changed) {
             bound = it.buffers;
             cl->IASetIndexBuffer(&sets_[bound].ibv);
@@ -1880,17 +1901,67 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         if (bound_topology != topology) cl->IASetPrimitiveTopology(bound_topology = topology);
         if (it.dynamic) {
-            for (size_t p = 0; p < set.object_cb.size(); ++p) {
+            for (size_t p = first_instance; p < size_t(first_instance) + instances; ++p) {
                 for (uint32_t param : it.object_params) set_cbv(param, set.object_cb[p]);
                 if (p < it.ps_placement_addresses.size()) set_cbv(0, it.ps_placement_addresses[p]);
                 if (p < it.vs_placement_addresses.size()) set_cbv(6, it.vs_placement_addresses[p]);
                 cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
             }
-        } else if (!cg) cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, 0);
-        else
-            for (int l = 0; l < 4; ++l)
-                if (((it.lod_mask >> l) & 1) && cg->count[size_t(l)])
-                    cl->DrawIndexedInstanced(it.part.index_count, cg->count[size_t(l)], it.part.index_start, 0, cg->first[size_t(l)]);
+        } else cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, first_instance);
+    };
+    if (stage == kStageTransparent) {
+        struct Draw { const Item* item; uint32_t instance; float depth; bool sky; };
+        std::vector<Draw> ordered;
+        auto enqueue = [&](const Item& item, uint32_t instance, float depth, bool sky = false) {
+            ordered.push_back({&item, instance, std::isfinite(depth) ? depth : 0, sky});
+        };
+        for (const auto& it : items_) {
+            if (it.stage != stage || !item_instances(it)) continue;
+            const auto& set = sets_[it.buffers];
+            if (it.dynamic) {
+                const auto c = set.model_center;
+                for (uint32_t i = 0; i < set.placements.size(); ++i) {
+                    if (!set.sky_order.empty()) {
+                        enqueue(it, i, set.sky_order[i], true);
+                        continue;
+                    }
+                    const auto& p = set.placements[i];
+                    const V3 pos{p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3],
+                                 p[4] * c.x + p[5] * c.y + p[6] * c.z + p[7],
+                                 p[8] * c.x + p[9] * c.y + p[10] * c.z + p[11]};
+                    enqueue(it, i, dot(pos - vm.eye, vm.fwd));
+                }
+            } else {
+                const auto& group = cull_groups_[set.cull];
+                for (size_t l = 0; l < 4; ++l) {
+                    if (!((it.lod_mask >> l) & 1)) continue;
+                    for (uint32_t i = group.first[l]; i < group.first[l] + group.count[l]; ++i)
+                        enqueue(it, i, group.visible_depths[i]);
+                }
+            }
+        }
+        // Preserve the authored part order for equal depths, including parts of one placement.
+        std::stable_sort(ordered.begin(), ordered.end(), [](const Draw& a, const Draw& b) {
+            if (a.sky != b.sky) return a.sky;
+            return a.sky ? a.depth < b.depth : a.depth > b.depth;
+        });
+        for (const auto& entry : ordered) draw(*entry.item, 1, entry.instance);
+        return;
+    }
+    // Blended G-buffer items (decals) go over opaque surfaces.
+    for (int pass = 0; pass < 2; ++pass)
+    for (const auto& it : items_) {
+        if (it.stage != stage || it.blended != (pass == 1) || (shadow && (!it.shadow_pso || it.blended))) continue;
+        const uint32_t instances = item_instances(it);
+        if (!instances) continue;
+        const auto& set = sets_[it.buffers];
+        if (set.cull == UINT32_MAX) draw(it, instances, 0);
+        else {
+            const auto& group = cull_groups_[set.cull];
+            for (size_t l = 0; l < 4; ++l)
+                if (((it.lod_mask >> l) & 1) && group.count[l])
+                    draw(it, group.count[l], group.first[l]);
+        }
     }
 }
 
@@ -1979,6 +2050,7 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height) {
     const float pixel = 2.0f / (vm.fy * float(std::max(1u, height)));
     const float half_h = 0.5f * float(std::max(1u, height)) * vm.fy;
     for (auto& group : cull_groups_) {
+        group.visible_depths.clear();
         const auto upload = gpu.dynamic(group.spheres.size() * 4);
         auto* out = static_cast<uint32_t*>(static_cast<void*>(upload.cpu));
         const bool lods = group.levels != 1;
@@ -2003,6 +2075,7 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height) {
             }
             if (!lods) {
                 out[visible++] = i;
+                if (group.has_transparency) group.visible_depths.push_back(z);
                 continue;
             }
             int level = px >= 160 ? 0 : px >= 64 ? 1 : px >= 24 ? 2 : 3;
@@ -2017,6 +2090,11 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height) {
                 group.first[l] = visible;
                 group.count[l] = uint32_t(cull_scratch_[l].size());
                 if (!cull_scratch_[l].empty()) std::memcpy(out + visible, cull_scratch_[l].data(), cull_scratch_[l].size() * 4);
+                if (group.has_transparency)
+                    for (uint32_t i : cull_scratch_[l]) {
+                        const auto& s = group.spheres[i];
+                        group.visible_depths.push_back(dot(V3{s[0], s[1], s[2]} - vm.eye, vm.fwd));
+                    }
                 visible += group.count[l];
             }
         else group.count[0] = visible;
@@ -2072,6 +2150,8 @@ void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl
                                          const ViewMatrices& vm, const ExternStore& inputs) {
     if (!transparent_count_) return;
     auto& ext = *material_externs_;
+    ext.note_estimate("transparent pass order: authored sky order, then object placement depth",
+                      "sky collections are stored in ascending order; engine interleaving and ties are unknown");
     ext.copy_block_from(ext::Atmosphere, inputs);
     ext.copy_block_from(ext::Transparent, inputs);
     ext.copy_block_from(ext::Deferred, inputs);

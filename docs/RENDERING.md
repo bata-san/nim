@@ -10,7 +10,7 @@ pixel equality with the running game has been established.
 
 Map rendering uses original game DXIL for SSAO, near/far sky lookups, sky ambient, local lights,
 reflection/diffuse probe volumes, volumetrics, bloom, tonemapping and TAA. Static geometry and
-placed entities render in the GUI; sky objects are currently loaded only by nimshade.
+placed opaque entities and sky objects render in the GUI and nimshade.
 The normal build is `build/Release/nim.exe`.
 
 Unknown engine-owned constants, incomplete froxel inputs and viewer-produced shadow/depth

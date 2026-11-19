@@ -383,7 +383,10 @@ int run(int argc, char** argv) {
             try {
                 if (!prepared[j]) throw std::runtime_error(errors[j]);
                 if (is_terrain) scene.add_mesh(gpu, std::move(*prepared[j]), layouts, std::span(&identity, 1));
-                else scene.add_mesh(gpu, std::move(*prepared[j]), layouts, region[j - terrain.size()].rows);
+                else {
+                    const auto& model = region[j - terrain.size()];
+                    scene.add_mesh(gpu, std::move(*prepared[j]), layouts, model.rows, model.sky_order);
+                }
                 prepared[j].reset();
                 terrain_ok += is_terrain;
             } catch (const std::exception& ex) {
@@ -505,7 +508,15 @@ int run(int argc, char** argv) {
     }
     GameLighting gl;
     auto transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-        scene.render_transparent(gpu, c, gb, hdr, vm, gl.externs());
+        const auto& inputs = gl.externs();
+        if (verify_frame_inputs) {
+            const auto depth = inputs.texture(ext::Deferred, 0x98);
+            if (!depth.resource || depth.format != DXGI_FORMAT_R32G32_FLOAT ||
+                depth.resource->GetDesc().Width != gb.width() || depth.resource->GetDesc().Height != gb.height() ||
+                inputs.get_v(ext::Deferred, 0x00) != float4{0, 1, 0, 0})
+                throw std::runtime_error("Transparent pass requires current linear depth with a matching decode");
+        }
+        scene.render_transparent(gpu, c, gb, hdr, vm, inputs);
     };
     if (game) {
         gl.init(pm, gpu);
@@ -536,11 +547,13 @@ int run(int argc, char** argv) {
         // The materials read the same global channels as the lighting (the map environment).
         scene.set_global_channel_values(gl.update_global_channels(lp));
         scene.set_global_channels(gl.world_channels());
+        scene.set_material_time_of_day(gl.time_of_day(lp));
         if (gl.environment_channels()) {
             std::println("map environment: {} global channels at time of day {:.3f}", gl.environment_channels(),
-                         lp.time_of_day >= 0 ? lp.time_of_day : gl.default_time_of_day());
-            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                         gl.time_of_day(lp));
         }
+        if (gl.environment_channels() || gl.has_atmosphere())
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
         if (print_channels) {
             const auto& ch = gl.externs().channels;
             const auto& ids = gl.externs().channel_ids;
@@ -909,8 +922,9 @@ int run(int argc, char** argv) {
                     }
                     previous_min = slice_min;
                 }
-                if (ext.texture(ext::Transparent, 0x78).resource != volume)
-                    throw std::runtime_error("Opaque and transparent passes have different froxel volumes");
+                if (ext.texture(ext::Transparent, 0x78).resource != volume ||
+                    ext.get_v(ext::Transparent, 0xD0) != ext.get_v(ext::Atmosphere, 0x130))
+                    throw std::runtime_error("Opaque and transparent passes have different froxel volumes or depth coordinates");
                 std::println("verified froxels: {}x{}x{}, all slices finite, transmittance monotonic (far minimum {})",
                              vd.Width, vd.Height, vd.DepthOrArraySize, previous_min);
             }
@@ -942,6 +956,17 @@ int run(int argc, char** argv) {
             if (error > 0.003f) throw std::runtime_error(std::format("Atmosphere LUT / CPU equation mismatch: {}", error));
             std::println("verified atmosphere LUT: {}x{}, finite transmittance, zero-distance = 1, CPU max error {}{}",
                 desc.Width, desc.Height, error, white ? "" : " (nonuniform source: analytic comparison skipped)");
+            if (gl.volumetrics_drawn()) {
+                const auto depths = gpu.read_texture(gl.volumetric_depth(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 16);
+                const auto* values = reinterpret_cast<const float*>(depths.data());
+                for (size_t i = 0; i < depths.size() / sizeof(float); i += 4) {
+                    const float far_depth = values[i], near_depth = values[i + 1], mean = values[i + 2], coverage = values[i + 3];
+                    if (!std::isfinite(far_depth) || !std::isfinite(near_depth) || !std::isfinite(mean) || !std::isfinite(coverage) ||
+                        near_depth <= 0 || mean < near_depth * 0.99999f || mean > far_depth * 1.00001f || coverage < 0 || coverage > 1)
+                        throw std::runtime_error("Invalid depth range for volumetric lights");
+                }
+                std::println("verified volumetric depth: {} finite min/max ranges", depths.size() / 16);
+            }
         };
         verify_lut(vm);
         // Both a larger target and the original size: the first transparent draw after resize

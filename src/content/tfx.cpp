@@ -335,6 +335,9 @@ Texture load_texture(PackageManager& pm, TagHash header) {
     t.height = r.u16_at(0x24);
     t.depth = r.u16_at(0x26);
     t.array_size = r.u16_at(0x28);
+    t.tile_count = r.u16_at(0x2A);
+    if (t.tile_count > 1)
+        for (uint32_t i = 0; i < 4; ++i) t.tile_uv[i] = r.f32_at(0x10 + 4 * i);
     uint16_t mips_hint = r.u8_at(0x2D);
     TagHash large(r.u32_at(0x3C));
 
@@ -370,6 +373,9 @@ Texture load_texture(PackageManager& pm, TagHash header, uint32_t max_dim) {
         return load_texture(pm, header);
     Texture t;
     t.dxgi_format = r.u32_at(0x04);
+    t.tile_count = r.u16_at(0x2A);
+    if (t.tile_count > 1)
+        for (uint32_t i = 0; i < 4; ++i) t.tile_uv[i] = r.f32_at(0x10 + 4 * i);
     const uint16_t mips_hint = r.u8_at(0x2D);
     uint16_t smallest = std::min(w0, h0), full = 1;
     while ((1u << full) <= smallest) ++full;

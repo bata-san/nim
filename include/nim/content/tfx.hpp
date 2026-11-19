@@ -137,6 +137,8 @@ struct Texture {
     uint32_t dxgi_format = 0;
     uint16_t width = 0, height = 0, depth = 1, array_size = 1;
     uint16_t mip_count = 1;
+    uint16_t tile_count = 1;
+    float4 tile_uv{};  // atlas local UV scale (xy) and per-frame UV step (zw)
     std::vector<uint8_t> data;  // full mip chain, D3D subresource order
 };
 Texture load_texture(PackageManager& pm, TagHash header);

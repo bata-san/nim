@@ -918,8 +918,9 @@ float ps_main(float4 pos : SV_Position) : SV_Target {
 // View-space depth from the reversed depth buffer (z = near / d): the hdao pass's second depth
 // input, gathered from R on one side of each sample pair and from G on the other (both hold the
 // same depth here). The engine's producer of that texture is not identified, so nim makes it.
+constexpr float kSkyViewDepth = 1e6f;  // finite view depth at the cleared device depth
 constexpr const char* kLinearDepthHlsl = R"(
-cbuffer P : register(b0) { float near_z; float3 pad; };
+cbuffer P : register(b0) { float near_z; float sky_depth; float2 pad; };
 Texture2D<float> depth : register(t0);
 float4 vs_main(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -927,7 +928,7 @@ float4 vs_main(uint id : SV_VertexID) : SV_Position {
 }
 float2 ps_main(float4 pos : SV_Position) : SV_Target {
     float d = depth.Load(int3(pos.xy, 0));
-    return (d > 0 ? near_z / d : 1e6).xx;
+    return (d > 0 ? near_z / d : sky_depth).xx;
 }
 )";
 
@@ -1294,31 +1295,33 @@ M4 inverse(const M4& m);
 void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const ViewMatrices& vm) {
     const float w = float(width), h = float(height);
 
-    // View, in nim's camera space (x right, y up, z forward). The lighting VS reconstructs a
-    // per-pixel ray at unit depth from 0x160 and moves it to world space with 0xE0.
+    // The game uses a backward camera Z axis (the forward distance in transparent PS is
+    // dot(-cb12[6], world - eye)). Change both sides of the camera-space transforms so
+    // a view ray transformed to world space stays aligned with the viewer's projection.
     M4 cam_to_world;
     cam_to_world.c[0] = v4(vm.right, 0);
     cam_to_world.c[1] = v4(vm.up, 0);
-    cam_to_world.c[2] = v4(vm.fwd, 0);
+    cam_to_world.c[2] = v4(vm.fwd * -1.0f, 0);
     cam_to_world.c[3] = v4(vm.eye, 1);
     M4 world_to_cam;
-    world_to_cam.c[0] = {vm.right.x, vm.up.x, vm.fwd.x, 0};
-    world_to_cam.c[1] = {vm.right.y, vm.up.y, vm.fwd.y, 0};
-    world_to_cam.c[2] = {vm.right.z, vm.up.z, vm.fwd.z, 0};
-    world_to_cam.c[3] = {-dot(vm.right, vm.eye), -dot(vm.up, vm.eye), -dot(vm.fwd, vm.eye), 1};
-    const M4 cam_to_proj = vm.proj;  // perspective, or the sun's orthographic shadow view
+    world_to_cam.c[0] = {vm.right.x, vm.up.x, -vm.fwd.x, 0};
+    world_to_cam.c[1] = {vm.right.y, vm.up.y, -vm.fwd.y, 0};
+    world_to_cam.c[2] = {vm.right.z, vm.up.z, -vm.fwd.z, 0};
+    world_to_cam.c[3] = {-dot(vm.right, vm.eye), -dot(vm.up, vm.eye), dot(vm.fwd, vm.eye), 1};
+    M4 cam_to_proj = vm.proj;
+    for (float& v : cam_to_proj.c[2]) v = -v;
     // A perspective view's jitter (NDC offset, temporal anti-aliasing) is taken out of the rays.
     const float jx = vm.ortho > 0 ? 0 : vm.proj.c[2][0], jy = vm.ortho > 0 ? 0 : vm.proj.c[2][1];
-    M4 proj_to_ray;  // (ndc.x, ndc.y, any, 1) -> camera-space ray with z = 1, w = 0
+    M4 proj_to_ray;  // (ndc.x, ndc.y, any, 1) -> camera-space ray with z = -1, w = 0
     proj_to_ray.c[0] = {1 / vm.fx, 0, 0, 0};
     proj_to_ray.c[1] = {0, 1 / vm.fy, 0, 0};
     proj_to_ray.c[2] = {0, 0, 0, 0};
-    proj_to_ray.c[3] = {-jx / vm.fx, -jy / vm.fy, 1, 0};
+    proj_to_ray.c[3] = {-jx / vm.fx, -jy / vm.fy, -1, 0};
     M4 pixel_to_ray;
     pixel_to_ray.c[0] = {2 / (w * vm.fx), 0, 0, 0};
     pixel_to_ray.c[1] = {0, -2 / (h * vm.fy), 0, 0};
     pixel_to_ray.c[2] = {0, 0, 0, 0};
-    pixel_to_ray.c[3] = {(-1 - jx) / vm.fx, (1 - jy) / vm.fy, 1, 0};
+    pixel_to_ray.c[3] = {(-1 - jx) / vm.fx, (1 - jy) / vm.fy, -1, 0};
     ext.set(ext::View, 0x00, w);
     ext.set(ext::View, 0x04, h);
     ext.set(ext::View, 0x10, float4{0, 0, 0, 0});
@@ -1356,7 +1359,12 @@ void fill_view_externs(ExternStore& ext, uint32_t width, uint32_t height, const 
     uv_to_ndc.c[2] = {0, 0, 1, 0};
     uv_to_ndc.c[3] = {-1, 1, 0, 1};
     ext.set(ext::View, 0x2A0, mul(inverse(vm.vp_abs), uv_to_ndc));
-
+    // Local lights and their shaft shaders reconstruct camera-relative positions from
+    // (pixel x, pixel y, device depth, 1). Publish the matrix for this viewport.
+    M4 pixel_to_ndc = uv_to_ndc;
+    pixel_to_ndc.c[0][0] /= w;
+    pixel_to_ndc.c[1][1] /= h;
+    ext.set(ext::View, 0x2E0, mul(inverse(vm.vp_rel), pixel_to_ndc));
 }
 
 V3 sun_direction(const LightingParams& p) {
@@ -1380,11 +1388,9 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     estimate_engine_frame(ext_, p.time, p.delta_time);
     // +0x10: the time of day in days (goriath: time_of_day / 3600 s); the shading fog reads the
     // density LUT's time column with it.
-    if (atm_.valid) ext_.set(ext::Frame, 0x10, p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time);
-    else {
-        ext_.set(ext::Frame, 0x10, 0.5f);
+    ext_.set(ext::Frame, 0x10, time_of_day(p));
+    if (!atm_.valid)
         ext_.note_estimate("extern 1 +0x10 = 0.5", "time of day without a map: noon");
-    }
     update_global_channels(p);
     fill_atmosphere(p);
     if (!froxels_on(p) || !froxel_vol_)
@@ -1579,9 +1585,6 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     // histories) is not yet decoded. Its outputs must be supplied by their real producers.
     // Transparent parts (render stage 8: the sky objects, glass ...) are drawn over the sky into the
     // HDR target, before the light shafts; SV_Target4 updates the G-buffer motion texture for TAA.
-    if (transparents)
-        ext_.note_estimate("transparent parts: drawn in item order (not sorted back to front)",
-                           "engine transparent sorting not decoded");
     for (auto& rt : gb.rt)
         Gpu::barrier(cl, rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     const auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1675,6 +1678,9 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(ext::Transparent, 0x00, atmosphere ? sky_near_rt_.Get() : nullptr);
     ext_.set_texture(ext::Transparent, 0x10, atmosphere ? sky_far_rt_.Get() : nullptr);
     ext_.set_texture(ext::Transparent, 0x20, atmosphere ? atmo_density_rt_.Get() : nullptr);
+    // The transparent and shaft PS use the same depth-to-Z expression as opaque shading.
+    // Supply both its texture and the coefficients from the same froxel producer.
+    ext_.set(ext::Transparent, 0xD0, atmosphere ? ext_.get_v(ext::Atmosphere, 0x130) : float4{0, 0, 1, 0});
     if (!froxels_on(p))
         ext_.estimate_texture(ext::Transparent, 0x78, no_atmosphere_.Get(), "atmosphere froxels disabled: clear air (1,1,0,0)");
     ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
@@ -1760,8 +1766,13 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
     }
     if (transparents) {
+        const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
+        // The transparent view's reciprocal-depth flag is clear. Its soft intersections
+        // compare cb2[0].y * t10.x + cb2[0].x directly with distance in metres.
+        ext_.set(ext::Deferred, 0x00, float4{0, 1, 0, 0});
         ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
         transparents(cl, hdr);
+        ext_.set(ext::Deferred, 0x00, depth_decode);
         ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
@@ -1990,7 +2001,7 @@ void GameLighting::render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, 
         sd.Texture2D.MipLevels = 1;
         sd.Format = GBuffer::kDepthSrvFormat;
         gpu.device()->CreateShaderResourceView(gb.depth.Get(), &sd, gpu.srv().cpu(env_srv_));
-        const float4 k{near_z, 0, 0, 0};
+        const float4 k{near_z, kSkyViewDepth, 0, 0};
         const auto cb = gpu.dynamic(sizeof(k));
         std::memcpy(cb.cpu, &k, sizeof(k));
         Gpu::barrier(cl, linear_depth_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2417,14 +2428,6 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
     cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
     if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
     if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
-    // View +0x2E0 (goriath tptow_no_proj_w): (pixel x, pixel y, depth, 1) -> camera-relative world,
-    // homogeneous; the light PS rebuilds each pixel's position with it.
-    M4 pixel_to_ndc;
-    pixel_to_ndc.c[0] = {2.0f / float(w_), 0, 0, 0};
-    pixel_to_ndc.c[1] = {0, -2.0f / float(h_), 0, 0};
-    pixel_to_ndc.c[2] = {0, 0, 1, 0};
-    pixel_to_ndc.c[3] = {-1, 1, 0, 1};
-    ext_.set(ext::View, 0x2E0, mul(inverse(vm.vp_rel), pixel_to_ndc));
     M4 to_rel;  // world -> camera-relative world
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
@@ -2503,7 +2506,11 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     ext_.set_texture(kDownsample, 0x00, gb.depth.Get(), GBuffer::kDepthSrvFormat);
     ext_.set(kDownsample, 0x10, float4{lw, lh, 1 / lw, 1 / lh});  // cb0[2]: target size
     ext_.set(kDownsample, 0x20, float4{w, h, 1 / w, 1 / h});      // cb0[3]: source size (x: 4 source texels per target texel)
-    ext_.set(kDownsample, 0x30, float4{0, 1 / near_z, 0, 0});     // cb0[4]: 1 / view depth = x + y * device depth
+    // The original shader takes the reciprocal before computing the depth range.
+    // With an infinite projection, clear depth would make its range/mean non-finite.
+    // Use the same finite sky distance as the full-resolution depth passed to upres.
+    const float4 shaft_depth_decode{1 / kSkyViewDepth, 1 / near_z, 0, 0};
+    ext_.set(kDownsample, 0x30, shaft_depth_decode);
     Gpu::barrier(cl, vol_minmax_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const auto minmax_rtv = rtv(0);
     cl->OMSetRenderTargets(1, &minmax_rtv, FALSE, nullptr);
@@ -2512,13 +2519,8 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 
     // 2. The lights, with a quarter-resolution view (cb12 and the pixel -> world matrix).
     fill_view_externs(ext_, vw_, vh_, vm);
-    M4 pixel_to_ndc;
-    pixel_to_ndc.c[0] = {2.0f / lw, 0, 0, 0};
-    pixel_to_ndc.c[1] = {0, -2.0f / lh, 0, 0};
-    pixel_to_ndc.c[2] = {0, 0, 1, 0};
-    pixel_to_ndc.c[3] = {-1, 1, 0, 1};
-    const M4 pixel_to_rel = mul(inverse(vm.vp_rel), pixel_to_ndc);
-    ext_.set(ext::View, 0x2E0, pixel_to_rel);
+    M4 pixel_to_rel;
+    for (uint32_t i = 0; i < 4; ++i) pixel_to_rel.c[i] = ext_.get_v(ext::View, 0x2E0 + 16 * i);
     const auto q12v = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
     const auto q12p = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
     const Scope* extra_scopes[] = {&rigid_scope_, &transparent_scope_, &transparent_adv_scope_};
@@ -2533,6 +2535,10 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         return 0;
     };
     ext_.set_texture(ext::Deferred, 0x98, vol_minmax_.Get());  // t10 of the transparent scope
+    const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
+    ext_.set(ext::Deferred, 0x00, shaft_depth_decode);  // the light march converts the depths back to device depth
+    ext_.note_estimate("volumetrics clear depth: finite 1,000,000 m",
+                       "finite far distance for the infinite viewer projection; shared with full-resolution linear depth");
     constexpr uint8_t kVolumetricsPass = 0x58, kTemporal = 0x59;
     if (!ext_.zero_policy(kVolumetricsPass))
         ext_.zero_when_missing(kVolumetricsPass, "volumetric fog density slices (extern 88 t0/t1): producer not identified, zero (base density only)");
@@ -2621,6 +2627,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
 
     // Restore what the other passes read.
     ext_.set_texture(ext::Postprocess, 0x00, post.resource, post.format);
+    ext_.set(ext::Deferred, 0x00, depth_decode);
     ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
 }
 

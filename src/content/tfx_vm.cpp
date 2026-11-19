@@ -225,6 +225,29 @@ TfxResult inspect_tfx_bindings(std::span<const uint8_t> bc) {
     return result;
 }
 
+std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bc) {
+    std::optional<uint8_t> count_operand, scale_operand;
+    bool has_step = false;
+    for (size_t ip = 0; ip < bc.size();) {
+        const auto [name, len] = op_info(bc[ip]);
+        if (!name || ip + len > bc.size()) return {};
+        if (bc[ip] == 0x80) break;
+        if (bc[ip] == 0x68) {
+            if (bc[ip + 1] == 0 && bc[ip + 2] == 0xBB && !has_step) has_step = true;
+            else if (bc[ip + 2] == 0x11 && !scale_operand) scale_operand = bc[ip + 1];
+            else return {};
+        }
+        if (bc[ip] == 0x69) {
+            if (bc[ip + 2] != 0 || count_operand) return {};
+            count_operand = bc[ip + 1];
+        }
+        ip += len;
+    }
+    if (has_step && count_operand && scale_operand && *scale_operand == *count_operand + 1)
+        return count_operand;
+    return {};
+}
+
 TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants, std::span<float4> out,
                   const TfxEnvironment& env, std::string* trace) {
     auto missing = [](const char* kind) -> float4 {
@@ -421,7 +444,13 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             last_extern_offset = a2;
             vm.push(float4{});
             break;
-        case 0x4E: case 0x69:  // raw u32 bits, splatted (reading the bytes as a float keeps them)
+        case 0x69:
+            if (env.atlas_frame_count) {
+                vm.push(splat(env.atlas_frame_count(a1, a2)));
+                break;
+            }
+            [[fallthrough]];
+        case 0x4E:  // raw u32 bits, splatted (reading the bytes as a float keeps them)
             vm.push(splat(env.extern_float ? env.extern_float(a1, a2) : missing("extern scalar")[0]));
             break;
         case 0x51: vm.push(vm.output(a1)); break;

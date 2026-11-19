@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace nim {
@@ -491,7 +492,7 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
 std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map) {
     constexpr uint32_t kClassSkyComponent = 0x80808378, kClassSkyModelRef = 0x80808383;
     std::map<uint32_t, MapStatic> models;
-    std::set<std::vector<float>> seen;  // the activity layers repeat the same collection
+    std::set<std::tuple<uint32_t, std::array<float, 12>, float>> seen;
     std::set<uint32_t> collections;
     for (TagHash t : map.node_tables) {
         std::vector<uint8_t> data;
@@ -542,12 +543,16 @@ std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout&
             std::array<float, 12> row{};
             for (int k = 0; k < 4; ++k)
                 for (int a = 0; a < 3; ++a) row[size_t(a * 4 + k)] = r.f32_at(o + size_t(k) * 16 + size_t(a) * 4);
-            std::vector<float> key(row.begin(), row.end());
-            key.push_back(float(model.value));
-            if (!seen.insert(std::move(key)).second) continue;
+            const float order = r.f32_at(o + 0x64);
+            if (!std::isfinite(order) || !std::all_of(row.begin(), row.end(), [](float v) { return std::isfinite(v); }))
+                continue;
+            // Activity layers repeat records. Keep the exact tag so different sky models at
+            // the same transform cannot collide when the low tag bits differ.
+            if (!seen.emplace(model.value, row, order).second) continue;
             auto& m = models[model.value];
             m.mesh = model;
             m.rows.push_back(row);
+            m.sky_order.push_back(order);
         }
     }
     std::vector<MapStatic> out;
@@ -868,13 +873,15 @@ std::vector<MapStatic> map_region(const std::vector<MapStatic>& placed, std::arr
     std::vector<std::pair<float, MapStatic>> found;
     const float r2 = radius * radius;
     for (const auto& st : placed) {
-        MapStatic m{st.mesh, {}};
+        MapStatic m{st.mesh, {}, {}};
         float nearest = 1e30f;
-        for (const auto& r : st.rows) {
+        for (size_t i = 0; i < st.rows.size(); ++i) {
+            const auto& r = st.rows[i];
             const float dx = r[3] - center[0], dy = r[7] - center[1], dz = r[11] - center[2];
             const float d2 = dx * dx + dy * dy + dz * dz;
             if (d2 > r2) continue;
             m.rows.push_back(r);
+            if (!st.sky_order.empty()) m.sky_order.push_back(st.sky_order.at(i));
             nearest = std::min(nearest, d2);
         }
         if (!m.rows.empty()) found.emplace_back(nearest, std::move(m));

@@ -99,9 +99,8 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     const V3 sun = sun_toward(p);
     ext_.set_channel("sun_light_direction", float4{sun.x, sun.y, sun.z, 0});
 
-    auto view = evaluate_scope(view_scope_, ScopeStage::Compute, ext_);
+    const auto view = evaluate_scope(view_scope_, ScopeStage::Compute, ext_);
     if (view.size() < 8) throw std::runtime_error("Original froxel view scope is incomplete");
-    view[6] = {-vm.fwd.x, -vm.fwd.y, -vm.fwd.z, 0};
     const auto frame = ext_.frame_constants();
     auto upload = [&](const auto& values) {
         auto a = gpu.dynamic(values.size() * sizeof(float4));

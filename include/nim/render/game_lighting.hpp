@@ -252,6 +252,7 @@ public:
     void drop_ssr_history() { ssr_history_valid_ = false; }  // the next frame's image is unrelated (map switch)
     ID3D12Resource* specular_ibl() const { return env_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE between frames
     ID3D12Resource* volumetric_layer(int i) const { return vol_blurred_[i ? 1 : 0].Get(); }  // blurred far / near shafts: RGBA16F, quarter resolution, PIXEL_SHADER_RESOURCE
+    ID3D12Resource* volumetric_depth() const { return vol_minmax_.Get(); }  // RGBA32F max/min/mean/coverage, PIXEL_SHADER_RESOURCE
     size_t volumetric_shadows_used() const { return vol_shadows_used_; }  // shafts drawn with a shadow map last frame
     const std::vector<std::string>& light_notes() const { return light_notes_; }
     ID3D12Resource* light_buffer(int i) const { return i ? light_specular_.Get() : light_diffuse_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE
@@ -284,6 +285,7 @@ public:
     bool has_atmosphere() const { return atm_.valid; }
     const std::vector<std::string>& atmosphere_notes() const { return atm_notes_; }
     float default_time_of_day() const { return atm_.valid ? atm_.data.default_time : 0.5f; }
+    float time_of_day(const LightingParams& p) const { return atm_.valid && p.time_of_day >= 0 ? p.time_of_day : default_time_of_day(); }
     // The global channels for these parameters: the render-globals defaults, then (with the map's
     // atmosphere on) the map environment's channel expressions at the time of day, then the
     // weather. Runs every frame in render(); call it first to give the materials the same values.

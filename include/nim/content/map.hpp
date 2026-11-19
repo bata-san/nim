@@ -69,6 +69,7 @@ struct MapStatic {
     TagHash mesh;
     // Per instance: the 3x4 object-to-world rows (rotation * scale, translation in .w).
     std::vector<std::array<float, 12>> rows;
+    std::vector<float> sky_order;  // one authored sort key per row for sky collections
 };
 struct MapLayout {
     TagHash bubble;

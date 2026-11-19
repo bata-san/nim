@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@ struct TfxEnvironment {
     std::function<float4(uint32_t hash)> object_channel;
     std::function<float4(uint8_t texture)> texture_tiling;  // push_tex_tiling (streaming state)
     std::function<float4(uint8_t texture)> texture_layer_count;  // push_tex_layer_count
+    std::function<float(uint8_t operand, uint8_t texture)> atlas_frame_count;  // resolved atlas form of 0x69
     // Set: run as the sequencer VM (global channel expressions), whose 0x4A n pushes input n
     // (0 = time of day, 0..1) and 0x4C n pops to output n.
     std::function<float4(uint8_t input)> sequencer_input;
@@ -46,6 +48,8 @@ struct TfxResult {
 
 // Inspect texture/sampler assignments without evaluating numeric expressions.
 TfxResult inspect_tfx_bindings(std::span<const uint8_t> bytecode);
+// The paired 0x68/0x69 expressions for a diagonally packed animated atlas bound to t0.
+std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bytecode);
 
 // Runs a TFX expression program. `constants` are the stage's bytecode constants; `out` is the
 // cbuffer (pre-filled with the stage's initial cbuffer contents) the program writes into.

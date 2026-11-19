@@ -241,7 +241,7 @@ public:
     // shared across meshes; each mesh is drawn instanced.
     void begin(Gpu& gpu);
     void add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
-                  std::span<const std::array<float, 12>> placements);
+                  std::span<const std::array<float, 12>> placements, std::span<const float> sky_order = {});
     void finish(Gpu& gpu, TagHash tag, V3 center, float radius);
     size_t mesh_count() const { return sets_.size(); }
     size_t instance_count() const { return instance_total_; }
@@ -275,6 +275,7 @@ public:
     size_t transparent_count() const { return transparent_count_; }
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
+    void set_material_time_of_day(float day_fraction) { material_time_of_day_ = day_fraction; }
     // The engine exposure scale (extern 1 +0x1C) the emissive materials read: GameLighting::exposure().
     void set_exposure(float scale) { material_exposure_ = scale; }
     void set_render_inputs(const ExternStore& inputs);
@@ -312,6 +313,8 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> scope_slots;                   // (root parameter, scope_defs_ slot)
         std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
         std::vector<float4> vs_constants, ps_constants;
+        struct AnimatedAtlas { float4 uv; uint16_t frames; };
+        std::optional<AnimatedAtlas> ps_atlas;
         D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
         // Stages that read the object's own position (object channel interpolated_world_position):
         // their constants differ per placement. -1 = not scanned yet.
@@ -348,6 +351,7 @@ private:
     ChannelValues channel_overrides_;
     ChannelValues channel_defaults_;
     float material_time_ = 0, material_delta_ = 0, material_exposure_ = 1;
+    float material_time_of_day_ = 0.5f;
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
     size_t transparent_count_ = 0;
@@ -373,12 +377,14 @@ private:
         // rows 0-3) and the placements; this frame's constants per placement.
         bool dynamic = false;
         std::array<float4, 20> model_cb{};
+        V3 model_center{};
         std::vector<std::array<float, 12>> placements;
+        std::vector<float> sky_order;
         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> object_cb;
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
-                        std::span<const std::array<float, 12>> placements);
+                        std::span<const std::array<float, 12>> placements, std::span<const float> sky_order);
     std::vector<BufferSet> sets_;
     std::vector<std::string> notes_;
     size_t instance_total_ = 0;
@@ -386,6 +392,8 @@ private:
     // world bounding spheres, and per frame the indices that survive into the instance stream.
     struct CullGroup {
         std::vector<std::array<float, 4>> spheres;
+        bool has_transparency = false;
+        std::vector<float> visible_depths;  // follows the compacted instance stream, including LOD order
         uint8_t levels = 1;  // LOD levels the mesh has (bit n = LOD n)
         D3D12_GPU_VIRTUAL_ADDRESS visible_address = 0;
         uint32_t visible = 0;

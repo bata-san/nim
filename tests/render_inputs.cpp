@@ -147,6 +147,13 @@ int main() {
     check(far_point[3] > 0 && std::isfinite(1 / far_point[3]), "sky far point is at infinity");
     const V3 point{far_point[0] / far_point[3], far_point[1] / far_point[3], far_point[2] / far_point[3]};
     check(std::abs(dot(point - camera.eye, camera.fwd) - 50000) < 100, "sky far reconstruction distance is wrong");
+    const float4 camera_back = scene.get_v(ext::View, 0x100);  // third column of +0xE0, PS cb12[6]
+    check(dot(V3{camera_back[0], camera_back[1], camera_back[2]}, camera.fwd) < -0.9999f,
+          "transparent PS would sample its froxel from negative forward depth");
+    const auto center_ray = scene.get_v(ext::View, 0x190);
+    check(center_ray[2] == -1 && center_ray[3] == 0, "screen ray Z does not match the engine camera basis");
+    const auto projection_z = scene.get_v(ext::View, 0xC0);
+    check(projection_z[3] == -1, "engine projection does not project negative view Z in front of the camera");
     std::printf("render input tests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

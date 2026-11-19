@@ -142,6 +142,23 @@ int main() {
     }
 
     {
+        const uint8_t atlas[] = {0x68, 0, 0xBB, 0x53, 0, 0x69, 4, 0, 0x53, 1, 0x68, 5, 0x11, 0x53, 2};
+        CHECK(tfx_animated_atlas_operand(atlas) == 4);
+        CHECK(!tfx_animated_atlas_operand(std::span(atlas).first(10)));
+        TfxEnvironment env;
+        env.texture_layer_count = [](uint8_t) { return float4{0.125f, 0.25f, 0.125f, 0.03125f}; };
+        env.atlas_frame_count = [](uint8_t operand, uint8_t texture) {
+            CHECK(operand == 4 && texture == 0);
+            return 32.0f;
+        };
+        std::array<float4, 3> out{};
+        run_tfx(atlas, {}, out, env);
+        CHECK((out[0] == float4{0.125f, 0.03125f, 0.125f, 0.03125f}));
+        CHECK((out[1] == float4{32, 32, 32, 32}));
+        CHECK((out[2] == float4{0.125f, 0.25f, 0.125f, 0.25f}));
+    }
+
+    {
         // Weather: a state's channels at the middle of their range; unregistered channels skipped.
         WeatherController c;
         c.name = "exp_outpost/hz_emberwave";
