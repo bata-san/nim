@@ -80,6 +80,22 @@ ModelRigIndex index_model_skeletons(PackageManager& pm, const std::unordered_map
 // of the declared size which shares several authored bind joints with another part.
 std::optional<ModelRig> find_assembly_rig(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
                                            const Skeleton& other);
+// For a skinned model with no skeleton reachable from its entity (outfits, bodies and faces the
+// game picks at run time), the skeleton + rig of `bones` bones whose bind joints its skin fits:
+// the mean distance of each vertex to the bone segment it is mostly weighted to. Candidates with
+// equivalent bind poses prefer a rig with clips. None when nothing fits within 20 cm or another
+// skeleton fits nearly as well (within 1.5x). An estimate.
+struct ClipInfo;
+struct SkinFit {
+    ModelRig binding;
+    float error = 0;  // metres
+};
+std::optional<SkinFit> fit_skin_to_skeleton(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
+                                            std::span<const std::array<float, 3>> positions,
+                                            std::span<const std::array<uint16_t, 4>> vertex_bones,
+                                            std::span<const std::array<float, 4>> vertex_weights,
+                                            std::span<const ClipInfo> clips = {},
+                                            std::vector<SkinFit>* ranking = nullptr);
 // Each secondary bone follows the corresponding source bind joint or its own nearest
 // ancestor with a matching bind transform. Unmatched bones stay in bind pose (-1).
 std::vector<int32_t> assembly_pose_map(const Skeleton& source, const Skeleton& target);

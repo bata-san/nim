@@ -546,7 +546,11 @@ private:
                     if (!rigs_) rigs_ = index_model_skeletons(*pm, *materials_, &assemblies_);
                     r.mesh = prepare_entity_preview(*pm, tag, *materials_, assemblies_, permutation,
                                                     channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
-                    if (!thumb && !r.mesh->no_drawable && (rigs_->contains(tag.value) || !r.mesh->attachments.empty())) {
+                    const auto skinned = [](const PreparedMesh& m) {
+                        return std::ranges::any_of(m.buffers, [](const auto& b) { return !b.skin.bones.empty(); });
+                    };
+                    if (!thumb && !r.mesh->no_drawable &&
+                        (rigs_->contains(tag.value) || !r.mesh->attachments.empty() || skinned(*r.mesh))) {
                         try {
                             if (!clips_) clips_ = index_animation_clips(*pm);
                             r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_);
@@ -1874,7 +1878,7 @@ public:
         const auto& clips = binding.clips;
         ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", binding.skeleton.component.str().c_str(), binding.skeleton.size(),
                             binding.rig.component.str().c_str());
-        if (binding.inferred_binding) ImGui::TextDisabled("胴体リグの対応は共通ボーンから推定");
+        if (binding.inferred_binding) ImGui::TextDisabled("スケルトンとリグの対応は推定 (共通ボーン・スキンの一致)");
         if (!binding.followers.empty()) ImGui::TextDisabled("連動パーツ %zu", binding.followers.size());
         if (binding.model != a.model) ImGui::TextDisabled("再生元パーツ %s", binding.model.str().c_str());
         if (clips.empty()) {

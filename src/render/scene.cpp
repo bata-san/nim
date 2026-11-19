@@ -854,9 +854,12 @@ void pack_skin_vertex(V3 p, V3 normal, V3 tangent, uint32_t* pos, uint32_t* nrm)
     nrm[1] = (uint32_t(quant_snorm(tv, 16)) << 16) | (uint32_t(quant_snorm(tu, 16)) & 0xFFFF);
 }
 
-// Packed positions of skinned meshes span twice the model's half-extent, so posed vertices that
-// leave the bind-pose box still fit.
-constexpr float kSkinRange = 2.0f;
+// Packed positions of skinned meshes ((position - offset) / range, 21/21/22-bit snorm) are clamped to
+// [-1, 1]. A range tied to the bind-pose box squashed limbs and parts that a clip moves farther
+// than that, so the range is fixed at 128 m around the model (0.12 mm steps, below the source
+// vertices' own snorm16 precision for models larger than 8 m) unless the model itself is larger.
+constexpr float kSkinMinRange = 128.0f;
+float skin_pack_range(float half_extent) { return std::max(half_extent * 2.0f, kSkinMinRange); }
 
 // The bind pose in the layout the game's compute skinning writes (24-byte layout-7 vertices).
 bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vector<uint32_t>& pos,
@@ -950,7 +953,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         }
         const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
         const bool packed =
-            !mesh.skinning.is_none() && pack_skin_streams(bufs.vb0, scale, s1 * kSkinRange, bufs.skin_pos, bufs.skin_normal);
+            !mesh.skinning.is_none() && pack_skin_streams(bufs.vb0, scale, skin_pack_range(s1), bufs.skin_pos, bufs.skin_normal);
         if (packed) {
             try {
                 bufs.skin = decode_skin_weights(bufs.vb0, load_vertex_buffer(pm, mesh.skinning));
@@ -1032,7 +1035,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     // c8-c11 previous placement (identity before placement), c12/c13 packed-position offset + 1D scale, c15-c18 identity.
     const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
     cb[8] = {1, 0, 0, 0}; cb[9] = {0, 1, 0, 0}; cb[10] = {0, 0, 1, 0}; cb[11] = {0, 0, 0, 1};
-    cb[12] = cb[13] = {offset.x, offset.y, offset.z, s1 * kSkinRange};
+    cb[12] = cb[13] = {offset.x, offset.y, offset.z, skin_pack_range(s1)};
     cb[15] = {1, 0, 0, 0}; cb[16] = {0, 1, 0, 0}; cb[17] = {0, 0, 1, 0}; cb[18] = {0, 0, 0, 1};
     return out;
 }
@@ -1105,7 +1108,30 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
     };
     add(mesh);
     for (const auto& attachment : mesh.attachments) add(attachment);
+    // Parts the entity graph does not bind (outfits, bodies and faces picked at run time): the
+    // skeleton their bind-pose skin fits (estimate).
+    auto fit = [&](Part& part) {
+        std::vector<std::array<float, 3>> positions;
+        std::vector<std::array<uint16_t, 4>> bones;
+        std::vector<std::array<float, 4>> weights;
+        const auto& cb = part.mesh->model_cb;
+        for (const auto& b : part.mesh->buffers) {
+            if (b.skin.bones.empty() || b.vb0.stride < 6 || b.skin.bones.size() * b.vb0.stride > b.vb0.data.size()) continue;
+            for (size_t v = 0; v < b.skin.bones.size(); ++v) {
+                const uint8_t* p = b.vb0.data.data() + v * b.vb0.stride;
+                positions.push_back({s16(p) * cb[4][0] + cb[5][0], s16(p + 2) * cb[4][1] + cb[5][1], s16(p + 4) * cb[4][2] + cb[5][2]});
+            }
+            bones.insert(bones.end(), b.skin.bones.begin(), b.skin.bones.end());
+            weights.insert(weights.end(), b.skin.weights.begin(), b.skin.weights.end());
+        }
+        const auto match = fit_skin_to_skeleton(pm, rigs, part.mesh->bone_count, positions, bones, weights, clips);
+        if (!match) return;
+        part.skeleton = load_skeleton(pm, match->binding.skeleton);
+        part.rig = match->binding.rig;
+        part.inferred = true;
+    };
     auto root = std::ranges::find_if(parts, [&](const Part& p) { return p.mesh->tag == mesh.assembly_root; });
+    if (root == parts.end() && parts.size() > 1) root = parts.begin();
     if (root != parts.end()) {
         if (!root->skeleton) {
             std::optional<ModelRig> inferred;
@@ -1127,6 +1153,8 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
         }
         std::rotate(parts.begin(), root, root + 1);
     }
+    for (auto& part : parts)
+        if (!part.skeleton) fit(part);
     auto valid_skin = [](const Part& part) {
         return part.skeleton && std::ranges::none_of(part.mesh->buffers, [&](const auto& b) {
             return !b.skin.bones.empty() && b.skin.max_bone >= part.skeleton->size();
@@ -1142,7 +1170,7 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
         result = PreviewAnimation{part.mesh->tag, *part.skeleton, std::move(rig), std::move(matches), {}, part.inferred};
         if (!result->clips.empty()) break;
     }
-    if (result && result->model == mesh.assembly_root) {
+    if (result && preferred.is_none() && parts.size() > 1) {
         for (const auto& part : parts) {
             if (part.mesh->tag == result->model || !valid_skin(part)) continue;
             auto map = assembly_pose_map(result->skeleton, *part.skeleton);

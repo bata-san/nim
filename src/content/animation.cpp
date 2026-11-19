@@ -99,18 +99,22 @@ std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r,
     return result;
 }
 
-// S8080A313 groups optional equipment parts. A slot with one choice has a unique preview.
-std::vector<TagHash> read_equipment_entities(PackageManager& pm, const TagReader& r, size_t resource) {
+// S8080A313 groups optional equipment parts. A slot with one choice has a unique preview; every
+// choice of every slot (outfits, variants) is worn on the same skeleton.
+std::vector<TagHash> read_equipment_entities(PackageManager& pm, const TagReader& r, size_t resource, bool all_choices) {
     const auto slots = r.vec_at(resource + 0x98);
     std::vector<TagHash> result;
     if (slots.element_class != 0x8080A320) return result;
     for (uint64_t i = 0; i < slots.count; ++i) {
         const auto choices = r.vec_at(slots.data + size_t(i) * 0x18 + 8);
-        if (choices.count != 1 || choices.element_class != 0x8080A322) continue;
-        const auto child = resolve_wide_hash(pm, r.u32_at(choices.data + 8), r.u64_at(choices.data + 0x10));
-        if (!child) continue;
-        const Entry* entry = pm.entry(*child);
-        if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+        if (choices.element_class != 0x8080A322 || (!all_choices && choices.count != 1)) continue;
+        for (uint64_t k = 0; k < choices.count; ++k) {
+            const size_t row = choices.data + size_t(k) * 0x18;
+            const auto child = resolve_wide_hash(pm, r.u32_at(row + 8), r.u64_at(row + 0x10));
+            if (!child) continue;
+            const Entry* entry = pm.entry(*child);
+            if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+        }
     }
     return result;
 }
@@ -220,7 +224,7 @@ ModelRigIndex index_model_skeletons(
                 else if (cls == 0x808032B3)
                     children_of_component.emplace(tag.value, read_child_entities(pm, r, resource));
                 else if (cls == 0x8080A313 && assemblies)
-                    equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource));
+                    equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource, true));
             } catch (...) {
             }
         }
@@ -364,6 +368,45 @@ ModelRigIndex index_model_skeletons(
         for (const auto& [model, roots] : roots_of) {
             if (roots.size() == 1) assemblies->try_emplace(model, assemblies->at(*roots.begin()));
         }
+        // Bodies built from several skinned models placed by one entity (torso, limbs, head)
+        // share one skeleton and object space: preview them together. The root is a part bound to
+        // a skeleton with a rig, else the one declaring the most bones.
+        std::unordered_map<uint32_t, uint32_t> bones_of;
+        auto skinned_bones = [&](uint32_t model) -> uint32_t {
+            if (const auto it = bones_of.find(model); it != bones_of.end()) return it->second;
+            uint32_t bones = 0;
+            try {
+                const auto m = load_dynamic_model(pm, TagHash(model));
+                if (std::ranges::any_of(m.meshes, [](const DynamicMesh& d) { return !d.skinning.is_none(); })) bones = std::max(1u, m.bone_count);
+            } catch (const std::exception&) {
+            }
+            return bones_of[model] = bones;
+        };
+        std::unordered_map<uint32_t, std::vector<TagHash>> groups;
+        std::unordered_set<uint32_t> grouped_twice;
+        for (const auto& [entity, node] : bindings) {
+            if (node.models.size() < 2) continue;
+            std::vector<TagHash> parts;
+            for (uint32_t model : node.models)
+                if (skinned_bones(model)) parts.emplace_back(model);
+            std::ranges::sort(parts);
+            parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+            if (parts.size() < 2) continue;
+            auto root = std::ranges::max_element(parts, [&](TagHash a, TagHash b) {
+                const auto key = [&](TagHash t) {
+                    const auto it = out.find(t.value);
+                    return std::pair(it != out.end() && !it->second.rig.is_none(), skinned_bones(t.value));
+                };
+                return key(a) < key(b);
+            });
+            std::rotate(parts.begin(), root, root + 1);
+            for (TagHash part : parts) {
+                const auto [found, fresh] = groups.try_emplace(part.value, parts);
+                if (!fresh && found->second != parts) grouped_twice.insert(part.value);
+            }
+        }
+        for (const auto& [model, parts] : groups)
+            if (!grouped_twice.contains(model)) assemblies->try_emplace(model, parts);
     }
     return out;
 }
@@ -719,6 +762,90 @@ std::vector<ClipInfo> compatible_animation_clips(PackageManager& pm, const Model
     return result;
 }
 
+std::optional<SkinFit> fit_skin_to_skeleton(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
+                                            std::span<const std::array<float, 3>> positions,
+                                            std::span<const std::array<uint16_t, 4>> vertex_bones,
+                                            std::span<const std::array<float, 4>> vertex_weights,
+                                            std::span<const ClipInfo> clips, std::vector<SkinFit>* ranking) {
+    if (!bones || positions.empty() || vertex_bones.size() != positions.size() || vertex_weights.size() != positions.size())
+        return std::nullopt;
+    // Up to ~4000 vertices, each with its dominant bone.
+    std::vector<std::pair<size_t, uint16_t>> samples;
+    const size_t step = std::max<size_t>(1, positions.size() / 4000);
+    for (size_t v = 0; v < positions.size(); v += step) {
+        size_t k = 0;
+        for (size_t j = 1; j < 4; ++j)
+            if (vertex_weights[v][j] > vertex_weights[v][k]) k = j;
+        if (vertex_weights[v][k] < 0.5f || vertex_bones[v][k] >= bones) continue;
+        samples.emplace_back(v, vertex_bones[v][k]);
+    }
+    if (samples.size() < 16) return std::nullopt;
+    struct Candidate {
+        ModelRig binding;
+        float error = 0;
+        Skeleton skeleton;
+        size_t clips = 0;
+    };
+    std::vector<Candidate> candidates;
+    std::set<std::pair<TagHash, TagHash>> seen;
+    for (const auto& [model, binding] : models) {
+        if (binding.rig.is_none() || !seen.emplace(binding.skeleton, binding.rig).second) continue;
+        try {
+            Skeleton sk = load_skeleton(pm, binding.skeleton);
+            if (sk.size() != bones) continue;
+            // Each bone's segments: to its children, or a point without children.
+            std::vector<std::vector<size_t>> children(sk.size());
+            for (size_t b = 0; b < sk.size(); ++b)
+                if (sk.parents[b] >= 0) children[size_t(sk.parents[b])].push_back(b);
+            double sum = 0;
+            for (const auto& [v, b] : samples) {
+                const auto& p = positions[v];
+                const auto& a = sk.bind[b].translation;
+                auto dist = [&](const std::array<float, 3>& e) {
+                    const float d[3]{e[0] - a[0], e[1] - a[1], e[2] - a[2]};
+                    const float w[3]{p[0] - a[0], p[1] - a[1], p[2] - a[2]};
+                    const float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    const float t = dd > 1e-12f ? std::clamp((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / dd, 0.0f, 1.0f) : 0.0f;
+                    const float x = w[0] - d[0] * t, y = w[1] - d[1] * t, z = w[2] - d[2] * t;
+                    return std::sqrt(x * x + y * y + z * z);
+                };
+                float best = dist(a);
+                for (size_t c : children[b]) best = std::min(best, dist(sk.bind[c].translation));
+                sum += best;
+            }
+            Candidate c{binding, float(sum / double(samples.size())), std::move(sk), 0};
+            if (!clips.empty()) {
+                try {
+                    c.clips = compatible_animation_clips(pm, models, load_animation_rig(pm, binding.rig), clips).size();
+                } catch (const std::exception&) {
+                }
+            }
+            candidates.push_back(std::move(c));
+        } catch (const std::exception&) {
+        }
+    }
+    if (candidates.empty()) return std::nullopt;
+    std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+        return a.error != b.error ? a.error < b.error : a.binding.rig < b.binding.rig;
+    });
+    if (ranking)
+        for (const auto& c : candidates) ranking->push_back({c.binding, c.error});
+    // Skin vertices lie on the surface, a few centimetres from the bone segments. Skeletons that fit
+    // to within 1 mm are the same bind pose under another tag: among those take the rig with the
+    // most clips. Another skeleton must fit clearly worse (1.5x), else the choice is ambiguous.
+    const float best_error = candidates.front().error;
+    if (best_error > 0.2f) return std::nullopt;
+    const Candidate* best = &candidates.front();
+    for (const auto& c : candidates) {
+        if (c.error > best_error + 0.001f) {
+            if (c.error < best_error * 1.5f) return std::nullopt;
+            break;
+        }
+        if (c.clips > best->clips) best = &c;
+    }
+    return SkinFit{best->binding, best->error};
+}
+
 void sample_clip(const AnimationClip& clip, float frame, std::vector<BoneTransform>& local) {
     const float last = float(clip.frame_count - 1);
     frame = std::clamp(frame, 0.0f, last);
@@ -758,12 +885,33 @@ void sample_clip(const AnimationClip& clip, float frame, std::vector<BoneTransfo
 }
 
 bool is_additive(const AnimationRig& rig, const AnimationClip& clip) {
+    // Each tracked bone whose default pose is clearly away from identity votes for the pose its
+    // first frame is nearer to: a delta stays near identity (zero offset), a full pose near the
+    // default. Partial deltas (faces, upper body) move several bones by 10-20 degrees, so the
+    // nearer pose decides rather than a fixed identity threshold.
     size_t votes = 0, at_identity = 0;
+    auto angle = [](const Q& a, const Q& b) {
+        return std::acos(std::min(1.0f, std::fabs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])));
+    };
     for (const auto& t : clip.rotations) {
-        if (t.bone >= rig.size() || !rig.object_space[t.bone] || t.frames.empty()) continue;
-        if (std::fabs(rig.default_pose[t.bone].rotation[3]) > 0.995f) continue;  // identity in the full pose too
+        if (t.bone >= rig.size() || t.frames.empty()) continue;
+        const Q& rest = rig.default_pose[t.bone].rotation;
+        const float to_rest = angle(t.frames[0], rest), to_identity = angle(t.frames[0], {0, 0, 0, 1});
+        if (angle(rest, {0, 0, 0, 1}) < 0.25f) continue;  // under ~30 degrees: identity in a full pose too
         ++votes;
-        if (std::fabs(t.frames[0][3]) > 0.995f) ++at_identity;
+        if (to_identity < to_rest) ++at_identity;
+    }
+    for (const auto& t : clip.translations) {
+        if (t.bone >= rig.size() || t.frames.empty() || rig.object_space[t.bone]) continue;
+        const auto& rest = rig.default_pose[t.bone].translation;
+        const float rest_len = std::sqrt(rest[0] * rest[0] + rest[1] * rest[1] + rest[2] * rest[2]);
+        if (rest_len < 0.01f) continue;
+        const auto& v = t.frames[0];
+        const float to_zero = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        const float to_rest = std::sqrt((v[0] - rest[0]) * (v[0] - rest[0]) + (v[1] - rest[1]) * (v[1] - rest[1]) +
+                                        (v[2] - rest[2]) * (v[2] - rest[2]));
+        ++votes;
+        if (to_zero < to_rest) ++at_identity;
     }
     return votes > 0 && at_identity * 2 > votes;
 }
@@ -771,7 +919,27 @@ bool is_additive(const AnimationRig& rig, const AnimationClip& clip) {
 void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationClip& clip, float frame,
                    std::vector<BoneTransform>& object) {
     std::vector<BoneTransform> pose = rig.default_pose;
-    if (is_additive(rig, clip)) {
+    // Clips shared by rigs of other proportions carry their own limb offsets. A parent-relative
+    // translation track that never comes near this rig's rest offset was authored for another
+    // body: keep the bind offset so limbs keep their length. Tracks that start from the rest
+    // offset (sliding parts, jaws) play as authored.
+    std::vector<uint8_t> foreign_offset(rig.size(), 0);
+    const bool additive = is_additive(rig, clip);
+    if (!additive) {
+        for (const auto& t : clip.translations) {
+            if (t.bone >= rig.size() || rig.object_space[t.bone] || t.frames.empty()) continue;
+            const auto& rest = rig.default_pose[t.bone].translation;
+            const float length = std::sqrt(rest[0] * rest[0] + rest[1] * rest[1] + rest[2] * rest[2]);
+            const float tolerance = std::max(0.005f, 0.1f * length);
+            float nearest = 1e30f;
+            for (const auto& v : t.frames) {
+                const float x = v[0] - rest[0], y = v[1] - rest[1], z = v[2] - rest[2];
+                nearest = std::min(nearest, std::sqrt(x * x + y * y + z * z));
+            }
+            if (nearest > tolerance) foreign_offset[t.bone] = 1;
+        }
+    }
+    if (additive) {
         std::vector<BoneTransform> delta(rig.size());
         sample_clip(clip, frame, delta);
         for (size_t i = 0; i < rig.size(); ++i) {
@@ -800,29 +968,37 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
             }
             const int32_t ri = rig_of[b];
             BoneTransform& o = object[b];
+            // A rig node need not share its bone's frame: feet and hands are animated as targets
+            // aligned to the object axes. The bone keeps its bind offset from the node's default
+            // pose (identity where they agree, as for most bones).
+            auto attached = [&](const Q& clip, const Q& bone_rest) {
+                const Q& node_rest = rig.default_pose[size_t(ri)].rotation;
+                const Q offset = qmul({-node_rest[0], -node_rest[1], -node_rest[2], node_rest[3]}, bone_rest);
+                return qnormalize(qmul(clip, offset));
+            };
             if (p < 0) {
                 o = sk.bind[b];
-                if (ri >= 0) o.rotation = pose[size_t(ri)].rotation;
+                if (ri >= 0) o.rotation = attached(pose[size_t(ri)].rotation, sk.bind[b].rotation);
             } else {
                 const BoneTransform& po = object[size_t(p)];
                 auto local = sk.local_bind[b];
                 if (ri >= 0 && !rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
                     const auto& rest = rig.default_pose[size_t(ri)];
-                    local.rotation = c.rotation;
+                    local.rotation = attached(c.rotation, sk.local_bind[b].rotation);
                     // A matching rest offset establishes that this track uses the local
                     // skeleton space and units. Variant rigs can have different proportions.
                     float rest_error = 0;
                     for (int k = 0; k < 3; ++k)
                         rest_error = std::max(rest_error, std::fabs(rest.translation[k] - local.translation[k]));
-                    if (rest_error <= 0.0001f) local.translation = c.translation;
+                    if (rest_error <= 0.0001f && !foreign_offset[size_t(ri)]) local.translation = c.translation;
                     if (std::fabs(local.scale - rest.scale) <= 0.001f && c.scale > 0 && std::isfinite(c.scale))
                         local.scale = c.scale;
                 }
                 o = po * local;
                 if (ri >= 0 && rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
-                    o.rotation = c.rotation;
+                    o.rotation = attached(c.rotation, sk.bind[b].rotation);
                     if (sk.parents[size_t(p)] < 0)
                         for (int k = 0; k < 3; ++k) o.translation[k] = sk.bind[b].translation[k] + c.translation[k];
                 }

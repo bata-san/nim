@@ -27,7 +27,8 @@
 //   nimcli [--install DIR] rig COMPONENT                animation rig (8080AD7E): rig -> skeleton bones, spaces
 //   nimcli [--install DIR] clip TAG [FRAME]             decode an animation clip (8080AE01), print one frame
 //   nimcli [--install DIR] clips [BONES]                decode every clip (or those with BONES bones)
-//   nimcli [--install DIR] clipfit MODEL                pose the model's skeleton with every clip of its rig
+//   nimcli [--install DIR] animaudit                    skinned models without skeleton / rig / clips; rigs whose clips stretch bones
+//   nimcli [--install DIR] clipfit MODEL [-v]           pose the model's skeleton with every clip of its rig (-v: per clip)
 //   nimcli [--install DIR] skin MODEL                   skin weight summary of a dynamic model
 //   nimcli [--install DIR] survey-entities               prepare every ENTITIES entry and histogram outcomes
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
@@ -1329,14 +1330,151 @@ int cmd_rig(PackageManager& pm, TagHash tag) {
         std::println("{:3} -> skeleton {:3}  {:6}  rot ({:6.3f},{:6.3f},{:6.3f},{:6.3f}) pos ({:7.4f},{:7.4f},{:7.4f})", i,
                      rig.skeleton_bone[i], rig.object_space[i] ? "object" : "local", t.rotation[0], t.rotation[1], t.rotation[2],
                      t.rotation[3], t.translation[0], t.translation[1], t.translation[2]);
+        // The authored 72-byte node: hash, i16 fields, then the rest as hex.
+        const uint8_t* n = rig.node_layout.data() + i * 72;
+        int16_t f[4];
+        std::memcpy(f, n + 4, 8);
+        std::string hex;
+        for (size_t k = 12; k < 72; ++k) hex += std::format("{:02X}{}", n[k], (k % 4 == 3) ? " " : "");
+        std::println("      node hash {:08X} i16 ({},{},{},{})  {}", *reinterpret_cast<const uint32_t*>(n), f[0], f[1], f[2], f[3], hex);
     }
+    return 0;
+}
+
+// Largest change of a bone's distance to its parent over sampled frames (bones under the root
+// move freely and are skipped). A correct pose keeps it near zero.
+float clip_stretch(const Skeleton& sk, const AnimationRig& rig, const AnimationClip& c, std::vector<int>* worst_bone = nullptr) {
+    float stretch = 0;
+    std::vector<BoneTransform> object;
+    auto len = [](const auto& a, const auto& b) {
+        const float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+        return std::sqrt(x * x + y * y + z * z);
+    };
+    for (uint32_t fr = 0; fr < c.frame_count; fr += std::max(1u, c.frame_count / 8)) {
+        pose_skeleton(sk, rig, c, float(fr), object);
+        for (size_t b = 0; b < sk.size(); ++b) {
+            const int32_t p = sk.parents[b];
+            if (p < 0 || sk.parents[size_t(p)] < 0) continue;
+            const float e = std::fabs(len(object[b].translation, object[size_t(p)].translation) -
+                                      len(sk.bind[b].translation, sk.bind[size_t(p)].translation));
+            if (e > 0.02f && worst_bone) worst_bone->push_back(int(b));
+            if (e > 0.1f && std::getenv("NIM_STRETCH_DEBUG")) {
+                const auto& o = object[b];
+                const auto& q = object[size_t(p)];
+                std::println("    frame {} bone {} ({:.3f},{:.3f},{:.3f}) s{:.3f} parent {} ({:.3f},{:.3f},{:.3f}) s{:.3f}", fr, b, o.translation[0],
+                             o.translation[1], o.translation[2], o.scale, p, q.translation[0], q.translation[1], q.translation[2], q.scale);
+            }
+            stretch = std::max(stretch, e);
+        }
+    }
+    return stretch;
+}
+
+// Every skinned dynamic model: whether it has a skeleton, a rig and clips, and for each rig the
+// share of its clips that stretch bones (a wrong rig binding or pose composition).
+int cmd_animaudit(PackageManager& pm) {
+    pm.build_hash64_index();
+    const auto materials = index_dynamic_model_materials(pm);
+    ModelAssemblyIndex assemblies;
+    const auto rigs = index_model_skeletons(pm, materials, &assemblies);
+    const auto clips = index_animation_clips(pm);
+    size_t skinned = 0, no_skeleton = 0, no_rig = 0, no_clips = 0, assembled = 0, fitted = 0;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> by_rig;
+    std::vector<std::string> missing;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassDynamicModel) continue;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            DynamicModel m;
+            try { m = load_dynamic_model(pm, tag); } catch (...) { continue; }
+            if (std::ranges::none_of(m.meshes, [](const DynamicMesh& d) { return !d.skinning.is_none(); })) continue;
+            ++skinned;
+            const auto it = rigs.find(tag.value);
+            if (it == rigs.end()) {
+                ++no_skeleton;
+                if (assemblies.contains(tag.value)) ++assembled;
+                // The skeleton its bind-pose skin fits (what the viewer uses).
+                std::vector<std::array<float, 3>> positions;
+                std::vector<std::array<uint16_t, 4>> bones;
+                std::vector<std::array<float, 4>> weights;
+                for (const auto& d : m.meshes) {
+                    if (d.skinning.is_none()) continue;
+                    try {
+                        const auto vb0 = load_vertex_buffer(pm, d.vertex0);
+                        const auto skin = decode_skin_weights(vb0, load_vertex_buffer(pm, d.skinning));
+                        for (size_t v = 0; v < skin.bones.size(); ++v) {
+                            const uint8_t* q = vb0.data.data() + v * vb0.stride;
+                            int16_t c[3];
+                            std::memcpy(c, q, 6);
+                            positions.push_back({c[0] / 32767.0f * m.model_scale[0] + m.model_offset[0], c[1] / 32767.0f * m.model_scale[1] + m.model_offset[1],
+                                                 c[2] / 32767.0f * m.model_scale[2] + m.model_offset[2]});
+                        }
+                        bones.insert(bones.end(), skin.bones.begin(), skin.bones.end());
+                        weights.insert(weights.end(), skin.weights.begin(), skin.weights.end());
+                    } catch (...) {
+                    }
+                }
+                std::vector<SkinFit> ranking;
+                const auto fit = fit_skin_to_skeleton(pm, rigs, m.bone_count, positions, bones, weights, clips, &ranking);
+                if (fit) ++fitted;
+                std::string ranked;
+                for (size_t k = 0; k < std::min<size_t>(3, ranking.size()); ++k)
+                    ranked += std::format(" {}:{:.1f}cm", ranking[k].binding.skeleton.str(), ranking[k].error * 100);
+                missing.push_back(std::format("{} bones {:3}{}  {}", tag.str(), m.bone_count, assemblies.contains(tag.value) ? " (assembly part)" : "",
+                                              fit ? std::format("fits skeleton {} rig {} ({:.1f} cm)", fit->binding.skeleton.str(),
+                                                                fit->binding.rig.str(), fit->error * 100)
+                                                  : std::format("no fit ({} candidates{})", ranking.size(), ranked)));
+                continue;
+            }
+            if (it->second.rig.is_none()) { ++no_rig; continue; }
+            by_rig[{it->second.skeleton.value, it->second.rig.value}].push_back(tag.value);
+        }
+    }
+    size_t rigs_bad = 0;
+    for (const auto& [key, models] : by_rig) {
+        try {
+            const Skeleton sk = load_skeleton(pm, TagHash(key.first));
+            const AnimationRig rig = load_animation_rig(pm, TagHash(key.second));
+            const auto matches = compatible_animation_clips(pm, rigs, rig, clips);
+            if (matches.empty()) { no_clips += models.size(); continue; }
+            size_t bad = 0, tested = 0;
+            std::map<int, size_t> bones;
+            for (size_t k = 0; k < matches.size(); k += std::max<size_t>(1, matches.size() / 60)) {
+                AnimationClip c;
+                try { c = load_animation_clip(pm, matches[k].tag); } catch (...) { continue; }
+                std::vector<int> worst;
+                ++tested;
+                if (clip_stretch(sk, rig, c, &worst) > 0.02f) ++bad;
+                for (int b : worst) ++bones[b];
+            }
+            if (bad * 10 > tested) {
+                ++rigs_bad;
+                std::string list;
+                for (const auto& [b, n] : bones) list += std::format(" {}x{}", b, n);
+                std::println("rig {} skeleton {} ({} bones, {} models e.g. {}): {}/{} clips stretch;{}", TagHash(key.second).str(),
+                             TagHash(key.first).str(), sk.size(), models.size(), TagHash(models.front()).str(), bad, tested, list);
+            }
+        } catch (const std::exception& ex) {
+            std::println("rig {}: {}", TagHash(key.second).str(), ex.what());
+        }
+    }
+    std::println("skinned models {}: no skeleton {} ({} in assemblies, {} fitted by skin), no rig {}, rig without clips {}, rigs with stretching clips {}/{}",
+                 skinned, no_skeleton, assembled, fitted, no_rig, no_clips, rigs_bad, by_rig.size());
+    std::map<TagHash, size_t> roots;
+    for (const auto& [model, parts] : assemblies) roots[parts.front()] = parts.size();
+    std::println("assembled previews {} (root: parts)", roots.size());
+    for (const auto& [root, n] : roots) std::print(" {}:{}", root.str(), n);
+    std::println("");
+    for (const auto& m : missing) std::println("  no skeleton: {}", m);
     return 0;
 }
 
 // Poses a model's skeleton with every compatible clip and reports, per codec, how
 // far bones move from the bind pose and how low the lowest bone goes (a wrong decoder or rig
 // mapping shows up as large displacements and bones far below the ground).
-int cmd_clipfit(PackageManager& pm, TagHash model) {
+int cmd_clipfit(PackageManager& pm, TagHash model, bool verbose) {
     pm.build_hash64_index();
     auto skeletons = index_model_skeletons(pm, index_dynamic_model_materials(pm));
     auto f = skeletons.find(model.value);
@@ -1348,7 +1486,7 @@ int cmd_clipfit(PackageManager& pm, TagHash model) {
     AnimationRig rig = load_animation_rig(pm, f->second.rig);
     std::println("model {} skeleton {} ({} bones) rig {} ({} bones)", model.str(), sk.component.str(), sk.size(), rig.component.str(),
                  rig.size());
-    std::map<std::string, std::vector<float>> moved, lowest, to_default;
+    std::map<std::string, std::vector<float>> moved, lowest, to_default, stretches;
     size_t additive = 0;
     std::vector<BoneTransform> object;
     for (const auto& info : compatible_animation_clips(pm, skeletons, rig, index_animation_clips(pm))) {
@@ -1378,6 +1516,17 @@ int cmd_clipfit(PackageManager& pm, TagHash model) {
                 ++count;
             }
         }
+        std::vector<int> stretched;
+        const float stretch = clip_stretch(sk, rig, c, &stretched);
+        std::map<int, size_t> worst_count;
+        for (int bone : stretched) ++worst_count[bone];
+        stretches[clip_codec_name(c.codec)].push_back(stretch);
+        if (verbose) {
+            std::string bad;
+            for (const auto& [bone, n] : worst_count) bad += std::format(" {}", bone);
+            std::println("  {} {:7} frames {:4} {} max stretch {:.4f}{}", c.tag.str(), clip_codec_name(c.codec), c.frame_count,
+                         is_additive(rig, c) ? "additive" : "full    ", stretch, bad);
+        }
         if (is_additive(rig, c)) ++additive;
         moved[clip_codec_name(c.codec)].push_back(sum / float(std::max<size_t>(1, count)));
         lowest[clip_codec_name(c.codec)].push_back(low);
@@ -1395,6 +1544,10 @@ int cmd_clipfit(PackageManager& pm, TagHash model) {
         std::sort(l.begin(), l.end());
         std::println("{:8} clips {:4}  mean bone displacement p25 {:.3f} p50 {:.3f} p90 {:.3f}   lowest bone z p10 {:.3f} p50 {:.3f}", k,
                      v.size(), pct(v, 25), pct(v, 50), pct(v, 90), pct(l, 10), pct(l, 50));
+        auto& st = stretches[k];
+        std::sort(st.begin(), st.end());
+        std::println("{:8}             max bone stretch (m) p50 {:.4f} p90 {:.4f} max {:.4f}", "", pct(st, 50), pct(st, 90),
+                     st.empty() ? 0.0f : st.back());
         auto& a = to_default[k];
         std::sort(a.begin(), a.end());
         std::println("{:8}             animated rotations vs rig default pose, median angle p25 {:.1f} p50 {:.1f} p90 {:.1f} deg", "", pct(a, 25),
@@ -1757,9 +1910,10 @@ int main(int argc, char** argv) {
         if (cmd == "scope" && args.size() >= 2) return cmd_scope(pm, TagHash(parse_hex(args[1])));
         if (cmd == "technique" && args.size() >= 2) return cmd_technique(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skeleton" && args.size() >= 2) return cmd_skeleton(pm, TagHash(parse_hex(args[1])));
-        if (cmd == "clipfit" && args.size() >= 2) return cmd_clipfit(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "clipfit" && args.size() >= 2) return cmd_clipfit(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");
         if (cmd == "rig" && args.size() >= 2) return cmd_rig(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skeletons") return cmd_skeletons(pm);
+        if (cmd == "animaudit") return cmd_animaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
