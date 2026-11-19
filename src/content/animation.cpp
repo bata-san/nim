@@ -194,7 +194,12 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
         rig.skeleton_bone.push_back(r.u16_at(to_skeleton.data + size_t(i) * 2));
         const int16_t space = int16_t(r.u16_at(nodes.data + size_t(i) * 72 + 8));
         rig.object_space.push_back(space == 2 || space == 6);
-        rig.default_pose.push_back(read_transform(r, pose.data + size_t(i) * 32));
+        const auto rest = read_transform(r, pose.data + size_t(i) * 32);
+        const bool identity = std::fabs(rest.rotation[3]) > 0.999999f &&
+                              std::ranges::all_of(rest.translation, [](float v) { return std::fabs(v) < 1e-5f; }) &&
+                              std::fabs(rest.scale - 1) < 1e-5f;
+        rig.bind_relative.push_back(space == 1 && identity);
+        rig.default_pose.push_back(rest);
     }
     return rig;
 }
@@ -924,8 +929,42 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
     // body: keep the bind offset so limbs keep their length. Tracks that start from the rest
     // offset (sliding parts, jaws) play as authored.
     std::vector<uint8_t> foreign_offset(rig.size(), 0);
+    // Rig nodes with an identity rest (bind_relative) may hold either offsets from the bind pose
+    // (weapon rigs) or the full parent-relative transform: a track that reaches the bone's bind
+    // offset / rotation is a full transform, one that reaches zero / identity is an offset.
+    std::vector<int32_t> rig_to_skeleton_parent_child(rig.size(), -1);
+    for (size_t i = 0; i < rig.size(); ++i)
+        if (rig.skeleton_bone[i] < sk.size()) rig_to_skeleton_parent_child[i] = rig.skeleton_bone[i];
+    std::vector<uint8_t> offset_translation(rig.size(), 0), offset_rotation(rig.size(), 1);
     const bool additive = is_additive(rig, clip);
     if (!additive) {
+        auto bind_relative = [&](size_t bone) { return bone < rig.bind_relative.size() && rig.bind_relative[bone]; };
+        for (const auto& t : clip.rotations) {
+            if (t.bone >= rig.size() || !bind_relative(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
+            const Q& bind = sk.local_bind[size_t(rig_to_skeleton_parent_child[t.bone])].rotation;
+            float to_bind = 1e30f, to_identity = 1e30f;
+            for (const auto& q : t.frames) {
+                to_bind = std::min(to_bind, 1 - std::fabs(q[0] * bind[0] + q[1] * bind[1] + q[2] * bind[2] + q[3] * bind[3]));
+                to_identity = std::min(to_identity, 1 - std::fabs(q[3]));
+            }
+            offset_rotation[t.bone] = to_identity <= to_bind;
+        }
+        for (const auto& t : clip.translations) {
+            if (t.bone >= rig.size() || !bind_relative(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
+            const auto& bind = sk.local_bind[size_t(rig_to_skeleton_parent_child[t.bone])].translation;
+            const float length = std::sqrt(bind[0] * bind[0] + bind[1] * bind[1] + bind[2] * bind[2]);
+            const float tolerance = std::max(0.005f, 0.1f * length);
+            float to_bind = 1e30f, to_zero = 1e30f;
+            for (const auto& v : t.frames) {
+                const float x = v[0] - bind[0], y = v[1] - bind[1], z = v[2] - bind[2];
+                to_bind = std::min(to_bind, std::sqrt(x * x + y * y + z * z));
+                to_zero = std::min(to_zero, std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));
+            }
+            // 1: an offset from the bind pose; 2: the full offset; 0: another body's, keep the bind.
+            // A full transform must reproduce this skeleton's own offset; a track only near it was authored
+            // for another body sharing the rig (its proportions) and keeps the bind.
+            offset_translation[t.bone] = to_zero <= tolerance && to_zero <= to_bind ? 1 : to_bind <= std::max(0.005f, 0.01f * length) ? 2 : 0;
+        }
         for (const auto& t : clip.translations) {
             if (t.bone >= rig.size() || rig.object_space[t.bone] || t.frames.empty()) continue;
             const auto& rest = rig.default_pose[t.bone].translation;
@@ -985,15 +1024,25 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 if (ri >= 0 && !rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
                     const auto& rest = rig.default_pose[size_t(ri)];
-                    local.rotation = attached(c.rotation, sk.local_bind[b].rotation);
-                    // A matching rest offset establishes that this track uses the local
-                    // skeleton space and units. Variant rigs can have different proportions.
-                    float rest_error = 0;
-                    for (int k = 0; k < 3; ++k)
-                        rest_error = std::max(rest_error, std::fabs(rest.translation[k] - local.translation[k]));
-                    if (rest_error <= 0.0001f && !foreign_offset[size_t(ri)]) local.translation = c.translation;
-                    if (std::fabs(local.scale - rest.scale) <= 0.001f && c.scale > 0 && std::isfinite(c.scale))
-                        local.scale = c.scale;
+                    if (size_t(ri) < rig.bind_relative.size() && rig.bind_relative[size_t(ri)] && !additive) {
+                        // Local-mode weapon rigs can store offsets from the model bind pose.
+                        local.rotation = offset_rotation[size_t(ri)] ? qnormalize(qmul(c.rotation, local.rotation)) : c.rotation;
+                        if (offset_translation[size_t(ri)] == 1)
+                            for (int k = 0; k < 3; ++k) local.translation[k] += c.translation[k];
+                        else if (offset_translation[size_t(ri)] == 2)
+                            local.translation = c.translation;
+                        if (c.scale > 0 && std::isfinite(c.scale)) local.scale *= c.scale;
+                    } else {
+                        local.rotation = attached(c.rotation, sk.local_bind[b].rotation);
+                        // A matching rest offset establishes that this track uses the local
+                        // skeleton space and units. Variant rigs can have different proportions.
+                        float rest_error = 0;
+                        for (int k = 0; k < 3; ++k)
+                            rest_error = std::max(rest_error, std::fabs(rest.translation[k] - local.translation[k]));
+                        if (rest_error <= 0.0001f && !foreign_offset[size_t(ri)]) local.translation = c.translation;
+                        if (std::fabs(local.scale - rest.scale) <= 0.001f && c.scale > 0 && std::isfinite(c.scale))
+                            local.scale = c.scale;
+                    }
                 }
                 o = po * local;
                 if (ri >= 0 && rig.object_space[size_t(ri)]) {

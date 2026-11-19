@@ -217,6 +217,13 @@ int main() {
         rig.default_pose[1].translation[2] = 3;
         pose_skeleton(mechanism, rig, clip, 1, posed);
         CHECK(posed[1].translation[2] == 1);
+        rig.bind_relative = {0, 1};
+        rig.default_pose[1] = {};
+        clip.translations[0].frames = {{{0, 0, 0}, {0, 0, 1}}};
+        pose_skeleton(mechanism, rig, clip, 0, posed);
+        CHECK(posed[1] == mechanism.bind[1]);
+        pose_skeleton(mechanism, rig, clip, 1, posed);
+        CHECK(posed[1].translation[2] == 2);
 
         // A matching joint follows by name and bind transform even when the part's bone order differs.
         Skeleton attachment;

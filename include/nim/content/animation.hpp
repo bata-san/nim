@@ -60,6 +60,7 @@ struct AnimationRig {
     TagHash component;
     std::vector<uint16_t> skeleton_bone;      // rig bone -> skeleton bone
     std::vector<uint8_t> object_space;        // rig bone: rotation is object space, not parent-relative
+    std::vector<uint8_t> bind_relative;      // local mode with identity rig rest transform
     std::vector<BoneTransform> default_pose;  // rig order
     std::vector<AnimationBoneGroup> bone_groups;
     std::vector<uint8_t> node_layout;         // full authored node records for layout comparisons
