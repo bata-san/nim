@@ -1,6 +1,7 @@
 // Unit tests that do not need a game install.
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
+#include "nim/content/codex.hpp"
 #include "nim/content/usm.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
@@ -323,6 +324,31 @@ int main() {
     ui::Lang parsed = ui::Lang::Ja;
     CHECK(ui::parse_lang("ko", parsed) && parsed == ui::Lang::Ko);
     CHECK(!ui::parse_lang("fr", parsed));
+
+    // Codex definition table: one entry with one display component.
+    {
+        std::vector<uint8_t> b(0x80, 0);
+        auto w32 = [&](size_t o, uint32_t v) { std::memcpy(&b[o], &v, 4); };
+        auto w64 = [&](size_t o, uint64_t v) { std::memcpy(&b[o], &v, 8); };
+        w64(0x00, b.size());
+        w64(0x08, 1); w64(0x10, 0x10);                        // Vec -> header at 0x20
+        w64(0x20, 1); w32(0x28, nim::kClassCodexDefinition);
+        w32(0x30, 0x11111111); w32(0x34, nim::kCodexKindEntry);
+        w64(0x38, 1); w64(0x40, 0x10);                        // components -> header at 0x50
+        w64(0x50, 1); w32(0x58, 0x808028EB);
+        w64(0x60, 0x0C);                                      // pointer -> 0x6C
+        w32(0x68, nim::kClassCodexDisplay);
+        w32(0x74, 0xCAFEF00D);                                // title hash at +8
+        auto defs = nim::parse_codex_definitions(b);
+        CHECK(defs.size() == 1);
+        CHECK(defs[0].hash == 0x11111111 && defs[0].kind == nim::kCodexKindEntry);
+        CHECK(defs[0].components.size() == 1);
+        CHECK(defs[0].components[0].cls == nim::kClassCodexDisplay && defs[0].components[0].offset == 0x6C);
+        w64(0x60, 0x1000);                                    // pointer out of range
+        bool threw = false;
+        try { nim::parse_codex_definitions(b); } catch (...) { threw = true; }
+        CHECK(threw);
+    }
 
     if (g_failures) return 1;
     std::puts("all tests passed");

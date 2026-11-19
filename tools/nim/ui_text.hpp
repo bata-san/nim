@@ -29,6 +29,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(NavText, "テキスト", "Text", "텍스트")                                                                              \
     X(NavDialogue, "台詞", "Dialogue", "대사")                                                                            \
     X(NavMovies, "ムービー", "Movies", "영상")                                                                            \
+    X(NavCodex, "コデックス", "Codex", "코덱스") \
     X(NavPackages, "パッケージ", "Packages", "패키지")                                                                    \
     X(NavLog, "ログ", "Log", "로그")                                                                                      \
     X(NavSettings, "設定", "Settings", "설정")                                                                            \
@@ -52,6 +53,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(DescMovies, "ムービー (USM) を音声トラック・字幕の言語を選んで再生",                                              \
       "Play USM movies with a chosen audio track and subtitle language",                                                   \
       "USM 영상을 음성 트랙과 자막 언어를 골라 재생합니다")                                                                 \
+    X(DescCodex, "ゲーム内コデックスの記録を全言語で読み、音声ログを再生", "Read the in-game codex records in every language and play their audio logs", "게임 내 코덱스 기록을 모든 언어로 읽고 음성 로그를 재생합니다") \
     X(DescPackages, "パッケージとエントリの生データ", "Raw package entries and bytes", "패키지 항목과 원시 데이터")              \
     X(DescLog, "読込とエラーの記録", "Load and error messages", "로드 및 오류 기록")                                       \
     X(DescSettings, "インストール・表示・言語", "Install, display and language", "설치·표시·언어")                          \
@@ -62,6 +64,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(StatusListingMeshes, "静的メッシュを列挙中…", "Listing static meshes…", "정적 메시 목록 작성 중…")                    \
     X(StatusLoadingText, "テキストを読込中…", "Loading text…", "텍스트 불러오는 중…")                                       \
     X(StatusLoadingDialogue, "セリフを読込中…", "Loading dialogue…", "대사 불러오는 중…")                                    \
+    X(StatusLoadingCodex, "コデックスを読込中…", "Loading the codex…", "코덱스 불러오는 중…") \
     X(StatusListingMovies, "ムービーを列挙中…", "Listing movies…", "영상 목록 작성 중…")                                    \
     X(StatusLoadError, "読込エラー: {}", "Load error: {}", "불러오기 오류: {}")                                           \
     X(MeshesListing, "メッシュを列挙中…", "Listing meshes…", "메시 목록 작성 중…")                                        \
@@ -375,6 +378,15 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(LogSaved, "保存しました: {}", "Saved: {}", "저장했습니다: {}")                                                    \
     X(ErrSave, "保存に失敗: {}", "Save failed: {}", "저장 실패: {}")                                                    \
     X(MovieCount, "%zu 本 (多言語音声 %zu)", "%zu movies (multilingual audio %zu)", "%zu개 (다국어 음성 %zu)")            \
+    X(CodexFilterHint, "タイトル・本文で検索", "Search titles and text", "제목·본문 검색") \
+    X(CodexAudioOnly, "音声ログのみ", "Audio logs only", "음성 로그만") \
+    X(CodexCount, "{} コレクション / {} 記録 / 音声 {}", "{} collections / {} records / {} with audio", "{} 컬렉션 / {} 기록 / 음성 {}") \
+    X(CodexPick, "左の一覧から記録を選んでください。", "Choose a record from the list on the left.", "왼쪽 목록에서 기록을 고르세요.") \
+    X(CodexUnlock, "解除条件", "unlock", "해제 조건") \
+    X(CodexPlayLog, "音声ログ", "audio log", "음성 로그") \
+    X(CodexAssetNoAudio, "録音アセット {} はありますが、対応する台詞が見つかりません", "Recording asset {} has no matching dialogue line", "녹음 에셋 {} 에 맞는 대사가 없습니다") \
+    X(CodexNoBody, "(本文なし)", "(no text)", "(본문 없음)") \
+    X(CodexNoIllustration, "イラスト: コデックスのデータにテクスチャ参照が見つかっていません (未解明)", "Illustration: the codex data references no texture that nim has found (unresolved)", "일러스트: 코덱스 데이터에서 텍스처 참조를 찾지 못했습니다 (미해명)") \
     X(MovieFilterHint, "  ファイル名で検索", "  Search file name", "  파일 이름 검색")                                 \
     X(AudioTrack, "音声トラック", "Audio track", "음성 트랙")                                                           \
     X(TrackTip, "言語トラックの割り当てはゲームデータに無いため推定です\n(チャンネル番号 = 文字列の言語スロット + 1。繁体字中国語の ch9 は欠番)", \

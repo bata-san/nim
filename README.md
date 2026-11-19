@@ -33,10 +33,12 @@ build/Release/nim.exe                 # opens the Steam install automatically
 build/Release/nim.exe 80A878C8        # ...and shows this static mesh (or dynamic model)
 ```
 
-Laid out after goriath: a HOME page and document tabs — **STATICS** (57k static meshes) and
-**ENTITIES** (2.3k dynamic models, rigid and skinned) as package lists with live 3D thumbnail
-cards and a live view, **TEXT** (every localized string beside a second language), **DIALOGUE**
-(speaker, line, audio event), **PACKAGES** (entry table + hex) and **LOG**.
+A minimal, terminal-style window: one line of pages at the top (`nim> [home] statics entities …`),
+the page, and a status line. Pages: **STATICS** (57k static meshes) and **ENTITIES** (2.3k dynamic
+models, rigid and skinned) with live 3D thumbnails and a live view, **MAPS**, **TEXT** (every
+localized string beside a second language), **DIALOGUE** (lines in 13 languages with voice playback),
+**MOVIES** (USM with HCA/ADX audio), **CODEX** (the in-game codex: collections, records in 13
+languages and their audio logs), **PACKAGES** (entry table + hex) and **LOG**.
 
 Everything is drawn with the game's own shaders: the G-buffer pass with each material's DXIL,
 then the game's deferred `global_lighting_and_shading` and its `final_combine` film curve
@@ -87,6 +89,7 @@ build/Release/nimcli fonts out/fonts   # the game's UI fonts (for your own inspe
 build/Release/nimcli weather 80AF9550    # a map's world channel controllers (weather, Heat Cascade) and their states
 build/Release/nimcli wem 80A1B2C3 out/line.wav   # decode a WEM stream or a dialogue audio event to WAV (NIM_LANGUAGE=6 for Japanese)
 build/Release/nimcli wem-audit         # decode every dialogue WEM and report failures
+build/Release/nimcli codex out/codex.md ja  # the in-game codex: collections, records, audio logs (Markdown)
 build/Release/nimcli movies -v         # list movies (USM): size, codecs, audio tracks, subtitles
 build/Release/nimcli movie-audio USM out/m.wav 1   # decode one ADX/HCA track of a movie
 build/Release/nimcli movie-video USM out/m.m1v 8   # dump the MPEG-1 elementary stream (first 8 MB)

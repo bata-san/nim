@@ -37,6 +37,7 @@ add_library(nim_core STATIC
   src/content/mpeg1.cpp
   src/content/hca.cpp
   src/content/movies.cpp
+  src/content/codex.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)

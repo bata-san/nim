@@ -40,6 +40,7 @@
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/content/codex.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/hca.hpp"
 #include "media.hpp"
@@ -488,12 +489,76 @@ int cmd_h64(PackageManager& pm, const std::vector<std::string>& values) {
         for (auto& [k, n] : by_target) if (n > 50) std::println("  type {:>3} class {:08X}  {}", k.first, k.second, n);
         return 0;
     }
+    if (values[0] == "-r") {  // reverse: the 64-bit hashes that name these tags
+        std::set<uint32_t> want;
+        for (size_t i = 1; i < values.size(); ++i) want.insert(uint32_t(std::stoul(values[i], nullptr, 16)));
+        for (const auto& info : pm.packages())
+            for (const auto& h : pm.open(info).hash64s())
+                if (want.contains(h.hash32.value)) std::println("{} <- {:016X}", h.hash32.str(), h.hash64);
+        return 0;
+    }
     for (const auto& s : values) {
         uint64_t v = std::stoull(s, nullptr, 16);
         auto t = pm.resolve64(v);
         const Entry* e = t ? pm.entry(*t) : nullptr;
         std::println("{:016X} -> {}", v, t ? std::format("{} type {}/{} class {:08X}", t->str(), e ? e->type : 0,
                                                               e ? e->subtype : 0, e ? e->reference : 0) : "-");
+    }
+    return 0;
+}
+
+// The in-game codex: collections and their intel entries, with the recording lines of each entry.
+// With OUT, writes a Markdown dump (titles and bodies in LANG, default en).
+int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
+    auto t0 = std::chrono::steady_clock::now();
+    StringTable table;
+    table.load_all(pm);
+    auto lines = load_all_dialogue(pm);
+    Codex codex = load_codex(pm, lines);
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    size_t lang = 0;
+    if (lang_code)
+        for (size_t l = 0; l < kTextLanguageCount; ++l)
+            if (language_code(TextLanguage(l)) == lang_code) lang = l;
+    auto text = [&](uint32_t h, size_t lg) -> std::string {
+        const LocalizedString* s = h ? table.find(h) : nullptr;
+        return s ? s->text[lg] : std::string();
+    };
+    size_t titled = 0, bodied = 0, line_total = 0, wem_lines = 0;
+    for (const auto& c : codex.collections)
+        for (const auto& e : c.entries) {
+            titled += !text(e.title, 0).empty();
+            bodied += !text(e.body, 0).empty();
+            line_total += e.lines.size();
+            for (size_t li : e.lines) wem_lines += !lines[li].wem.empty();
+        }
+    std::println("codex {}  collections {}  entries {}  with title {}  with body {}  in {:.1f}s", codex.definitions.str(),
+                 codex.collections.size(), codex.entries, titled, bodied, secs);
+    std::println("recording assets {}  entries with audio {}  lines {}  lines with WEM {}", codex.with_asset,
+                 codex.with_audio, line_total, wem_lines);
+    for (size_t i = 0; i < std::min<size_t>(codex.collections.size(), 12); ++i) {
+        const auto& c = codex.collections[i];
+        std::println("  [{}] {} ({} entries)", text(c.title, lang), text(c.title, 1), c.entries.size());
+    }
+    if (out_path) {
+        std::ofstream f(out_path, std::ios::binary);
+        for (const auto& c : codex.collections) {
+            f << "# " << text(c.title, lang) << std::format("  ({:08X})\n\n", c.hash);
+            for (const auto& e : c.entries) {
+                f << "## " << text(e.title, lang) << std::format("  ({:08X})\n\n", e.hash);
+                if (e.unlock) f << "> " << text(e.unlock, lang) << "\n\n";
+                f << text(e.body, lang) << "\n\n";
+                if (!e.lines.empty()) {
+                    f << std::format("recording: asset {} table {} conversation {:08X}\n\n", e.asset.str(),
+                                     e.dialogue_table.str(), e.conversation);
+                    for (size_t li : e.lines)
+                        f << "- " << text(lines[li].speaker_hash, lang) << ": " << text(lines[li].subtitle_hash, lang)
+                          << (lines[li].wem.empty() ? "" : "  [" + lines[li].wem[0].str() + "]") << "\n";
+                    f << "\n";
+                }
+            }
+        }
+        std::println("wrote {}", out_path);
     }
     return 0;
 }
@@ -2131,6 +2196,7 @@ int main(int argc, char** argv) {
         if (cmd == "strings")
             return cmd_strings(pm, args.size() >= 2 && args[1] != "-" ? args[1].c_str() : nullptr,
                                args.size() >= 3 ? args[2].c_str() : nullptr);
+        if (cmd == "codex") return cmd_codex(pm, args.size() >= 2 ? args[1].c_str() : nullptr, args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "wem-audit") return cmd_wem_audit(pm, args.size() >= 2 ? std::stoul(args[1]) : 0);
         if (cmd == "movies") return cmd_movies(pm, args.size() >= 2 && args[1] == "-v");

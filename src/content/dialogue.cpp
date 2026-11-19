@@ -42,6 +42,7 @@ std::vector<DialogueLine> load_all_dialogue(PackageManager& pm, DialogueStats* s
                     DialogueLine line;
                     line.table = table;
                     line.line_id = r.u32_at(target + 0x00);
+                    line.conversation = r.u32_at(target + 0x08);
                     line.audio_event64 = r.u64_at(target + 0x28);
                     line.subtitle_hash = r.u32_at(target + 0x40);
                     line.caption_hash = r.u32_at(target + 0x78);

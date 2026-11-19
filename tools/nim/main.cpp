@@ -10,6 +10,7 @@
 #include "nim/content/audio.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/content/codex.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/strings.hpp"
@@ -155,7 +156,7 @@ namespace ico {
 constexpr uint32_t Home = 0xE80F, Settings = 0xE713, Statics = 0xE7B8, Text = 0xE8D2, Dialogue = 0xE8BD,
                    Packages = 0xE8B7, Log = 0xE9D9, Tune = 0xE9E9, Frame = 0xE740, Save = 0xE74E, Light = 0xE706,
                    Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890, Maps = 0xE774,
-                   Movies = 0xE714, Play = 0xE768, Pause = 0xE769, Stop = 0xE71A, Volume = 0xE767, Folder = 0xE8B7;
+                   Movies = 0xE714, Play = 0xE768, Pause = 0xE769, Stop = 0xE71A, Volume = 0xE767, Folder = 0xE8B7, Codex = 0xE8F1;
 }
 std::string format_bytes(uint64_t b) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -319,18 +320,18 @@ void load_fonts(PackageManager* pm) {
     io.FontDefault = g_fonts.body;
 }
 
-// The interface theme: a neutral dark palette, one accent (Marathon green), soft rounded corners.
+// The interface theme: terminal-like. Black, one text colour, one accent, square corners.
 namespace theme {
-constexpr ImU32 kRail = IM_COL32(18, 18, 22, 255);
-constexpr ImU32 kBg = IM_COL32(13, 13, 16, 255);
-constexpr ImU32 kSurface = IM_COL32(24, 24, 30, 255);
-constexpr ImU32 kSurfaceHi = IM_COL32(31, 31, 39, 255);
-constexpr ImU32 kHover = IM_COL32(38, 38, 47, 255);
-constexpr ImU32 kActive = IM_COL32(50, 50, 62, 255);
-constexpr ImU32 kBorder = IM_COL32(44, 44, 54, 255);
-constexpr ImU32 kText = IM_COL32(236, 236, 240, 255);
-constexpr ImU32 kMuted = IM_COL32(146, 146, 160, 255);
-constexpr ImU32 kError = IM_COL32(255, 118, 118, 255);
+constexpr ImU32 kRail = IM_COL32(8, 8, 8, 255);
+constexpr ImU32 kBg = IM_COL32(8, 8, 8, 255);
+constexpr ImU32 kSurface = IM_COL32(8, 8, 8, 255);
+constexpr ImU32 kSurfaceHi = IM_COL32(20, 20, 20, 255);
+constexpr ImU32 kHover = IM_COL32(28, 28, 28, 255);
+constexpr ImU32 kActive = IM_COL32(36, 36, 36, 255);
+constexpr ImU32 kBorder = IM_COL32(48, 48, 48, 255);
+constexpr ImU32 kText = IM_COL32(214, 214, 214, 255);
+constexpr ImU32 kMuted = IM_COL32(118, 118, 118, 255);
+constexpr ImU32 kError = IM_COL32(255, 110, 110, 255);
 constexpr ImU32 kAccentHi = IM_COL32(222, 255, 96, 255);
 } // namespace theme
 
@@ -338,25 +339,25 @@ void apply_style(float scale) {
     ImGui::StyleColorsDark();
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 0;
-    s.ChildRounding = 10;
-    s.FrameRounding = 8;
-    s.PopupRounding = 10;
-    s.TabRounding = 8;
-    s.ScrollbarRounding = 8;
-    s.GrabRounding = 8;
+    s.ChildRounding = 0;
+    s.FrameRounding = 0;
+    s.PopupRounding = 0;
+    s.TabRounding = 0;
+    s.ScrollbarRounding = 0;
+    s.GrabRounding = 0;
     s.WindowBorderSize = 0;
     s.ChildBorderSize = 1;
     s.PopupBorderSize = 1;
-    s.FrameBorderSize = 0;
+    s.FrameBorderSize = 1;
     s.TabBorderSize = 0;
-    s.WindowPadding = {16, 14};
-    s.FramePadding = {10, 6};
-    s.ItemSpacing = {10, 8};
-    s.ItemInnerSpacing = {8, 6};
-    s.CellPadding = {8, 5};
-    s.IndentSpacing = 18;
-    s.ScrollbarSize = 10;
-    s.GrabMinSize = 10;
+    s.WindowPadding = {10, 8};
+    s.FramePadding = {6, 3};
+    s.ItemSpacing = {8, 4};
+    s.ItemInnerSpacing = {6, 4};
+    s.CellPadding = {6, 2};
+    s.IndentSpacing = 14;
+    s.ScrollbarSize = 8;
+    s.GrabMinSize = 8;
     s.SeparatorTextBorderSize = 1;
     s.DockingSeparatorSize = 2;
     s.TabBarOverlineSize = 2;
@@ -368,24 +369,24 @@ void apply_style(float scale) {
     c[ImGuiCol_TextDisabled] = ImGui::ColorConvertU32ToFloat4(theme::kMuted);
     c[ImGuiCol_WindowBg] = ImGui::ColorConvertU32ToFloat4(theme::kBg);
     c[ImGuiCol_ChildBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurface);
-    c[ImGuiCol_PopupBg] = rgb(22, 22, 28, 0.98f);
+    c[ImGuiCol_PopupBg] = rgb(12, 12, 12, 0.98f);
     c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
     c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
     c[ImGuiCol_FrameBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
-    c[ImGuiCol_FrameBgHovered] = rgb(44, 44, 54);
-    c[ImGuiCol_FrameBgActive] = rgb(56, 56, 68);
+    c[ImGuiCol_FrameBgHovered] = rgb(30, 30, 30);
+    c[ImGuiCol_FrameBgActive] = rgb(40, 40, 40);
     c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
     c[ImGuiCol_MenuBarBg] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
     c[ImGuiCol_Header] = {accent.x, accent.y, accent.z, 0.16f};
     c[ImGuiCol_HeaderHovered] = {accent.x, accent.y, accent.z, 0.24f};
     c[ImGuiCol_HeaderActive] = {accent.x, accent.y, accent.z, 0.32f};
-    c[ImGuiCol_Button] = rgb(40, 40, 50);
-    c[ImGuiCol_ButtonHovered] = rgb(54, 54, 66);
-    c[ImGuiCol_ButtonActive] = rgb(68, 68, 82);
+    c[ImGuiCol_Button] = rgb(8, 8, 8);
+    c[ImGuiCol_ButtonHovered] = {accent.x, accent.y, accent.z, 0.18f};
+    c[ImGuiCol_ButtonActive] = {accent.x, accent.y, accent.z, 0.32f};
     c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = accent;
     c[ImGuiCol_SliderGrabActive] = ImGui::ColorConvertU32ToFloat4(theme::kAccentHi);
     c[ImGuiCol_Tab] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
-    c[ImGuiCol_TabHovered] = rgb(40, 40, 50);
+    c[ImGuiCol_TabHovered] = rgb(30, 30, 30);
     c[ImGuiCol_TabSelected] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
     c[ImGuiCol_TabSelectedOverline] = accent;
     c[ImGuiCol_TabDimmed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
@@ -398,12 +399,12 @@ void apply_style(float scale) {
     c[ImGuiCol_ResizeGrip] = {0, 0, 0, 0};
     c[ImGuiCol_ResizeGripHovered] = c[ImGuiCol_ResizeGripActive] = {accent.x, accent.y, accent.z, 0.4f};
     c[ImGuiCol_ScrollbarBg] = {0, 0, 0, 0};
-    c[ImGuiCol_ScrollbarGrab] = rgb(58, 58, 70);
-    c[ImGuiCol_ScrollbarGrabHovered] = rgb(76, 76, 90);
-    c[ImGuiCol_ScrollbarGrabActive] = rgb(96, 96, 112);
-    c[ImGuiCol_TableHeaderBg] = rgb(28, 28, 35);
+    c[ImGuiCol_ScrollbarGrab] = rgb(48, 48, 48);
+    c[ImGuiCol_ScrollbarGrabHovered] = rgb(70, 70, 70);
+    c[ImGuiCol_ScrollbarGrabActive] = rgb(90, 90, 90);
+    c[ImGuiCol_TableHeaderBg] = rgb(16, 16, 16);
     c[ImGuiCol_TableBorderStrong] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
-    c[ImGuiCol_TableBorderLight] = rgb(34, 34, 42);
+    c[ImGuiCol_TableBorderLight] = rgb(28, 28, 28);
     c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.02f};
     c[ImGuiCol_TextSelectedBg] = {accent.x, accent.y, accent.z, 0.26f};
     c[ImGuiCol_NavCursor] = accent;
@@ -411,37 +412,22 @@ void apply_style(float scale) {
     s.FontScaleDpi = scale;
 }
 
-// The primary action: an accent-filled rounded button with dark text. `secondary` draws it as an
-// outlined surface instead. Returns true on click.
+// An action: a bracketed text button, accent-coloured for the primary one. Returns true on click.
 bool dbutton(const char* label, float min_w, bool secondary = false) {
-    const float sc = ImGui::GetStyle().FontScaleDpi;
-    ImGui::PushFont(g_fonts.bold, 0);
-    const ImVec2 ts = ImGui::CalcTextSize(label);
-    const ImVec2 size{std::max(min_w, ts.x + 36 * sc), 38 * sc};
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const bool pressed = ImGui::InvisibleButton(label, size);
-    const bool hovered = ImGui::IsItemHovered();
-    auto* dl = ImGui::GetWindowDrawList();
-    const float r = 8 * sc;
-    const ImVec2 q{p.x + size.x, p.y + size.y};
-    if (secondary) {
-        dl->AddRectFilled(p, q, hovered ? theme::kHover : theme::kSurfaceHi, r);
-        dl->AddRect(p, q, theme::kBorder, r, 0, 1 * sc);
-        dl->AddText({p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f}, theme::kText, label);
-    } else {
-        dl->AddRectFilled(p, q, hovered ? theme::kAccentHi : kGreen, r);
-        dl->AddText({p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f}, IM_COL32(10, 12, 4, 255), label);
-    }
-    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    ImGui::PopFont();
+    (void)min_w;
+    const std::string text = std::string("[ ") + label + " ]";
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    if (!secondary) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kGreen));
+    const bool pressed = ImGui::Button(text.c_str());
+    if (!secondary) ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
     return pressed;
 }
 
 // A page title: the heading face in a given pixel size.
-void heading(const char* text, float size = 28) {
-    ImGui::PushFont(g_fonts.heading, size);
-    ImGui::TextUnformatted(text);
-    ImGui::PopFont();
+void heading(const char* text, float size = 0) {
+    (void)size;
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "# %s", text);
 }
 
 // Text centred on a line within `w` pixels (single line).
@@ -469,36 +455,19 @@ void spinner(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
     dl->PathStroke(col, 0, r * 0.25f);
 }
 
-// A centred block for "nothing here yet": glyph, title, and a short hint that says what to do.
+// "Nothing here yet": one muted line with what to do.
 void empty_state(uint32_t glyph, const char* title, const char* hint) {
-    const float sc = ImGui::GetStyle().FontScaleDpi;
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float wrap = std::min(avail.x, 440 * sc);
-    const ImVec2 hs = ImGui::CalcTextSize(hint, nullptr, false, wrap);
-    const float block = ImGui::GetTextLineHeight() * 2 + 14 * sc + hs.y;
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - block) * 0.38f));
-    ImGui::PushFont(g_fonts.bold, 0);
-    centered_text(icon(glyph).c_str(), avail.x, theme::kMuted);
-    centered_text(title, avail.x);
-    ImGui::PopFont();
-    ImGui::Dummy({0, 6 * sc});
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail.x - wrap) * 0.5f));
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme::kMuted));
-    ImGui::TextUnformatted(hint);
-    ImGui::PopStyleColor();
+    (void)glyph;
+    ImGui::TextUnformatted(title);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", hint);
     ImGui::PopTextWrapPos();
 }
 
 // A centred spinner and a line of text while something is being read.
 void loading_state(const char* text) {
-    const float sc = ImGui::GetStyle().FontScaleDpi;
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - 60 * sc) * 0.4f));
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    spinner(ImGui::GetWindowDrawList(), {p.x + avail.x * 0.5f, p.y + 12 * sc}, 11 * sc, kGreen);
-    ImGui::Dummy({0, 34 * sc});
-    centered_text(text, avail.x, theme::kMuted);
+    static const char kSpin[4] = {'|', '/', '-', '\\'};
+    ImGui::TextDisabled("%c %s", kSpin[int(ImGui::GetTime() * 8) & 3], text);
 }
 
 // A clickable card for the home page: a glyph, a title and a wrapped description. Returns clicked.
@@ -530,7 +499,7 @@ struct EntryRow { TagHash tag; uint16_t type, subtype; uint32_t reference, size;
 struct Catalog {
     std::mutex mutex;
     std::string status = ui::tr(ui::S::Preparing);
-    std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, movies_ready{false}, done{false};
+    std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, codex_ready{false}, movies_ready{false}, done{false};
     std::vector<MeshEntry> meshes;
     std::vector<PackageGroup> packages;  // packages that hold static meshes
     std::vector<MeshEntry> dynamics;     // dynamic models (entity meshes)
@@ -538,6 +507,8 @@ struct Catalog {
     StringTable strings;
     std::vector<DialogueLine> dialogue;
     std::vector<MovieEntry> movies;
+    Codex codex;
+    std::string codex_error;  // the codex failed alone; the rest of the catalog is fine
     std::string error;
 };
 
@@ -591,6 +562,23 @@ void load_catalog(fs::path install, Catalog* cat) {
             cat->status = ui::tr(ui::S::StatusListingMovies);
         }
         cat->dialogue_ready = true;
+        {
+            std::lock_guard lk(cat->mutex);
+            cat->status = ui::tr(ui::S::StatusLoadingCodex);
+        }
+        try {
+            Codex cx = load_codex(pm, cat->dialogue);
+            std::lock_guard lk(cat->mutex);
+            cat->codex = std::move(cx);
+            cat->codex_ready = true;
+        } catch (const std::exception& ex) {
+            std::lock_guard lk(cat->mutex);
+            cat->codex_error = ex.what();
+        }
+        {
+            std::lock_guard lk(cat->mutex);
+            cat->status = ui::tr(ui::S::StatusListingMovies);
+        }
         auto movies = list_movies(pm);
         {
             std::lock_guard lk(cat->mutex);
@@ -1218,7 +1206,7 @@ struct Camera {
 enum class Engine : int { Game };
 
 // The pages of the navigation rail. Every page is always reachable from the rail.
-enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabPackages, TabLog, TabCount };
+enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; ui::S name; ui::S desc; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, ui::S::NavHome, ui::S::DescHome},
@@ -1229,6 +1217,7 @@ constexpr TabInfo kTabs[TabCount] = {
     {ico::Text, ui::S::NavText, ui::S::DescText},
     {ico::Dialogue, ui::S::NavDialogue, ui::S::DescDialogue},
     {ico::Movies, ui::S::NavMovies, ui::S::DescMovies},
+    {ico::Codex, ui::S::NavCodex, ui::S::DescCodex},
     {ico::Packages, ui::S::NavPackages, ui::S::DescPackages},
     {ico::Log, ui::S::NavLog, ui::S::DescLog},
 };
@@ -1400,6 +1389,12 @@ public:
         bool tex_readable = false, has_frame = false, seeking = false;
         float seek_value = 0;
     } movie;
+    struct CodexUi {
+        char filter[128] = "";
+        int lang = -1;  // -1: the second-language setting
+        bool audio_only = false;
+        int collection = -1, entry = -1;
+    } codex;
     int selected_package = -1;
     std::vector<EntryRow> package_rows;
     char entry_filter[32] = "";
@@ -2252,29 +2247,26 @@ public:
         viewport_visible = false;
         ImGuiViewport* vp = ImGui::GetMainViewport();
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float rail_w = 232 * sc, status_h = 30 * sc;
+        const float line = ImGui::GetFrameHeight();
+        const float bar_h = line + 8 * sc, status_h = line + 4 * sc;
         const ImVec2 work = vp->WorkPos, wsize = vp->WorkSize;
         const ImGuiWindowFlags chrome = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
                                         ImGuiWindowFlags_NoNav;
 
         ImGui::SetNextWindowPos(work);
-        ImGui::SetNextWindowSize({rail_w, wsize.y - status_h});
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kRail));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-        if (ImGui::Begin("##rail", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) nav_rail(wsize.y - status_h);
+        ImGui::SetNextWindowSize({wsize.x, bar_h});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10 * sc, 4 * sc});
+        if (ImGui::Begin("##bar", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) tab_bar();
         ImGui::End();
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
 
-        ImGui::SetNextWindowPos({work.x + rail_w, work.y});
-        ImGui::SetNextWindowSize({wsize.x - rail_w, wsize.y - status_h});
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kBg));
+        ImGui::SetNextWindowPos({work.x, work.y + bar_h});
+        ImGui::SetNextWindowSize({wsize.x, wsize.y - bar_h - status_h});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
         if (ImGui::Begin("##content", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) content_frame(sc);
         ImGui::End();
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
 
         status_bar(work, wsize, status_h);
         if (!pm) install_picker();
@@ -2282,25 +2274,15 @@ public:
             capture_requested = true;
     }
 
-    // The page header (title, one-line description) and the page body below it.
+    // The page body under a one-pixel rule.
     void content_frame(float sc) {
-        const TabInfo& info = kTabs[tab];
-        const float pad = 24 * sc;
         const ImVec2 origin = ImGui::GetWindowPos();
         const float width = ImGui::GetWindowWidth();
-        ImGui::SetCursorPos({pad, 16 * sc});
-        ImGui::PushFont(g_fonts.heading, 24);
-        ImGui::TextUnformatted(ui::tr(info.name));
-        ImGui::PopFont();
-        ImGui::SetCursorPosX(pad);
-        ImGui::TextDisabled("%s", ui::tr(info.desc));
-        const float rule = ImGui::GetCursorPosY() + 12 * sc;
-        ImGui::GetWindowDrawList()->AddLine({origin.x, origin.y + rule}, {origin.x + width, origin.y + rule}, theme::kBorder);
-
-        // The 3D pages draw edge to edge; the rest sit inside the page margins.
+        ImGui::GetWindowDrawList()->AddLine(origin, {origin.x + width, origin.y}, theme::kBorder);
+        // The 3D pages draw edge to edge; the rest sit inside a small margin.
         const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps;
-        ImGui::SetCursorPos({0, rule + 1});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{pad, 16 * sc});
+        ImGui::SetCursorPos({0, 1});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{10 * sc, 8 * sc});
         ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         switch (tab) {
         case TabHome: home_tab(); break;
@@ -2311,6 +2293,7 @@ public:
         case TabText: strings_tab(); break;
         case TabDialogue: dialogue_tab(); break;
         case TabMovies: movies_tab(); break;
+        case TabCodex: codex_tab(); break;
         case TabPackages: packages_tab(); break;
         case TabLog: log_tab(); break;
         default: break;
@@ -2319,68 +2302,27 @@ public:
         ImGui::PopStyleVar();
     }
 
-    // Left rail: the brand, the pages in three groups, and the install / log / settings at the foot.
-    void nav_rail(float h) {
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float x = 12 * sc;
-        ImGui::SetCursorPos({x + 8 * sc, 18 * sc});
-        ImGui::PushFont(g_fonts.heading, 26);
-        ImGui::TextUnformatted("nim");
-        ImGui::PopFont();
-        ImGui::SetCursorPosX(x + 8 * sc);
-        ImGui::TextDisabled("%s", ui::tr(ui::S::AppSubtitle));
-        ImGui::Dummy({0, 14 * sc});
-        nav_item(TabHome);
-        nav_group(ui::S::GroupModels3D);
-        nav_item(TabStatics);
-        nav_item(TabEntities);
-        nav_item(TabMaps);
-        nav_group(ui::S::Group2D);
-        nav_item(TabText);
-        nav_item(TabDialogue);
-        nav_item(TabMovies);
-        nav_group(ui::S::GroupData);
-        nav_item(TabPackages);
-
-        const float item = 40 * sc + 2 * sc;
-        ImGui::SetCursorPos({x + 8 * sc, h - 2 * item - 58 * sc});
-        ImGui::TextDisabled("%s", pm ? to_utf8(install.filename().wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
-        ImGui::Dummy({0, 6 * sc});
-        nav_item(TabLog);
-        nav_item(TabSettings);
-    }
-
-    void nav_item(Tab t) {
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        const TabInfo& info = kTabs[t];
-        const float h = 40 * sc, x = 12 * sc;
-        const float w = ImGui::GetWindowWidth() - 2 * x;
-        ImGui::SetCursorPosX(x);
-        ImGui::PushID(int(t));
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const bool clicked = ImGui::InvisibleButton("nav", {w, h});
-        const bool hovered = ImGui::IsItemHovered();
-        if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (clicked) open_tab(t);
-        const bool sel = tab == t;
-        auto* dl = ImGui::GetWindowDrawList();
-        const ImVec2 q{p.x + w, p.y + h};
-        if (sel) dl->AddRectFilled(p, q, theme::kActive, 8 * sc);
-        else if (hovered) dl->AddRectFilled(p, q, theme::kHover, 8 * sc);
-        if (sel) dl->AddRectFilled({p.x, p.y + 10 * sc}, {p.x + 3 * sc, q.y - 10 * sc}, kGreen, 2 * sc);
-        const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
-        dl->AddText({p.x + 16 * sc, ty}, sel ? kGreen : theme::kMuted, icon(info.icon).c_str());
-        dl->AddText({p.x + 46 * sc, ty}, sel || hovered ? theme::kText : IM_COL32(206, 206, 216, 255), ui::tr(info.name));
-        ImGui::PopID();
-        ImGui::Dummy({0, 2 * sc});
-    }
-
-    void nav_group(ui::S label) {
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        ImGui::Dummy({0, 10 * sc});
-        ImGui::SetCursorPosX(22 * sc);
-        ImGui::TextDisabled("%s", ui::tr(label));
-        ImGui::Dummy({0, 2 * sc});
+    // One line of page names, like a shell prompt: "nim> [home] statics entities ...".
+    void tab_bar() {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "nim>");
+        static const Tab order[] = {TabHome, TabStatics, TabEntities, TabMaps, TabText, TabDialogue,
+                                    TabMovies, TabCodex, TabPackages, TabLog, TabSettings};
+        for (Tab t : order) {
+            ImGui::SameLine(0, 10);
+            const bool sel = tab == t;
+            const std::string label = sel ? std::format("[{}]", ui::tr(kTabs[t].name)) : std::string(ui::tr(kTabs[t].name));
+            ImGui::PushID(int(t));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sel ? kGreen : theme::kText));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {2, ImGui::GetStyle().FramePadding.y});
+            if (ImGui::Button(label.c_str())) open_tab(t);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ui::tr(kTabs[t].desc));
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+            ImGui::PopID();
+        }
     }
 
     // The bottom line: the current status (the catalogue or the last message), the version and GPU.
@@ -2388,11 +2330,12 @@ public:
         const float sc = ImGui::GetStyle().FontScaleDpi;
         ImGui::SetNextWindowPos({work.x, work.y + size.y - h});
         ImGui::SetNextWindowSize({size.x, h});
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kRail));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {14 * sc, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10 * sc, 0});
         if (ImGui::Begin("##status", nullptr,
                          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav)) {
+            const ImVec2 o = ImGui::GetWindowPos();
+            ImGui::GetWindowDrawList()->AddLine(o, {o.x + ImGui::GetWindowWidth(), o.y}, theme::kBorder);
             std::string left;
             if (catalog) {
                 std::lock_guard lk(catalog->mutex);
@@ -2402,16 +2345,15 @@ public:
             if (left.empty()) left = ui::tr(ui::S::LogIdle);
             ImGui::AlignTextToFramePadding();
             const bool last_error = !log.empty() && log.back().error && left == log.back().text;
-            if (last_error) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "%s", left.c_str());
-            else ImGui::TextDisabled("%s", left.c_str());
+            if (last_error) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "! %s", left.c_str());
+            else ImGui::TextDisabled("-- %s", left.c_str());
             if (ImGui::IsItemClicked()) open_tab(TabLog);
-            const std::string right = std::format("nim {}  ·  {}", kVersion, gpu.adapter_name());
-            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(right.c_str()).x - 14 * sc);
+            const std::string right = std::format("nim {} | {}", kVersion, gpu.adapter_name());
+            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(right.c_str()).x - 10 * sc);
             ImGui::TextDisabled("%s", right.c_str());
         }
         ImGui::End();
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
     }
 
     void install_picker() {
@@ -2436,45 +2378,33 @@ public:
     }
 
     // -- HOME --
-    // The start page: the install, then the pages as cards in three groups.
+    // The start page: the install, then one line per page.
     void home_tab() {
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float card_w = 288 * sc, card_h = 120 * sc, gap = 14 * sc;
-        const float avail = ImGui::GetContentRegionAvail().x;
-        const size_t cols = size_t(std::max(1.0f, std::floor((avail + gap) / (card_w + gap))));
-
-        // install line
-        const float install_w = std::min(avail, 760 * sc);
-        ImGui::BeginChild("##install", {install_w, 74 * sc}, ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
-        ImGui::SetCursorPos({16 * sc, 13 * sc});
-        ImGui::TextDisabled("%s", ui::tr(ui::S::HomeInstall));
-        ImGui::SetCursorPos({16 * sc, 36 * sc});
-        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
-        ImGui::SetCursorPos({ImGui::GetWindowWidth() - 150 * sc, 18 * sc});
-        if (dbutton(ui::tr(pm ? ui::S::HomeChange : ui::S::SelectFolder), 128 * sc, pm != nullptr))
-            if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
-        ImGui::EndChild();
-
-        auto group = [&](ui::S label, std::initializer_list<Tab> tabs) {
-            ImGui::Dummy({0, 14 * sc});
-            ImGui::TextDisabled("%s", ui::tr(label));
-            size_t i = 0;
-            for (Tab t : tabs) {
-                const TabInfo& info = kTabs[t];
-                if (card(ui::tr(info.name), info.icon, ui::tr(info.name), ui::tr(info.desc), card_w, card_h)) open_tab(t);
-                if ((i + 1) % cols != 0 && i + 1 < tabs.size()) ImGui::SameLine(0, gap);
-                ++i;
-            }
-        };
-        group(ui::S::GroupModels3D, {TabStatics, TabEntities, TabMaps});
-        group(ui::S::Group2D, {TabText, TabDialogue, TabMovies});
-        group(ui::S::GroupData, {TabPackages});
-
-        ImGui::Dummy({0, 24 * sc});
-        ImGui::TextDisabled("%s", ui::trf(ui::S::HomeFooter, kVersion).c_str());
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("install:");
         ImGui::SameLine();
-        if (ImGui::SmallButton((icon(ico::Link) + " GitHub").c_str()))
-            ShellExecuteW(nullptr, L"open", L"https://github.com/bata-san/nim", nullptr, nullptr, SW_SHOWNORMAL);
+        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
+        ImGui::SameLine();
+        if (dbutton(ui::tr(pm ? ui::S::HomeChange : ui::S::SelectFolder), 0, pm != nullptr))
+            if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
+        ImGui::Spacing();
+        static const Tab order[] = {TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages};
+        float name_w = 0;
+        for (Tab t : order) name_w = std::max(name_w, ImGui::CalcTextSize(ui::tr(kTabs[t].name)).x);
+        const float desc_x = ImGui::GetCursorPosX() + ImGui::CalcTextSize("> ").x + name_w + 24;
+        for (Tab t : order) {
+            ImGui::PushID(int(t));
+            const ImVec2 p = ImGui::GetCursorPos();
+            if (ImGui::Selectable("##go", false)) open_tab(t);
+            const bool hovered = ImGui::IsItemHovered();
+            ImGui::SetCursorPos(p);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hovered ? theme::kAccentHi : kGreen), "> %s", ui::tr(kTabs[t].name));
+            ImGui::SameLine(desc_x);
+            ImGui::TextDisabled("%s", ui::tr(kTabs[t].desc));
+            ImGui::PopID();
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s", ui::trf(ui::S::HomeFooter, kVersion).c_str());
     }
 
     // -- SETTINGS --
@@ -3604,6 +3534,123 @@ public:
     }
 
     size_t movie_sub_lang() const { return size_t(movie.sub_lang < 0 ? language : movie.sub_lang); }
+
+    // -- CODEX --
+    // The in-game codex: collections in game order, each entry's title, unlock hint and body in any
+    // of the 13 languages, and its audio log in any installed voice language.
+    void codex_tab() {
+        if (!catalog || !catalog->codex_ready) {
+            if (catalog && catalog->done && !catalog->codex_error.empty())
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "! %s", catalog->codex_error.c_str());
+            else loading_state(ui::tr(ui::S::Loading));
+            return;
+        }
+        ensure_audio_languages();
+        const Codex& cx = catalog->codex;
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const size_t lang = codex.lang < 0 ? language : size_t(codex.lang);
+
+        // toolbar
+        ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x * 0.3f));
+        ImGui::InputTextWithHint("##cxfilter", ui::tr(ui::S::CodexFilterHint), codex.filter, sizeof(codex.filter));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(170 * sc);
+        if (ImGui::BeginCombo(ui::tr(ui::S::Subtitles), text_language_name(lang))) {
+            for (int l = 0; l < int(kTextLanguageCount); ++l)
+                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) codex.lang = l;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox(ui::tr(ui::S::CodexAudioOnly), &codex.audio_only);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130 * sc);
+        if (audio_langs.empty()) {
+            ImGui::TextDisabled(ui::tr(ui::S::NoVoicePackages));
+        } else if (ImGui::BeginCombo(ui::tr(ui::S::Voice), audio_langs[size_t(audio_lang)].second.c_str())) {
+            for (int i = 0; i < int(audio_langs.size()); ++i)
+                if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", ui::trf(ui::S::CodexCount, cx.collections.size(), cx.entries, cx.with_audio).c_str());
+
+        // left: collections and entries, like a directory listing
+        const std::string f = lower_ascii(codex.filter);
+        auto match = [&](uint32_t h) {
+            return f.empty() || contains_ci(text(h, lang), f) || contains_ci(text(h, 0), f);
+        };
+        ImGui::BeginChild("cxlist", {360 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+        for (int ci = 0; ci < int(cx.collections.size()); ++ci) {
+            const auto& c = cx.collections[size_t(ci)];
+            bool any = false;
+            for (const auto& e : c.entries)
+                if ((!codex.audio_only || !e.lines.empty()) && (match(c.title) || match(e.title) || match(e.body))) any = true;
+            if (!any) continue;
+            ImGui::PushID(ci);
+            const std::string& ct = text(c.title, lang);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s/", ct.empty() ? "?" : ct.c_str());
+            for (int ei = 0; ei < int(c.entries.size()); ++ei) {
+                const auto& e = c.entries[size_t(ei)];
+                if (codex.audio_only && e.lines.empty()) continue;
+                if (!match(c.title) && !match(e.title) && !match(e.body)) continue;
+                ImGui::PushID(ei);
+                const std::string& et = text(e.title, lang);
+                const std::string label = std::format("  {} {}", e.lines.empty() ? ' ' : '~', et.empty() ? "?" : et);
+                if (ImGui::Selectable(label.c_str(), codex.collection == ci && codex.entry == ei)) {
+                    codex.collection = ci;
+                    codex.entry = ei;
+                }
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        // right: the record
+        ImGui::BeginChild("cxentry", {0, 0}, ImGuiChildFlags_None);
+        if (codex.collection < 0 || size_t(codex.collection) >= cx.collections.size() || codex.entry < 0 ||
+            size_t(codex.entry) >= cx.collections[size_t(codex.collection)].entries.size()) {
+            ImGui::TextDisabled("%s", ui::tr(ui::S::CodexPick));
+            ImGui::EndChild();
+            return;
+        }
+        const auto& c = cx.collections[size_t(codex.collection)];
+        const auto& e = c.entries[size_t(codex.entry)];
+        ImGui::TextDisabled("%s / %08X", text(c.title, lang).c_str(), e.hash);
+        heading(text(e.title, lang).c_str());
+        if (e.unlock && !text(e.unlock, lang).empty())
+            ImGui::TextDisabled("[%s] %s", ui::tr(ui::S::CodexUnlock), text(e.unlock, lang).c_str());
+        if (!e.lines.empty()) {
+            const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
+            for (size_t li : e.lines) {
+                const auto& l = catalog->dialogue[li];
+                if (l.wem.empty()) continue;
+                play_button(uint32_t(li), 0, voice, ui::tr(ui::S::CodexPlayLog));
+                const uint64_t id = clip_id(uint32_t(li), 0, voice);
+                if (clip && clip->id() == id) {
+                    ImGui::SameLine();
+                    const double len = clip->length();
+                    ImGui::SetNextItemWidth(std::min(360 * sc, ImGui::GetContentRegionAvail().x));
+                    ImGui::ProgressBar(len > 0 ? float(clip->position() / len) : 0.f, {std::min(360 * sc, ImGui::GetContentRegionAvail().x), 0},
+                                       std::format("{} / {}", clock_text(clip->position()), clock_text(len)).c_str());
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s %s", l.wem[0].str().c_str(), speaker_name(l.speaker_hash, lang).c_str());
+            }
+        } else if (!e.asset.is_none()) {
+            ImGui::TextDisabled("%s", ui::trf(ui::S::CodexAssetNoAudio, e.asset.str()).c_str());
+        }
+        ImGui::Separator();
+        const std::string& body = text(e.body, lang);
+        ImGui::PushTextWrapPos(0);
+        if (body.empty()) ImGui::TextDisabled("%s", ui::tr(ui::S::CodexNoBody));
+        else ImGui::TextUnformatted(body.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s", ui::tr(ui::S::CodexNoIllustration));
+        ImGui::EndChild();
+    }
 
     void movies_tab() {
         if (!catalog || !catalog->movies_ready) { ImGui::TextDisabled(ui::tr(ui::S::Loading)); return; }

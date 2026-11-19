@@ -10,7 +10,7 @@ namespace nim {
 // Dialogue layout (verified on Marathon data):
 //   Tables (class 8080B4D1, and others) hold Vec<S8080AA3B> (0x28 bytes, variant pointer at 0x20).
 //   The variant target of class 8080AA3F (0xA0 bytes) is one spoken line:
-//     0x00 u32   line id
+//     0x00 u32   line id                      0x08 u32 conversation key
 //     0x28 u64   TagHash64 of the audio event (class 8080B128)
 //     0x30 Tag   string container (subtitle)      0x40 u32 string hash
 //     0x48 f32   unknown (2.5 typical)
@@ -24,6 +24,7 @@ constexpr uint32_t kClassAudioEvent = 0x8080B128;
 struct DialogueLine {
     TagHash table;      // tag that holds the line
     uint32_t line_id = 0;
+    uint32_t conversation = 0;      // 0x08: key shared by the lines of one conversation
     uint32_t speaker_hash = 0;
     uint32_t subtitle_hash = 0;
     uint32_t caption_hash = 0;
