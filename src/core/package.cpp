@@ -161,6 +161,25 @@ std::vector<uint8_t> Package::read_entry(uint32_t index) const {
     return out;
 }
 
+std::vector<uint8_t> Package::read_entry_range(uint32_t index, uint64_t offset, size_t size) const {
+    const Entry& e = entries_.at(index);
+    if (offset >= e.file_size) return {};
+    size = size_t(std::min<uint64_t>(size, e.file_size - offset));
+    std::vector<uint8_t> out;
+    out.reserve(size);
+    uint64_t pos = e.starting_block_offset + offset;
+    uint32_t block = e.starting_block + uint32_t(pos / kBlockSize);
+    size_t in_block = size_t(pos % kBlockSize);
+    while (out.size() < size) {
+        const auto data = read_block(block++);
+        if (in_block >= data.size()) throw std::runtime_error("entry offset beyond block");
+        const size_t n = std::min(data.size() - in_block, size - out.size());
+        out.insert(out.end(), data.begin() + in_block, data.begin() + in_block + n);
+        in_block = 0;
+    }
+    return out;
+}
+
 void Package::clear_block_cache() const {
     std::unique_lock lock(cache_mutex_);
     cache_.clear();

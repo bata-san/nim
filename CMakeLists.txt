@@ -32,13 +32,17 @@ add_library(nim_core STATIC
   src/content/fonts.cpp
   src/content/animation.cpp
   src/content/weather.cpp
+  src/content/audio.cpp
+  src/content/usm.cpp
+  src/content/movies.cpp
 )
 target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)
 
 # ---- nimcli: headless inspection / extraction --------------------------------
-add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp tools/nimcli/environment.cpp)
-target_link_libraries(nimcli PRIVATE nim_core)
+add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp tools/nimcli/environment.cpp tools/nim/media.cpp)
+target_include_directories(nimcli PRIVATE tools/nim)
+target_link_libraries(nimcli PRIVATE nim_core xaudio2 mfplat mfuuid)
 
 # ---- nim_render: D3D12 renderer running the game's own shaders --------------
 add_library(nim_render STATIC
@@ -60,14 +64,14 @@ target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32)
 
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)
-add_executable(nim WIN32 tools/nim/main.cpp
+add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp
     ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp)
 target_include_directories(nim PRIVATE ${IMGUI_DIR})
 file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
-target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi)
+target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2 mfplat mfuuid)
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()

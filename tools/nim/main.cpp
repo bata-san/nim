@@ -4,7 +4,10 @@
 // big buttons, and browsers whose right-hand panel is a live 3D view. Meshes are drawn with the
 // game's own G-buffer shaders and, by default, shaded by the game's own deferred lighting pass;
 // the UI itself is set in the game's fonts, read from the user's install at startup.
+#include "media.hpp"
 #include "nim/content/animation.hpp"
+#include "nim/content/audio.hpp"
+#include "nim/content/movies.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
@@ -26,6 +29,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -34,11 +38,14 @@
 #include <deque>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -84,6 +91,55 @@ bool contains_ci(const std::string& hay, const std::string& needle_lower) {
     if (needle_lower.empty()) return true;
     return lower_ascii(hay).find(needle_lower) != std::string::npos;
 }
+// Display names of the string-table language slots (TextLanguage order).
+const char* text_language_name(size_t l) {
+    static constexpr const char* k[] = {"英語", "日本語", "ドイツ語", "フランス語", "スペイン語", "スペイン語 (中南米)", "イタリア語",
+                                        "韓国語", "繁体字中国語", "簡体字中国語", "ポルトガル語 (ブラジル)", "ポーランド語", "ロシア語"};
+    return l < std::size(k) ? k[l] : "?";
+}
+// Localized audio packages end in a language suffix (w64_sr_audio_015a_jpn).
+std::string audio_language_name(const std::string& suffix) {
+    static const std::pair<const char*, size_t> k[] = {{"en", 0},   {"jpn", 1},  {"ja", 1},   {"de", 2},  {"fr", 3},
+                                                       {"es", 4},   {"esmx", 5}, {"mx", 5},   {"it", 6},  {"ko", 7},
+                                                       {"kor", 7},  {"cht", 8},  {"zht", 8},  {"chs", 9}, {"zhs", 9},
+                                                       {"ptbr", 10}, {"pt", 10}, {"pl", 11},  {"ru", 12}};
+    for (const auto& [s, l] : k)
+        if (suffix == s) return text_language_name(l);
+    return suffix;
+}
+// The longest prefix of `s` that is at most `bytes` long and ends on a UTF-8 character boundary.
+std::string utf8_prefix(const std::string& s, size_t bytes) {
+    if (s.size() <= bytes) return s;
+    size_t n = bytes;
+    while (n > 0 && (uint8_t(s[n]) & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+std::string safe_file_name(std::string s) {
+    static constexpr char kBadChars[] = {'<', '>', ':', '"', '/', '\\', '|', '?', '*', 0};
+    for (auto& c : s)
+        if (uint8_t(c) < 0x20 || std::strchr(kBadChars, c)) c = '_';
+    while (!s.empty() && (s.back() == ' ' || s.back() == '.')) s.pop_back();
+    while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+    s = utf8_prefix(s, 120);
+    return s.empty() ? std::string("_") : s;
+}
+bool write_wav_file(const fs::path& path, const PcmAudio& pcm) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint32_t data = uint32_t(pcm.samples.size() * 2);
+    auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    f.write("RIFF", 4);
+    u32(36 + data);
+    f.write("WAVEfmt ", 8);
+    u32(16), u16(1), u16(pcm.channels), u32(pcm.sample_rate), u32(pcm.sample_rate * pcm.channels * 2u);
+    u16(uint16_t(pcm.channels * 2)), u16(16);
+    f.write("data", 4);
+    u32(data);
+    f.write(reinterpret_cast<const char*>(pcm.samples.data()), std::streamsize(data));
+    return bool(f);
+}
+
 // UTF-8 for a private-use icon codepoint (Segoe Fluent Icons / MDL2 Assets).
 std::string icon(uint32_t cp) {
     std::string s;
@@ -95,7 +151,8 @@ std::string icon(uint32_t cp) {
 namespace ico {
 constexpr uint32_t Home = 0xE80F, Settings = 0xE713, Statics = 0xE7B8, Text = 0xE8D2, Dialogue = 0xE8BD,
                    Packages = 0xE8B7, Log = 0xE9D9, Tune = 0xE9E9, Frame = 0xE740, Save = 0xE74E, Light = 0xE706,
-                   Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890, Maps = 0xE774;
+                   Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890, Maps = 0xE774,
+                   Movies = 0xE714, Play = 0xE768, Pause = 0xE769, Stop = 0xE71A, Volume = 0xE767, Folder = 0xE8B7;
 }
 std::string format_bytes(uint64_t b) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -356,13 +413,14 @@ struct EntryRow { TagHash tag; uint16_t type, subtype; uint32_t reference, size;
 struct Catalog {
     std::mutex mutex;
     std::string status = "準備中…";
-    std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, done{false};
+    std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, movies_ready{false}, done{false};
     std::vector<MeshEntry> meshes;
     std::vector<PackageGroup> packages;  // packages that hold static meshes
     std::vector<MeshEntry> dynamics;     // dynamic models (entity meshes)
     std::vector<PackageGroup> dyn_packages;
     StringTable strings;
     std::vector<DialogueLine> dialogue;
+    std::vector<MovieEntry> movies;
     std::string error;
 };
 
@@ -413,9 +471,16 @@ void load_catalog(fs::path install, Catalog* cat) {
         {
             std::lock_guard lk(cat->mutex);
             cat->dialogue = std::move(dlg);
-            cat->status = "";
+            cat->status = "ムービーを列挙中…";
         }
         cat->dialogue_ready = true;
+        auto movies = list_movies(pm);
+        {
+            std::lock_guard lk(cat->mutex);
+            cat->movies = std::move(movies);
+            cat->status = "";
+        }
+        cat->movies_ready = true;
     } catch (const std::exception& ex) {
         std::lock_guard lk(cat->mutex);
         cat->error = ex.what();
@@ -1035,14 +1100,15 @@ struct Camera {
 
 enum class Engine : int { Game };
 
-enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabPackages, TabLog, TabCount };
+enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; const char* title; const char* id; bool closable; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, "HOME", "home", false},         {ico::Settings, "", "settings", false},
     {ico::Statics, "STATICS", "statics", true}, {ico::Entities, "ENTITIES", "entities", true},
     {ico::Maps, "MAPS", "maps", true},
     {ico::Text, "TEXT", "text", true},
-    {ico::Dialogue, "DIALOGUE", "dialogue", true}, {ico::Packages, "PACKAGES", "packages", true},
+    {ico::Dialogue, "DIALOGUE", "dialogue", true}, {ico::Movies, "MOVIES", "movies", true},
+    {ico::Packages, "PACKAGES", "packages", true},
     {ico::Log, "LOG", "log", true},
 };
 
@@ -1142,7 +1208,7 @@ public:
 
     std::deque<LogLine> log;
     int language = 1;  // second column language (ja by default)
-    bool tab_open[TabCount] = {true, true, true, true, true, true, true, true, false};
+    bool tab_open[TabCount] = {true, true, true, true, true, true, true, true, true, false};
     int focus_tab = -1, focus_frames = 0;
 
     // statics browser
@@ -1166,6 +1232,53 @@ public:
     std::vector<uint32_t> dialogue_view;
     std::string dialogue_filter_applied = "\x01";
     int dialogue_filter_lang = -1;
+    struct DialogueGroup {
+        uint64_t key = 0;
+        std::string name;
+        std::vector<uint32_t> lines;
+    };
+    int dialogue_text_lang = -1;  // -1: the second-language setting
+    bool dialogue_show_english = true;
+    int dialogue_group_mode = 0;  // 0 speaker, 1 conversation table
+    char dialogue_group_filter[64] = "";
+    int dialogue_group = -1;      // index into dialogue_groups, -1 = all lines
+    std::vector<DialogueGroup> dialogue_groups;
+    int dialogue_groups_mode = -1, dialogue_groups_lang = -1;
+    int dialogue_selected = -1;   // index into catalog->dialogue
+    std::vector<std::pair<uint16_t, std::string>> audio_langs;  // installed localized audio packages
+    int audio_lang = 0;           // index into audio_langs
+
+    // audio playback (dialogue) and WAV export
+    std::unique_ptr<media::AudioEngine> audio_engine_;
+    std::unique_ptr<media::ClipPlayer> clip;
+    struct AudioRequest {
+        uint64_t id = 0;
+        std::future<std::shared_ptr<const PcmAudio>> result;
+    };
+    std::optional<AudioRequest> audio_request;
+    std::string audio_error;
+    std::thread export_thread;
+    std::atomic<bool> export_running{false}, export_cancel{false};
+    std::atomic<size_t> export_done{0}, export_total{0}, export_failed{0}, export_missing{0};
+    std::mutex export_mutex;
+    std::string export_message;
+
+    // movies
+    static constexpr int kSubtitlesOff = -1;
+    struct MovieState {
+        char filter[64] = "";
+        int selected = -1;   // index into catalog->movies
+        int channel = 0;     // USM audio channel
+        int sub_lang = -2;   // -2: the second-language setting, kSubtitlesOff, or a text language
+        std::unique_ptr<media::MoviePlayer> player;
+        std::unique_ptr<media::MoviePlayer::Frame> pending;
+        ComPtr<ID3D12Resource> tex;
+        std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> upload;
+        std::array<size_t, Gpu::kFramesInFlight> upload_size{};
+        uint32_t srv = UINT32_MAX, w = 0, h = 0;
+        bool tex_readable = false, has_frame = false, seeking = false;
+        float seek_value = 0;
+    } movie;
     int selected_package = -1;
     std::vector<EntryRow> package_rows;
     char entry_filter[32] = "";
@@ -2013,6 +2126,7 @@ public:
     }
 
     void ui() {
+        media_tick();
         ImGuiViewport* vp = ImGui::GetMainViewport();
         status_bar(vp);
         const ImGuiID dock = ImGui::GetID("nim_dock");
@@ -2047,6 +2161,7 @@ public:
                 case TabMaps: maps_tab(); break;
                 case TabText: strings_tab(); break;
                 case TabDialogue: dialogue_tab(); break;
+                case TabMovies: movies_tab(); break;
                 case TabPackages: packages_tab(); break;
                 case TabLog: log_tab(); break;
                 }
@@ -2124,7 +2239,9 @@ public:
             if (dbutton((icon(ico::Text) + "  TEXT").c_str(), bw)) open_tab(TabText);
             ImGui::SetItemTooltip("ローカライズ文字列 (全言語)");
             if (dbutton((icon(ico::Dialogue) + "  DIALOGUE").c_str(), bw)) open_tab(TabDialogue);
-            ImGui::SetItemTooltip("話者・台詞・音声イベント");
+            ImGui::SetItemTooltip("台詞を全言語で表示し、音声を再生・話者ごとに書き出す");
+            if (dbutton((icon(ico::Movies) + "  MOVIES").c_str(), bw)) open_tab(TabMovies);
+            ImGui::SetItemTooltip("ムービー (USM) を音声トラック・字幕の言語を選んで再生");
             if (dbutton((icon(ico::Packages) + "  PACKAGES").c_str(), bw)) open_tab(TabPackages);
             ImGui::SetItemTooltip("パッケージとエントリの生データ");
             ImGui::EndTable();
@@ -2737,68 +2854,690 @@ public:
     }
 
     // -- DIALOGUE --
-    void dialogue_tab() {
-        if (!catalog || !catalog->dialogue_ready) { ImGui::TextDisabled("読込中…"); return; }
+    // Text in any of the 13 languages, the line's audio in any installed voice language, lines
+    // filed by speaker or by conversation table, and WAV export into one folder per speaker.
+    size_t dialogue_lang() const { return size_t(dialogue_text_lang < 0 ? language : dialogue_text_lang); }
+
+    std::string speaker_name(uint32_t hash, size_t lang) {
+        if (hash == 0 || hash == 0x811C9DC5) return "(話者なし)";
+        const std::string& t = text(hash, lang);
+        if (!t.empty()) return t;
+        const std::string& en = text(hash, 0);
+        return en.empty() ? std::format("(不明 {:08X})", hash) : en;
+    }
+
+    void ensure_audio_languages() {
+        if (!audio_langs.empty() || !pm) return;
+        std::map<uint16_t, std::string> found;
+        for (const auto& p : pm->packages())
+            if (p.language != 0 && !found.contains(p.language)) {
+                const auto us = p.name.rfind('_');
+                found[p.language] = us == std::string::npos ? std::to_string(p.language) : p.name.substr(us + 1);
+            }
+        for (auto& [id, suffix] : found) audio_langs.emplace_back(id, audio_language_name(suffix));
+        // default to the voice that matches the second text language, else English
+        const std::string want = text_language_name(size_t(language));
+        for (size_t i = 0; i < audio_langs.size(); ++i)
+            if (audio_langs[i].second == want) audio_lang = int(i);
+    }
+
+    media::AudioEngine* audio_engine() {
+        if (!audio_engine_) {
+            audio_engine_ = std::make_unique<media::AudioEngine>();
+            if (!audio_engine_->ok()) error(audio_engine_->error());
+            clip = std::make_unique<media::ClipPlayer>(*audio_engine_);
+        }
+        return audio_engine_->ok() ? audio_engine_.get() : nullptr;
+    }
+
+    static uint64_t clip_id(uint32_t line, size_t wem, uint16_t lang) {
+        return (uint64_t(line) + 1) | uint64_t(wem & 0xFF) << 32 | uint64_t(lang) << 40;
+    }
+
+    void play_line(uint32_t line, size_t wem_index, uint16_t lang) {
+        if (!catalog || line >= catalog->dialogue.size() || !pm) return;
+        const auto& l = catalog->dialogue[line];
+        if (wem_index >= l.wem.size()) return;
+        const uint64_t id = clip_id(line, wem_index, lang);
+        audio_engine();
+        if (clip && clip->id() == id && clip->playing()) {
+            clip->stop();
+            return;
+        }
+        if (clip) clip->stop();
+        std::shared_ptr<PackageManager> fork(pm->fork());
+        const TagHash wem = l.wem[wem_index];
+        audio_request.reset();
+        audio_request = AudioRequest{id, std::async(std::launch::async, [fork, wem, lang] {
+                                         fork->set_language(lang);
+                                         auto bytes = fork->read(wem);
+                                         return std::make_shared<const PcmAudio>(decode_wem(bytes));
+                                     })};
+    }
+
+    // ▶ / ■ for one line in one voice language; "…" while decoding.
+    void play_button(uint32_t line, size_t wem_index, uint16_t lang, const char* label = nullptr) {
+        const uint64_t id = clip_id(line, wem_index, lang);
+        const bool loading = audio_request && audio_request->id == id;
+        const bool playing = clip && clip->id() == id && clip->playing();
+        std::string text_label = loading ? "…" : icon(playing ? ico::Stop : ico::Play);
+        if (label) text_label += std::string("  ") + label;
+        ImGui::PushID(int(id ^ (id >> 32)));
+        if (ImGui::SmallButton(text_label.c_str())) play_line(line, wem_index, lang);
+        ImGui::PopID();
+    }
+
+    void rebuild_dialogue_groups() {
         const auto& lines = catalog->dialogue;
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##dlgfilter", (icon(ico::Search) + "  話者・台詞で検索").c_str(), dialogue_filter,
-                                 sizeof(dialogue_filter));
-        std::string f = lower_ascii(dialogue_filter);
-        if (f != dialogue_filter_applied || dialogue_filter_lang != language) {
-            dialogue_filter_applied = f;
-            dialogue_filter_lang = language;
-            dialogue_view.clear();
-            for (uint32_t i = 0; i < lines.size(); ++i) {
-                const auto& l = lines[i];
-                if (f.empty() || contains_ci(text(l.speaker_hash, 0), f) || contains_ci(text(l.subtitle_hash, 0), f) ||
-                    text(l.subtitle_hash, size_t(language)).find(dialogue_filter) != std::string::npos ||
-                    text(l.speaker_hash, size_t(language)).find(dialogue_filter) != std::string::npos)
-                    dialogue_view.push_back(i);
+        const size_t lang = dialogue_lang();
+        dialogue_groups.clear();
+        std::unordered_map<uint64_t, size_t> index;
+        for (uint32_t i = 0; i < lines.size(); ++i) {
+            const auto& l = lines[i];
+            const uint64_t key = dialogue_group_mode == 0 ? l.speaker_hash : l.table.value;
+            auto [it, inserted] = index.emplace(key, dialogue_groups.size());
+            if (inserted) {
+                DialogueGroup g;
+                g.key = key;
+                g.name = dialogue_group_mode == 0 ? speaker_name(l.speaker_hash, lang) : l.table.str();
+                dialogue_groups.push_back(std::move(g));
+            }
+            dialogue_groups[it->second].lines.push_back(i);
+        }
+        if (dialogue_group_mode == 1)  // a table is labelled by its speakers
+            for (auto& g : dialogue_groups) {
+                std::vector<std::pair<size_t, uint32_t>> counts;
+                for (uint32_t li : g.lines) {
+                    const uint32_t sp = lines[li].speaker_hash;
+                    auto c = std::find_if(counts.begin(), counts.end(), [&](auto& p) { return p.second == sp; });
+                    if (c == counts.end()) counts.push_back({1, sp});
+                    else c->first++;
+                }
+                std::sort(counts.begin(), counts.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                std::string who;
+                for (size_t k = 0; k < counts.size() && k < 2; ++k) who += (k ? ", " : "") + speaker_name(counts[k].second, lang);
+                if (counts.size() > 2) who += " 他";
+                g.name += "  " + who;
+            }
+        std::sort(dialogue_groups.begin(), dialogue_groups.end(), [&](const DialogueGroup& a, const DialogueGroup& b) {
+            if (dialogue_group_mode == 0 && a.lines.size() != b.lines.size()) return a.lines.size() > b.lines.size();
+            return a.name < b.name;
+        });
+        dialogue_groups_mode = dialogue_group_mode;
+        dialogue_groups_lang = int(lang);
+        dialogue_group = -1;
+    }
+
+    void start_dialogue_export(const fs::path& dir) {
+        if (export_running || dialogue_view.empty() || audio_langs.empty()) return;
+        if (export_thread.joinable()) export_thread.join();
+        const auto& lines = catalog->dialogue;
+        const size_t lang = dialogue_lang();
+        const auto [lang_id, lang_name] = audio_langs[size_t(audio_lang)];
+        struct Job { TagHash wem; fs::path file; };
+        auto jobs = std::make_shared<std::vector<Job>>();
+        std::string csv = "\xEF\xBB\xBF" "folder,file,table,line_id,speaker_en,speaker";
+        for (size_t l = 0; l < kTextLanguageCount; ++l) csv += std::format(",{}", language_code(TextLanguage(l)));
+        csv += "\n";
+        auto quote = [](const std::string& v) {
+            std::string q = "\"";
+            for (char c : v) q += c == '"' ? std::string("\"\"") : std::string(1, c);
+            return q + "\"";
+        };
+        std::set<std::string> used_names;
+        for (uint32_t li : dialogue_view) {
+            const auto& l = lines[li];
+            const std::string folder = safe_file_name(speaker_name(l.speaker_hash, lang));
+            for (size_t w = 0; w < l.wem.size(); ++w) {
+                std::string name = std::format("{}_{:08X}{}", l.table.str(), l.line_id, l.wem.size() > 1 ? std::format("_{}", w) : "");
+                std::string snippet = safe_file_name(text(l.subtitle_hash, lang));
+                if (snippet.size() > 48) snippet = utf8_prefix(snippet, 48);
+                if (!snippet.empty()) name += "_" + snippet;
+                std::string file = name + ".wav";
+                for (int n = 2; !used_names.insert(folder + "/" + file).second; ++n) file = std::format("{}_{}.wav", name, n);
+                jobs->push_back({l.wem[w], dir / to_wide(folder) / to_wide(file)});
+                csv += quote(folder) + "," + quote(file) + "," + l.table.str() + std::format(",{:08X},", l.line_id) +
+                       quote(speaker_name(l.speaker_hash, 0)) + "," + quote(speaker_name(l.speaker_hash, lang));
+                for (size_t t = 0; t < kTextLanguageCount; ++t) csv += "," + quote(text(l.subtitle_hash, t));
+                csv += "\n";
             }
         }
+        export_total = jobs->size();
+        export_done = 0;
+        export_failed = 0;
+        export_missing = 0;
+        export_cancel = false;
+        export_running = true;
+        {
+            std::lock_guard lk(export_mutex);
+            export_message = std::format("{} 本を {} 音声で書き出し中…", jobs->size(), lang_name);
+        }
+        std::shared_ptr<PackageManager> fork(pm->fork());
+        const uint16_t lid = lang_id;
+        export_thread = std::thread([this, fork, jobs, dir, csv = std::move(csv), lid, lang_name] {
+            fork->set_language(lid);
+            try {
+                fs::create_directories(dir);
+                std::ofstream(dir / "index.csv", std::ios::binary) << csv;
+            } catch (...) {
+            }
+            for (const auto& j : *jobs) {
+                if (export_cancel) break;
+                try {
+                    fs::create_directories(j.file.parent_path());
+                    const auto pcm = decode_wem(fork->read(j.wem));
+                    if (!write_wav_file(j.file, pcm)) throw std::runtime_error("書き込み失敗");
+                } catch (const std::exception& ex) {
+                    if (std::string_view(ex.what()).find("no recording") != std::string_view::npos) export_missing++;
+                    else export_failed++;
+                }
+                export_done++;
+            }
+            std::lock_guard lk(export_mutex);
+            export_message = std::format("{}{} / {} 本を書き出しました ({} 音声, 未収録 {}, 失敗 {}): {}",
+                                         export_cancel ? "中止: " : "",
+                                         export_done.load() - export_failed.load() - export_missing.load(),
+                                         export_total.load(), lang_name, export_missing.load(), export_failed.load(), to_utf8(dir.wstring()));
+            export_running = false;
+        });
+    }
+
+    void dialogue_tab() {
+        if (!catalog || !catalog->dialogue_ready) { ImGui::TextDisabled("読込中…"); return; }
+        ensure_audio_languages();
+        const auto& lines = catalog->dialogue;
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const size_t lang = dialogue_lang();
+
+        // toolbar
+        ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x * 0.35f));
+        ImGui::InputTextWithHint("##dlgfilter", (icon(ico::Search) + "  話者・台詞で検索").c_str(), dialogue_filter,
+                                 sizeof(dialogue_filter));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(170 * sc);
+        if (ImGui::BeginCombo("字幕", text_language_name(lang))) {
+            for (int l = 0; l < int(kTextLanguageCount); ++l)
+                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) dialogue_text_lang = l;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("英語を併記", &dialogue_show_english);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130 * sc);
+        if (audio_langs.empty()) {
+            ImGui::TextDisabled("音声パッケージなし");
+        } else if (ImGui::BeginCombo("音声", audio_langs[size_t(audio_lang)].second.c_str())) {
+            for (int i = 0; i < int(audio_langs.size()); ++i)
+                if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("インストール済みの音声言語パッケージ (Steam の言語設定で追加できます)");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(export_running || dialogue_view.empty() || audio_langs.empty());
+        if (ImGui::Button((icon(ico::Save) + "  書き出し…").c_str()))
+            if (auto dir = pick_folder(g_win.hwnd)) start_dialogue_export(*dir);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("表示中の台詞を WAV で話者ごとのフォルダに書き出し (index.csv に全言語のテキスト)");
+        if (export_running) {
+            ImGui::SameLine();
+            ImGui::ProgressBar(export_total ? float(export_done) / float(export_total) : 0, {140 * sc, 0},
+                               std::format("{} / {}", export_done.load(), export_total.load()).c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("中止")) export_cancel = true;
+        } else {
+            std::lock_guard lk(export_mutex);
+            if (!export_message.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", export_message.c_str());
+            }
+        }
+        if (!audio_error.empty()) ImGui::TextColored({1, 0.4f, 0.4f, 1}, "音声エラー: %s", audio_error.c_str());
+
+        if (dialogue_groups_mode != dialogue_group_mode || dialogue_groups_lang != int(lang)) rebuild_dialogue_groups();
+
+        // left: filing by speaker / table
+        ImGui::BeginChild("dlggroups", {280 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+        if (ImGui::RadioButton("話者", dialogue_group_mode == 0)) dialogue_group_mode = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("会話テーブル", dialogue_group_mode == 1)) dialogue_group_mode = 1;
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##grpfilter", "絞り込み", dialogue_group_filter, sizeof(dialogue_group_filter));
+        const std::string gf = lower_ascii(dialogue_group_filter);
+        if (ImGui::Selectable(std::format("すべて  ({})", lines.size()).c_str(), dialogue_group < 0)) dialogue_group = -1;
+        for (int g = 0; g < int(dialogue_groups.size()); ++g) {
+            const auto& grp = dialogue_groups[size_t(g)];
+            if (!gf.empty() && !contains_ci(grp.name, gf) && grp.name.find(dialogue_group_filter) == std::string::npos) continue;
+            if (ImGui::Selectable(std::format("{}  ({})##g{}", grp.name, grp.lines.size(), g).c_str(), dialogue_group == g))
+                dialogue_group = g;
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        // the filtered view
+        const std::string f = lower_ascii(dialogue_filter);
+        const std::string key = std::format("{}\x01{}\x01{}\x01{}", f, lang, dialogue_group, dialogue_group_mode);
+        if (key != dialogue_filter_applied) {
+            dialogue_filter_applied = key;
+            dialogue_view.clear();
+            auto match = [&](uint32_t i) {
+                const auto& l = lines[i];
+                return f.empty() || contains_ci(text(l.speaker_hash, 0), f) || contains_ci(text(l.subtitle_hash, 0), f) ||
+                       text(l.subtitle_hash, lang).find(dialogue_filter) != std::string::npos ||
+                       text(l.speaker_hash, lang).find(dialogue_filter) != std::string::npos;
+            };
+            if (dialogue_group >= 0 && size_t(dialogue_group) < dialogue_groups.size()) {
+                for (uint32_t i : dialogue_groups[size_t(dialogue_group)].lines)
+                    if (match(i)) dialogue_view.push_back(i);
+            } else {
+                for (uint32_t i = 0; i < lines.size(); ++i)
+                    if (match(i)) dialogue_view.push_back(i);
+            }
+        }
+
+        ImGui::BeginGroup();
+        const float details_h = dialogue_selected >= 0 ? std::min(330 * sc, ImGui::GetContentRegionAvail().y * 0.45f) : 0;
         ImGui::TextDisabled("%zu / %zu 行", dialogue_view.size(), lines.size());
+        const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
         if (ImGui::BeginTable("dialogue", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                                 ImGuiTableFlags_BordersOuter)) {
+                                                 ImGuiTableFlags_BordersOuter,
+                              {0, ImGui::GetContentRegionAvail().y - details_h})) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("SPEAKER", ImGuiTableColumnFlags_WidthFixed, 130);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 30 * sc);
+            ImGui::TableSetupColumn("SPEAKER", ImGuiTableColumnFlags_WidthFixed, 150 * sc);
             ImGui::TableSetupColumn("LINE");
-            ImGui::TableSetupColumn("AUDIO EVENT", ImGuiTableColumnFlags_WidthFixed, 110);
-            ImGui::TableSetupColumn("WEM", ImGuiTableColumnFlags_WidthFixed, 44);
+            ImGui::TableSetupColumn("TABLE", ImGuiTableColumnFlags_WidthFixed, 80 * sc);
             ImGui::TableHeadersRow();
-            ImGuiListClipper clip;
-            clip.Begin(int(dialogue_view.size()));
-            while (clip.Step())
-                for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
-                    const auto& l = lines[dialogue_view[r]];
+            ImGuiListClipper clip_rows;
+            clip_rows.Begin(int(dialogue_view.size()));
+            while (clip_rows.Step())
+                for (int r = clip_rows.DisplayStart; r < clip_rows.DisplayEnd; ++r) {
+                    const uint32_t li = dialogue_view[size_t(r)];
+                    const auto& l = lines[li];
                     ImGui::TableNextRow();
                     ImGui::PushID(r);
                     ImGui::TableNextColumn();
-                    const std::string& sp = text(l.speaker_hash, size_t(language));
-                    ImGui::PushFont(g_fonts.bold, 0);
-                    ImGui::TextUnformatted((sp.empty() ? text(l.speaker_hash, 0) : sp).c_str());
-                    ImGui::PopFont();
+                    if (!l.wem.empty()) play_button(li, 0, voice);
                     ImGui::TableNextColumn();
+                    ImGui::PushFont(g_fonts.bold, 0);
+                    if (ImGui::Selectable(speaker_name(l.speaker_hash, lang).c_str(), dialogue_selected == int(li),
+                                          ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                        dialogue_selected = int(li);
+                    ImGui::PopFont();
                     const std::string& en = text(l.subtitle_hash, 0);
-                    const std::string& tr = text(l.subtitle_hash, size_t(language));
-                    ImGui::TextWrapped("%s", en.c_str());
-                    if (!tr.empty() && tr != en) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kGreen));
-                        ImGui::TextWrapped("%s", tr.c_str());
-                        ImGui::PopStyleColor();
-                    }
+                    const std::string& tr = text(l.subtitle_hash, lang);
                     if (ImGui::BeginPopupContextItem("ctx")) {
+                        if (ImGui::MenuItem("表示言語をコピー")) ImGui::SetClipboardText(tr.c_str());
                         if (ImGui::MenuItem("英語をコピー")) ImGui::SetClipboardText(en.c_str());
-                        if (ImGui::MenuItem("翻訳をコピー")) ImGui::SetClipboardText(tr.c_str());
                         ImGui::EndPopup();
                     }
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(l.audio_event.is_none() ? "-" : l.audio_event.str().c_str());
+                    ImGui::TextWrapped("%s", (tr.empty() ? en : tr).c_str());
+                    if (dialogue_show_english && lang != 0 && !en.empty() && en != tr) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextWrapped("%s", en.c_str());
+                        ImGui::PopStyleColor();
+                    }
                     ImGui::TableNextColumn();
-                    ImGui::Text("%zu", l.wem.size());
+                    ImGui::TextDisabled("%s", l.table.str().c_str());
                     ImGui::PopID();
                 }
             ImGui::EndTable();
         }
+        if (dialogue_selected >= 0 && size_t(dialogue_selected) < lines.size()) dialogue_details(uint32_t(dialogue_selected));
+        ImGui::EndGroup();
+    }
+
+    void dialogue_details(uint32_t li) {
+        const auto& l = catalog->dialogue[li];
+        const size_t lang = dialogue_lang();
+        ImGui::BeginChild("dlgdetails", {0, 0}, ImGuiChildFlags_Borders);
+        ImGui::PushFont(g_fonts.bold, 0);
+        ImGui::TextUnformatted(speaker_name(l.speaker_hash, lang).c_str());
+        ImGui::PopFont();
+        ImGui::SameLine();
+        ImGui::TextDisabled("行 %08X  テーブル %s  音声イベント %s", l.line_id, l.table.str().c_str(),
+                            l.audio_event.is_none() ? "-" : l.audio_event.str().c_str());
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 24 * ImGui::GetStyle().FontScaleDpi);
+        if (ImGui::SmallButton("×")) dialogue_selected = -1;
+        if (l.wem.empty()) {
+            ImGui::TextDisabled("音声なし");
+        } else {
+            for (size_t w = 0; w < l.wem.size(); ++w) {
+                ImGui::TextDisabled("%s", l.wem[w].str().c_str());
+                for (const auto& [id, name] : audio_langs) {
+                    ImGui::SameLine();
+                    play_button(li, w, id, name.c_str());
+                }
+                ImGui::SameLine();
+                ImGui::PushID(int(w));
+                if (ImGui::SmallButton((icon(ico::Save) + "  WAV").c_str()) && !audio_langs.empty())
+                    if (auto dir = pick_folder(g_win.hwnd)) {
+                        try {
+                            std::unique_ptr<PackageManager> fork(pm->fork());
+                            fork->set_language(audio_langs[size_t(audio_lang)].first);
+                            const auto pcm = decode_wem(fork->read(l.wem[w]));
+                            const fs::path file = *dir / to_wide(safe_file_name(std::format(
+                                "{}_{:08X}_{}.wav", speaker_name(l.speaker_hash, lang), l.line_id, audio_langs[size_t(audio_lang)].second)));
+                            if (!write_wav_file(file, pcm)) throw std::runtime_error("書き込めません");
+                            info("保存しました: " + to_utf8(file.wstring()));
+                        } catch (const std::exception& ex) {
+                            error(std::string("WAV を保存できません: ") + ex.what());
+                        }
+                    }
+                ImGui::SetItemTooltip("選択中の音声言語で WAV に保存");
+                ImGui::PopID();
+            }
+            if (clip && clip->playing() && (clip->id() & 0xFFFFFFFF) == uint64_t(li) + 1)
+                ImGui::ProgressBar(float(clip->position() / std::max(0.001, clip->length())), {-1, 4 * ImGui::GetStyle().FontScaleDpi}, "");
+        }
+        if (ImGui::BeginTable("langs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("言語", ImGuiTableColumnFlags_WidthFixed, 150 * ImGui::GetStyle().FontScaleDpi);
+            ImGui::TableSetupColumn("話者", ImGuiTableColumnFlags_WidthFixed, 140 * ImGui::GetStyle().FontScaleDpi);
+            ImGui::TableSetupColumn("台詞");
+            for (size_t t = 0; t < kTextLanguageCount; ++t) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", text_language_name(t));
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(speaker_name(l.speaker_hash, t).c_str());
+                ImGui::TableNextColumn();
+                const std::string& s = text(l.subtitle_hash, t);
+                ImGui::PushID(int(t));
+                ImGui::TextWrapped("%s", s.c_str());
+                if (ImGui::BeginPopupContextItem("c")) {
+                    if (ImGui::MenuItem("コピー")) ImGui::SetClipboardText(s.c_str());
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+            if (l.caption_hash && l.caption_hash != 0x811C9DC5 && !text(l.caption_hash, 0).empty()) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("キャプション");
+                ImGui::TableNextColumn();
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", text(l.caption_hash, lang).c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndChild();
+    }
+
+    // -- MOVIES --
+    // Default track of a localized movie: the one for the second text language (estimated
+    // mapping, channel = text language slot + 1), else the first language track.
+    int default_movie_channel(const MovieEntry& m) const {
+        if (m.info.audio.empty()) return 0;
+        if (m.info.audio.size() > 1) {
+            for (const auto& a : m.info.audio)
+                if (a.channel == language + 1) return a.channel;
+            for (const auto& a : m.info.audio)
+                if (a.channel == 1) return 1;
+        }
+        return m.info.audio.front().channel;
+    }
+
+    static std::string movie_track_label(const MovieEntry& m, const UsmInfo::Audio& a) {
+        std::string name;
+        if (m.info.audio.size() > 1 && a.channel >= 1 && size_t(a.channel) <= kTextLanguageCount)
+            name = std::format("{} (推定)", text_language_name(size_t(a.channel - 1)));
+        else
+            name = m.info.audio.size() > 1 ? "既定" : "音声";
+        name += std::format("  ch{} {} {}ch", a.channel, usm_audio_codec_name(a.codec), a.channels);
+        if (a.codec != 2) name += " 未対応";
+        return name;
+    }
+
+    void open_movie(int index, double at, bool paused) {
+        if (!catalog || index < 0 || size_t(index) >= catalog->movies.size() || !pm) return;
+        const auto& m = catalog->movies[size_t(index)];
+        movie.player.reset();
+        movie.pending.reset();
+        if (movie.selected != index) {
+            movie.selected = index;
+            movie.channel = default_movie_channel(m);
+            movie.has_frame = false;
+        }
+        if (!m.error.empty()) return;
+        movie.player = std::make_unique<media::MoviePlayer>(*pm, audio_engine(), m, movie.channel, at);
+        if (paused) movie.player->set_paused(true);
+    }
+
+    void media_tick() {
+        if (audio_request && audio_request->result.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                auto pcm = audio_request->result.get();
+                audio_engine();
+                if (clip) clip->play(pcm, audio_request->id);
+                audio_error.clear();
+            } catch (const std::exception& ex) {
+                audio_error = ex.what();
+                if (audio_error.find("no recording") != std::string::npos) audio_error = "この言語の音声は収録されていません";
+                error("音声を再生できません: " + audio_error);
+            }
+            audio_request.reset();
+        }
+        if (movie.player)
+            if (auto f = movie.player->take_due_frame()) movie.pending = std::move(f);
+    }
+
+    // Copies the newest movie frame into its texture (recorded before the UI draws).
+    void record_uploads(ID3D12GraphicsCommandList* cl, uint32_t fi) {
+        if (!movie.pending) return;
+        auto f = std::move(movie.pending);
+        if (!f->width || !f->height) return;
+        try {
+            if (!movie.tex || movie.w != f->width || movie.h != f->height) {
+                gpu.wait_idle();
+                movie.tex = gpu.texture2d(f->width, f->height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+                if (movie.srv == UINT32_MAX) movie.srv = gpu.srv().alloc(1);
+                gpu.device()->CreateShaderResourceView(movie.tex.Get(), nullptr, gpu.srv().cpu(movie.srv));
+                movie.w = f->width, movie.h = f->height;
+                movie.tex_readable = false;
+            }
+            const UINT pitch = (f->width * 4 + 255u) & ~255u;
+            const size_t need = size_t(pitch) * f->height;
+            auto& up = movie.upload[fi];
+            if (!up || movie.upload_size[fi] < need) {
+                up = gpu.buffer(need, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                movie.upload_size[fi] = need;
+            }
+            uint8_t* dst = nullptr;
+            const D3D12_RANGE none{0, 0};
+            check_hr(up->Map(0, &none, reinterpret_cast<void**>(&dst)), "movie upload Map");
+            for (uint32_t y = 0; y < f->height; ++y)
+                std::memcpy(dst + size_t(y) * pitch, f->rgba.data() + size_t(y) * f->width * 4, size_t(f->width) * 4);
+            up->Unmap(0, nullptr);
+            if (movie.tex_readable)
+                Gpu::barrier(cl, movie.tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION to{};
+            to.pResource = movie.tex.Get();
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION from{};
+            from.pResource = up.Get();
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, f->width, f->height, 1, pitch};
+            cl->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            Gpu::barrier(cl, movie.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            movie.tex_readable = true;
+            movie.has_frame = true;
+        } catch (const std::exception& ex) {
+            error(std::string("ムービーのフレームを転送できません: ") + ex.what());
+        }
+    }
+
+    static std::string clock_text(double s) {
+        const int t = int(std::max(0.0, s));
+        return std::format("{}:{:02}", t / 60, t % 60);
+    }
+
+    size_t movie_sub_lang() const { return size_t(movie.sub_lang < 0 ? language : movie.sub_lang); }
+
+    void movies_tab() {
+        if (!catalog || !catalog->movies_ready) { ImGui::TextDisabled("読込中…"); return; }
+        const auto& movies = catalog->movies;
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+
+        // left: movie list
+        ImGui::BeginChild("movielist", {330 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##moviefilter", (icon(ico::Search) + "  ファイル名で検索").c_str(), movie.filter, sizeof(movie.filter));
+        const std::string mf = lower_ascii(movie.filter);
+        ImGui::TextDisabled("%zu 本 (多言語音声 %zu)", movies.size(),
+                            size_t(std::count_if(movies.begin(), movies.end(), [](const MovieEntry& m) { return m.info.audio.size() > 1; })));
+        for (int i = 0; i < int(movies.size()); ++i) {
+            const auto& m = movies[size_t(i)];
+            if (!contains_ci(m.info.filename, mf) && !contains_ci(m.usm.str(), mf)) continue;
+            ImGui::PushID(i);
+            const bool sel = movie.selected == i;
+            if (ImGui::Selectable("##m", sel, 0, {0, ImGui::GetTextLineHeight() * 2 + 4 * sc})) open_movie(i, 0, false);
+            ImGui::SameLine(4 * sc);
+            ImGui::BeginGroup();
+            ImGui::TextUnformatted(m.info.filename.empty() ? m.usm.str().c_str() : m.info.filename.c_str());
+            if (m.info.audio.size() > 1) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "多言語");
+            }
+            ImGui::TextDisabled("%s  %ux%u  %s  %s", m.usm.str().c_str(), m.info.width, m.info.height,
+                                clock_text(m.info.duration()).c_str(), format_bytes(m.size).c_str());
+            ImGui::EndGroup();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        ImGui::BeginGroup();
+        if (movie.selected < 0 || size_t(movie.selected) >= movies.size()) {
+            ImGui::TextDisabled("左の一覧からムービーを選ぶと再生します。");
+            ImGui::EndGroup();
+            return;
+        }
+        const auto& m = movies[size_t(movie.selected)];
+        auto* p = movie.player.get();
+        const double pos = p ? p->position() : 0, dur = m.info.duration();
+        const size_t sub_lang = movie_sub_lang();
+
+        // video area
+        const float list_h = 150 * sc, controls_h = ImGui::GetFrameHeightWithSpacing() * 2 + 8 * sc;
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float area_h = std::max(80 * sc, avail.y - controls_h - list_h);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        auto* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(origin, {origin.x + avail.x, origin.y + area_h}, IM_COL32(0, 0, 0, 255));
+        const float vw = float(m.info.display_width ? m.info.display_width : m.info.width);
+        const float vh = float(m.info.display_height ? m.info.display_height : m.info.height);
+        const float scale = std::min(avail.x / std::max(1.0f, vw), area_h / std::max(1.0f, vh));
+        const ImVec2 sz{vw * scale, vh * scale};
+        const ImVec2 a{origin.x + (avail.x - sz.x) * 0.5f, origin.y + (area_h - sz.y) * 0.5f};
+        if (movie.has_frame && movie.srv != UINT32_MAX)
+            dl->AddImage(ImTextureID(gpu.srv().gpu(movie.srv).ptr), a, {a.x + sz.x, a.y + sz.y});
+        ImGui::InvisibleButton("video", {avail.x, area_h});
+        if (ImGui::IsItemClicked() && p) p->set_paused(!p->paused());
+
+        // subtitles over the picture
+        std::vector<media::MovieSubtitle> subs = p ? p->subtitles() : std::vector<media::MovieSubtitle>{};
+        if (movie.sub_lang != kSubtitlesOff)
+            for (const auto& s : subs)
+                if (pos >= s.start && pos < s.start + s.duration) {
+                    std::string t = text(s.string_hash, sub_lang);
+                    if (t.empty()) t = text(s.string_hash, 0);
+                    if (t.empty()) t = s.key;
+                    const float wrap = sz.x * 0.8f;
+                    const ImVec2 ts = ImGui::CalcTextSize(t.c_str(), nullptr, false, wrap);
+                    const ImVec2 tp{a.x + (sz.x - ts.x) * 0.5f, a.y + sz.y - ts.y - 24 * sc};
+                    dl->AddRectFilled({tp.x - 8 * sc, tp.y - 4 * sc}, {tp.x + ts.x + 8 * sc, tp.y + ts.y + 4 * sc}, IM_COL32(0, 0, 0, 170));
+                    dl->AddText(nullptr, 0, tp, IM_COL32(255, 255, 255, 255), t.c_str(), nullptr, wrap);
+                }
+
+        // controls
+        const bool playing = p && !p->paused() && !p->finished();
+        if (ImGui::Button(icon(playing ? ico::Pause : ico::Play).c_str(), {36 * sc, 0})) {
+            if (!p || p->finished()) open_movie(movie.selected, 0, false);
+            else p->set_paused(!p->paused());
+            p = movie.player.get();
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted(std::format("{} / {}", clock_text(movie.seeking ? movie.seek_value : pos), clock_text(dur)).c_str());
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        if (!movie.seeking) movie.seek_value = float(pos);
+        if (ImGui::SliderFloat("##seek", &movie.seek_value, 0, float(std::max(0.001, dur)), "")) movie.seeking = true;
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            movie.seeking = false;
+            open_movie(movie.selected, movie.seek_value, p && p->paused());
+            p = movie.player.get();
+        } else if (!ImGui::IsItemActive()) {
+            movie.seeking = false;
+        }
+
+        ImGui::SetNextItemWidth(300 * sc);
+        const UsmInfo::Audio* cur = nullptr;
+        for (const auto& t : m.info.audio)
+            if (t.channel == movie.channel) cur = &t;
+        if (ImGui::BeginCombo("音声トラック", cur ? movie_track_label(m, *cur).c_str() : "なし")) {
+            for (const auto& t : m.info.audio)
+                if (ImGui::Selectable(movie_track_label(m, t).c_str(), t.channel == movie.channel)) {
+                    movie.channel = t.channel;
+                    open_movie(movie.selected, pos, p && p->paused());
+                    p = movie.player.get();
+                }
+            ImGui::EndCombo();
+        }
+        if (m.info.audio.size() > 1)
+            ImGui::SetItemTooltip("言語トラックの割り当てはゲームデータに無いため推定です\n(チャンネル番号 = 文字列の言語スロット + 1。繁体字中国語の ch9 は欠番)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200 * sc);
+        if (ImGui::BeginCombo("字幕", movie.sub_lang == kSubtitlesOff ? "オフ" : text_language_name(sub_lang))) {
+            if (ImGui::Selectable("オフ", movie.sub_lang == kSubtitlesOff)) movie.sub_lang = kSubtitlesOff;
+            for (int l = 0; l < int(kTextLanguageCount); ++l)
+                if (ImGui::Selectable(text_language_name(size_t(l)), movie.sub_lang != kSubtitlesOff && size_t(l) == sub_lang))
+                    movie.sub_lang = l;
+            ImGui::EndCombo();
+        }
+        if (p) {
+            if (const std::string e = p->error(); !e.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored({1, 0.4f, 0.4f, 1}, "%s", e.c_str());
+            } else if (cur && !p->audio_supported()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled(cur->codec != 2 ? "この音声 (%s) は未対応のため映像のみ" : "音声出力を開けません",
+                                    usm_audio_codec_name(cur->codec));
+            }
+        }
+
+        // subtitle list (the subtitles are interleaved with the video, so they appear as it plays)
+        if (ImGui::BeginTable("subs", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter,
+                              {0, ImGui::GetContentRegionAvail().y})) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("時刻", ImGuiTableColumnFlags_WidthFixed, 60 * sc);
+            ImGui::TableSetupColumn(text_language_name(sub_lang));
+            ImGui::TableSetupColumn("英語 / キー");
+            ImGui::TableHeadersRow();
+            if (subs.empty()) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("字幕は再生に合わせて読み込まれます (このムービーにはまだ字幕がありません)");
+            }
+            for (size_t i = 0; i < subs.size(); ++i) {
+                const auto& s = subs[i];
+                ImGui::TableNextRow();
+                ImGui::PushID(int(i));
+                ImGui::TableNextColumn();
+                const bool now = pos >= s.start && pos < s.start + s.duration;
+                if (ImGui::Selectable(clock_text(s.start).c_str(), now, ImGuiSelectableFlags_SpanAllColumns))
+                    open_movie(movie.selected, s.start, false);
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", text(s.string_hash, sub_lang).c_str());
+                ImGui::TableNextColumn();
+                const std::string& en = text(s.string_hash, 0);
+                ImGui::TextDisabled("%s", en.empty() ? s.key.c_str() : en.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::EndGroup();
     }
 
     // -- PACKAGES --
@@ -2918,12 +3657,22 @@ public:
     }
 
     void shutdown() {
+        movie.player.reset();
+        clip.reset();
+        if (export_thread.joinable()) {
+            export_cancel = true;
+            export_thread.join();
+        }
         worker.stop();
         map_worker.stop();
         gpu.wait_idle();
         for (auto& [k, t] : thumbs)
             if (t.srv != UINT32_MAX) gpu.srv().free(t.srv, 1);
         thumbs.clear();
+        if (movie.srv != UINT32_MAX) gpu.srv().free(movie.srv, 1);
+        movie.srv = UINT32_MAX;
+        movie.tex.Reset();
+        for (auto& u : movie.upload) u.Reset();
         game_lighting.release(gpu);
         thumb_lighting.release(gpu);
         rain.release(gpu);
@@ -3057,6 +3806,7 @@ int run(const std::wstring& cmdline) {
         check_hr(g_win.alloc[fi]->Reset(), "allocator Reset");
         check_hr(cl->Reset(g_win.alloc[fi].Get(), nullptr), "list Reset");
         try {
+            app->record_uploads(cl, fi);
             if (app->viewport_visible) app->record(cl);
         } catch (const std::exception& ex) {
             app->error(std::string("描画エラー: ") + ex.what());

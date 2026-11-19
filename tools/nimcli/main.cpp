@@ -8,6 +8,11 @@
 //   nimcli [--install DIR] grep TEXT|hex:BYTES [TYPE]  find entries containing a byte pattern
 //   nimcli [--install DIR] strings [OUT.csv] [FIND]   every localized string, all languages
 //   nimcli [--install DIR] dialogue [OUT.csv]         every spoken line: speaker, text (all languages), audio
+//   nimcli [--install DIR] wem-audit [LIMIT]          decode every dialogue stream (NIM_LANGUAGE=6: Japanese)
+//   nimcli [--install DIR] movies [-v]                every USM movie: name, size, video/audio streams
+//   nimcli [--install DIR] movie-audio USM OUT.wav [CH]  decode a movie's audio track (ADX)
+//   nimcli [--install DIR] movie-frames USM OUT_DIR [START_S] [COUNT]  decode frames (BMP) and list subtitles
+//   nimcli [--install DIR] wem TAG|EVENT OUT.wav      decode a Wwise stream (or a dialogue audio event)
 //   nimcli [--install DIR] xref-strings                which tag classes reference string hashes
 //   nimcli [--install DIR] xref-tags T/S|class:HASH    which tag classes reference tags of that kind
 //   nimcli [--install DIR] static TAG                  static mesh: groups, techniques, shaders, layouts
@@ -35,6 +40,9 @@
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/content/movies.hpp"
+#include "media.hpp"
+#include "nim/content/audio.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/weather.hpp"
@@ -1175,6 +1183,182 @@ int cmd_refs64(PackageManager& pm, TagHash tag) {
     return 0;
 }
 
+int cmd_movies(PackageManager& pm, bool verbose) {
+    auto movies = list_movies(pm);
+    size_t subtitles = 0, multi_audio = 0;
+    for (const auto& m : movies) {
+        const auto& i = m.info;
+        std::string audio;
+        for (const auto& a : i.audio)
+            audio += std::format(" ch{}:{} {}Hz x{}", a.channel, usm_audio_codec_name(a.codec), a.sample_rate, a.channels);
+        subtitles += !i.subtitle_channels.empty();
+        multi_audio += i.audio.size() > 1;
+        std::println("{}  {:>10}  {:<40} {} {}x{} {:>5} frames {:.3f} fps {:>7.1f}s audio{}{}{}", m.usm.str(), m.size,
+                     i.filename, usm_video_codec_name(i.video_codec), i.width, i.height, i.total_frames, i.frame_rate,
+                     i.duration(), audio.empty() ? " -" : audio, i.subtitle_channels.empty() ? "" : " subtitles",
+                     m.error.empty() ? "" : "  ERROR " + m.error);
+        if (verbose)
+            for (auto d : m.descriptors) std::println("    descriptor {}", d.str());
+    }
+    std::println("{} movies, {} with subtitle chunks in the header area, {} with several audio tracks", movies.size(),
+                 subtitles, multi_audio);
+    return 0;
+}
+
+bool write_wav(const char* path, const PcmAudio& pcm) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint32_t data = uint32_t(pcm.samples.size() * 2);
+    auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    f.write("RIFF", 4); u32(36 + data); f.write("WAVEfmt ", 8); u32(16); u16(1); u16(pcm.channels);
+    u32(pcm.sample_rate); u32(pcm.sample_rate * pcm.channels * 2); u16(uint16_t(pcm.channels * 2)); u16(16);
+    f.write("data", 4); u32(data);
+    f.write(reinterpret_cast<const char*>(pcm.samples.data()), data);
+    return bool(f);
+}
+
+int cmd_movie_audio(PackageManager& pm, TagHash usm, const char* out, int channel) {
+    const Entry* e = pm.entry(usm);
+    if (!e) throw std::runtime_error("no such entry");
+    AdxDecoder adx;
+    PcmAudio pcm;
+    std::vector<uint8_t> buf;
+    uint64_t pos = 0;
+    size_t subs = 0;
+    while (pos < e->file_size || !buf.empty()) {
+        if (pos < e->file_size) {
+            auto more = pm.read_range(usm, pos, 0x400000);
+            pos += more.size();
+            buf.insert(buf.end(), more.begin(), more.end());
+        }
+        size_t used = for_each_usm_chunk(buf, [&](const UsmChunk& c) {
+            if (c.data_type != 0) return;
+            if (c.stream == UsmStream::Audio && c.channel == channel) adx.feed(c.payload, pcm.samples);
+            if (c.stream == UsmStream::Subtitle) {
+                if (auto s = parse_usm_subtitle(c.payload); s && subs++ < 20)
+                    std::println("subtitle ch{} lang {} {}ms +{}: {}", c.channel, s->language, s->start, s->duration, s->text);
+            }
+        });
+        if (used == 0 && pos >= e->file_size) break;
+        buf.erase(buf.begin(), buf.begin() + std::ptrdiff_t(used));
+    }
+    pcm.sample_rate = adx.sample_rate;
+    pcm.channels = uint16_t(adx.channels);
+    std::println("ADX {} Hz x{}, {} samples decoded of {}{}", adx.sample_rate, adx.channels,
+                 adx.channels ? pcm.samples.size() / adx.channels : 0, adx.total_samples, adx.encrypted ? " (encrypted)" : "");
+    if (subs) std::println("{} subtitle chunks", subs);
+    return write_wav(out, pcm) ? 0 : 1;
+}
+
+void write_bmp(const fs::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba) {
+    const uint32_t row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    std::vector<uint8_t> b(size, 0);
+    auto put32 = [&](size_t o, uint32_t v) { std::memcpy(&b[o], &v, 4); };
+    b[0] = 'B', b[1] = 'M';
+    put32(2, size), put32(10, 54), put32(14, 40), put32(18, w), put32(22, h);
+    b[26] = 1, b[28] = 24;
+    put32(34, row * h);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = &rgba[(size_t(y) * w + x) * 4];
+            uint8_t* q = &b[54 + size_t(h - 1 - y) * row + x * 3];
+            q[0] = p[2], q[1] = p[1], q[2] = p[0];
+        }
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
+}
+
+int cmd_movie_frames(PackageManager& pm, TagHash usm, const fs::path& dir, double start, int count) {
+    auto movies = list_movies(pm);
+    auto it = std::find_if(movies.begin(), movies.end(), [&](const MovieEntry& m) { return m.usm == usm; });
+    if (it == movies.end()) throw std::runtime_error("not a movie");
+    fs::create_directories(dir);
+    media::MoviePlayer player(pm, nullptr, *it, 0, start);
+    int got = 0;
+    double first = -1, last = 0;
+    uint64_t checksum = 0;
+    while (got < count) {
+        auto f = player.take_next_frame(std::chrono::seconds(20));
+        if (!f) break;
+        if (first < 0) first = f->pts;
+        last = f->pts;
+        uint64_t mean = 0;
+        for (size_t i = 0; i < f->rgba.size(); i += 4) mean += f->rgba[i] + f->rgba[i + 1] + f->rgba[i + 2];
+        checksum += mean;
+        if (got == 0 || got == count - 1 || got % 30 == 0)
+            write_bmp(dir / std::format("frame_{:05}.bmp", int(std::lround(f->pts * it->info.frame_rate))), f->width, f->height, f->rgba);
+        ++got;
+    }
+    std::println("{} frames {:.3f}..{:.3f}s ({}x{}){}", got, first, last, it->info.display_width, it->info.display_height,
+                 player.error().empty() ? "" : "  ERROR " + player.error());
+    StringTable strings;
+    bool loaded = false;
+    for (const auto& s : player.subtitles()) {
+        if (!loaded) strings.load_all(pm), loaded = true;
+        const LocalizedString* ls = strings.find(s.string_hash);
+        std::println("  {:7.2f}s +{:.2f}  {}  {}  /  {}", s.start, s.duration, s.key, ls ? ls->text[0] : "?", ls ? ls->text[1] : "?");
+    }
+    return got > 0 && player.error().empty() ? 0 : 1;
+}
+
+int cmd_wem(PackageManager& pm, TagHash tag, const char* out) {
+    const Entry* e = pm.entry(tag);
+    if (!e) throw std::runtime_error("no such entry");
+    TagHash wem = tag;
+    if (e->type == 8 && e->reference == kClassAudioEvent) {
+        auto ev = pm.read(tag);
+        TagReader r(ev);
+        auto v = r.vec_at(0x20);
+        if (v.count == 0) throw std::runtime_error("audio event has no streams");
+        wem = r.tag_at(v.data);
+    }
+    auto bytes = pm.read(wem);
+    auto info = probe_wem(bytes);
+    if (!info) throw std::runtime_error("not a WEM");
+    std::println("{}: codec {:04X} {} Hz x{} {} samples", wem.str(), info->codec, info->sample_rate, info->channels,
+                 info->sample_count);
+    auto pcm = decode_wem(bytes);
+    std::println("decoded {} samples", pcm.frames());
+    return write_wav(out, pcm) ? 0 : 1;
+}
+
+// Decodes every dialogue stream and reports codecs, failures and silent results.
+int cmd_wem_audit(PackageManager& pm, size_t limit) {
+    auto lines = load_all_dialogue(pm);
+    std::map<uint16_t, size_t> codecs;
+    size_t streams = 0, ok = 0, failed = 0, silent = 0, missing = 0;
+    double seconds = 0;
+    std::set<uint32_t> seen;
+    for (const auto& l : lines)
+        for (TagHash w : l.wem) {
+            if (!seen.insert(w.value).second) continue;
+            if (limit && streams >= limit) break;
+            ++streams;
+            if (!pm.entry(w)) { ++missing; continue; }
+            try {
+                auto bytes = pm.read(w);
+                if (bytes.size() < 12) { ++missing; continue; }  // localized placeholder: no recording
+                auto info = probe_wem(bytes);
+                if (!info) throw std::runtime_error("not RIFF");
+                codecs[info->codec]++;
+                auto pcm = decode_wem(bytes);
+                int peak = 0;
+                for (int16_t v : pcm.samples) peak = std::max(peak, std::abs(int(v)));
+                if (info->sample_count && pcm.frames() != info->sample_count)
+                    throw std::runtime_error(std::format("{} of {} samples", pcm.frames(), info->sample_count));
+                silent += peak < 64;
+                seconds += pcm.seconds();
+                ++ok;
+            } catch (const std::exception& ex) {
+                if (failed++ < 10) std::println("  {}: {}", w.str(), ex.what());
+            }
+        }
+    for (auto [c, n] : codecs) std::println("codec {:04X} {:<10} {}", c, wem_codec_name(c), n);
+    std::println("{} streams: {} decoded ({:.0f} s), {} failed, {} silent, {} not installed/not recorded", streams, ok, seconds, failed,
+                 silent, missing);
+    return failed ? 1 : 0;
+}
+
 int cmd_find(PackageManager& pm, uint32_t cls) {
     size_t n = 0;
     for (const auto& info : pm.packages()) {
@@ -1883,6 +2067,7 @@ int main(int argc, char** argv) {
     }
     try {
         PackageManager pm(install);
+        if (const char* lang = std::getenv("NIM_LANGUAGE")) pm.set_language(uint16_t(std::atoi(lang)));  // localized packages
         const std::string& cmd = args[0];
         if (cmd == "pkgs") return cmd_pkgs(pm);
         if (cmd == "ls" && args.size() >= 2) return cmd_ls(pm, uint16_t(parse_hex(args[1])));
@@ -1895,6 +2080,14 @@ int main(int argc, char** argv) {
             return cmd_strings(pm, args.size() >= 2 && args[1] != "-" ? args[1].c_str() : nullptr,
                                args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
+        if (cmd == "wem-audit") return cmd_wem_audit(pm, args.size() >= 2 ? std::stoul(args[1]) : 0);
+        if (cmd == "movies") return cmd_movies(pm, args.size() >= 2 && args[1] == "-v");
+        if (cmd == "movie-audio" && args.size() >= 3)
+            return cmd_movie_audio(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoi(args[3]) : 0);
+        if (cmd == "movie-frames" && args.size() >= 3)
+            return cmd_movie_frames(pm, TagHash(parse_hex(args[1])), args[2], args.size() >= 4 ? std::stod(args[3]) : 0,
+                                    args.size() >= 5 ? std::stoi(args[4]) : 60);
+        if (cmd == "wem" && args.size() >= 3) return cmd_wem(pm, TagHash(parse_hex(args[1])), args[2].c_str());
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);

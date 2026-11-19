@@ -1,5 +1,7 @@
 // Unit tests that do not need a game install.
 #include "nim/content/animation.hpp"
+#include "nim/content/audio.hpp"
+#include "nim/content/usm.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/content/weather.hpp"
@@ -232,6 +234,66 @@ int main() {
         attachment.bind.resize(5);
         attachment.bind[1] = mechanism.bind[2];
         CHECK((assembly_pose_map(mechanism, attachment) == std::vector<int32_t>{0, 2, 2, 2, -1}));
+    }
+
+    {
+        // The FFT inverse MDCT matches the direct Vorbis formula.
+        for (size_t n : {size_t(256), size_t(2048)}) {
+            std::vector<float> in(n / 2), fast(n), slow(n);
+            for (size_t k = 0; k < in.size(); ++k) in[k] = float(std::sin(double(k) * 0.37) + 0.25 * std::cos(double(k * k) * 0.011));
+            inverse_mdct(in, fast);
+            double worst = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double acc = 0;
+                for (size_t k = 0; k < n / 2; ++k)
+                    acc += in[k] * std::cos(2.0 * 3.14159265358979323846 / double(n) * (double(i) + 0.5 + double(n) / 4) * (double(k) + 0.5));
+                worst = std::max(worst, std::abs(acc - double(fast[i])));
+            }
+            CHECK(worst < 1e-2);
+        }
+    }
+
+    {
+        // ADX: a two-channel stream with one frame of zero samples, then the end marker.
+        std::vector<uint8_t> adx = {0x80, 0x00, 0x00, 0x10, 3, 18, 4, 2, 0, 0, 0xBB, 0x80, 0, 0, 0, 32, 0x01, 0xF4, 4, 0};
+        adx.resize(0x14, 0);
+        for (int ch = 0; ch < 2; ++ch) {
+            adx.push_back(0), adx.push_back(9);
+            for (int i = 0; i < 16; ++i) adx.push_back(ch ? 0x11 : 0x00);
+        }
+        adx.push_back(0x80), adx.push_back(0x01);
+        adx.resize(adx.size() + 34, 0);
+        AdxDecoder dec;
+        std::vector<int16_t> pcm;
+        dec.feed(std::span(adx).first(10), pcm);  // split mid-header
+        dec.feed(std::span(adx).subspan(10), pcm);
+        CHECK(dec.sample_rate == 48000 && dec.channels == 2);
+        CHECK(pcm.size() == 64);
+        CHECK(pcm[0] == 0 && pcm[1] == 10);
+        CHECK(dec.ended);
+
+        // @UTF: one per-row u32 column and a constant string column.
+        std::vector<uint8_t> t = {'@', 'U', 'T', 'F', 0, 0, 0, 0};
+        std::vector<uint8_t> body = {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 4, 0, 0, 0, 2};
+        body.push_back(0x54), body.insert(body.end(), {0, 0, 0, 6});           // "value", per row, u32
+        body.push_back(0x3A), body.insert(body.end(), {0, 0, 0, 12});          // "name", constant string
+        body.insert(body.end(), {0, 0, 0, 0});                                // constant -> "abc"
+        const uint16_t rows = uint16_t(body.size());
+        body.insert(body.end(), {0, 0, 0, 7, 0, 0, 0, 9});
+        const uint32_t strings = uint32_t(body.size());
+        for (const char* str : {"TBL", "value", "name", "abc"}) body.insert(body.end(), str, str + std::strlen(str) + 1);
+        const uint32_t data = uint32_t(body.size());
+        auto put32 = [&](size_t o, uint32_t v) { body[o] = uint8_t(v >> 24), body[o + 1] = uint8_t(v >> 16), body[o + 2] = uint8_t(v >> 8), body[o + 3] = uint8_t(v); };
+        body[2] = uint8_t(rows >> 8), body[3] = uint8_t(rows);
+        put32(4, strings), put32(8, data), put32(12, 0);
+        put32(25, 4), put32(30, 10), put32(34, 15);
+        t[4] = 0, t[5] = 0, t[6] = uint8_t(body.size() >> 8), t[7] = uint8_t(body.size());
+        t.insert(t.end(), body.begin(), body.end());
+        auto table = parse_utf_table(t);
+        CHECK(table.name == "TBL");
+        CHECK(table.rows.size() == 2);
+        CHECK(table.integer(1, "value") == 9);
+        CHECK(table.text(0, "name") == "abc");
     }
 
     if (g_failures) return 1;

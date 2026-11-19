@@ -39,6 +39,7 @@ public:
 
     const Entry* entry(TagHash h);
     std::vector<uint8_t> read(TagHash h);
+    std::vector<uint8_t> read_range(TagHash h, uint64_t offset, size_t size);
     std::optional<TagHash> resolve64(uint64_t hash64);
 
     // Builds the global hash64 table by opening every package (header + tables only).

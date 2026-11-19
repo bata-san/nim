@@ -91,6 +91,9 @@ public:
     std::shared_ptr<const std::vector<uint8_t>> cached_block(uint32_t index) const;
     // Reads one entry's bytes. Thread-safe.
     std::vector<uint8_t> read_entry(uint32_t index) const;
+    // Reads `size` bytes from `offset` within an entry, decoding blocks without caching them
+    // (movies are hundreds of MB and are read sequentially). Thread-safe.
+    std::vector<uint8_t> read_entry_range(uint32_t index, uint64_t offset, size_t size) const;
     // Research scans release decoded blocks between packages; active readers retain ownership.
     void clear_block_cache() const;
 

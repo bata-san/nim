@@ -122,6 +122,11 @@ std::vector<uint8_t> PackageManager::read(TagHash h) {
     return open(h.pkg_id()).read_entry(h.entry_index());
 }
 
+std::vector<uint8_t> PackageManager::read_range(TagHash h, uint64_t offset, size_t size) {
+    if (!entry(h)) throw std::runtime_error("unresolvable tag " + h.str());
+    return open(h.pkg_id()).read_entry_range(h.entry_index(), offset, size);
+}
+
 void PackageManager::build_hash64_index() {
     for (const auto& i : infos_)
         for (const auto& e : open(i).hash64s()) h64_.emplace(e.hash64, e.hash32);
