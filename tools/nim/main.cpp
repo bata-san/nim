@@ -454,6 +454,7 @@ public:
         live_.reset();
         thumbs_.clear();
         results_.clear();
+        thumbnail_cache_ = PrepareCache{512};
     }
     void request_live(TagHash t, int permutation = -1, ChannelValues channels = {}) {
         {
@@ -540,14 +541,15 @@ private:
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
                     auto it = materials_->find(tag.value);
                     r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation,
-                                                   channels.empty() ? nullptr : &channels);
+                                                   channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
                     if (!thumb) find_animation(*pm, r);
                 } else {
-                    r.mesh = prepare_static_mesh(*pm, tag, channels.empty() ? nullptr : &channels);
+                    r.mesh = prepare_static_mesh(*pm, tag, channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
                 }
             } catch (const std::exception& ex) {
                 r.error = ex.what();
             }
+            if (thumb) thumbnail_cache_.textures.clear();
             r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             std::lock_guard lk(m_);
             if (!thumb) working_live_ = false;
@@ -586,6 +588,7 @@ private:
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
     std::optional<std::unordered_map<uint32_t, ModelRig>> rigs_;
     std::optional<std::vector<ClipInfo>> clips_;
+    PrepareCache thumbnail_cache_{512};
     std::deque<TagHash> thumbs_;
     std::deque<Result> results_;
 };
@@ -1183,6 +1186,8 @@ public:
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
+            entity_preview_atmosphere.reset();
+            entity_preview_active = thumb_preview_active = false;
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -1211,6 +1216,20 @@ public:
         } catch (...) {
             thumb_game_ready = false;
         }
+    }
+
+    bool set_entity_preview(GameLighting& renderer, bool& active) {
+        if (active) return true;
+        try {
+            if (!entity_preview_atmosphere) entity_preview_atmosphere = load_entity_preview_atmosphere(*pm);
+            if (entity_preview_atmosphere->valid()) {
+                renderer.set_atmosphere(*pm, gpu, &*entity_preview_atmosphere);
+                active = renderer.has_atmosphere();
+            }
+        } catch (const std::exception& ex) {
+            error(std::format("エンティティの環境光: {}", ex.what()));
+        }
+        return active;
     }
 
     // Object channels: the per-object state values the materials read (frozen, in a heat cascade,
@@ -1325,11 +1344,17 @@ public:
                     map_scene = false;
                     game_lighting.clear_lights(g);
                     game_lighting.clear_cubemaps(g);
-                    game_lighting.clear_atmosphere(), map_atmosphere.reset();
+                    const bool entity = r->mesh->dynamic;
+                    if (!entity || !entity_preview_active) {
+                        game_lighting.clear_atmosphere();
+                        entity_preview_active = false;
+                    }
+                    map_atmosphere.reset();
                     map_weather.reset();
                     weather_states.clear();
                     apply_weather();
                     scene.upload(g, std::move(*r->mesh), layouts);
+                    if (entity && game_ready) set_entity_preview(game_lighting, entity_preview_active);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
                     } else if (!anim || anim->model != r->tag) {
@@ -1356,7 +1381,10 @@ public:
                 error(std::format("{} を読めません: {}", r->tag.str(), r->error));
             }
         }
-        make_thumbnail(g);
+        // Preparing a card submits its uploads synchronously. Never put that work on each
+        // viewport frame or interrupt mouse-driven camera movement.
+        if (!map.streaming && frame_no % 6 == 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
+            make_thumbnail(g);
         try {
             stream_map(g);
         } catch (const std::exception& ex) {
@@ -1393,6 +1421,7 @@ public:
         game_lighting.clear_lights(gpu);
         game_lighting.clear_cubemaps(gpu);
         game_lighting.clear_atmosphere(), map_atmosphere.reset();
+        entity_preview_active = false;
         if (!same) map_weather.reset(), weather_states.clear();
         rain.valid = false;
         apply_weather();
@@ -1475,6 +1504,8 @@ public:
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
+    std::optional<MapAtmosphere> entity_preview_atmosphere;
+    bool entity_preview_active = false, thumb_preview_active = false;
     // Weather: the map's world channel controllers and the state chosen for each (-1 = none,
     // the render-globals defaults).
     std::shared_ptr<const MapWeather> map_weather;
@@ -1721,7 +1752,9 @@ public:
         }
         try {
             g.wait_idle();
+            const bool entity = r->mesh->dynamic;
             thumb_scene.upload(g, std::move(*r->mesh), layouts);
+            const bool preview = entity && thumb_game_ready && set_entity_preview(thumb_lighting, thumb_preview_active);
             thumb_gb.resize(g, kThumbSize, kThumbSize);
             ViewMatrices vm = make_view(frame_sphere(thumb_scene.center(), thumb_scene.radius(), kThumbSize, kThumbSize));
             auto* cl = g.immediate();
@@ -1729,6 +1762,8 @@ public:
             LightingParams lp = light;
             lp.mode = ViewMode::Lit;
             lp.time = lp.delta_time = 0;
+            lp.atmosphere = lp.entity_preview = preview;
+            lp.auto_exposure = lp.temporal_aa = false;
             if (thumb_game_ready)
                 thumb_lighting.render(g, cl, thumb_gb, vm, lp, [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                     thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm, thumb_lighting.externs());
@@ -1877,6 +1912,7 @@ public:
         if (game_ready) scene.set_exposure(game_lighting.exposure());
         light.time = material_time;
         light.delta_time = material_dt;
+        light.entity_preview = entity_preview_active && !map_scene;
         if (game_ready) {
             scene.set_global_channel_values(game_lighting.update_global_channels(light));
             scene.set_global_channels(game_lighting.world_channels());
@@ -1888,7 +1924,7 @@ public:
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
                 sun_shadow.fit_view(game_lighting.sun_toward(light), vm.eye, cam.target, scene.center(), scene.radius(), map_scene);
-                scene.render_shadow(gpu, cl, sun_shadow);
+                scene.render_sun_shadow(gpu, cl, sun_shadow, map_scene);
                 shadow = &sun_shadow;
             }
             // Shadowing local lights: a couple of depth maps per frame for the lights on screen,

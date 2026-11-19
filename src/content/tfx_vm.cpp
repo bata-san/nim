@@ -249,13 +249,12 @@ std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bc) {
 }
 
 TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants, std::span<float4> out,
-                  const TfxEnvironment& env, std::string* trace) {
+                  const TfxEnvironment& env, std::string* trace, bool record_bindings) {
     auto missing = [](const char* kind) -> float4 {
         throw std::runtime_error(std::format("TFX: missing {} input", kind));
     };
     TfxResult res;
     Vm vm(constants, out, env);
-    std::vector<int> pending_textures;  // stack depth bookkeeping for texture views
     uint8_t last_extern_id = 0, last_extern_offset = 0, last_sampler = 0;
 
     auto note = [&](const char* name) {
@@ -464,15 +463,15 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         case 0x57: if (a1 >= 16) throw std::runtime_error("TFX temp slot"); vm.push(vm.temp[a1]); break;
         case 0x58: if (a1 >= 16) throw std::runtime_error("TFX temp slot"); vm.temp[a1] = vm.pop(); break;
         case 0x59: case 0x5B:
-            res.extern_textures.push_back({uint32_t(a1 & 0x1F), last_extern_id, last_extern_offset});
+            if (record_bindings) res.extern_textures.push_back({uint32_t(a1 & 0x1F), last_extern_id, last_extern_offset});
             vm.pop();
             break;
         case 0x5D:
-            res.samplers.push_back({uint32_t(a1 & 0x1F), last_sampler});
+            if (record_bindings) res.samplers.push_back({uint32_t(a1 & 0x1F), last_sampler});
             vm.pop();
             break;
         case 0x5E:
-            res.extern_uavs.push_back({uint32_t(a1 & 31), last_extern_id, last_extern_offset});
+            if (record_bindings) res.extern_uavs.push_back({uint32_t(a1 & 31), last_extern_id, last_extern_offset});
             vm.pop();
             break;                     // UAV bind
         case 0x61: last_sampler = a1; vm.push(float4{}); break;  // sampler handle

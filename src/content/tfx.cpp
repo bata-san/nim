@@ -312,7 +312,8 @@ VertexBuffer load_vertex_buffer(PackageManager& pm, TagHash header) {
     VertexBuffer vb;
     vb.stride = r.u16_at(4);
     vb.vtype = r.u16_at(6);
-    vb.data = pm.read(TagHash(pm.entry(header)->reference));
+    vb.data_tag = TagHash(pm.entry(header)->reference);
+    vb.data = pm.read(vb.data_tag);
     return vb;
 }
 
@@ -321,7 +322,8 @@ IndexBuffer load_index_buffer(PackageManager& pm, TagHash header) {
     BinaryReader r(h);
     IndexBuffer ib;
     ib.is_32bit = r.u8_at(1) != 0;
-    ib.data = pm.read(TagHash(pm.entry(header)->reference));
+    ib.data_tag = TagHash(pm.entry(header)->reference);
+    ib.data = pm.read(ib.data_tag);
     return ib;
 }
 

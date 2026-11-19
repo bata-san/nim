@@ -11,10 +11,18 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <future>
 #include <stdexcept>
 #include <tuple>
 
 namespace nim {
+namespace {
+constexpr uint8_t kStageShadow = 4;
+constexpr uint8_t kStageTransparent = 8;
+size_t stage_slot(uint8_t stage) {
+    return stage == kStageShadow ? 2 : stage == kStageTransparent ? 1 : 0;
+}
+}
 
 // ---- math -----------------------------------------------------------------------------------------
 float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -67,6 +75,7 @@ ViewMatrices make_view(const View& v) {
 
 void SunShadow::resize(Gpu& gpu, uint32_t n) {
     if (n == size && depth) return;
+    valid = false;
     size = n;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
@@ -136,8 +145,12 @@ void SunShadow::fit_view(V3 sun_dir, V3 eye, V3 focus, V3 scene_center, float sc
     if (scene_radius <= reach) fit(sun_dir, scene_center, scene_radius * 1.05f);
     else {
         const float distance = std::sqrt(dot(d, d));
-        const V3 center = map && distance > 1e-3f && distance < reach * 0.45f
+        V3 center = map && distance > 1e-3f && distance < reach * 0.45f
             ? eye + d * (reach * 0.45f / distance) : focus;
+        if (map) {
+            constexpr float step = 4.0f;
+            center = {std::round(center.x / step) * step, std::round(center.y / step) * step, std::round(center.z / step) * step};
+        }
         fit(sun_dir, center, reach);
     }
 }
@@ -552,6 +565,7 @@ void StaticMeshScene::set_material_frame(float seconds, float delta_seconds) {
 }
 
 void StaticMeshScene::release(Gpu& gpu) {
+    ++shadow_generation_;
     // A failed upload leaves texture copies recorded on the immediate list; run them while their
     // resources are still alive, or the next flush page-faults the GPU (device removed).
     if (!items_.empty() || !sets_.empty()) {
@@ -568,8 +582,12 @@ void StaticMeshScene::release(Gpu& gpu) {
     scopes_resolved_ = false;
     scope_defs_.clear();
     cull_groups_.clear();
+    uncullable_opaque_.clear();
+    visible_opaque_.clear();
+    for (auto& bundle : draw_bundles_) bundle = {};
     instance_total_ = 0;
     texture_cache_.clear();
+    geometry_cache_.clear();
     root_cache_.clear();
     pipeline_cache_.clear();
     info_.clear();
@@ -705,12 +723,20 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     info.vs = vs_stage.shader;
     info.ps = ps_stage.shader;
     g.vs = load_shader_bytecode(pm, vs_stage.shader);
-    g.ps = load_shader_bytecode(pm, ps_stage.shader);
-    if (validate_entity_resources) {
-        for (const auto& b : shader_bindings(g.ps)) {
+    if (!ps_stage.shader.is_none()) g.ps = load_shader_bytecode(pm, ps_stage.shader);
+    if (validate_entity_resources && !g.ps.empty()) {
+        const auto bindings = shader_bindings(g.ps);
+        const auto has_cb = [&](uint32_t reg) {
+            return std::any_of(bindings.begin(), bindings.end(), [&](const auto& b) {
+                return b.type == BindingType::Cbv && b.lower == reg;
+            });
+        };
+        const bool engine_reflection = has_cb(3) && has_cb(8);
+        for (const auto& b : bindings) {
             if (b.type != BindingType::Srv) continue;
             for (uint32_t slot = b.lower; slot <= b.upper; ++slot)
-                if (!g.ps_sources.textures.contains(slot) && !g.ps_sources.extern_textures.contains(slot))
+                if (!g.ps_sources.textures.contains(slot) && !g.ps_sources.extern_textures.contains(slot) &&
+                    !(engine_reflection && slot == 26 && b.kind == BindingKind::TextureCube))
                     throw std::runtime_error(std::format("{}: missing original PS t{}", tech.tag.str(), slot));
         }
     }
@@ -750,12 +776,14 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     for (const auto& [slot, tag] : g.vs_sources.textures)
         g.vs_textures[slot] = cached_texture(pm, tag, texture_cache);
     // A missing sampler must not silently select an anisotropic or linear preset.
-    for (auto [code, samplers] : {std::pair{&g.vs, &g.vs_samplers}, std::pair{&g.ps, &g.ps_samplers}})
+    for (auto [code, samplers] : {std::pair{&g.vs, &g.vs_samplers}, std::pair{&g.ps, &g.ps_samplers}}) {
+        if (code->empty()) continue;
         for (const auto& binding : shader_bindings(*code))
             if (binding.type == BindingType::Sampler)
                 for (uint32_t reg = binding.lower; reg <= binding.upper; ++reg)
                     if (!samplers->contains(reg))
                         throw std::runtime_error(std::format("{}: missing original sampler s{}", tech.tag.str(), reg));
+    }
     return g;
 }
 
@@ -827,7 +855,6 @@ bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vect
 
 // Render stages nim draws: 0 GenerateGbuffer, 8 Transparents.
 constexpr uint8_t kDrawnStages[] = {0, 8};
-constexpr uint8_t kStageTransparent = 8;
 class UnsupportedMeshPart : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -914,12 +941,12 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         bool used = false;
         for (uint8_t stage : kDrawnStages) {
         const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
-        // Highest detail: lod_category bit 0 (goriath); fall back to every part when none has it.
-        bool any_high = false;
-        for (size_t k = first; k < last; ++k) any_high |= (mesh.parts[k].lod_category & 1) != 0;
+        uint8_t authored_lods = 0;
+        for (size_t k = first; k < last; ++k) authored_lods |= mesh.parts[k].lod_category;
+        const uint8_t highest = uint8_t(authored_lods & -int(authored_lods));
         for (size_t k = first; k < last; ++k) {
             const DynamicMeshPart& dp = mesh.parts[k];
-            if (any_high && !(dp.lod_category & 1)) continue;
+            if (highest && !(dp.lod_category & highest)) continue;
             // The entity's material variant wins over the part's own technique (goriath binds both,
             // the variant last).
             TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
@@ -1015,34 +1042,40 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     texture_cache.shared = cache;
 
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
-    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent; };
+    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageShadow; };
     std::vector<Pending> pending;
-    uint8_t lod = 0xFF;
+    std::array<uint8_t, 3> stage_lods{};
     for (const auto& g : mesh.groups)
-        if (drawn(g.render_stage)) lod = std::min(lod, mesh.parts.at(g.part_index).lod_category);
-    // lod_category is a mask of LOD levels (1 = LOD0, 2 = LOD1, 4 = LOD2 ...). Every level shares
-    // the mesh's buffers; with all_lods each part keeps its mask.
+        if (drawn(g.render_stage))
+            stage_lods[stage_slot(g.render_stage)] |= std::max<uint8_t>(1, mesh.parts.at(g.part_index).lod_category);
+    const uint8_t all_levels = stage_lods[0] | stage_lods[1];
     const bool all_lods = cache && cache->all_lods;
     for (size_t g = 0; g < mesh.groups.size(); ++g) {
         const auto& gr = mesh.groups[g];
-        if (!drawn(gr.render_stage) || g >= mesh.techniques.size()) continue;
+        if (!drawn(gr.render_stage) || g >= mesh.techniques.size() || mesh.techniques[g].is_none()) continue;
         const auto& part = mesh.parts.at(gr.part_index);
-        if (all_lods ? (part.lod_category & 0x0F) == 0 : part.lod_category != lod) continue;
-        Technique t = load_technique(pm, mesh.techniques[g]);
-        if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
-        pending.push_back({gr, part, std::move(t)});
+        const uint8_t stages = stage_lods[stage_slot(gr.render_stage)];
+        const uint8_t highest = uint8_t(stages & -int(stages));
+        if (!(std::max<uint8_t>(1, part.lod_category) & (all_lods ? stages : highest))) continue;
+        try {
+            Technique t = load_technique(pm, mesh.techniques[g]);
+            if (t.stage(ShaderStage::Vertex).shader.is_none()) continue;
+            if (t.stage(ShaderStage::Pixel).shader.is_none() && gr.render_stage != kStageShadow) continue;
+            pending.push_back({gr, part, std::move(t)});
+        } catch (const std::exception& ex) {
+            if (gr.render_stage == 0) throw;
+            out.notes.push_back(std::format("{} part {}: {}", tag.str(), gr.part_index, ex.what()));
+        }
     }
-    if (pending.empty()) throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
-    out.lod = lod;
+    if (std::none_of(pending.begin(), pending.end(), [](const Pending& p) { return p.group.render_stage != kStageShadow; }))
+        throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
+    out.lod = uint8_t(std::countr_zero(all_levels));
     if (all_lods) out.lod_levels = 0;
 
     ProfileScope profile_buffers("prepare.static.buffers_bounds");
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
     const V3 scale{mesh.mesh_scale, mesh.mesh_scale, mesh.mesh_scale};
     const V3 offset{mesh.mesh_offset[0], mesh.mesh_offset[1], mesh.mesh_offset[2]};
-    uint8_t lowest = 0x0F;
-    for (const auto& it : pending) lowest = std::min<uint8_t>(lowest, it.part.lod_category & 0x0F);
-    const uint8_t lowest_bit = uint8_t(lowest & (~lowest + 1));
     std::map<uint8_t, uint32_t> buffer_sets;
     for (const auto& it : pending) {
         const auto [entry, inserted] = buffer_sets.try_emplace(it.part.buffer_index, uint32_t(out.buffers.size()));
@@ -1055,8 +1088,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             if (!bufs.color.is_none()) set.color = load_vertex_buffer(pm, bufs.color).data;
         }
         const auto& set = out.buffers[entry->second];
-        if (!all_lods || (it.part.lod_category & lowest_bit))
-            grow_bounds(set.ib, set.vb0, it.part, scale, offset, lo, hi);
+        grow_bounds(set.ib, set.vb0, it.part, scale, offset, lo, hi);
     }
     out.center = (lo + hi) * 0.5f;
     out.radius = std::max(0.01f, std::sqrt(dot(hi - lo, hi - lo)) * 0.5f);
@@ -1080,10 +1112,10 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
                                              p.group.render_stage == kStageTransparent));
             out.groups.back().stage = p.group.render_stage;
             out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
-            out.groups.back().lod_mask = all_lods ? uint8_t(p.part.lod_category & 0x0F) : 1;
+            out.groups.back().lod_mask = all_lods ? std::max<uint8_t>(1, p.part.lod_category) : 1;
             if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
         } catch (const std::exception& ex) {
-            if (p.group.render_stage != kStageTransparent) throw;
+            if (p.group.render_stage == 0) throw;
             out.notes.push_back(std::format("{} part {}: {}", tag.str(), p.group.part_index, ex.what()));
         }
     }
@@ -1177,9 +1209,6 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
 
 void StaticMeshScene::begin(Gpu& gpu) {
     release(gpu);
-    ID3D12Device* dev = gpu.device();
-    if (!root_sig_) root_sig_ = make_gbuffer_root_signature(dev);
-    if (!root_sig_dynamic_) root_sig_dynamic_ = make_gbuffer_root_signature(dev, true);
 }
 
 void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
@@ -1197,8 +1226,10 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
     // All or nothing: a mesh that fails validation leaves no partial parts behind.
     const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count();
     const size_t instances = instance_total_, culls = cull_groups_.size();
+    const size_t uncullable = uncullable_opaque_.size();
     try {
         add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
+        ++shadow_generation_;
     } catch (...) {
         try { gpu.flush(); } catch (...) {}
         for (size_t k = items; k < items_.size(); ++k) {
@@ -1212,6 +1243,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         info_.resize(infos);
         instance_total_ = instances;
         cull_groups_.resize(culls);
+        uncullable_opaque_.resize(uncullable);
         throw;
     }
 }
@@ -1268,19 +1300,29 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         t2 = arena_.upload(gpu, data.data(), data.size());
     }
     uint32_t cull = UINT32_MAX;
-    if (!mesh.dynamic) {
+    if (!mesh.dynamic || (!dynamic_ && sky_order.empty())) {
         CullGroup group;
+        group.dynamic = mesh.dynamic;
+        group.first_item = items_.size();
         group.spheres.reserve(n);
+        V3 lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
         for (const auto& m : placements) {
             const V3 c = mesh.center;
-            const float scale = std::sqrt(std::max({m[0] * m[0] + m[1] * m[1] + m[2] * m[2], m[4] * m[4] + m[5] * m[5] + m[6] * m[6],
-                                                    m[8] * m[8] + m[9] * m[9] + m[10] * m[10]}));
-            group.spheres.push_back({m[0] * c.x + m[1] * c.y + m[2] * c.z + m[3], m[4] * c.x + m[5] * c.y + m[6] * c.z + m[7],
-                                     m[8] * c.x + m[9] * c.y + m[10] * c.z + m[11], mesh.radius * scale});
+            const V3 x{m[0], m[4], m[8]}, y{m[1], m[5], m[9]}, z{m[2], m[6], m[10]};
+            // Maximum row sum of A^T A bounds the squared length for nonuniform scale or shear.
+            const float xy = std::fabs(dot(x,y)), xz = std::fabs(dot(x,z)), yz = std::fabs(dot(y,z));
+            const float scale = std::sqrt(std::max({dot(x,x) + xy + xz, dot(y,y) + xy + yz, dot(z,z) + xz + yz}));
+            const V3 center = x * c.x + y * c.y + z * c.z + V3{m[3], m[7], m[11]};
+            const float r = mesh.radius * scale;
+            group.spheres.push_back({center.x, center.y, center.z, r});
+            lo = {std::min(lo.x, center.x - r), std::min(lo.y, center.y - r), std::min(lo.z, center.z - r)};
+            hi = {std::max(hi.x, center.x + r), std::max(hi.y, center.y + r), std::max(hi.z, center.z + r)};
         }
+        const auto center = (hi + lo) * 0.5f, extent = (hi - lo) * 0.5f;
+        group.bounds = n == 1 ? group.spheres.front() : float4{center.x, center.y, center.z, std::sqrt(dot(extent, extent))};
         group.levels = mesh.lod_levels ? mesh.lod_levels : 1;
         if (std::popcount(group.levels) > 1 && material_externs_)
-            material_externs_->note_estimate("static mesh LOD per instance by screen radius (LOD1 < 160 px, LOD2 < 64 px, LOD3 < 24 px)",
+            material_externs_->note_estimate("static mesh LOD: highest available detail within 25 m of the bounds; farther LOD uses a 1080p reference projection",
                                              "engine LOD distances not decoded");
         cull = uint32_t(cull_groups_.size());
         cull_groups_.push_back(std::move(group));
@@ -1302,11 +1344,18 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         placement_constants = arena_.upload(gpu, constants.data(), constants.size() * sizeof(PlacementConstants));
     }
     instance_total_ += n;
+    auto upload_geometry = [&](const auto& buffer) {
+        if (buffer.data_tag.is_none()) return arena_.upload(gpu, buffer.data.data(), buffer.data.size());
+        if (const auto it = geometry_cache_.find(buffer.data_tag.value); it != geometry_cache_.end())
+            return it->second;
+        auto uploaded = arena_.upload(gpu, buffer.data.data(), buffer.data.size());
+        return geometry_cache_.emplace(buffer.data_tag.value, std::move(uploaded)).first->second;
+    };
     for (const auto& b : mesh.buffers) {
         BufferSet set;
-        set.ib = arena_.upload(gpu, b.ib.data.data(), b.ib.data.size());
-        set.vb0 = arena_.upload(gpu, b.vb0.data.data(), b.vb0.data.size());
-        if (!b.vb1.data.empty()) set.vb1 = arena_.upload(gpu, b.vb1.data.data(), b.vb1.data.size());
+        set.ib = upload_geometry(b.ib);
+        set.vb0 = upload_geometry(b.vb0);
+        if (!b.vb1.data.empty()) set.vb1 = upload_geometry(b.vb1);
         set.ibv = {set.ib.gpu, UINT(b.ib.data.size()), b.ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         set.vbv[0] = {set.vb0.gpu, UINT(b.vb0.data.size()), b.vb0.stride};
         if (set.vb1) set.vbv[1] = {set.vb1.gpu, UINT(b.vb1.data.size()), b.vb1.stride};
@@ -1413,7 +1462,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         profile_root.stop();
         upload_textures(g.textures, item.ps_sources, item.textures);
         upload_textures(g.vs_textures, item.vs_sources, item.vs_textures);
-        for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}})
+        for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}}) {
+            if (code->empty()) continue;
             for (const auto& binding : shader_bindings(*code)) {
                 if (binding.space != 0) throw UnsupportedMeshPart("Original material register space is unsupported");
                 if (binding.type == BindingType::Cbv) {
@@ -1421,7 +1471,20 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                     registers->push_back(binding.lower);
                 }
             }
-        const auto ps_kinds = srv_kinds(g.ps), vs_kinds = srv_kinds(g.vs);
+        }
+        const auto ps_kinds = g.ps.empty() ? std::map<uint32_t, BindingKind>{} : srv_kinds(g.ps);
+        const auto vs_kinds = srv_kinds(g.vs);
+        const auto grid_scope = item.ps_sources.cbuffer_scopes.find(3);
+        item.light_grid = g.stage == kStageTransparent && item.scopes &&
+            grid_scope != item.ps_sources.cbuffer_scopes.end() &&
+            std::find(item.ps_cbvs.begin(), item.ps_cbvs.end(), 3u) != item.ps_cbvs.end() &&
+            std::any_of(item.scopes->begin(), item.scopes->end(), [&](const Scope& scope) {
+                return scope.tag == grid_scope->second && scope.name == "player_centered_cascaded_grid";
+            });
+        const auto advanced_cube = [&](uint32_t slot, BindingKind kind) {
+            return item.light_grid && slot == 26 && kind == BindingKind::TextureCube &&
+                std::find(item.ps_cbvs.begin(), item.ps_cbvs.end(), 8u) != item.ps_cbvs.end();
+        };
         item.ps_kinds = ps_kinds;
         item.vs_kinds = vs_kinds;
         auto kind_of = [](const std::map<uint32_t, BindingKind>& m, uint32_t r) {
@@ -1430,7 +1493,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         };
         // Reject missing resources before allocating per-draw descriptor rings.
         for (const auto& [slot, kind] : ps_kinds)
-            if (!item.textures.contains(slot) && !item.ps_sources.extern_textures.contains(slot))
+            if (!item.textures.contains(slot) && !item.ps_sources.extern_textures.contains(slot) && !advanced_cube(slot, kind))
                 throw UnsupportedMeshPart(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), slot));
         for (auto [stage, sources, registers] : {std::tuple{ShaderStage::Vertex, &item.vs_sources, &item.vs_cbvs},
                                                std::tuple{ShaderStage::Pixel, &item.ps_sources, &item.ps_cbvs}}) {
@@ -1490,7 +1553,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             for (UINT s = 0; s < kPsSrvs; ++s) {
                 auto f = item.textures.find(s);
                 const BindingKind k = kind_of(ps_kinds, s);
-                if (f == item.textures.end() && ps_kinds.contains(s) && !item.ps_sources.extern_textures.contains(s))
+                if (f == item.textures.end() && ps_kinds.contains(s) && !item.ps_sources.extern_textures.contains(s) && !advanced_cube(s, k))
                     throw UnsupportedMeshPart(std::format("{}: missing original PS texture t{} (shared game producer not ported)", item.technique.str(), s));
                 create_texture_srv(dev, f != item.textures.end() ? f->second.Get() : nullptr, k, gpu.srv().cpu(srv_first + s));
             }
@@ -1554,7 +1617,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
-        const auto outputs = shader_outputs(g.ps);
+        const bool authored_shadow = g.stage == kStageShadow;
+        const auto outputs = g.ps.empty() ? std::vector<ShaderInput>{} : shader_outputs(g.ps);
         const bool motion = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
             return _stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index == 4 && !output.never_written;
         });
@@ -1594,13 +1658,18 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             pd.IBStripCutValue = mesh.buffers.at(g.buffers).ib.is_32bit ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
         // SV_Target4 is the motion vector. Slots 1..3 are null RTVs with writes disabled.
-        pd.NumRenderTargets = transparent ? 5 : 4;
+        pd.NumRenderTargets = authored_shadow ? 0 : transparent ? 5 : 4;
         for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : GBuffer::kFormats[r];
         for (const auto& output : outputs)
             if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw UnsupportedMeshPart(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
-        pd.DSVFormat = GBuffer::kDepthFormat;
+        pd.DSVFormat = authored_shadow ? DXGI_FORMAT_D32_FLOAT : GBuffer::kDepthFormat;
+        if (authored_shadow) {
+            pd.RasterizerState.DepthBias = -16;
+            pd.RasterizerState.SlopeScaledDepthBias = -2;
+            pd.RasterizerState.DepthBiasClamp = -0.01f;
+        }
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
                                              mesh.buffers.at(g.buffers).ib.is_32bit};
@@ -1617,6 +1686,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             for (const auto& d : ied) layout += std::format(" {}{}@{}", d.SemanticName, d.SemanticIndex, d.InputSlot);
             auto binds = [](std::span<const uint8_t> code) {
                 std::string o;
+                if (code.empty()) return o;
                 for (const auto& b : shader_bindings(code))
                     o += std::format(" {}{}-{}/s{}k{}", "?scbu"[int(b.type)], b.lower, b.upper, b.space, int(b.kind));
                 return o;
@@ -1628,7 +1698,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         }
         profile_pso.stop();
 
-        if (!transparent) {
+        if (authored_shadow) {
+            item.shadow_pso = item.pso;
+        } else if (!transparent && sky_order.empty()) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
             const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
@@ -1651,26 +1723,41 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         items_.push_back(std::move(item));
         upload_guard.committed = true;
         if (transparent) transparent_items_.push_back(items_.size() - 1);
-        info_.push_back(std::move(g.info));
+        else if (cull == UINT32_MAX && !authored_shadow) uncullable_opaque_.push_back(items_.size() - 1);
+        if (!authored_shadow) info_.push_back(std::move(g.info));
       } catch (const UnsupportedMeshPart& ex) {
-        if (!mesh.dynamic && g.stage != kStageTransparent) throw;
+        if (!mesh.dynamic && g.stage == 0) throw;
         if (first_unsupported_part.empty()) first_unsupported_part = ex.what();
         notes_.push_back(std::format("{} part {}: {}", mesh.tag.str(), g.info.part, ex.what()));
       }
     }
-    if (items_.size() == first_item)
+    if (std::none_of(items_.begin() + first_item, items_.end(), [](const Item& item) { return item.stage != kStageShadow; }))
         throw std::runtime_error(first_unsupported_part.empty() ? "mesh has no drawable parts" : first_unsupported_part);
-}
-
-void StaticMeshScene::bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices&,
-                                  ID3D12RootSignature* root) {
-    D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
-    D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
-    cl->RSSetViewports(1, &vp);
-    cl->RSSetScissorRects(1, &sc);
-    cl->SetGraphicsRootSignature(root ? root : dynamic_ ? root_sig_dynamic_.Get() : root_sig_.Get());
-    ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
-    cl->SetDescriptorHeaps(1, heaps);
+    if (cull != UINT32_MAX) {
+        auto& group = cull_groups_[cull];
+        group.end_item = items_.size();
+        if (!group.dynamic) {
+            // A translucent layer may only have one authored LOD while the opaque mesh has four.
+            // Keep that layer at the nearest level actually supplied for its own stage.
+            std::array<uint8_t, 3> stage_levels{};
+            for (size_t i = group.first_item; i < group.end_item; ++i)
+                stage_levels[stage_slot(items_[i].stage)] |= items_[i].lod_mask;
+            group.levels = stage_levels[0] | stage_levels[1];
+            group.authored_shadow = stage_levels[2] != 0;
+            for (size_t i = group.first_item; i < group.end_item; ++i) {
+                auto& item = items_[i];
+                const auto available = stage_levels[stage_slot(item.stage)];
+                const auto authored = item.lod_mask;
+                for (int level = 0; level < 8; ++level) {
+                    if (available & (1u << level)) continue;
+                    int nearest = level;
+                    while (nearest > 0 && !(available & (1u << nearest))) --nearest;
+                    while (nearest < 7 && !(available & (1u << nearest))) ++nearest;
+                    if (authored & (1u << nearest)) item.lod_mask |= uint8_t(1u << level);
+                }
+            }
+        }
+    }
 }
 
 void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage,
@@ -1759,7 +1846,10 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         const ShaderStage stage = def.stage;
         const uint32_t reg = def.reg;
         std::vector<float4> constants;
-        if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
+        if (frame_inputs && (scope->name == "player_centered_cascaded_grid" || scope->name == "transparent_advanced") &&
+            frame_inputs->has_scope_constants(stage, reg))
+            constants = frame_inputs->scope_constants(stage, reg);
+        else if (ext.has_scope_constants(stage, reg)) constants = ext.scope_constants(stage, reg);
         else if (scope->name == "frame") {
             const auto& frame = frame_inputs ? frame_inputs->frame_constants() : ext.frame_constants();
             constants.assign(frame.begin(), frame.end());
@@ -1785,10 +1875,10 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         return scope_frame_[slot] = upload.gpu;
     };
     const bool transparent = render_stage == kStageTransparent;
-    const size_t candidates = transparent ? transparent_items_.size() : items_.size();
-    for (size_t i = 0; i < candidates; ++i) {
-        auto& it = items_[transparent ? transparent_items_[i] : i];
-        if (it.stage != render_stage) continue;  // transparent inputs are produced after the G-buffer
+    const auto& candidates = transparent ? transparent_items_ : visible_opaque_;
+    for (const auto index : candidates) {
+        auto& it = items_[index];
+        if (it.light_grid) it.light_grid_ready = frame_inputs && frame_inputs->texture(ext::Transparent, 0x28).resource;
         if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
       try {
         it.scope_addresses.resize(it.scope_slots.size());
@@ -1862,11 +1952,18 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                 return a.gpu;
             };
             if (set.dynamic) {
-                for (const auto& p : set.placements) {
+                if (it.vs_reads_position) it.vs_placement_addresses.resize(set.placements.size());
+                if (it.ps_reads_position) it.ps_placement_addresses.resize(set.placements.size());
+                auto placement = [&](uint32_t i) {
+                    const auto& p = set.placements[i];
                     const float4 position{p[3], p[7], p[11], 1};
-                    if (it.vs_reads_position) it.vs_placement_addresses.push_back(at(it.vs_material, it.vs_constants, position, true));
-                    if (it.ps_reads_position) it.ps_placement_addresses.push_back(at(it.ps_material, it.ps_constants, position, false));
-                }
+                    if (it.vs_reads_position) it.vs_placement_addresses[i] = at(it.vs_material, it.vs_constants, position, true);
+                    if (it.ps_reads_position) it.ps_placement_addresses[i] = at(it.ps_material, it.ps_constants, position, false);
+                };
+                if (set.cull == UINT32_MAX)
+                    for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
+                else
+                    for (const auto i : cull_groups_[set.cull].visible_placements) placement(i);
             } else if (dynamic_) {
                 const float4 position{model_cb_[3][0], model_cb_[3][1], model_cb_[3][2], 1};
                 if (it.vs_reads_position) it.vs_address = at(it.vs_material, it.vs_constants, position, true);
@@ -1884,57 +1981,63 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
 
 void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                                  bool shadow) {
-    uint32_t bound = UINT32_MAX;
-    ID3D12RootSignature* bound_root = nullptr;
-    bool bound_root_changed = false;
-    // Redundant root arguments are skipped (maps issue tens of thousands of draws).
-    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 31> bound_cbv{};
-    ID3D12PipelineState* bound_pso = nullptr;
-    uint32_t bound_table = UINT32_MAX;
-    D3D_PRIMITIVE_TOPOLOGY bound_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    auto set_cbv = [&](uint32_t param, D3D12_GPU_VIRTUAL_ADDRESS address) {
-        if (bound_cbv[param] == address) return;
-        bound_cbv[param] = address;
-        cl->SetGraphicsRootConstantBufferView(param, address);
+    const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+    const D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
+    ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->SetDescriptorHeaps(1, heaps);
+    struct DrawState {
+        uint32_t buffers = UINT32_MAX, table = UINT32_MAX;
+        ID3D12RootSignature* root = nullptr;
+        ID3D12PipelineState* pso = nullptr;
+        D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        std::array<D3D12_GPU_VIRTUAL_ADDRESS, 31> cbv{};
     };
-    auto draw = [&](const Item& it, uint32_t instances, uint32_t first_instance) {
-        if (bound_root != it.root_sig.Get()) {
-            bind_common(gpu, cl, w, h, vm, it.root_sig.Get());
-            bound_root = it.root_sig.Get();
-            bound_root_changed = true;
-            bound_cbv = {};
-            bound_table = UINT32_MAX;
+    auto draw = [&](ID3D12GraphicsCommandList* commands, DrawState& state, const Item& it, uint32_t instances, uint32_t first_instance) {
+        const bool root_changed = state.root != it.root_sig.Get();
+        if (root_changed) {
+            commands->SetGraphicsRootSignature(state.root = it.root_sig.Get());
+            state.cbv = {};
+            state.table = UINT32_MAX;
         }
         const auto& set = sets_[it.buffers];
-        if (it.buffers != bound || bound_root_changed) {
-            bound = it.buffers;
-            cl->IASetIndexBuffer(&sets_[bound].ibv);
-            cl->IASetVertexBuffers(0, 4, sets_[bound].vbv);
-            if (!it.dynamic) cl->SetGraphicsRootShaderResourceView(2, sets_[bound].t2.gpu);
+        if (it.buffers != state.buffers) {
+            state.buffers = it.buffers;
+            commands->IASetIndexBuffer(&set.ibv);
+            commands->IASetVertexBuffers(0, 4, set.vbv);
         }
-        bound_root_changed = false;
+        if (!it.dynamic && (root_changed || state.cbv[2] != set.t2.gpu)) {
+            commands->SetGraphicsRootShaderResourceView(2, set.t2.gpu);
+            state.cbv[2] = set.t2.gpu;
+        }
         ID3D12PipelineState* pso = shadow ? it.shadow_pso.Get() : it.pso.Get();
-        if (bound_pso != pso) cl->SetPipelineState(bound_pso = pso);
+        if (state.pso != pso) commands->SetPipelineState(state.pso = pso);
+        auto set_cbv = [&](uint32_t param, D3D12_GPU_VIRTUAL_ADDRESS address) {
+            if (state.cbv[param] == address) return;
+            state.cbv[param] = address;
+            commands->SetGraphicsRootConstantBufferView(param, address);
+        };
         set_cbv(0, it.ps_address);
         set_cbv(6, it.vs_address);
         for (const auto& [param, address] : it.scope_addresses) set_cbv(param, address);
         for (const auto& [param, buffer] : it.own_cbvs) set_cbv(param, buffer.gpu);
         const uint32_t first = it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs;
-        if (bound_table != first) {
-            bound_table = first;
-            cl->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
-            cl->SetGraphicsRootDescriptorTable(it.dynamic ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
+        if (state.table != first) {
+            state.table = first;
+            commands->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
+            commands->SetGraphicsRootDescriptorTable(it.dynamic ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
         }
         const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        if (bound_topology != topology) cl->IASetPrimitiveTopology(bound_topology = topology);
+        if (state.topology != topology) commands->IASetPrimitiveTopology(state.topology = topology);
         if (it.dynamic) {
             for (size_t p = first_instance; p < size_t(first_instance) + instances; ++p) {
                 for (uint32_t param : it.object_params) set_cbv(param, set.object_cb.gpu + p * sizeof(PlacementConstants));
                 if (p < it.ps_placement_addresses.size()) set_cbv(0, it.ps_placement_addresses[p]);
                 if (p < it.vs_placement_addresses.size()) set_cbv(6, it.vs_placement_addresses[p]);
-                cl->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
+                commands->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
             }
-        } else cl->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, first_instance);
+        } else commands->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, first_instance);
     };
     if (stage == kStageTransparent) {
         struct Draw { const Item* item; uint32_t instance; float depth; bool sky; };
@@ -1948,20 +2051,24 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             const auto& set = sets_[it.buffers];
             if (it.dynamic) {
                 const auto c = set.model_center;
-                for (uint32_t i = 0; i < set.placements.size(); ++i) {
+                auto placement = [&](uint32_t i) {
                     if (!set.sky_order.empty()) {
                         enqueue(it, i, set.sky_order[i], true);
-                        continue;
+                        return;
                     }
                     const auto& p = set.placements[i];
                     const V3 pos{p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3],
                                  p[4] * c.x + p[5] * c.y + p[6] * c.z + p[7],
                                  p[8] * c.x + p[9] * c.y + p[10] * c.z + p[11]};
                     enqueue(it, i, dot(pos - vm.eye, vm.fwd));
-                }
+                };
+                if (set.cull == UINT32_MAX)
+                    for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
+                else
+                    for (const auto i : cull_groups_[set.cull].visible_placements) placement(i);
             } else {
                 const auto& group = cull_groups_[set.cull];
-                for (size_t l = 0; l < 4; ++l) {
+                for (size_t l = 0; l < group.count.size(); ++l) {
                     if (!((it.lod_mask >> l) & 1)) continue;
                     for (uint32_t i = group.first[l]; i < group.first[l] + group.count[l]; ++i)
                         enqueue(it, i, group.visible_depths[i]);
@@ -1974,32 +2081,81 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             return a.sky ? a.depth < b.depth : a.depth > b.depth;
         });
         world_transparent_draws_ = 0;
+        DrawState state;
         for (const auto& entry : ordered) {
-            draw(*entry.item, 1, entry.instance);
+            draw(cl, state, *entry.item, 1, entry.instance);
             if (!entry.sky) ++world_transparent_draws_;
         }
         return;
     }
-    // Blended G-buffer items (decals) go over opaque surfaces.
-    for (int pass = 0; pass < 2; ++pass)
-    for (const auto& it : items_) {
-        if (it.stage != stage || it.blended != (pass == 1) || (shadow && (!it.shadow_pso || it.blended))) continue;
-        const uint32_t instances = item_instances(it);
-        if (!instances) continue;
-        const auto& set = sets_[it.buffers];
-        if (set.cull == UINT32_MAX) draw(it, instances, 0);
-        else {
-            const auto& group = cull_groups_[set.cull];
-            for (size_t l = 0; l < 4; ++l)
-                if (((it.lod_mask >> l) & 1) && group.count[l])
-                    draw(it, group.count[l], group.first[l]);
+    auto record = [&](ID3D12GraphicsCommandList* commands, std::span<const size_t> items, bool blended) {
+        DrawState state;
+        for (const auto index : items) {
+            const auto& it = items_[index];
+            if (it.blended != blended || (shadow && !it.shadow_pso)) continue;
+            const uint32_t instances = item_instances(it);
+            if (!instances) continue;
+            const auto& set = sets_[it.buffers];
+            if (set.cull == UINT32_MAX) draw(commands, state, it, instances, 0);
+            else if (it.dynamic) {
+                for (const auto i : cull_groups_[set.cull].visible_placements) draw(commands, state, it, 1, i);
+            } else {
+                const auto& group = cull_groups_[set.cull];
+                for (size_t level = 0; level < group.count.size(); ++level)
+                    if ((it.lod_mask & (1u << level)) && group.count[level])
+                        draw(commands, state, it, group.count[level], group.first[level]);
+            }
+        }
+    };
+    const std::span<const size_t> opaque(visible_opaque_);
+    std::array<DrawBundle*, 3> bundles{};
+    size_t available = 0;
+    if (opaque.size() >= 1800) {
+        const auto completed = gpu.completed();
+        for (auto& bundle : draw_bundles_) {
+            if (bundle.fence > completed) continue;
+            bundles[available++] = &bundle;
+            if (available == bundles.size()) break;
         }
     }
+    if (available == bundles.size()) {
+        const size_t chunk = opaque.size() / 3;
+        for (auto* bundle : bundles) {
+            if (!bundle->allocator) {
+                check_hr(gpu.device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle->allocator)), "draw bundle allocator");
+                check_hr(gpu.device()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle->allocator.Get(), nullptr,
+                                                        IID_PPV_ARGS(&bundle->list)), "draw bundle");
+                check_hr(bundle->list->Close(), "new draw bundle");
+            }
+            check_hr(bundle->allocator->Reset(), "reset draw bundle allocator");
+            check_hr(bundle->list->Reset(bundle->allocator.Get(), nullptr), "reset draw bundle");
+        }
+        auto fill_bundle = [&](size_t i) {
+            auto* commands = bundles[i]->list.Get();
+            commands->SetDescriptorHeaps(1, heaps);
+            record(commands, opaque.subspan(i * chunk, i == 2 ? opaque.size() - 2 * chunk : chunk), false);
+            check_hr(commands->Close(), "close draw bundle");
+        };
+        auto first = std::async(std::launch::async, fill_bundle, 0);
+        auto second = std::async(std::launch::async, fill_bundle, 1);
+        fill_bundle(2);
+        first.get();
+        second.get();
+        for (auto* bundle : bundles) {
+            cl->ExecuteBundle(bundle->list.Get());
+            bundle->fence = gpu.pending_fence();
+        }
+    } else {
+        record(cl, opaque, false);
+    }
+    // Blended G-buffer items (decals) go over opaque surfaces.
+    if (!shadow) record(cl, opaque, true);
 }
 
 void StaticMeshScene::set_skin_pose(std::vector<BoneTransform> bones) {
     skin_pose_ = std::move(bones);
     skin_dirty_ = skinned_;
+    ++shadow_generation_;
 }
 
 // Linear blend skinning of every skinned buffer set, packed into this frame's upload buffer and
@@ -2067,74 +2223,111 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
 
 uint32_t StaticMeshScene::item_instances(const Item& it) const {
     if (it.failed) return 0;
+    if (it.light_grid && !it.light_grid_ready) return 0;
     const auto& set = sets_[it.buffers];
     if (set.cull == UINT32_MAX) return set.instances;
+    if (it.dynamic) return cull_groups_[set.cull].visible;
     uint32_t n = 0;
-    for (size_t l = 0; l < 4; ++l)
+    for (size_t l = 0; l < cull_groups_[set.cull].count.size(); ++l)
         if ((it.lod_mask >> l) & 1) n += cull_groups_[set.cull].count[l];
     return n;
 }
 
-void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height) {
-    // Frustum side planes from the projection scales (x' = x * fx / z), plus a size cut: an
-    // instance smaller than about a pixel on screen is skipped.
+std::array<size_t, 3> StaticMeshScene::visibility_counts() const {
+    std::array<size_t, 3> counts{};
+    for (const auto& group : cull_groups_) {
+        if (group.dynamic) counts[2] += group.visible;
+        else {
+            counts[0] += group.visible;
+            counts[1] += group.count[0];
+        }
+    }
+    return counts;
+}
+
+void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow) {
+    // Test the bounds against the projection. Leave room for subpixel camera jitter.
     const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
-    const float pixel = 2.0f / (vm.fy * float(std::max(1u, height)));
-    const float half_h = 0.5f * float(std::max(1u, height)) * vm.fy;
+    const float half_h = 0.5f * float(std::max(1u, height));
+    const float margin_y = 2.0f / half_h, margin_x = margin_y * vm.fx / vm.fy;
+    const float far_z = vm.proj.c[2][2] < 0 ?
+        -vm.proj.c[3][2] / vm.proj.c[2][2] : INFINITY;
+    auto outside = [&](const float4& s, float& z) {
+        const V3 d{s[0] - vm.eye.x, s[1] - vm.eye.y, s[2] - vm.eye.z};
+        const float r = s[3];
+        z = dot(d, vm.fwd);
+        if (z < -r || z - r > far_z) return true;
+        const float x = std::abs(dot(d, vm.right)), y = std::abs(dot(d, vm.up));
+        if (vm.ortho > 0) return x - r > vm.ortho || y - r > vm.ortho;
+        return x * vm.fx > std::max(0.0f, z) * (1 + margin_x) + r * kx ||
+               y * vm.fy > std::max(0.0f, z) * (1 + margin_y) + r * ky;
+    };
+    visible_opaque_.clear();
     for (auto& group : cull_groups_) {
         group.visible_depths.clear();
-        const auto upload = gpu.dynamic(group.spheres.size() * 4);
-        auto* out = static_cast<uint32_t*>(static_cast<void*>(upload.cpu));
-        const bool lods = group.levels != 1;
-        if (lods)
-            for (auto& v : cull_scratch_) v.clear();
-        uint32_t visible = 0;
-        for (uint32_t i = 0; i < group.spheres.size(); ++i) {
-            const auto& sp = group.spheres[i];
-            const V3 d{sp[0] - vm.eye.x, sp[1] - vm.eye.y, sp[2] - vm.eye.z};
-            const float z = dot(d, vm.fwd), r = sp[3];
-            const float x = dot(d, vm.right), y = dot(d, vm.up);
-            float px;  // projected radius in pixels
-            if (vm.ortho > 0) {
-                if (std::abs(x) - r > vm.ortho || std::abs(y) - r > vm.ortho || z < -r) continue;
-                px = r / vm.ortho * 0.5f * float(std::max(1u, height));
-                if (px < 0.5f) continue;
-            } else {
-                if (z < -r) continue;
-                if (std::abs(x) * vm.fx - z > r * kx || std::abs(y) * vm.fy - z > r * ky) continue;
-                if (z > r && r < z * pixel) continue;
-                px = z > r ? r * half_h / z : 1e9f;
-            }
-            if (!lods) {
-                out[visible++] = i;
-                if (group.has_transparency) group.visible_depths.push_back(z);
-                continue;
-            }
-            int level = px >= 160 ? 0 : px >= 64 ? 1 : px >= 24 ? 2 : 3;
-            while (level > 0 && !((group.levels >> level) & 1)) --level;
-            while (level < 3 && !((group.levels >> level) & 1)) ++level;
-            cull_scratch_[size_t(level)].push_back(i);
-        }
+        group.visible_placements.clear();
         group.first = {};
         group.count = {};
-        if (lods)
-            for (size_t l = 0; l < 4; ++l) {
-                group.first[l] = visible;
+        group.visible = 0;
+        float z = 0;
+        if (outside(group.bounds, z)) continue;
+        for (auto& v : cull_scratch_) v.clear();
+        for (uint32_t i = 0; i < group.spheres.size(); ++i) {
+            const auto& sp = group.spheres[i];
+            if (group.spheres.size() != 1 && outside(sp, z)) continue;
+            const float r = sp[3];
+            const float projected = vm.ortho > 0 ? r / vm.ortho : r * vm.fy / std::max(z - r, 1e-4f);
+            const auto delta = V3{sp[0], sp[1], sp[2]} - vm.eye;
+            const bool near_camera = vm.ortho == 0 && dot(delta, delta) <= (25 + r) * (25 + r);
+            if (!near_camera && projected * half_h < 0.5f) continue;
+            ++group.visible;
+            if (group.dynamic) {
+                group.visible_placements.push_back(i);
+                continue;
+            }
+            const float px = projected * (vm.ortho > 0 ? half_h : 540.0f);
+            constexpr std::array<float, 7> detail_radii{144, 60, 24, 12, 7, 3, 1};
+            int level = 0;
+            while (!near_camera && level < int(detail_radii.size()) && px < detail_radii[size_t(level)]) ++level;
+            while (level > 0 && !((group.levels >> level) & 1)) --level;
+            while (level < 7 && !((group.levels >> level) & 1)) ++level;
+            cull_scratch_[size_t(level)].push_back(i);
+        }
+        if (!group.visible) continue;
+        uint8_t lods = 0;
+        if (!group.dynamic) {
+            const auto upload = gpu.dynamic(group.visible * sizeof(uint32_t));
+            auto* out = reinterpret_cast<uint32_t*>(upload.cpu);
+            group.visible_address = upload.gpu;
+            uint32_t first = 0;
+            for (size_t l = 0; l < group.count.size(); ++l) {
+                group.first[l] = first;
                 group.count[l] = uint32_t(cull_scratch_[l].size());
-                if (!cull_scratch_[l].empty()) std::memcpy(out + visible, cull_scratch_[l].data(), cull_scratch_[l].size() * 4);
+                if (cull_scratch_[l].empty()) continue;
+                lods |= uint8_t(1u << l);
+                std::memcpy(out + first, cull_scratch_[l].data(), cull_scratch_[l].size() * sizeof(uint32_t));
                 if (group.has_transparency)
                     for (uint32_t i : cull_scratch_[l]) {
                         const auto& s = group.spheres[i];
                         group.visible_depths.push_back(dot(V3{s[0], s[1], s[2]} - vm.eye, vm.fwd));
                     }
-                visible += group.count[l];
+                first += group.count[l];
             }
-        else group.count[0] = visible;
-        group.visible = visible;
-        group.visible_address = upload.gpu;
+        }
+        const uint8_t stage = shadow && group.authored_shadow ? kStageShadow : 0;
+        for (size_t index = group.first_item; index < group.end_item; ++index)
+            if (items_[index].stage == stage && (group.dynamic || (items_[index].lod_mask & lods))) visible_opaque_.push_back(index);
     }
-    for (auto& set : sets_)
-        if (set.cull != UINT32_MAX) set.vbv[2] = {cull_groups_[set.cull].visible_address, std::max(4u, cull_groups_[set.cull].visible * 4), 4};
+    const size_t first_uncullable = visible_opaque_.size();
+    visible_opaque_.insert(visible_opaque_.end(), uncullable_opaque_.begin(), uncullable_opaque_.end());
+    if (first_uncullable && !uncullable_opaque_.empty() &&
+        visible_opaque_[first_uncullable - 1] > uncullable_opaque_.front())
+        std::inplace_merge(visible_opaque_.begin(), visible_opaque_.begin() + first_uncullable, visible_opaque_.end());
+    for (auto& set : sets_) {
+        if (set.cull == UINT32_MAX || set.dynamic) continue;
+        const auto& group = cull_groups_[set.cull];
+        if (group.visible) set.vbv[2] = {group.visible_address, group.visible * 4, 4};
+    }
 }
 
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
@@ -2153,12 +2346,26 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {
     shadow.valid = false;
     if (!shadow.depth || items_.size() == transparent_count()) return;
-    cull(gpu, shadow.vm, shadow.size);
+    cull(gpu, shadow.vm, shadow.size, true);
     update_materials(gpu, shadow.size, shadow.size, shadow.vm);
     cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
     cl->OMSetRenderTargets(0, nullptr, FALSE, &shadow.dsv);
     draw_items(gpu, cl, 0, shadow.size, shadow.size, shadow.vm, true);
     shadow.valid = true;
+}
+
+void StaticMeshScene::render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map) {
+    if (map && material_externs_)
+        material_externs_->note_estimate("sun shadow: map origin snapped to 4 m, depth refreshed at 20 Hz in a stable view",
+                                        "single viewer shadow map; engine cascade update schedule unknown");
+    if (map && shadow.valid && shadow.cached_sun_generation == shadow_generation_ &&
+        std::equal(std::begin(shadow.cached_sun_view.c), std::end(shadow.cached_sun_view.c), std::begin(shadow.vm.vp_abs.c)) &&
+        material_time_ >= shadow.cached_sun_time && material_time_ - shadow.cached_sun_time < 0.049f)
+        return;
+    render_shadow(gpu, cl, shadow);
+    shadow.cached_sun_view = shadow.vm.vp_abs;
+    shadow.cached_sun_generation = shadow_generation_;
+    shadow.cached_sun_time = material_time_;
 }
 
 void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl, RainOcclusion& rain, V3 center, float radius) {

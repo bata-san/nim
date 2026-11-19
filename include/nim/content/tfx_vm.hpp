@@ -54,7 +54,7 @@ std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bytec
 // Runs a TFX expression program. `constants` are the stage's bytecode constants; `out` is the
 // cbuffer (pre-filled with the stage's initial cbuffer contents) the program writes into.
 TfxResult run_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants, std::span<float4> out,
-                  const TfxEnvironment& env = {}, std::string* trace = nullptr);
+                  const TfxEnvironment& env = {}, std::string* trace = nullptr, bool record_bindings = true);
 
 // Evaluate a material for a new frame from its original constants, never the previous frame's
 // outputs. Untouched registers and opaque uint/float bit patterns retain their original values.

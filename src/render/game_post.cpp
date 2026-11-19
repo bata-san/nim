@@ -166,12 +166,13 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
     const bool automatic = p.post && p.auto_exposure && ae_columns_.loaded() && bloom_initial_.loaded() && bloom_down_.loaded();
     if (!automatic) {
         ae_valid_ = false;
+        ae_fence_ = {};
         exposure_ = p.exposure;
         return;
     }
     const uint64_t done = gpu.completed();
     int newest = -1;
-    for (uint64_t back = 1; back <= 2 && back <= ae_frame_; ++back) {
+    for (uint64_t back = 1; back <= ae_readback_.size() && back <= ae_frame_; ++back) {
         const size_t s = size_t((ae_frame_ - back) % ae_readback_.size());
         if (ae_fence_[s] && ae_readback_[s] && done >= ae_fence_[s]) { newest = int(s); break; }
     }
@@ -180,26 +181,32 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
         const uint32_t columns = uint32_t(ae_columns_rt_->GetDesc().Width);
         float* v = nullptr;
         const D3D12_RANGE range{0, size_t(columns) * 16};
-        double log_sum = 0, lin_sum = 0, weight = 0;
+        double log_sum = 0, weight = 0;
         if (SUCCEEDED(rb->Map(0, &range, reinterpret_cast<void**>(&v)))) {
             for (uint32_t c = 0; c < columns; ++c) {
-                log_sum += v[c * 4 + 0];
-                lin_sum += v[c * 4 + 1];
-                weight += v[c * 4 + 2];
+                const float log_luminance = v[c * 4], column_weight = v[c * 4 + 2];
+                if (!std::isfinite(log_luminance) || !std::isfinite(column_weight) || column_weight <= 0) continue;
+                log_sum += log_luminance;
+                weight += column_weight;
             }
             const D3D12_RANGE none{0, 0};
             rb->Unmap(0, &none);
         }
-        ae_fence_[size_t(newest)] = 0;
+        // An older result must never be applied after the newest completed measurement.
+        for (auto& fence : ae_fence_) if (fence <= done) fence = 0;
         if (weight > 1e-6 && std::isfinite(log_sum)) {
-            ae_luminance_ = float(std::exp2(log_sum / weight));
+            ae_luminance_ = float(std::max(0.0, std::exp2(log_sum / weight) - 1e-5));
             // Key and range: the channels autoexposure_max_stops (0x06) and its pair 0x05 (-3,
             // named visual_expositing by the hash list: read as the minimum stops) bound the
             // exposure; the key value is chosen.
-            const auto ch = [&](size_t i, float d) { return i < ext_.channels.size() ? ext_.channels[i][0] : d; };
-            const float lo = std::exp2(ch(0x05, -3)), hi = std::exp2(ch(0x06, 3));
+            const auto ch = [&](size_t i, float d) {
+                return i < ext_.channels.size() && std::isfinite(ext_.channels[i][0])
+                    ? std::clamp(ext_.channels[i][0], -16.0f, 16.0f) : d;
+            };
+            const float min_stops = ch(0x05, -3), max_stops = ch(0x06, 3);
+            const float lo = std::exp2(std::min(min_stops, max_stops)), hi = std::exp2(std::max(min_stops, max_stops));
             constexpr float key = 0.18f;
-            const float target = std::clamp(key / std::max(ae_luminance_, 1e-6f), lo, hi);
+            const float target = std::clamp(key * std::exp2(ch(0x01, 0)) / std::max(ae_luminance_, 1e-6f), lo, hi);
             if (!ae_valid_) ae_auto_ = target;
             else {
                 const float dt = p.delta_time > 0 ? std::min(p.delta_time, 0.25f) : 1.0f / 60.0f;
@@ -209,7 +216,9 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
             ae_valid_ = true;
         }
     }
-    exposure_ = (ae_valid_ ? ae_auto_ : 1.0f) * p.exposure;
+    const float next = (ae_valid_ ? ae_auto_ : 1.0f) * p.exposure;
+    if (next > 2 * exposure_ || exposure_ > 2 * next) taa_valid_ = false;
+    exposure_ = next;
 }
 
 void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes) {
@@ -280,8 +289,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         Gpu::barrier(cl, ae_columns_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         ae_fence_[slot] = gpu.pending_fence();
         ++ae_frame_;
-        ext_.note_estimate("auto exposure: key 0.18 over the centre-weighted log average, clamped to 2^ch05..2^ch06, adapting 3 / 1.5 per s",
-                           "engine auto exposure settings (not in game data); the columns pass is the game's");
+        ext_.note_estimate("auto exposure: key 0.18, autoexposure_bias as stops, bounds ch05..ch06, adapting 3 / 1.5 per s",
+                           "engine reduction and adaptation are estimated; authored bias and the original columns shader are used");
     }
     ID3D12Resource* bloom_tex = black_.Get();
     if (bloom) {

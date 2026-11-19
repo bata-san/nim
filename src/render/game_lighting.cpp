@@ -430,7 +430,8 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     release(gpu);
     tag_ = technique;
     Technique t = load_technique(pm, technique);
-    compute_ = t.bind_mode == 6;
+    compute_ = t.bind_mode == 6 || (t.bind_mode == 2 &&
+        !t.stage(ShaderStage::Compute).shader.is_none() && t.stage(ShaderStage::Pixel).shader.is_none());
     if (!compute_ && t.bind_mode != 1) throw std::runtime_error("Unsupported original pipeline bind mode");
     auto authored_scopes = load_technique_scopes(pm, load_render_globals(pm), t);
     std::vector<const Scope*> scope_ptrs;
@@ -622,8 +623,8 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
 
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                                const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                               uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures) {
-    const Geometry g{materials, &vbv, &ibv, indices, ps_textures};
+                               uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures, VolumeBatch* batch) {
+    const Geometry g{materials, &vbv, &ibv, indices, ps_textures, batch};
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
 }
 
@@ -657,18 +658,40 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     // Identical resolved views share an immutable table for this frame. Per-light constants
     // still change independently; different cubemap textures never alias a mutable table.
 
-    if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
-    else cl->SetGraphicsRootSignature(root_sig_.Get());
-    cl->SetPipelineState(pso_.Get());
-    ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
-    cl->SetDescriptorHeaps(1, heaps);
+    auto* batch = geometry ? geometry->batch : nullptr;
+    if (!batch || batch->pipeline != this) {
+        if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
+        else cl->SetGraphicsRootSignature(root_sig_.Get());
+        cl->SetPipelineState(pso_.Get());
+        if (!batch || !batch->pipeline) {
+            ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+            cl->SetDescriptorHeaps(1, heaps);
+        }
+        if (batch) {
+            batch->pipeline = this;
+            batch->root_bindings.fill(UINT64_MAX);
+        }
+    }
     if (geometry && geometry->vbv) {
-        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cl->IASetVertexBuffers(0, 1, geometry->vbv);
-        cl->IASetIndexBuffer(geometry->ibv);
+        if (!batch || batch->vertices != geometry->vbv || batch->indices != geometry->ibv) {
+            cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cl->IASetVertexBuffers(0, 1, geometry->vbv);
+            cl->IASetIndexBuffer(geometry->ibv);
+            if (batch) {
+                batch->vertices = geometry->vbv;
+                batch->indices = geometry->ibv;
+            }
+        }
     } else if (!compute_) {
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     }
+    auto changed = [&](uint32_t param, uint64_t value) {
+        if (!batch) return true;
+        auto& old = batch->root_bindings[param];
+        if (old == value) return false;
+        old = value;
+        return true;
+    };
 
     for (auto& st : stages_) {
         const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
@@ -676,7 +699,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
         cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
         const auto& textures = st.extern_textures;
-        if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env);
+        // The authored resource bindings were decoded at pipeline creation.
+        if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env, nullptr, false);
         D3D12_GPU_VIRTUAL_ADDRESS own_cb = 0;
         for (auto [reg, param] : st.cbvs) {
             if (int32_t(reg) == tfx.cbuffer_slot && !own_cb) {
@@ -685,6 +709,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 own_cb = a.gpu;
             }
             const auto va = int32_t(reg) == tfx.cbuffer_slot ? own_cb : scopes ? scopes(st.which, reg) : 0;
+            if (!changed(param, va)) continue;
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
@@ -718,7 +743,6 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 elements = t.elements;
                 first_element = t.first_element;
             }
-            if (r && kind_is_texture(kind) && !resource_fits(r, kind)) r = nullptr, fmt = DXGI_FORMAT_UNKNOWN;
             bool null_view = false;
             if (!r)
                 for (const auto& et : textures)
@@ -751,8 +775,11 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             }
         }
         if (st.table_param >= 0) {
-            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base));
-            else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), gpu.srv().gpu(base));
+            const auto handle = gpu.srv().gpu(base);
+            if (changed(uint32_t(st.table_param), handle.ptr)) {
+                if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), handle);
+                else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), handle);
+            }
         }
         if (st.uav_table_param >= 0) {
             const auto handle = gpu.srv().gpu(base + st.srv_count);
@@ -1001,6 +1028,7 @@ void GameLighting::release(Gpu& gpu) {
     release_sky_ambient(gpu);
     release_froxels(gpu);
     release_ssr(gpu);
+    release_light_grid(gpu);
     if (env_srv_ != UINT32_MAX) gpu.srv().free(env_srv_, 4);
     env_srv_ = UINT32_MAX;
     env_.Reset();
@@ -1182,6 +1210,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     load_sky_ambient(pm, gpu, scopes);
     load_froxels(pm, gpu, scopes);
     load_ssr(pm, gpu, scopes);
+    load_light_grid(pm, gpu, scopes);
     gpu.flush();
 }
 
@@ -1398,7 +1427,6 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set(ext::Frame, 0x10, time_of_day(p));
     if (!atm_.valid)
         ext_.note_estimate("extern 1 +0x10 = 0.5", "time of day without a map: noon");
-    update_global_channels(p);
     fill_atmosphere(p);
     if (!froxels_on(p) || !froxel_vol_)
         ext_.estimate_texture(ext::Atmosphere, 0x108, no_atmosphere_.Get(),
@@ -1567,8 +1595,12 @@ void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                           const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
+    if (p.entity_preview)
+        ext_.note_estimate("entity preview: Outpost's authored sky and lighting channels",
+                           "an isolated model does not specify a map environment");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
     const bool shadowed = shadow && shadow->valid && shadow->depth;
+    update_global_channels(p);
     update_exposure(gpu, p);
     fill_externs(gb, vm, p, shadowed);
     // Validate every dependency before recording any render-target transitions.
@@ -1695,6 +1727,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (!froxels_on(p))
         ext_.estimate_texture(ext::Transparent, 0x78, no_atmosphere_.Get(), "atmosphere froxels disabled: clear air (1,1,0,0)");
     ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
+    grid_ready_ = false;
+    for (uint32_t off : {0x28u, 0x30u, 0x38u, 0x40u}) ext_.set_texture(ext::Transparent, off, nullptr);
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
     if (sky_ambient) {
@@ -1737,7 +1771,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
                                "engine pass order not in game data; the cubemap alpha replaces what is under it");
         }
-        if (!lights_.empty()) draw_lights(gpu, cl, vm, scopes);
+        if (!lights_.empty()) draw_lights(gpu, cl, gb, vm, scopes);
         if (p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
             constexpr uint8_t kApply = 0x26;
             // Extern 38 is the full-screen input shared with final_combine: its own store here.
@@ -1751,6 +1785,13 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         }
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    if (transparents && sky_ambient) {
+        try {
+            render_light_grid(gpu, cl, vm, scopes, overhead_occlusion_on(p));
+        } catch (const std::exception& ex) {
+            ext_.note_estimate("transparent light grid is unavailable", ex.what());
+        }
     }
     // Screen-space reflections replace the specular IBL where a ray hits what is on screen.
     ssr_drawn_ = false;
@@ -1810,6 +1851,10 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
 // the density LUT and the sun path; the remaining extern 7 values are the global fog / sky
 // channels copied in their own order (estimate), the engine code that copies them is not data.
 void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* a) {
+    ae_valid_ = false;
+    ae_fence_ = {};
+    taa_valid_ = false;
+    grid_key_.reset();
     if (atm_.valid) gpu.wait_idle();
     hemi_inputs_.reset();
     atm_ = {};
@@ -2114,21 +2159,29 @@ M4 inverse(const M4& m) {
     for (int c = 0; c < 4; ++c) for (int rr = 0; rr < 4; ++rr) r.c[c][size_t(rr)] = inv[c * 4 + rr] * det;
     return r;
 }
-// A world box entirely outside one clip plane.
-bool off_screen(const ViewMatrices& vm, const std::array<float, 3>& lo, const std::array<float, 3>& hi) {
-    int out[5]{};
-    for (int c = 0; c < 8; ++c) {
-        const float4 p{c & 1 ? hi[0] - vm.eye.x : lo[0] - vm.eye.x, c & 2 ? hi[1] - vm.eye.y : lo[1] - vm.eye.y,
-                       c & 4 ? hi[2] - vm.eye.z : lo[2] - vm.eye.z, 1};
-        float4 q{};
-        for (int r = 0; r < 4; ++r)
-            for (int k = 0; k < 4; ++k) q[size_t(r)] += vm.vp_rel.c[k][size_t(r)] * p[size_t(k)];
-        out[0] += q[0] < -q[3]; out[1] += q[0] > q[3]; out[2] += q[1] < -q[3]; out[3] += q[1] > q[3]; out[4] += q[3] <= 0;
+// The supporting corner gives the maximum signed distance of an AABB to each clip plane.
+struct LightFrustum {
+    explicit LightFrustum(const ViewMatrices& vm) : eye{vm.eye.x, vm.eye.y, vm.eye.z} {
+        for (size_t c = 0; c < 4; ++c) {
+            const auto& col = vm.vp_rel.c[c];
+            planes[0][c] = col[3] + col[0];
+            planes[1][c] = col[3] - col[0];
+            planes[2][c] = col[3] + col[1];
+            planes[3][c] = col[3] - col[1];
+            planes[4][c] = col[3];
+        }
     }
-    for (int i = 0; i < 5; ++i)
-        if (out[i] == 8) return true;
-    return false;
-}
+    bool outside(const std::array<float, 3>& lo, const std::array<float, 3>& hi) const {
+        for (const auto& p : planes) {
+            const float max_distance = p[3] + p[0] * ((p[0] >= 0 ? hi[0] : lo[0]) - eye[0]) +
+                p[1] * ((p[1] >= 0 ? hi[1] : lo[1]) - eye[1]) + p[2] * ((p[2] >= 0 ? hi[2] : lo[2]) - eye[2]);
+            if (max_distance < -0.001f) return true;
+        }
+        return false;
+    }
+    std::array<float, 3> eye;
+    std::array<float4, 5> planes;
+};
 
 // goriath compute_light_bounds + compute_light_local_to_world: the light volume's box (in light
 // space) as a transform of the unit cube [0,1]^3 with x and z swapped.
@@ -2217,6 +2270,7 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                     GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                     opt.volume = true;
                     opt.cull_front = front;
+                    opt.depth_func = D3D12_COMPARISON_FUNC_LESS_EQUAL;
                     opt.cbuffer_floor = 64;
                     lp->load(pm, gpu, l->technique, scopes, opt);
                     light_pipelines_.push_back(std::move(lp));
@@ -2224,6 +2278,10 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                 it = keys.emplace(key, index).first;
             }
             LocalLight local{it->second, tech, *l};
+            const M4 node = m4(l->node), light_space = m4(l->light_space);
+            local.world_volume = mul(node, light_space);
+            local.world_to_box = inverse(light_box_to_world(node, light_space));
+            local.mirrored = det4(local.world_volume) > 0;
             if (l->shadowing && !l->shadow_technique.is_none() && light_shadow_view(*l)) {
                 // The +0xD8 technique: its own shaders, the same pipeline sharing.
                 try {
@@ -2245,6 +2303,7 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                             GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                             opt.volume = true;
                             opt.cull_front = front;
+                            opt.depth_func = D3D12_COMPARISON_FUNC_LESS_EQUAL;
                             opt.cbuffer_floor = 64;
                             lp->load(pm, gpu, l->shadow_technique, scopes, opt);
                             light_pipelines_.push_back(std::move(lp));
@@ -2401,6 +2460,7 @@ std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12Gr
     constexpr uint32_t kSize = 1024;
     std::vector<SunShadow*> out;
     if (!light_shadows_) return out;
+    const LightFrustum frustum(vm);
     if (scene_items != light_shadow_items_) {
         for (auto& ll : lights_)
             if (ll.shadow) ll.shadow->valid = false;
@@ -2408,7 +2468,7 @@ std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12Gr
     }
     for (auto& ll : lights_) {
         if (out.size() >= budget) break;
-        if (!ll.shadow_technique || (ll.shadow && ll.shadow->valid) || off_screen(vm, ll.light.lo, ll.light.hi)) continue;
+        if (!ll.shadow_technique || (ll.shadow && ll.shadow->valid) || frustum.outside(ll.light.lo, ll.light.hi)) continue;
         const auto view = light_shadow_view(ll.light);
         if (!view) continue;
         if (!ll.shadow) ll.shadow = std::make_unique<SunShadow>();
@@ -2445,26 +2505,32 @@ void GameLighting::bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& 
     ext_.set(kShadow, 0x180, 2.0f);                   // > 1: the 21-tap filter of the PS
 }
 
-void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
+void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {{base.ptr + 3 * inc}, {base.ptr + 4 * inc}};
-    cl->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+    cl->OMSetRenderTargets(2, rtvs, FALSE, &gb.dsv_ro);
     if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
     if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
     M4 to_rel;  // world -> camera-relative world
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    const LightFrustum frustum(vm);
+    GamePipeline::VolumeBatch batch;
+    const bool light_debug = std::getenv("NIM_LIGHT_DEBUG") != nullptr;
     light_shadows_used_ = 0;
     for (auto& ll : lights_) {
         const MapLight& l = ll.light;
-        if (off_screen(vm, l.lo, l.hi)) continue;
-        const M4 node = m4(l.node), space = m4(l.light_space);
-        const M4 node_rel = mul(to_rel, node);
-        const M4 volume = mul(node_rel, space);  // unit cube -> camera-relative world
+        if (frustum.outside(l.lo, l.hi)) continue;
+        const M4 node_rel = mul(to_rel, m4(l.node));
+        const M4 volume = mul(to_rel, ll.world_volume);  // unit cube -> camera-relative world
         ext_.set(15, 0x00, mul(vm.vp_rel, volume));
         ext_.set(ext::DeferredLight, 0x00, 0.0f);
-        ext_.set(ext::DeferredLight, 0x40, inverse(mul(to_rel, light_box_to_world(node, space))));
+        M4 relative_to_box = ll.world_to_box;
+        for (size_t i = 0; i < 4; ++i)
+            relative_to_box.c[3][i] += vm.eye.x * relative_to_box.c[0][i] + vm.eye.y * relative_to_box.c[1][i] +
+                vm.eye.z * relative_to_box.c[2][i];
+        ext_.set(ext::DeferredLight, 0x40, relative_to_box);
         ext_.set(ext::DeferredLight, 0xC0, node_rel);
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         ext_.set(ext::DeferredLight, 0x150, 1.0f);
@@ -2478,14 +2544,13 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Vi
         ext_.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
         // Only the far side of the volume is drawn (the camera may be inside it); the cube's
         // winding on screen flips with the handedness of its transform.
-        const bool mirrored = det4(volume) > 0;  // the clip-space map flips handedness when its determinant is positive (D3D NDC is left-handed)
-        GamePipeline& gp = *light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (mirrored ? 1 : 0)];
+        GamePipeline& gp = *light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (ll.mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, scopes, shadowed ? ll.shadow_technique.get() : ll.technique.get(), cube_vbv_, cube_ibv_, 36);
-            if (std::getenv("NIM_LIGHT_DEBUG") && lights_drawn_ < 2) {
+            gp.draw_volume(gpu, cl, ext_, scopes, shadowed ? ll.shadow_technique.get() : ll.technique.get(), cube_vbv_, cube_ibv_, 36, {}, &batch);
+            if (light_debug && lights_drawn_ < 2) {
                 const auto& vs = gp.stage_constants(0);
                 const auto& ps = gp.stage_constants(1);
-                std::string t = std::format("light {} mirrored {}\n", ll.technique->tag.str(), mirrored);
+                std::string t = std::format("light {} mirrored {}\n", ll.technique->tag.str(), ll.mirrored);
                 for (size_t k = 0; k < 4; ++k) t += std::format(" vs{:2} {:.3g} {:.3g} {:.3g} {:.3g}\n", 0x23 + k, vs[0x23 + k][0], vs[0x23 + k][1], vs[0x23 + k][2], vs[0x23 + k][3]);
                 for (size_t k = 0; k < 0x2B && k < ps.size(); ++k) t += std::format(" ps{:2X} {:.4g} {:.4g} {:.4g} {:.4g}\n", k, ps[k][0], ps[k][1], ps[k][2], ps[k][3]);
                 std::fputs(t.c_str(), stdout);
@@ -2584,10 +2649,12 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
     to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
     vol_shadows_used_ = 0;
+    const LightFrustum frustum(vm);
+    GamePipeline::VolumeBatch batch;
     for (const auto& vl : vol_lights_) {
         LocalLight& ll = lights_[vl.light];
         const MapLight& l = ll.light;
-        if (off_screen(vm, l.lo, l.hi)) continue;
+        if (frustum.outside(l.lo, l.hi)) continue;
         // +0xE0: each march sample is looked up in the light's depth map (t2) through the light
         // box, weighted by +0x154 (cb0[41]).
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
@@ -2614,7 +2681,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         const bool mirrored = det4(volume) > 0;
         GamePipeline& gp = *vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, qscopes, shadowed ? vl.shadow_technique.get() : vl.technique.get(), cube_vbv_, cube_ibv_, 36);
+            gp.draw_volume(gpu, cl, ext_, qscopes, shadowed ? vl.shadow_technique.get() : vl.technique.get(), cube_vbv_, cube_ibv_, 36, {}, &batch);
             ++vol_drawn_;
         } catch (const std::exception& ex) {
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));
@@ -2990,9 +3057,10 @@ void GameLighting::draw_cubemaps(Gpu& gpu, ID3D12GraphicsCommandList* cl, const 
     };
     // The volume VS expects the same backward camera axis as the transparent PS.
     // Reuse the frame's view scope; negating cb12[6] again places receivers behind the camera.
+    const LightFrustum frustum(vm);
     for (const auto& cv : cubemaps_) {
         const MapCubemap& m = cv.volume;
-        if (off_screen(vm, m.lo, m.hi)) continue;
+        if (frustum.outside(m.lo, m.hi)) continue;
         float fade = 1.0f;
         if (distance_fade && m.fade_end > m.fade_start) {
             const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};

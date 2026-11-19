@@ -171,6 +171,7 @@ void GameLighting::render_sky_hemisphere(Gpu& gpu, ID3D12GraphicsCommandList* cl
         tint != 0 ? channels[0x57] : float4{}, float4{tint, 0, 0, 0}};
     ext_.set_texture(ext::Deferred, 0xF8, hemi_.Get());
     if (hemi_inputs_ == inputs) return;
+    grid_key_.reset();
     hemi_inputs_.reset();
     ID3D12Device* dev = gpu.device();
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);

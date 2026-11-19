@@ -223,6 +223,7 @@ int run(int argc, char** argv) {
     std::vector<const MapCubemap*> region_cubemaps;
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
+    bool is_entity = false;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -397,6 +398,8 @@ int run(int argc, char** argv) {
         std::println("  prepare {:.1f}s, add {:.1f}s", prep_s, add_s);
         for (const auto& [why, n] : failures) std::println("  skipped {}: {}", n, why);
     } else if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
+        is_entity = true;
+        if (!no_atmosphere) atmosphere = load_entity_preview_atmosphere(pm);
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
         auto it = mats.find(mesh_tag.value);
@@ -467,6 +470,7 @@ int run(int argc, char** argv) {
     lp.volumetrics = !no_volumetrics;
     lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;
+    lp.entity_preview = is_entity && atmosphere.valid();
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
@@ -484,7 +488,7 @@ int run(int argc, char** argv) {
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
         if (!shadows) return;
         shadow.fit_view(sun_direction(p, atmosphere.valid() ? &atmosphere : nullptr), vm.eye, view.target, scene.center(), scene.radius(), is_map);
-        scene.render_shadow(gpu, list, shadow);
+        scene.render_sun_shadow(gpu, list, shadow, is_map);
     };
     shadow_pass(cl, lp);
     scene.render_gbuffer(gpu, cl, gb, vm);
@@ -652,6 +656,8 @@ int run(int argc, char** argv) {
         if (verify_static_motion && (!gl.temporal_aa_on(lp) || stationary_motion_max > 0.1f))
             throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
         std::println("world transparent draws: {}", scene.world_transparent_draws());
+        if (scene.has_transparent())
+            std::println("transparent light grid: {}", gl.light_grid_drawn() ? "ready" : "unavailable");
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         std::println("view tables: {} unique, {} reused", gpu.transient_table_count(), gpu.transient_table_hits());
@@ -712,12 +718,14 @@ int run(int argc, char** argv) {
 
     if (benchmark_frames) {
         ComPtr<ID3D12QueryHeap> queries;
-        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+        D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4, 0};
         check_hr(gpu.device()->CreateQueryHeap(&qd, IID_PPV_ARGS(&queries)), "timestamp heap");
-        auto readback = gpu.buffer(16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto readback = gpu.buffer(32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         uint64_t frequency = 0;
         check_hr(gpu.queue()->GetTimestampFrequency(&frequency), "timestamp frequency");
-        double cpu_ms = 0, gpu_ms = 0;
+        std::array<double, 3> cpu{}, gpu_pass{};
+        std::vector<double> budget_samples;
+        budget_samples.reserve(benchmark_frames);
         const auto start = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < benchmark_frames + 8; ++i) {
             gpu.begin_frame(i);
@@ -728,25 +736,49 @@ int run(int argc, char** argv) {
             scene.set_material_frame(lp.time, lp.delta_time);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
             shadow_pass(list, lp);
-            scene.render_gbuffer(gpu, list, gb, vm);
-            if (game) gl.render(gpu, list, gb, vm, lp, transparents, &shadow);
-            else lighting.render(gpu, list, gb, vm, lp);
+            const auto after_shadow = std::chrono::steady_clock::now();
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-            list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback.Get(), 0);
-            const double record_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpu_start).count();
+            scene.render_gbuffer(gpu, list, gb, vm);
+            const auto after_geometry = std::chrono::steady_clock::now();
+            list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+            if (game) gl.render(gpu, list, gb, vm, lp,
+                                scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            else lighting.render(gpu, list, gb, vm, lp);
+            list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+            list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, readback.Get(), 0);
+            const auto end_record = std::chrono::steady_clock::now();
             gpu.flush();
             if (i < 8) continue;
             uint64_t* ticks = nullptr;
-            const D3D12_RANGE read{0, 16};
+            const D3D12_RANGE read{0, 32};
             check_hr(readback->Map(0, &read, reinterpret_cast<void**>(&ticks)), "timestamp readback");
-            gpu_ms += double(ticks[1] - ticks[0]) * 1000.0 / double(frequency);
+            const std::array times{cpu_start, after_shadow, after_geometry, end_record};
+            double cpu_total = 0, gpu_total = 0;
+            for (size_t pass = 0; pass < 3; ++pass) {
+                const double record = std::chrono::duration<double, std::milli>(times[pass + 1] - times[pass]).count();
+                const double render = double(ticks[pass + 1] - ticks[pass]) * 1000.0 / double(frequency);
+                cpu[pass] += record;
+                gpu_pass[pass] += render;
+                cpu_total += record;
+                gpu_total += render;
+            }
+            budget_samples.push_back(std::max(cpu_total, gpu_total));
             const D3D12_RANGE written{0, 0};
             readback->Unmap(0, &written);
-            cpu_ms += record_ms;
         }
+        const double cpu_ms = cpu[0] + cpu[1] + cpu[2], gpu_ms = gpu_pass[0] + gpu_pass[1] + gpu_pass[2];
         std::println("benchmark {} frames at {}x{}: CPU record {:.4f} ms/frame, GPU {:.4f} ms/frame (wall {:.2f}s, 8 warmup frames)",
                      benchmark_frames, width, height, cpu_ms / benchmark_frames, gpu_ms / benchmark_frames,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        std::sort(budget_samples.begin(), budget_samples.end());
+        constexpr std::array names{"sun shadows", "geometry", "lighting and post"};
+        for (size_t i = 0; i < names.size(); ++i)
+            std::println("  {}: CPU {:.2f} ms, GPU {:.2f} ms", names[i], cpu[i] / benchmark_frames, gpu_pass[i] / benchmark_frames);
+        std::println("  p95 frame budget max(CPU record, GPU): {:.2f} ms", budget_samples[(budget_samples.size() - 1) * 95 / 100]);
+        if (is_map) {
+            const auto [statics, lod0, entities] = scene.visibility_counts();
+            std::println("  visible: {} static placements ({} at LOD0), {} entity placements", statics, lod0, entities);
+        }
     }
 
     // Debug views of the game's G-buffer through the same pass.

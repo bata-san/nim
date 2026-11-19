@@ -63,6 +63,9 @@ struct SunShadow {
     ViewMatrices vm;
     float half = 1, range = 1;  // ortho half extent, depth range (m)
     bool valid = false;         // rendered this frame
+    M4 cached_sun_view;
+    uint64_t cached_sun_generation = 0;
+    float cached_sun_time = 0;
     void resize(Gpu& gpu, uint32_t size);
     // Covers the sphere (center, radius) seen from the sun (sun_dir points toward the sun),
     // snapped to whole texels so the map does not shimmer as the camera moves.
@@ -161,7 +164,7 @@ struct PreparedMesh {
         std::vector<uint8_t> vs, ps;
         std::vector<float4> cb0;
         std::map<uint32_t, std::shared_ptr<const Texture>> textures;
-        uint8_t stage = 0;  // render stage: 0 = G-buffer, 8 = transparents
+        uint8_t stage = 0;  // render stage: 0 = G-buffer, 4 = shadow, 8 = transparents
         uint8_t lod_mask = 1;  // static mesh LOD levels this part belongs to (bit n = LOD n)
         int blend = -1;     // engine blend state index (transparents)
         std::vector<float4> vs_cb0;                // the VS stage's own cb0
@@ -251,6 +254,7 @@ public:
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
     // Depth of the G-buffer parts from the sun (shadow.fit first); sets shadow.valid.
     void render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow);
+    void render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map);
     // Draws the overhead visibility map over the scene (radius around `center`) and hands it to
     // the materials (extern 80) from then on.
     void render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList* cl, RainOcclusion& rain, V3 center, float radius);
@@ -273,6 +277,7 @@ public:
     void set_skin_pose(std::vector<BoneTransform> bones);
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
+    std::array<size_t, 3> visibility_counts() const;  // visible statics, LOD0 statics, visible placed entities
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
     void set_material_time_of_day(float day_fraction) { material_time_of_day_ = day_fraction; }
@@ -280,7 +285,7 @@ public:
     void set_exposure(float scale) { material_exposure_ = scale; }
     void set_render_inputs(const ExternStore& inputs);
     size_t item_count() const { return items_.size(); }
-    void set_channels(const ChannelValues& values) { channel_overrides_ = values; }
+    void set_channels(const ChannelValues& values) { channel_overrides_ = values; ++shadow_generation_; }
 
     TagHash tag() const { return tag_; }
     V3 center() const { return center_; }
@@ -324,6 +329,8 @@ private:
         bool vs_live = false, ps_live = false;
         bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items
         bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
+        bool light_grid = false;
+        bool light_grid_ready = false;
         bool dynamic = false;  // a dynamic model part: drawn once per placement with its object constants
         std::vector<uint32_t> object_params;  // root parameters of its rigid_model / skinning scopes
         uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
@@ -337,8 +344,6 @@ private:
     static constexpr uint32_t kPsSrvs = 32, kVsSrvs = 32, kItemSrvs = kPsSrvs + kVsSrvs;
     static constexpr uint32_t kSrvCopies = Gpu::kFramesInFlight + 1;
     uint32_t srv_frame_ = 0;
-    void bind_common(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h, const ViewMatrices& vm,
-                     ID3D12RootSignature* root = nullptr);
     void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                     bool shadow = false);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage = 0,
@@ -355,11 +360,11 @@ private:
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
     size_t world_transparent_draws_ = 0;
+    uint64_t shadow_generation_ = 0;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
     std::vector<size_t> transparent_items_;
     std::vector<SceneGroupInfo> info_;
-    ComPtr<ID3D12RootSignature> root_sig_, root_sig_dynamic_;
     struct PlacementConstants { std::array<float4, 32> values; };
     struct BufferSet {
         GpuBuffer ib, vb0, vb1, color;
@@ -393,16 +398,28 @@ private:
     // world bounding spheres, and per frame the indices that survive into the instance stream.
     struct CullGroup {
         std::vector<std::array<float, 4>> spheres;
+        float4 bounds{};
+        std::vector<uint32_t> visible_placements;
+        size_t first_item = 0, end_item = 0;
+        bool dynamic = false;
+        bool authored_shadow = false;
         bool has_transparency = false;
         std::vector<float> visible_depths;  // follows the compacted instance stream, including LOD order
         uint8_t levels = 1;  // LOD levels the mesh has (bit n = LOD n)
         D3D12_GPU_VIRTUAL_ADDRESS visible_address = 0;
         uint32_t visible = 0;
-        std::array<uint32_t, 4> first{}, count{};  // visible instances per LOD level, in that order
+        std::array<uint32_t, 8> first{}, count{};  // visible instances per LOD level, in that order
     };
-    std::array<std::vector<uint32_t>, 4> cull_scratch_;
+    std::array<std::vector<uint32_t>, 8> cull_scratch_;
     std::vector<CullGroup> cull_groups_;
-    void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height);
+    std::vector<size_t> uncullable_opaque_, visible_opaque_;
+    struct DrawBundle {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        uint64_t fence = 0;
+    };
+    std::array<DrawBundle, 3 * Gpu::kFramesInFlight> draw_bundles_;
+    void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow = false);
     uint32_t item_instances(const Item& it) const;  // this frame's, after cull()
     struct ScopeDef { const Scope* scope; ShaderStage stage; uint32_t reg; };
     std::vector<ScopeDef> scope_defs_;
@@ -411,6 +428,7 @@ private:
     GpuBuffer white_color_;
     BufferArena arena_;  // geometry and fixed constants of this scene  // 1 x RGBA8 white: VS colour stream of meshes without one
     std::map<uint32_t, ComPtr<ID3D12Resource>> texture_cache_;
+    std::unordered_map<uint32_t, GpuBuffer> geometry_cache_;
     std::map<uint32_t, ComPtr<ID3D12RootSignature>> root_cache_;
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
     std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
@@ -447,6 +465,7 @@ struct LightingParams {
     // fog and the sky background with the engine's pipelines. time_of_day in days (0..1), < 0 =
     // the map's own; the sun then follows the map's sun path instead of sun_azimuth/elevation.
     bool atmosphere = true;
+    bool entity_preview = false;
     bool froxel_noise = true;  // original spatial density-noise permutation; source/selection are estimates
     float time_of_day = -1.0f;
     float day_night_state = -1.0f;  // world channel day_night_state; < 0: 1 while the sun is below the horizon (estimate)

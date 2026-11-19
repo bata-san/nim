@@ -49,6 +49,7 @@ add_library(nim_render STATIC
   src/render/game_sky_ambient.cpp
   src/render/game_froxels.cpp
   src/render/game_ssr.cpp
+  src/render/game_light_grid.cpp
 )
 target_link_libraries(nim_render PUBLIC nim_core d3d12 dxgi d3dcompiler)
 target_link_libraries(nimcli PRIVATE nim_render)

@@ -501,6 +501,12 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
     return out;
 }
 
+MapAtmosphere load_entity_preview_atmosphere(PackageManager& pm) {
+    const TagHash outpost{0x80AF9550};
+    if (!pm.entry(outpost)) return {};
+    return load_map_atmosphere(pm, load_map_layout(pm, outpost));
+}
+
 std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map) {
     constexpr uint32_t kClassSkyComponent = 0x80808378, kClassSkyModelRef = 0x80808383;
     std::map<uint32_t, MapStatic> models;

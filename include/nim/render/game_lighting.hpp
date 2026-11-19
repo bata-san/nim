@@ -158,9 +158,15 @@ public:
     // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
     // (slots no TFX fills, e.g. a cubemap volume's cubes). With an empty ibv, `indices` is the
     // vertex count of an authored non-indexed triangle list.
+    struct VolumeBatch {
+        const GamePipeline* pipeline = nullptr;
+        const D3D12_VERTEX_BUFFER_VIEW* vertices = nullptr;
+        const D3D12_INDEX_BUFFER_VIEW* indices = nullptr;
+        std::array<uint64_t, 64> root_bindings{};
+    };
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                      const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                     uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {});
+                     uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {}, VolumeBatch* batch = nullptr);
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
     // The group counts come from the first three words of `args` (INDIRECT_ARGUMENT state).
@@ -191,6 +197,7 @@ private:
         const D3D12_INDEX_BUFFER_VIEW* ibv;
         uint32_t indices;
         std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures;
+        VolumeBatch* batch = nullptr;
     };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
@@ -248,6 +255,7 @@ public:
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
     bool ssr_drawn() const { return ssr_drawn_; }             // reflections were traced last frame
+    bool light_grid_drawn() const { return grid_ready_; }
     // Half-resolution SSR buffers (UNORDERED_ACCESS between frames): RGBA16F radiance (w: 0 no ray,
     // 1 fallback, 2 hit) and R32 hit distance (float bits).
     ID3D12Resource* ssr_radiance() const { return ssr_radiance_.Get(); }
@@ -282,7 +290,14 @@ public:
     // _far pipelines render the in-scatter seen along every view ray for the time of day, the
     // shading pass fogs with them and the `sky` pipeline draws the background. nullptr clears.
     void set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* atmosphere);
-    void clear_atmosphere() { atm_ = {}; atm_notes_.clear(); }
+    void clear_atmosphere() {
+        atm_ = {};
+        atm_notes_.clear();
+        hemi_inputs_.reset();
+        grid_key_.reset();
+        ae_valid_ = taa_valid_ = false;
+        ae_fence_ = {};
+    }
     // The map seen from straight above (StaticMeshScene::render_rain_occlusion) for the sky
     // ambient's overhead occlusion; must outlive the frames rendered with it. nullptr clears.
     void set_overhead_occlusion(const RainOcclusion* top) { overhead_ = top; }
@@ -390,7 +405,7 @@ private:
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     uint32_t w_ = 0, h_ = 0;
 
-    void draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    void draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     struct LocalLight {
         uint32_t pipeline = 0;
         std::shared_ptr<const Technique> technique;
@@ -400,6 +415,8 @@ private:
         std::shared_ptr<const Technique> shadow_technique;
         std::unique_ptr<SunShadow> shadow;
         bool shadow_readable = false;  // depth map in PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
+        M4 world_volume, world_to_box;
+        bool mirrored = false;
     };
     size_t light_shadow_items_ = 0, light_shadows_used_ = 0;
     // Hands a light's depth map to the deferred_shadow extern (6) for its +0xD8 / +0xE0 technique.
@@ -502,6 +519,16 @@ private:
     // and cascade_raymarch_atmosphere_volume_inscatter integrates it front to back into
     // (transmittance, fog transmittance, in-scatter): extern 7 +0x108 / extern 40 +0x78.
     void load_froxels(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
+    void release_light_grid(Gpu& gpu);
+    void render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
+                           const ScopeBufferFn& scopes, bool overhead);
+    GamePipeline grid_sky_, grid_blend_, grid_encode_;
+    ExternStore grid_ext_;
+    std::array<ComPtr<ID3D12Resource>, 3> grid_basis_, grid_sh_;
+    ComPtr<ID3D12DescriptorHeap> grid_clear_heap_;
+    std::optional<std::array<float4, 8>> grid_key_;
+    bool grid_ready_ = false;
     // Screen-space reflections (game_ssr.cpp, docs/PROGRESS.md 3.12).
     void load_ssr(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
     void release_ssr(Gpu& gpu);

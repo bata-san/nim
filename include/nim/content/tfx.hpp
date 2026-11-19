@@ -128,8 +128,8 @@ struct DynamicModelMaterials {
 std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm);
 
 // ---- Buffers / textures ---------------------------------------------------------------------
-struct VertexBuffer { uint32_t stride = 0; uint16_t vtype = 0; std::vector<uint8_t> data; };
-struct IndexBuffer { bool is_32bit = false; std::vector<uint8_t> data; };
+struct VertexBuffer { uint32_t stride = 0; uint16_t vtype = 0; std::vector<uint8_t> data; TagHash data_tag; };
+struct IndexBuffer { bool is_32bit = false; std::vector<uint8_t> data; TagHash data_tag; };
 VertexBuffer load_vertex_buffer(PackageManager& pm, TagHash header);
 IndexBuffer load_index_buffer(PackageManager& pm, TagHash header);
 
