@@ -64,7 +64,7 @@ target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32)
 
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)
-add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp
+add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_text.cpp
     ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp)
@@ -75,7 +75,8 @@ target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi 
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()
-add_executable(nim_tests tests/test_main.cpp)
+add_executable(nim_tests tests/test_main.cpp tools/nim/ui_text.cpp)
+target_include_directories(nim_tests PRIVATE tools/nim)
 target_link_libraries(nim_tests PRIVATE nim_core)
 add_test(NAME nim_tests COMMAND nim_tests)
 

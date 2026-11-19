@@ -8,8 +8,11 @@
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
 #include "nim/core/tag_reader.hpp"
+#include "ui_text.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <string>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -295,6 +298,31 @@ int main() {
         CHECK(table.integer(1, "value") == 9);
         CHECK(table.text(0, "name") == "abc");
     }
+
+    // UI text: every key has a non-empty text in each interface language, and the
+    // languages keep the same printf / std::format placeholders.
+    for (size_t i = 0; i < size_t(ui::S::Count); ++i) {
+        const auto key = ui::S(i);
+        const std::string ja = ui::tr_in(key, ui::Lang::Ja);
+        CHECK(!ja.empty());
+        CHECK(!std::string(ui::tr_in(key, ui::Lang::En)).empty());
+        CHECK(!std::string(ui::tr_in(key, ui::Lang::Ko)).empty());
+        auto count = [](const std::string& s, char c) { return std::count(s.begin(), s.end(), c); };
+        for (auto l : {ui::Lang::En, ui::Lang::Ko}) {
+            const std::string t = ui::tr_in(key, l);
+            if (count(t, '{') != count(ja, '{') || count(t, '%') != count(ja, '%')) {
+                std::fprintf(stderr, "UI key %zu: placeholders differ in language %d\n", i, int(l));
+                ++g_failures;
+            }
+        }
+    }
+    CHECK(std::string(ui::tr_in(ui::S::EstimatesHeader, ui::Lang::En)).find("Estimated") != std::string::npos);
+    CHECK(std::string(ui::tr_in(ui::S::EstimatesHeader, ui::Lang::Ko)).find("추정") != std::string::npos);
+    CHECK(std::string(ui::tr_in(ui::S::EstimatesHeader, ui::Lang::Ja)).find("推定") != std::string::npos);
+    CHECK(std::string(ui::trf(ui::S::LogModelLoaded, "m", 2, 1.0, 2.0, "")).size() > 0);
+    ui::Lang parsed = ui::Lang::Ja;
+    CHECK(ui::parse_lang("ko", parsed) && parsed == ui::Lang::Ko);
+    CHECK(!ui::parse_lang("fr", parsed));
 
     if (g_failures) return 1;
     std::puts("all tests passed");

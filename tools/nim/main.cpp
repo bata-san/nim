@@ -5,6 +5,7 @@
 // game's own G-buffer shaders and, by default, shaded by the game's own deferred lighting pass;
 // the UI itself is set in the game's fonts, read from the user's install at startup.
 #include "media.hpp"
+#include "ui_text.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
 #include "nim/content/movies.hpp"
@@ -91,21 +92,23 @@ bool contains_ci(const std::string& hay, const std::string& needle_lower) {
     if (needle_lower.empty()) return true;
     return lower_ascii(hay).find(needle_lower) != std::string::npos;
 }
-// Display names of the string-table language slots (TextLanguage order).
-const char* text_language_name(size_t l) {
-    static constexpr const char* k[] = {"英語", "日本語", "ドイツ語", "フランス語", "スペイン語", "スペイン語 (中南米)", "イタリア語",
-                                        "韓国語", "繁体字中国語", "簡体字中国語", "ポルトガル語 (ブラジル)", "ポーランド語", "ロシア語"};
-    return l < std::size(k) ? k[l] : "?";
-}
-// Localized audio packages end in a language suffix (w64_sr_audio_015a_jpn).
-std::string audio_language_name(const std::string& suffix) {
-    static const std::pair<const char*, size_t> k[] = {{"en", 0},   {"jpn", 1},  {"ja", 1},   {"de", 2},  {"fr", 3},
-                                                       {"es", 4},   {"esmx", 5}, {"mx", 5},   {"it", 6},  {"ko", 7},
-                                                       {"kor", 7},  {"cht", 8},  {"zht", 8},  {"chs", 9}, {"zhs", 9},
-                                                       {"ptbr", 10}, {"pt", 10}, {"pl", 11},  {"ru", 12}};
+// Display names of the string-table language slots (TextLanguage order). Content, shown in the
+// selectors; the names themselves follow the interface language.
+const char* text_language_name(size_t l) { return ui::content_language_name(l); }
+// Localized audio packages end in a language suffix (w64_sr_audio_015a_jpn). The index is the
+// TextLanguage slot the suffix stands for (-1 when unknown).
+int audio_language_slot(const std::string& suffix) {
+    static const std::pair<const char*, int> k[] = {{"en", 0},   {"jpn", 1},  {"ja", 1},   {"de", 2},  {"fr", 3},
+                                                    {"es", 4},   {"esmx", 5}, {"mx", 5},   {"it", 6},  {"ko", 7},
+                                                    {"kor", 7},  {"cht", 8},  {"zht", 8},  {"chs", 9}, {"zhs", 9},
+                                                    {"ptbr", 10}, {"pt", 10}, {"pl", 11},  {"ru", 12}};
     for (const auto& [s, l] : k)
-        if (suffix == s) return text_language_name(l);
-    return suffix;
+        if (suffix == s) return l;
+    return -1;
+}
+std::string audio_language_name(const std::string& suffix) {
+    const int slot = audio_language_slot(suffix);
+    return slot < 0 ? suffix : text_language_name(size_t(slot));
 }
 // The longest prefix of `s` that is at most `bytes` long and ends on a UTF-8 character boundary.
 std::string utf8_prefix(const std::string& s, size_t bytes) {
@@ -162,13 +165,32 @@ std::string format_bytes(uint64_t b) {
     return std::format("{:.1f} {}", v, units[u]);
 }
 
+// The interface language is kept in nim_settings.ini next to the exe ("language=ja"). Missing or
+// unknown values fall back to Japanese.
+ui::Lang load_ui_language() {
+    ui::Lang l = ui::Lang::Ja;
+    std::ifstream f(exe_dir() / "nim_settings.ini");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("language=", 0) != 0) continue;
+        std::string v = line.substr(9);
+        while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+        ui::parse_lang(v, l);
+    }
+    return l;
+}
+void save_ui_language(ui::Lang l) {
+    std::ofstream f(exe_dir() / "nim_settings.ini", std::ios::trunc);
+    if (f) f << "language=" << ui::code(l) << "\n";
+}
+
 std::optional<fs::path> pick_folder(HWND owner) {
     ComPtr<IFileOpenDialog> dlg;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return {};
     DWORD opts = 0;
     dlg->GetOptions(&opts);
     dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    dlg->SetTitle(L"Marathon のインストールフォルダを選択");
+    dlg->SetTitle(to_wide(ui::tr(ui::S::PickInstallFolder)).c_str());
     if (FAILED(dlg->Show(owner))) return {};
     ComPtr<IShellItem> item;
     if (FAILED(dlg->GetResult(&item))) return {};
@@ -266,6 +288,8 @@ void load_fonts(PackageManager* pm) {
             add(game_font("NotoSansKR-Regular"), 0, f, 1.3f);
             add(game_font("NotoSansSC-Regular"), 0, f, 1.3f);
             add(game_font("NotoSansTC-Regular"), 0, f, 1.3f);
+            // Hangul the Noto set lacks (merged: only missing glyphs are taken from Malgun Gothic).
+            add(first_sys({"malgun.ttf"}), 0, f, 1.0f);
         } else {
             add(first_sys({"YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"}), 0, f);
             add(first_sys({"malgun.ttf"}), 0, f);
@@ -295,96 +319,136 @@ void load_fonts(PackageManager* pm) {
     io.FontDefault = g_fonts.body;
 }
 
-// goriath's look: near-black panels, white text, black tab bar, white "D buttons".
+// The interface theme: a neutral dark palette, one accent (Marathon green), soft rounded corners.
+namespace theme {
+constexpr ImU32 kRail = IM_COL32(18, 18, 22, 255);
+constexpr ImU32 kBg = IM_COL32(13, 13, 16, 255);
+constexpr ImU32 kSurface = IM_COL32(24, 24, 30, 255);
+constexpr ImU32 kSurfaceHi = IM_COL32(31, 31, 39, 255);
+constexpr ImU32 kHover = IM_COL32(38, 38, 47, 255);
+constexpr ImU32 kActive = IM_COL32(50, 50, 62, 255);
+constexpr ImU32 kBorder = IM_COL32(44, 44, 54, 255);
+constexpr ImU32 kText = IM_COL32(236, 236, 240, 255);
+constexpr ImU32 kMuted = IM_COL32(146, 146, 160, 255);
+constexpr ImU32 kError = IM_COL32(255, 118, 118, 255);
+constexpr ImU32 kAccentHi = IM_COL32(222, 255, 96, 255);
+} // namespace theme
+
 void apply_style(float scale) {
     ImGui::StyleColorsDark();
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 0;
-    s.ChildRounding = 0;
-    s.FrameRounding = 4;
-    s.PopupRounding = 4;
-    s.TabRounding = 0;
-    s.ScrollbarRounding = 4;
-    s.GrabRounding = 4;
+    s.ChildRounding = 10;
+    s.FrameRounding = 8;
+    s.PopupRounding = 10;
+    s.TabRounding = 8;
+    s.ScrollbarRounding = 8;
+    s.GrabRounding = 8;
     s.WindowBorderSize = 0;
     s.ChildBorderSize = 1;
+    s.PopupBorderSize = 1;
     s.FrameBorderSize = 0;
     s.TabBorderSize = 0;
-    s.WindowPadding = {12, 10};
-    s.FramePadding = {8, 7};  // 32 px tab bar
-    s.ItemSpacing = {14, 8};
+    s.WindowPadding = {16, 14};
+    s.FramePadding = {10, 6};
+    s.ItemSpacing = {10, 8};
     s.ItemInnerSpacing = {8, 6};
-    s.ScrollbarSize = 12;
+    s.CellPadding = {8, 5};
+    s.IndentSpacing = 18;
+    s.ScrollbarSize = 10;
+    s.GrabMinSize = 10;
+    s.SeparatorTextBorderSize = 1;
     s.DockingSeparatorSize = 2;
     s.TabBarOverlineSize = 2;
     s.TabBarBorderSize = 0;
     ImVec4* c = s.Colors;
     auto rgb = [](int r, int g, int b, float a = 1) { return ImVec4{r / 255.0f, g / 255.0f, b / 255.0f, a}; };
-    const ImVec4 panel = rgb(19, 19, 22), bar = rgb(4, 4, 4), sel = rgb(0, 92, 128);
-    c[ImGuiCol_Text] = {1, 1, 1, 1};
-    c[ImGuiCol_TextDisabled] = rgb(150, 150, 156);
-    c[ImGuiCol_WindowBg] = panel;
-    c[ImGuiCol_ChildBg] = {0, 0, 0, 0.376f};  // black alpha 96
-    c[ImGuiCol_PopupBg] = rgb(14, 14, 16, 0.98f);
-    c[ImGuiCol_Border] = rgb(48, 48, 54);
-    c[ImGuiCol_FrameBg] = rgb(36, 36, 42);
-    c[ImGuiCol_FrameBgHovered] = rgb(52, 52, 60);
-    c[ImGuiCol_FrameBgActive] = rgb(64, 64, 72);
-    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = bar;
-    c[ImGuiCol_MenuBarBg] = bar;
-    c[ImGuiCol_Header] = sel;
-    c[ImGuiCol_HeaderHovered] = rgb(0, 92, 128, 0.6f);
-    c[ImGuiCol_HeaderActive] = rgb(0, 110, 150);
-    c[ImGuiCol_Button] = rgb(40, 40, 46);
-    c[ImGuiCol_ButtonHovered] = rgb(60, 60, 68);
-    c[ImGuiCol_ButtonActive] = rgb(80, 80, 90);
-    c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = ImGui::ColorConvertU32ToFloat4(kGreen);
-    c[ImGuiCol_SliderGrabActive] = {1, 1, 1, 1};
-    c[ImGuiCol_Tab] = bar;
-    c[ImGuiCol_TabHovered] = rgb(38, 38, 44);
-    c[ImGuiCol_TabSelected] = panel;
-    c[ImGuiCol_TabSelectedOverline] = {1, 1, 1, 1};
-    c[ImGuiCol_TabDimmed] = bar;
-    c[ImGuiCol_TabDimmedSelected] = panel;
+    const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(kGreen);
+    c[ImGuiCol_Text] = ImGui::ColorConvertU32ToFloat4(theme::kText);
+    c[ImGuiCol_TextDisabled] = ImGui::ColorConvertU32ToFloat4(theme::kMuted);
+    c[ImGuiCol_WindowBg] = ImGui::ColorConvertU32ToFloat4(theme::kBg);
+    c[ImGuiCol_ChildBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurface);
+    c[ImGuiCol_PopupBg] = rgb(22, 22, 28, 0.98f);
+    c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
+    c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
+    c[ImGuiCol_FrameBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
+    c[ImGuiCol_FrameBgHovered] = rgb(44, 44, 54);
+    c[ImGuiCol_FrameBgActive] = rgb(56, 56, 68);
+    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
+    c[ImGuiCol_MenuBarBg] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
+    c[ImGuiCol_Header] = {accent.x, accent.y, accent.z, 0.16f};
+    c[ImGuiCol_HeaderHovered] = {accent.x, accent.y, accent.z, 0.24f};
+    c[ImGuiCol_HeaderActive] = {accent.x, accent.y, accent.z, 0.32f};
+    c[ImGuiCol_Button] = rgb(40, 40, 50);
+    c[ImGuiCol_ButtonHovered] = rgb(54, 54, 66);
+    c[ImGuiCol_ButtonActive] = rgb(68, 68, 82);
+    c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = accent;
+    c[ImGuiCol_SliderGrabActive] = ImGui::ColorConvertU32ToFloat4(theme::kAccentHi);
+    c[ImGuiCol_Tab] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
+    c[ImGuiCol_TabHovered] = rgb(40, 40, 50);
+    c[ImGuiCol_TabSelected] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
+    c[ImGuiCol_TabSelectedOverline] = accent;
+    c[ImGuiCol_TabDimmed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
+    c[ImGuiCol_TabDimmedSelected] = ImGui::ColorConvertU32ToFloat4(theme::kSurface);
     c[ImGuiCol_TabDimmedSelectedOverline] = {0, 0, 0, 0};
-    c[ImGuiCol_DockingPreview] = rgb(201, 254, 0, 0.5f);
-    c[ImGuiCol_DockingEmptyBg] = panel;
-    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = rgb(48, 48, 54);
-    c[ImGuiCol_SeparatorActive] = ImGui::ColorConvertU32ToFloat4(kGreen);
-    c[ImGuiCol_TableHeaderBg] = rgb(28, 28, 32);
-    c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.025f};
-    c[ImGuiCol_TextSelectedBg] = rgb(0, 92, 128, 0.7f);
-    c[ImGuiCol_NavCursor] = {1, 1, 1, 1};
+    c[ImGuiCol_DockingPreview] = {accent.x, accent.y, accent.z, 0.5f};
+    c[ImGuiCol_DockingEmptyBg] = ImGui::ColorConvertU32ToFloat4(theme::kBg);
+    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
+    c[ImGuiCol_SeparatorActive] = accent;
+    c[ImGuiCol_ResizeGrip] = {0, 0, 0, 0};
+    c[ImGuiCol_ResizeGripHovered] = c[ImGuiCol_ResizeGripActive] = {accent.x, accent.y, accent.z, 0.4f};
+    c[ImGuiCol_ScrollbarBg] = {0, 0, 0, 0};
+    c[ImGuiCol_ScrollbarGrab] = rgb(58, 58, 70);
+    c[ImGuiCol_ScrollbarGrabHovered] = rgb(76, 76, 90);
+    c[ImGuiCol_ScrollbarGrabActive] = rgb(96, 96, 112);
+    c[ImGuiCol_TableHeaderBg] = rgb(28, 28, 35);
+    c[ImGuiCol_TableBorderStrong] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
+    c[ImGuiCol_TableBorderLight] = rgb(34, 34, 42);
+    c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.02f};
+    c[ImGuiCol_TextSelectedBg] = {accent.x, accent.y, accent.z, 0.26f};
+    c[ImGuiCol_NavCursor] = accent;
     s.ScaleAllSizes(scale);
     s.FontScaleDpi = scale;
 }
 
-// goriath's DButton: white rounded slab with black text (or black with a white stroke).
-bool dbutton(const char* label, float min_w, bool black = false) {
+// The primary action: an accent-filled rounded button with dark text. `secondary` draws it as an
+// outlined surface instead. Returns true on click.
+bool dbutton(const char* label, float min_w, bool secondary = false) {
     const float sc = ImGui::GetStyle().FontScaleDpi;
-    ImGui::PushFont(g_fonts.button, 24);
+    ImGui::PushFont(g_fonts.bold, 0);
     const ImVec2 ts = ImGui::CalcTextSize(label);
-    const ImVec2 size{std::max(min_w, ts.x + 50 * sc), std::max(60 * sc, ts.y + 40 * sc)};
+    const ImVec2 size{std::max(min_w, ts.x + 36 * sc), 38 * sc};
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const bool pressed = ImGui::InvisibleButton(label, size);
     const bool hovered = ImGui::IsItemHovered();
     auto* dl = ImGui::GetWindowDrawList();
     const float r = 8 * sc;
-    dl->AddRectFilled(p, {p.x + size.x, p.y + size.y}, black ? IM_COL32_BLACK : IM_COL32_WHITE, r);
-    if (black) dl->AddRect(p, {p.x + size.x, p.y + size.y}, IM_COL32_WHITE, r, 0, 2 * sc);
-    dl->AddText({p.x + 25 * sc, p.y + (size.y - ts.y) * 0.5f}, black ? IM_COL32_WHITE : IM_COL32_BLACK, label);
-    if (hovered) {
-        dl->AddRectFilled(p, {p.x + size.x, p.y + size.y}, IM_COL32(0, 0, 0, 96), r);
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    const ImVec2 q{p.x + size.x, p.y + size.y};
+    if (secondary) {
+        dl->AddRectFilled(p, q, hovered ? theme::kHover : theme::kSurfaceHi, r);
+        dl->AddRect(p, q, theme::kBorder, r, 0, 1 * sc);
+        dl->AddText({p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f}, theme::kText, label);
+    } else {
+        dl->AddRectFilled(p, q, hovered ? theme::kAccentHi : kGreen, r);
+        dl->AddText({p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f}, IM_COL32(10, 12, 4, 255), label);
     }
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     ImGui::PopFont();
     return pressed;
 }
 
-void heading(const char* text) {
-    ImGui::PushFont(g_fonts.heading, 42);
+// A page title: the heading face in a given pixel size.
+void heading(const char* text, float size = 28) {
+    ImGui::PushFont(g_fonts.heading, size);
     ImGui::TextUnformatted(text);
     ImGui::PopFont();
+}
+
+// Text centred on a line within `w` pixels (single line).
+void centered_text(const char* text, float w, ImU32 col = theme::kText) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (w - ts.x) * 0.5f));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", text);
 }
 
 // Shadowed text, for HUDs drawn over the 3D view.
@@ -405,6 +469,59 @@ void spinner(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
     dl->PathStroke(col, 0, r * 0.25f);
 }
 
+// A centred block for "nothing here yet": glyph, title, and a short hint that says what to do.
+void empty_state(uint32_t glyph, const char* title, const char* hint) {
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float wrap = std::min(avail.x, 440 * sc);
+    const ImVec2 hs = ImGui::CalcTextSize(hint, nullptr, false, wrap);
+    const float block = ImGui::GetTextLineHeight() * 2 + 14 * sc + hs.y;
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - block) * 0.38f));
+    ImGui::PushFont(g_fonts.bold, 0);
+    centered_text(icon(glyph).c_str(), avail.x, theme::kMuted);
+    centered_text(title, avail.x);
+    ImGui::PopFont();
+    ImGui::Dummy({0, 6 * sc});
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail.x - wrap) * 0.5f));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme::kMuted));
+    ImGui::TextUnformatted(hint);
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+}
+
+// A centred spinner and a line of text while something is being read.
+void loading_state(const char* text) {
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - 60 * sc) * 0.4f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    spinner(ImGui::GetWindowDrawList(), {p.x + avail.x * 0.5f, p.y + 12 * sc}, 11 * sc, kGreen);
+    ImGui::Dummy({0, 34 * sc});
+    centered_text(text, avail.x, theme::kMuted);
+}
+
+// A clickable card for the home page: a glyph, a title and a wrapped description. Returns clicked.
+bool card(const char* id, uint32_t glyph, const char* title, const char* desc, float w, float h) {
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    ImGui::PushID(id);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("card", {w, h});
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    auto* dl = ImGui::GetWindowDrawList();
+    const ImVec2 q{p.x + w, p.y + h};
+    const float fs = ImGui::GetFontSize();
+    dl->AddRectFilled(p, q, hovered ? theme::kHover : theme::kSurface, 12 * sc);
+    dl->AddRect(p, q, hovered ? kGreen : theme::kBorder, 12 * sc, 0, 1 * sc);
+    dl->AddText(ImGui::GetFont(), fs * 1.5f, {p.x + 18 * sc, p.y + 14 * sc}, kGreen, icon(glyph).c_str());
+    dl->AddText(g_fonts.bold ? g_fonts.bold : ImGui::GetFont(), fs * 1.1f, {p.x + 18 * sc, p.y + 52 * sc}, theme::kText, title);
+    dl->AddText(ImGui::GetFont(), fs * 0.92f, {p.x + 18 * sc, p.y + 52 * sc + fs * 1.5f}, theme::kMuted, desc, nullptr,
+                w - 36 * sc);
+    ImGui::PopID();
+    return clicked;
+}
+
 // ---- data loaded in the background -----------------------------------------------------------------
 struct MeshEntry { TagHash tag; uint32_t size; uint16_t pkg; };
 struct PackageGroup { uint16_t pkg_id; std::string name; std::vector<uint32_t> meshes; };
@@ -412,7 +529,7 @@ struct EntryRow { TagHash tag; uint16_t type, subtype; uint32_t reference, size;
 
 struct Catalog {
     std::mutex mutex;
-    std::string status = "準備中…";
+    std::string status = ui::tr(ui::S::Preparing);
     std::atomic<bool> meshes_ready{false}, strings_ready{false}, dialogue_ready{false}, movies_ready{false}, done{false};
     std::vector<MeshEntry> meshes;
     std::vector<PackageGroup> packages;  // packages that hold static meshes
@@ -429,7 +546,7 @@ void load_catalog(fs::path install, Catalog* cat) {
         PackageManager pm(install);
         {
             std::lock_guard lk(cat->mutex);
-            cat->status = "静的メッシュを列挙中…";
+            cat->status = ui::tr(ui::S::StatusListingMeshes);
         }
         std::vector<MeshEntry> meshes, dynamics;
         std::vector<PackageGroup> groups, dyn_groups;
@@ -456,7 +573,7 @@ void load_catalog(fs::path install, Catalog* cat) {
             cat->packages = std::move(groups);
             cat->dynamics = std::move(dynamics);
             cat->dyn_packages = std::move(dyn_groups);
-            cat->status = "テキストを読込中…";
+            cat->status = ui::tr(ui::S::StatusLoadingText);
         }
         cat->meshes_ready = true;
         StringTable st;
@@ -464,14 +581,14 @@ void load_catalog(fs::path install, Catalog* cat) {
         {
             std::lock_guard lk(cat->mutex);
             cat->strings = std::move(st);
-            cat->status = "セリフを読込中…";
+            cat->status = ui::tr(ui::S::StatusLoadingDialogue);
         }
         cat->strings_ready = true;
         auto dlg = load_all_dialogue(pm);
         {
             std::lock_guard lk(cat->mutex);
             cat->dialogue = std::move(dlg);
-            cat->status = "ムービーを列挙中…";
+            cat->status = ui::tr(ui::S::StatusListingMovies);
         }
         cat->dialogue_ready = true;
         auto movies = list_movies(pm);
@@ -484,7 +601,7 @@ void load_catalog(fs::path install, Catalog* cat) {
     } catch (const std::exception& ex) {
         std::lock_guard lk(cat->mutex);
         cat->error = ex.what();
-        cat->status = std::string("読込エラー: ") + ex.what();
+        cat->status = ui::trf(ui::S::StatusLoadError, ex.what());
     }
     cat->done = true;
 }
@@ -1100,16 +1217,20 @@ struct Camera {
 
 enum class Engine : int { Game };
 
+// The pages of the navigation rail. Every page is always reachable from the rail.
 enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabPackages, TabLog, TabCount };
-struct TabInfo { uint32_t icon; const char* title; const char* id; bool closable; };
+struct TabInfo { uint32_t icon; ui::S name; ui::S desc; };
 constexpr TabInfo kTabs[TabCount] = {
-    {ico::Home, "HOME", "home", false},         {ico::Settings, "", "settings", false},
-    {ico::Statics, "STATICS", "statics", true}, {ico::Entities, "ENTITIES", "entities", true},
-    {ico::Maps, "MAPS", "maps", true},
-    {ico::Text, "TEXT", "text", true},
-    {ico::Dialogue, "DIALOGUE", "dialogue", true}, {ico::Movies, "MOVIES", "movies", true},
-    {ico::Packages, "PACKAGES", "packages", true},
-    {ico::Log, "LOG", "log", true},
+    {ico::Home, ui::S::NavHome, ui::S::DescHome},
+    {ico::Settings, ui::S::NavSettings, ui::S::DescSettings},
+    {ico::Statics, ui::S::NavStatics, ui::S::DescStatics},
+    {ico::Entities, ui::S::NavEntities, ui::S::DescEntities},
+    {ico::Maps, ui::S::NavMaps, ui::S::DescMaps},
+    {ico::Text, ui::S::NavText, ui::S::DescText},
+    {ico::Dialogue, ui::S::NavDialogue, ui::S::DescDialogue},
+    {ico::Movies, ui::S::NavMovies, ui::S::DescMovies},
+    {ico::Packages, ui::S::NavPackages, ui::S::DescPackages},
+    {ico::Log, ui::S::NavLog, ui::S::DescLog},
 };
 
 struct Thumb {
@@ -1208,8 +1329,7 @@ public:
 
     std::deque<LogLine> log;
     int language = 1;  // second column language (ja by default)
-    bool tab_open[TabCount] = {true, true, true, true, true, true, true, true, true, false};
-    int focus_tab = -1, focus_frames = 0;
+    Tab tab = TabHome;  // the page shown in the content area
 
     // statics browser
     struct Browser {
@@ -1245,7 +1365,8 @@ public:
     std::vector<DialogueGroup> dialogue_groups;
     int dialogue_groups_mode = -1, dialogue_groups_lang = -1;
     int dialogue_selected = -1;   // index into catalog->dialogue
-    std::vector<std::pair<uint16_t, std::string>> audio_langs;  // installed localized audio packages
+    std::vector<std::pair<uint16_t, std::string>> audio_langs;  // installed localized audio packages (id, name)
+    std::vector<std::string> audio_suffixes;                    // their package suffixes (names follow the UI language)
     int audio_lang = 0;           // index into audio_langs
 
     // audio playback (dialogue) and WAV export
@@ -1296,12 +1417,12 @@ public:
     bool open_install(const fs::path& dir) {
         try {
             auto p = std::make_unique<PackageManager>(dir);
-            if (p->packages().empty()) throw std::runtime_error("packages フォルダが見つからないか空です");
+            if (p->packages().empty()) throw std::runtime_error(ui::tr(ui::S::ErrPackagesMissing));
             p->build_hash64_index();
             layouts = load_input_layouts(*p);
             pm = std::move(p);
             install = dir;
-            info(std::format("インストールを開きました: {} ({} パッケージ)", to_utf8(dir.wstring()), pm->packages().size()));
+            info(ui::trf(ui::S::LogInstallOpened, to_utf8(dir.wstring()), pm->packages().size()));
             if (loader.joinable()) loader.join();
             catalog = std::make_unique<Catalog>();
             loader = std::thread(load_catalog, dir, catalog.get());
@@ -1316,7 +1437,7 @@ public:
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
-            error(std::format("インストールを開けません: {}", ex.what()));
+            error(ui::trf(ui::S::ErrOpenInstall, ex.what()));
             return false;
         }
     }
@@ -1327,12 +1448,12 @@ public:
             game_lighting.release(gpu);
             game_lighting.init(*pm, gpu);
             game_ready = true;
-            info(std::format("ゲームのライティング: global_lighting_and_shading ({})",
+            info(ui::trf(ui::S::LogLighting, 
                              game_lighting.shading_technique().str()));
             for (const auto& n : game_lighting.notes()) info("  " + n);
         } catch (const std::exception& ex) {
             game_ready = false;
-            error(std::format("ゲームのライティングを使えません (代替描画は無効): {}", ex.what()));
+            error(ui::trf(ui::S::ErrLighting, ex.what()));
         }
         try {
             thumb_lighting.release(gpu);
@@ -1348,7 +1469,7 @@ public:
         try {
             active = renderer.set_entity_preview(*pm, gpu);
         } catch (const std::exception& ex) {
-            error(std::format("エンティティの環境光: {}", ex.what()));
+            error(ui::trf(ui::S::ErrEntityLight, ex.what()));
         }
         return active;
     }
@@ -1363,9 +1484,9 @@ public:
             for (const auto& [what, why] : game_lighting.externs().estimates()) all.emplace(what, why);
         if (all.empty()) return;
         ImGui::Spacing();
-        if (!ImGui::CollapsingHeader(std::format("推定値 ({})###estimates", all.size()).c_str())) return;
+        if (!ImGui::CollapsingHeader((ui::trf(ui::S::EstimatesHeader, all.size()) + "###estimates").c_str())) return;
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("ゲームデータが無い入力 (マップ未読込・実行時の状態) に nim が入れた値");
+        ImGui::TextDisabled(ui::tr(ui::S::EstimatesHint));
         std::map<std::string, std::vector<const std::string*>> by_reason;
         for (const auto& [what, why] : all) by_reason[why].push_back(&what);
         for (const auto& [why, items] : by_reason) {
@@ -1380,17 +1501,17 @@ public:
         const auto& used = scene.channels();
         if (used.empty()) return;
         ImGui::Spacing();
-        if (!ImGui::CollapsingHeader(std::format("オブジェクトの状態 (チャネル {})###channels", used.size()).c_str(),
+        if (!ImGui::CollapsingHeader((ui::trf(ui::S::ChannelsHeader, used.size()) + "###channels").c_str(),
                                      ImGuiTreeNodeFlags_DefaultOpen))
             return;
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("マテリアルが読む値 (氷結・ヒートカスケード・ダメージ・ディゾルブなど)。名前が不明なものはハッシュ表示");
+        ImGui::TextDisabled(ui::tr(ui::S::ChannelsHint));
         ImGui::PopTextWrapPos();
         bool changed = false;
         if (ImGui::BeginTable("##channels", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
-            ImGui::TableSetupColumn("チャネル", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-            ImGui::TableSetupColumn("段", ImGuiTableColumnFlags_WidthFixed);
-            ImGui::TableSetupColumn("値", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColChannel), ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColStage), ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColValue), ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableHeadersRow();
             for (const auto& [hash, use] : used) {
                 ImGui::TableNextRow();
@@ -1419,7 +1540,7 @@ public:
             }
             ImGui::EndTable();
         }
-        if (!channel_overrides.empty() && ImGui::SmallButton("既定値に戻す")) {
+        if (!channel_overrides.empty() && ImGui::SmallButton(ui::tr(ui::S::ResetDefault))) {
             channel_overrides.clear();
             changed = true;
         }
@@ -1490,15 +1611,15 @@ public:
                     double up = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     size_t stubbed = 0;
                     for (const auto& gi : scene.groups()) stubbed += gi.stubbed_ops.size();
-                    info(std::format("{} を読込 ({} グループ, 準備 {:.0f} ms + GPU {:.0f} ms){}", r->tag.str(),
+                    info(ui::trf(ui::S::LogModelLoaded, r->tag.str(),
                                      scene.groups().size(), r->ms, up,
-                                     stubbed ? std::format(", 未実装 TFX op {} 種", stubbed) : ""));
+                                     stubbed ? ui::trf(ui::S::LogStubbed, stubbed) : ""));
                 } catch (const std::exception& ex) {
                     scene.release(g);
-                    error(std::format("{} を描画できません: {}", r->tag.str(), ex.what()));
+                    error(ui::trf(ui::S::ErrDraw, r->tag.str(), ex.what()));
                 }
             } else if (!no_drawable) {
-                error(std::format("{} を読めません: {}", r->tag.str(), r->error));
+                error(ui::trf(ui::S::ErrRead, r->tag.str(), r->error));
             }
         }
         // Preparing a card submits its uploads synchronously. Never put that work on each
@@ -1509,7 +1630,7 @@ public:
             stream_map(g);
         } catch (const std::exception& ex) {
             stop_map();
-            error(std::format("マップの読込を停止: {}", ex.what()));
+            error(ui::trf(ui::S::ErrMapStopped, ex.what()));
         }
     }
 
@@ -1548,8 +1669,8 @@ public:
         map.lights_set = false;
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
-        info(whole ? std::format("マップ {} ({}) を読込: 全域", m.package, m.bubble.str())
-                   : std::format("マップ {} ({}) を読込: 半径 {:.0f} m", m.package, m.bubble.str(), map.radius));
+        info(whole ? ui::trf(ui::S::LogMapLoadAll, m.package, m.bubble.str())
+                   : ui::trf(ui::S::LogMapLoadRadius, m.package, m.bubble.str(), map.radius));
     }
     void stream_map(Gpu& g) {
         if (!map.streaming) return;
@@ -1610,15 +1731,15 @@ public:
             if (!map.framed && scene.loaded()) {
                 frame_scene();
                 if (map.start)
-                    info(std::format("カメラ: プレイヤー開始地点 (推定, 80802D32) ({:.1f}, {:.1f}, {:.1f}) + 目の高さ {:.1f} m (推定)", map.start->position[0],
+                    info(ui::trf(ui::S::LogCameraStart, map.start->position[0],
                                      map.start->position[1], map.start->position[2], kStartEyeHeight));
                 map.framed = true;
             }
         }
         if (map_worker.drained(map.generation)) {
             map.streaming = false;
-            info(std::format("マップ {}: {} メッシュ / {} インスタンス{}", map.name, scene.mesh_count(), scene.instance_count(),
-                             pr.failed ? std::format(" ({} スキップ)", pr.failed) : ""));
+            info(ui::trf(ui::S::LogMapDone, map.name, scene.mesh_count(), scene.instance_count(),
+                             pr.failed ? ui::trf(ui::S::LogSkipped, pr.failed) : ""));
         }
     }
     std::map<std::string, size_t> map_add_failures;
@@ -1660,24 +1781,24 @@ public:
         ImGui::Spacing();
         const auto& cs = map_weather->controllers;
         ImGui::BeginDisabled(!map_weather->heat_cascade_controller);
-        if (ImGui::Checkbox("ヒートカスケード", &heat_cascade_enabled)) apply_weather();
+        if (ImGui::Checkbox(ui::tr(ui::S::HeatCascade), &heat_cascade_enabled)) apply_weather();
         ImGui::EndDisabled();
         if (map_weather->heat_cascade_controller)
-            ImGui::SetItemTooltip("%s\n%s\n状態の値は範囲の中央 (推定)。対応する元のマテリアルに適用。",
+            ImGui::SetItemTooltip(ui::tr(ui::S::HeatCascadeTip),
                 map_weather->heat_cascade_controller->name.c_str(),
-                map_weather->heat_cascade_shared ? "Outpost の元の状態を共用 (他マップへの適用は推定)" : "このマップの元の状態");
-        else ImGui::SetItemTooltip("インストール内に元のヒートカスケード状態が見つかりません");
-        if (ImGui::CollapsingHeader(std::format("天候とワールドチャンネル ({})###mapweather", cs.size()).c_str())) {
+                map_weather->heat_cascade_shared ? ui::tr(ui::S::HeatCascadeShared) : ui::tr(ui::S::HeatCascadeOwn));
+        else ImGui::SetItemTooltip(ui::tr(ui::S::HeatCascadeMissing));
+        if (ImGui::CollapsingHeader((ui::trf(ui::S::WeatherHeader, cs.size()) + "###mapweather").c_str())) {
             const float w = ImGui::GetContentRegionAvail().x * 0.6f;
             for (size_t i = 0; i < cs.size(); ++i) {
                 const auto& c = cs[i];
                 if (c.heat_cascade()) continue; // controlled by the persistent toggle above
                 ImGui::PushID(int(i));
                 const int cur = weather_states[i];
-                const std::string preview = cur < 0 ? "既定" : weather_state_label(c.states[size_t(cur)]);
+                const std::string preview = cur < 0 ? ui::tr(ui::S::Default) : weather_state_label(c.states[size_t(cur)]);
                 ImGui::SetNextItemWidth(w);
                 if (ImGui::BeginCombo("##state", preview.c_str())) {
-                    if (ImGui::Selectable("既定", cur < 0)) weather_states[i] = -1, apply_weather();
+                    if (ImGui::Selectable(ui::tr(ui::S::Default), cur < 0)) weather_states[i] = -1, apply_weather();
                     for (size_t k = 0; k < c.states.size(); ++k)
                         if (ImGui::Selectable(std::format("{}##{}", weather_state_label(c.states[k]), k).c_str(), cur == int(k)))
                             weather_states[i] = int(k), apply_weather();
@@ -1687,7 +1808,7 @@ public:
                 ImGui::TextDisabled("%s", c.name.c_str());
                 ImGui::PopID();
             }
-            ImGui::TextDisabled("状態の値は範囲の中央 (推定: ゲームは範囲内で選び、遷移時間で補間)");
+            ImGui::TextDisabled(ui::tr(ui::S::WeatherEstimate));
         }
     }
 
@@ -1700,12 +1821,12 @@ public:
             spinner(ImGui::GetWindowDrawList(), {ImGui::GetCursorScreenPos().x + 8 * sc, ImGui::GetCursorScreenPos().y + 8 * sc},
                     7 * sc, kGreen);
             ImGui::SetCursorPos({44 * sc, 20 * sc});
-            ImGui::TextDisabled("マップを列挙中…");
+            ImGui::TextDisabled(ui::tr(ui::S::MapsListing));
             return;
         }
         if (const auto err = map_worker.list_error(); !err.empty()) {
             ImGui::SetCursorPos({20 * sc, 20 * sc});
-            ImGui::TextColored({1, 0.45f, 0.45f, 1}, "マップを列挙できません: %s", err.c_str());
+            ImGui::TextColored({1, 0.45f, 0.45f, 1}, "%s", ui::trf(ui::S::ErrMapList, err).c_str());
             return;
         }
         const auto& maps = map_worker.maps();
@@ -1723,9 +1844,9 @@ public:
         ImGui::SetCursorPos({pad, pad});
         ImGui::SetNextItemWidth(left_w - 2 * pad);
         if (ImGui::Combo("##map_view_kind", &map.selection_mode, "map_view\0activity_view\0")) map.selected = -1;
-        ImGui::SetItemTooltip("DEIMOS と同じ選択元: map_view = SBubbleParent / activity_view = SActivity のマップ参照 + ambient + phase");
+        ImGui::SetItemTooltip(ui::tr(ui::S::MapKindTip));
         ImGui::SetNextItemWidth(left_w - 2 * pad);
-        ImGui::InputTextWithHint("##mfilter", (icon(ico::Search) + "  マップ / タグ").c_str(), map.filter, sizeof(map.filter));
+        ImGui::InputTextWithHint("##mfilter", (icon(ico::Search) + ui::tr(ui::S::MapFilterHint)).c_str(), map.filter, sizeof(map.filter));
         const float footer = ImGui::GetFrameHeightWithSpacing() * 3 + ImGui::GetTextLineHeightWithSpacing() * 3 + pad * 2;
         ImGui::SetCursorPosX(0);
         ImGui::BeginChild("maplist", {0, -footer}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
@@ -1747,13 +1868,13 @@ public:
             if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, kGreen);
             dl->AddText({pos.x + pad, pos.y + 2 * sc}, IM_COL32_WHITE, (m.name.empty() ? m.package : m.name).c_str());
             dl->AddText({pos.x + pad, pos.y + 2 * sc + lh}, grey,
-                        (m.activity.is_none() ? std::format("{}   {} メッシュ · {} 配置", m.bubble.str(), m.statics, m.instances) :
-                        std::format("activity {} / map[{}] → {}", m.activity.str(), m.activity_map, m.bubble.str())).c_str());
+                        (m.activity.is_none() ? ui::trf(ui::S::MapRowStats, m.bubble.str(), m.statics, m.instances) :
+                        ui::trf(ui::S::MapActivityRow, m.activity.str(), m.activity_map, m.bubble.str())).c_str());
             ImGui::PopID();
         }
         if (maps.empty()) {
             ImGui::SetCursorPosX(pad);
-            ImGui::TextDisabled("静的ジオメトリを持つマップがありません");
+            ImGui::TextDisabled(ui::tr(ui::S::MapsEmpty));
         }
         ImGui::EndChild();
 
@@ -1763,27 +1884,27 @@ public:
         const float w = left_w - 2 * pad;
         ImGui::SetNextItemWidth(w);
         ImGui::SliderFloat("##radius", &map.radius, 50, MapView::kUnlimited,
-                           map.radius >= MapView::kUnlimited ? "範囲  無制限" : "範囲  %.0f m", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("領域の中心からこの距離にある配置を読み込みます (右端 = マップ全域)");
+                           map.radius >= MapView::kUnlimited ? ui::tr(ui::S::RadiusUnlimited) : ui::tr(ui::S::RadiusFmt), ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip(ui::tr(ui::S::RadiusTip));
         ImGui::SetNextItemWidth(w);
-        const char* caps[] = {"テクスチャ  256", "テクスチャ  512", "テクスチャ  1024", "テクスチャ  原寸"};
+        const char* caps[] = {ui::tr(ui::S::TexCap256), ui::tr(ui::S::TexCap512), ui::tr(ui::S::TexCap1024), ui::tr(ui::S::TexCapFull)};
         ImGui::Combo("##texcap", &map.texture_cap, caps, 4);
-        ImGui::SetItemTooltip("テクスチャの最大辺 (VRAM と読込時間の節約。原寸 = ゲームのデータそのまま)");
+        ImGui::SetItemTooltip(ui::tr(ui::S::TexCapTip));
         ImGui::BeginDisabled(map.selected < 0);
-        if (dbutton("カメラの位置で読込", w)) {
+        if (dbutton(ui::tr(ui::S::LoadAtCamera), w)) {
             const bool here = map_scene && map.selected >= 0 && maps[size_t(map.selected)].bubble == map.bubble;
             load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt);
         }
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("いまのカメラの注視点を中心に、範囲内を読み込み直します");
+        ImGui::SetItemTooltip(ui::tr(ui::S::LoadAtCameraTip));
         if (map_scene) {
             const auto pr = map_worker.progress();
             if (map.streaming && pr.generation == map.generation)
-                ImGui::TextDisabled("読込中  %zu / %zu", pr.prepared, pr.total);
+                ImGui::TextDisabled(ui::tr(ui::S::MapLoading), pr.prepared, pr.total);
             else
-                ImGui::TextDisabled("%zu メッシュ · %zu 配置", scene.mesh_count(), scene.instance_count());
-            ImGui::TextDisabled("中心 (%.0f, %.0f, %.0f)", map.center[0], map.center[1], map.center[2]);
-            ImGui::TextDisabled("原プローブ %zu 領域 / 描画 %zu", game_lighting.cubemap_count(), game_lighting.cubemaps_drawn());
+                ImGui::TextDisabled(ui::tr(ui::S::MapCounts), scene.mesh_count(), scene.instance_count());
+            ImGui::TextDisabled(ui::tr(ui::S::MapCenter), map.center[0], map.center[1], map.center[2]);
+            ImGui::TextDisabled(ui::tr(ui::S::MapProbes), game_lighting.cubemap_count(), game_lighting.cubemaps_drawn());
         }
         ImGui::EndGroup();
         ImGui::EndChild();
@@ -1817,8 +1938,8 @@ public:
 
     void map_details_ui() {
         if (!map_scene) {
-            ImGui::TextDisabled("マップを選ぶと、周辺の静的ジオメトリをゲームのシェーダで描画します");
-            ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
+            ImGui::TextDisabled(ui::tr(ui::S::MapEmptyHint));
+            ImGui::TextDisabled(ui::tr(ui::S::FlyHint));
             return;
         }
         ImGui::PushFont(g_fonts.bold, 0);
@@ -1827,11 +1948,11 @@ public:
         ImGui::SameLine();
         ImGui::TextDisabled("%s", map.bubble.str().c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(map.bubble.str().c_str());
-        if (map.activity.is_none()) ImGui::TextDisabled("map_view · SBubbleParent %s", map.bubble.str().c_str());
-        else ImGui::TextDisabled("activity_view · SActivity %s / map[%u] → %s", map.activity.str().c_str(), map.activity_map, map.bubble.str().c_str());
+        if (ImGui::SmallButton(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(map.bubble.str().c_str());
+        if (map.activity.is_none()) ImGui::TextDisabled(ui::tr(ui::S::MapViewLine), map.bubble.str().c_str());
+        else ImGui::TextDisabled(ui::tr(ui::S::ActivityViewLine), map.activity.str().c_str(), map.activity_map, map.bubble.str().c_str());
         weather_ui();
-        ImGui::TextDisabled("右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)");
+        ImGui::TextDisabled(ui::tr(ui::S::FlyHint));
         const auto pr = map_worker.progress();
         std::map<std::string, size_t> skipped = map_add_failures;
         if (pr.generation == map.generation)
@@ -1840,7 +1961,7 @@ public:
         for (const auto& [why, n] : skipped) total += n;
         if (total) {
             ImGui::Spacing();
-            if (ImGui::CollapsingHeader(std::format("スキップしたメッシュ ({})###mapskipped", total).c_str())) {
+            if (ImGui::CollapsingHeader((ui::trf(ui::S::SkippedHeader, total) + "###mapskipped").c_str())) {
                 ImGui::PushTextWrapPos(0);
                 for (const auto& [why, n] : skipped) ImGui::TextDisabled("%zu  %s", n, why.c_str());
                 ImGui::PopTextWrapPos();
@@ -1848,7 +1969,7 @@ public:
         }
         ImGui::Spacing();
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("未対応: マップの大気 / 空・雨や VFX のパーティクル・ギミックの動き (推定値は下に記載)");
+        ImGui::TextDisabled(ui::tr(ui::S::MapUnsupported));
         ImGui::PopTextWrapPos();
         estimates_panel();
     }
@@ -1978,10 +2099,10 @@ public:
         if (!anim || !scene.skinned()) return;
         Animation& a = *anim;
         ImGui::Spacing();
-        if (!ImGui::CollapsingHeader(std::format("アニメーション (クリップ {})###anim", a.binding.clips.size()).c_str(),
+        if (!ImGui::CollapsingHeader((ui::trf(ui::S::AnimHeader, a.binding.clips.size()) + "###anim").c_str(),
                                      ImGuiTreeNodeFlags_DefaultOpen))
             return;
-        if (a.alternate && ImGui::Checkbox("選択パーツのクリップ", &a.part_only)) {
+        if (a.alternate && ImGui::Checkbox(ui::tr(ui::S::PartClips), &a.part_only)) {
             std::swap(a.binding, *a.alternate);
             a.clip = -1;
             a.error.clear();
@@ -1989,24 +2110,24 @@ public:
         }
         const auto& binding = a.binding;
         const auto& clips = binding.clips;
-        ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", binding.skeleton.component.str().c_str(), binding.skeleton.size(),
+        ImGui::TextDisabled(ui::tr(ui::S::SkeletonLine), binding.skeleton.component.str().c_str(), binding.skeleton.size(),
                             binding.rig.component.str().c_str());
-        if (binding.inferred_binding) ImGui::TextDisabled("スケルトンとリグの対応は推定 (共通ボーン・スキンの一致)");
-        if (!binding.followers.empty()) ImGui::TextDisabled("連動パーツ %zu", binding.followers.size());
-        if (binding.model != a.model) ImGui::TextDisabled("再生元パーツ %s", binding.model.str().c_str());
+        if (binding.inferred_binding) ImGui::TextDisabled(ui::tr(ui::S::SkeletonEstimated));
+        if (!binding.followers.empty()) ImGui::TextDisabled(ui::tr(ui::S::FollowerParts), binding.followers.size());
+        if (binding.model != a.model) ImGui::TextDisabled(ui::tr(ui::S::SourcePart), binding.model.str().c_str());
         if (clips.empty()) {
-            ImGui::TextDisabled("対応するクリップが見つかりません");
+            ImGui::TextDisabled(ui::tr(ui::S::NoClips));
             return;
         }
         if (clips.front().bone_groups != binding.rig.bone_groups)
-            ImGui::TextDisabled("ボーン構成が同じリグのクリップを使用");
+            ImGui::TextDisabled(ui::tr(ui::S::ClipsSameRig));
         const float em = ImGui::GetFontSize();
         ImGui::SetNextItemWidth(-1);
-        const std::string preview = a.clip < 0 ? std::string("バインドポーズ")
-                                               : std::format("{}  ({} フレーム)", clips[size_t(a.clip)].tag.str(),
+        const std::string preview = a.clip < 0 ? std::string(ui::tr(ui::S::BindPose))
+                                               : ui::trf(ui::S::ClipFrames, clips[size_t(a.clip)].tag.str(),
                                                              clips[size_t(a.clip)].frames);
         if (ImGui::BeginCombo("##clip", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
-            if (ImGui::Selectable("バインドポーズ", a.clip < 0)) {
+            if (ImGui::Selectable(ui::tr(ui::S::BindPose), a.clip < 0)) {
                 a.clip = -1;
                 a.dirty = true;
             }
@@ -2015,28 +2136,28 @@ public:
             while (clip.Step())
                 for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
                     const auto& c = clips[size_t(i)];
-                    if (ImGui::Selectable(std::format("{}  {} フレーム##{}", c.tag.str(), c.frames, i).c_str(), a.clip == i)) select_clip(i);
+                    if (ImGui::Selectable(ui::trf(ui::S::ClipFramesItem, c.tag.str(), c.frames, i).c_str(), a.clip == i)) select_clip(i);
                 }
             ImGui::EndCombo();
         }
         if (!a.error.empty()) ImGui::TextColored({1, 0.45f, 0.4f, 1}, "%s", a.error.c_str());
         if (a.clip < 0) return;
-        if (ImGui::Button(a.playing ? "一時停止" : "再生", {em * 5, 0})) a.playing = !a.playing;
+        if (ImGui::Button(a.playing ? ui::tr(ui::S::Pause) : ui::tr(ui::S::Play), {em * 5, 0})) a.playing = !a.playing;
         ImGui::SameLine();
         if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(clips.size()) - 1);
         ImGui::SameLine();
         if (ImGui::Button(">")) select_clip((a.clip + 1) % int(clips.size()));
         ImGui::SameLine();
-        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(binding.rig, a.loaded) ? "加算  " : "",
-                            std::format("{:.1f} 秒", float(a.loaded.frame_count) / kClipFps).c_str());
+        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(binding.rig, a.loaded) ? ui::tr(ui::S::Additive) : "",
+                            ui::trf(ui::S::Seconds, float(a.loaded.frame_count) / kClipFps).c_str());
         ImGui::SetNextItemWidth(-1);
         const float last = float(std::max(1u, a.loaded.frame_count) - 1);
-        if (ImGui::SliderFloat("##frame", &a.frame, 0, last, "フレーム %.1f")) {
+        if (ImGui::SliderFloat("##frame", &a.frame, 0, last, ui::tr(ui::S::FrameFmt))) {
             a.playing = false;
             a.dirty = true;
         }
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##speed", &a.speed, 0.1f, 2.0f, "速度 %.2fx");
+        ImGui::SliderFloat("##speed", &a.speed, 0.1f, 2.0f, ui::tr(ui::S::SpeedFmt));
     }
 
     void record(ID3D12GraphicsCommandList* cl) {
@@ -2085,7 +2206,7 @@ public:
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {
-            if (render_error != ex.what()) error(std::format("描画停止 (代替なし): {}", ex.what()));
+            if (render_error != ex.what()) error(ui::trf(ui::S::ErrRenderStopped, ex.what()));
             render_error = ex.what();
             capture_requested = false;
             // This is an explicit error surface, never a replacement material or lit scene.
@@ -2109,92 +2230,183 @@ public:
             const char* kind = light.mode != ViewMode::Lit ? "debug" : "game";
             fs::path file = dir / std::format("{}_{}_{}.png", scene.loaded() ? scene.tag().str() : "empty", kind, stamp);
             write_png(file, gb.width(), gb.height(), px);
-            info("保存しました: " + to_utf8(file.wstring()));
+            info(ui::trf(ui::S::LogSaved, to_utf8(file.wstring())));
         } catch (const std::exception& ex) {
-            error(std::string("保存に失敗: ") + ex.what());
+            error(ui::trf(ui::S::ErrSave, ex.what()));
         }
     }
 
     // ---- UI ----
-    std::string tab_title(int t) const {
-        const auto& ti = kTabs[t];
-        return std::format("{}{}{}###{}", icon(ti.icon), *ti.title ? "  " : "", ti.title, ti.id);
-    }
-    void open_tab(int t) {
-        tab_open[t] = true;
-        focus_tab = t;
+    // Layout: a navigation rail on the left, a page header and the page body on the right, and a
+    // status line along the bottom. Every page is one rail entry; the page shown is `tab`.
+    void open_tab(int t) { tab = Tab(t); }
+    void set_ui_language(ui::Lang l) {
+        ui::set_lang(l);
+        save_ui_language(l);
+        for (size_t i = 0; i < audio_langs.size() && i < audio_suffixes.size(); ++i)
+            audio_langs[i].second = audio_language_name(audio_suffixes[i]);
     }
 
     void ui() {
         media_tick();
-        ImGuiViewport* vp = ImGui::GetMainViewport();
-        status_bar(vp);
-        const ImGuiID dock = ImGui::GetID("nim_dock");
-        if (!ImGui::DockBuilderGetNode(dock) || ImGui::DockBuilderGetNode(dock)->IsLeafNode() &&
-                                                    ImGui::DockBuilderGetNode(dock)->Windows.Size == 0) {
-            ImGui::DockBuilderRemoveNode(dock);
-            ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
-            ImGui::DockBuilderSetNodeSize(dock, vp->WorkSize);
-            for (int t = 0; t < TabCount; ++t) ImGui::DockBuilderDockWindow(tab_title(t).c_str(), dock);
-            ImGui::DockBuilderFinish(dock);
-        }
-        ImGui::DockSpaceOverViewport(dock, vp, ImGuiDockNodeFlags_NoWindowMenuButton | ImGuiDockNodeFlags_NoCloseButton);
         viewport_visible = false;
-        for (int t = 0; t < TabCount; ++t) {
-            if (!tab_open[t]) continue;
-            if (focus_tab == t) {
-                ImGui::SetNextWindowFocus();
-                if (++focus_frames > 2) focus_tab = -1, focus_frames = 0;  // docking settles over a few frames
-            }
-            ImGui::SetNextWindowDockID(dock, ImGuiCond_FirstUseEver);
-            const bool pad0 = t == TabStatics || t == TabEntities || t == TabMaps;
-            if (pad0) ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-            bool visible = ImGui::Begin(tab_title(t).c_str(), kTabs[t].closable ? &tab_open[t] : nullptr,
-                                        ImGuiWindowFlags_NoCollapse);
-            if (pad0) ImGui::PopStyleVar();
-            if (visible) {
-                switch (t) {
-                case TabHome: home_tab(); break;
-                case TabSettings: settings_tab(); break;
-                case TabStatics: statics_tab(false); break;
-                case TabEntities: statics_tab(true); break;
-                case TabMaps: maps_tab(); break;
-                case TabText: strings_tab(); break;
-                case TabDialogue: dialogue_tab(); break;
-                case TabMovies: movies_tab(); break;
-                case TabPackages: packages_tab(); break;
-                case TabLog: log_tab(); break;
-                }
-            }
-            ImGui::End();
-        }
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const float rail_w = 232 * sc, status_h = 30 * sc;
+        const ImVec2 work = vp->WorkPos, wsize = vp->WorkSize;
+        const ImGuiWindowFlags chrome = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                        ImGuiWindowFlags_NoNav;
+
+        ImGui::SetNextWindowPos(work);
+        ImGui::SetNextWindowSize({rail_w, wsize.y - status_h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kRail));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        if (ImGui::Begin("##rail", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) nav_rail(wsize.y - status_h);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+
+        ImGui::SetNextWindowPos({work.x + rail_w, work.y});
+        ImGui::SetNextWindowSize({wsize.x - rail_w, wsize.y - status_h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kBg));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        if (ImGui::Begin("##content", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) content_frame(sc);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+
+        status_bar(work, wsize, status_h);
         if (!pm) install_picker();
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S) && gb.lit && scene.loaded())
             capture_requested = true;
     }
 
-    void status_bar(ImGuiViewport* vp) {
-        const float h = ImGui::GetFrameHeight();
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{4 / 255.0f, 4 / 255.0f, 4 / 255.0f, 1});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10, 4});
-        if (ImGui::BeginViewportSideBar("##status", vp, ImGuiDir_Down, h,
-                                        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
-                                            ImGuiWindowFlags_NoDecoration)) {
+    // The page header (title, one-line description) and the page body below it.
+    void content_frame(float sc) {
+        const TabInfo& info = kTabs[tab];
+        const float pad = 24 * sc;
+        const ImVec2 origin = ImGui::GetWindowPos();
+        const float width = ImGui::GetWindowWidth();
+        ImGui::SetCursorPos({pad, 16 * sc});
+        ImGui::PushFont(g_fonts.heading, 24);
+        ImGui::TextUnformatted(ui::tr(info.name));
+        ImGui::PopFont();
+        ImGui::SetCursorPosX(pad);
+        ImGui::TextDisabled("%s", ui::tr(info.desc));
+        const float rule = ImGui::GetCursorPosY() + 12 * sc;
+        ImGui::GetWindowDrawList()->AddLine({origin.x, origin.y + rule}, {origin.x + width, origin.y + rule}, theme::kBorder);
+
+        // The 3D pages draw edge to edge; the rest sit inside the page margins.
+        const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps;
+        ImGui::SetCursorPos({0, rule + 1});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{pad, 16 * sc});
+        ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        switch (tab) {
+        case TabHome: home_tab(); break;
+        case TabSettings: settings_tab(); break;
+        case TabStatics: statics_tab(false); break;
+        case TabEntities: statics_tab(true); break;
+        case TabMaps: maps_tab(); break;
+        case TabText: strings_tab(); break;
+        case TabDialogue: dialogue_tab(); break;
+        case TabMovies: movies_tab(); break;
+        case TabPackages: packages_tab(); break;
+        case TabLog: log_tab(); break;
+        default: break;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    }
+
+    // Left rail: the brand, the pages in three groups, and the install / log / settings at the foot.
+    void nav_rail(float h) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const float x = 12 * sc;
+        ImGui::SetCursorPos({x + 8 * sc, 18 * sc});
+        ImGui::PushFont(g_fonts.heading, 26);
+        ImGui::TextUnformatted("nim");
+        ImGui::PopFont();
+        ImGui::SetCursorPosX(x + 8 * sc);
+        ImGui::TextDisabled("%s", ui::tr(ui::S::AppSubtitle));
+        ImGui::Dummy({0, 14 * sc});
+        nav_item(TabHome);
+        nav_group(ui::S::GroupModels3D);
+        nav_item(TabStatics);
+        nav_item(TabEntities);
+        nav_item(TabMaps);
+        nav_group(ui::S::Group2D);
+        nav_item(TabText);
+        nav_item(TabDialogue);
+        nav_item(TabMovies);
+        nav_group(ui::S::GroupData);
+        nav_item(TabPackages);
+
+        const float item = 40 * sc + 2 * sc;
+        ImGui::SetCursorPos({x + 8 * sc, h - 2 * item - 58 * sc});
+        ImGui::TextDisabled("%s", pm ? to_utf8(install.filename().wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
+        ImGui::Dummy({0, 6 * sc});
+        nav_item(TabLog);
+        nav_item(TabSettings);
+    }
+
+    void nav_item(Tab t) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const TabInfo& info = kTabs[t];
+        const float h = 40 * sc, x = 12 * sc;
+        const float w = ImGui::GetWindowWidth() - 2 * x;
+        ImGui::SetCursorPosX(x);
+        ImGui::PushID(int(t));
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("nav", {w, h});
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (clicked) open_tab(t);
+        const bool sel = tab == t;
+        auto* dl = ImGui::GetWindowDrawList();
+        const ImVec2 q{p.x + w, p.y + h};
+        if (sel) dl->AddRectFilled(p, q, theme::kActive, 8 * sc);
+        else if (hovered) dl->AddRectFilled(p, q, theme::kHover, 8 * sc);
+        if (sel) dl->AddRectFilled({p.x, p.y + 10 * sc}, {p.x + 3 * sc, q.y - 10 * sc}, kGreen, 2 * sc);
+        const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+        dl->AddText({p.x + 16 * sc, ty}, sel ? kGreen : theme::kMuted, icon(info.icon).c_str());
+        dl->AddText({p.x + 46 * sc, ty}, sel || hovered ? theme::kText : IM_COL32(206, 206, 216, 255), ui::tr(info.name));
+        ImGui::PopID();
+        ImGui::Dummy({0, 2 * sc});
+    }
+
+    void nav_group(ui::S label) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        ImGui::Dummy({0, 10 * sc});
+        ImGui::SetCursorPosX(22 * sc);
+        ImGui::TextDisabled("%s", ui::tr(label));
+        ImGui::Dummy({0, 2 * sc});
+    }
+
+    // The bottom line: the current status (the catalogue or the last message), the version and GPU.
+    void status_bar(ImVec2 work, ImVec2 size, float h) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        ImGui::SetNextWindowPos({work.x, work.y + size.y - h});
+        ImGui::SetNextWindowSize({size.x, h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(theme::kRail));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {14 * sc, 0});
+        if (ImGui::Begin("##status", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav)) {
             std::string left;
             if (catalog) {
                 std::lock_guard lk(catalog->mutex);
                 left = catalog->status;
             }
             if (left.empty() && !log.empty()) left = log.back().text;
+            if (left.empty()) left = ui::tr(ui::S::LogIdle);
             ImGui::AlignTextToFramePadding();
-            if (!log.empty() && log.back().error && left == log.back().text)
-                ImGui::TextColored({1, 0.45f, 0.45f, 1}, "%s", left.c_str());
-            else
-                ImGui::TextDisabled("%s", left.c_str());
+            const bool last_error = !log.empty() && log.back().error && left == log.back().text;
+            if (last_error) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "%s", left.c_str());
+            else ImGui::TextDisabled("%s", left.c_str());
             if (ImGui::IsItemClicked()) open_tab(TabLog);
-            std::string right = std::format("nim {}  ·  {}  ·  {}", kVersion, gpu.adapter_name(),
-                                            g_fonts.from_game ? "game fonts" : "system fonts");
-            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(right.c_str()).x - 14);
+            const std::string right = std::format("nim {}  ·  {}", kVersion, gpu.adapter_name());
+            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(right.c_str()).x - 14 * sc);
             ImGui::TextDisabled("%s", right.c_str());
         }
         ImGui::End();
@@ -2203,90 +2415,107 @@ public:
     }
 
     void install_picker() {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
         ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, {0.5f, 0.5f});
-        ImGui::Begin("Marathon が見つかりません", nullptr,
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * sc, 22 * sc});
+        ImGui::Begin(ui::tr(ui::S::NoInstallTitle), nullptr,
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking);
-        ImGui::TextUnformatted("Steam のインストールを自動で見つけられませんでした。");
-        ImGui::TextUnformatted("Marathon のフォルダ (Marathon.exe と packages があるところ) を選んでください。");
-        if (dbutton("SELECT FOLDER", 240))
+        ImGui::PushFont(g_fonts.bold, 0);
+        ImGui::TextUnformatted(ui::tr(ui::S::NoInstallTitle));
+        ImGui::PopFont();
+        ImGui::Dummy({0, 6 * sc});
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 460 * sc);
+        ImGui::TextDisabled("%s", ui::tr(ui::S::NoInstallLine1));
+        ImGui::TextDisabled("%s", ui::tr(ui::S::NoInstallLine2));
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy({0, 10 * sc});
+        if (dbutton(ui::tr(ui::S::SelectFolder), 240 * sc))
             if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
         ImGui::End();
+        ImGui::PopStyleVar();
     }
 
     // -- HOME --
+    // The start page: the install, then the pages as cards in three groups.
     void home_tab() {
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        ImGui::SetCursorPos({ImGui::GetCursorPosX() + 115 * sc, ImGui::GetCursorPosY() + 64 * sc});
-        ImGui::BeginGroup();
-        const float col_w = std::min(520 * sc, (ImGui::GetContentRegionAvail().x - 230 * sc) * 0.5f);
-        const float bw = std::max(240 * sc, col_w - 40 * sc);
-        if (ImGui::BeginTable("home", 2, ImGuiTableFlags_SizingFixedFit)) {
-            ImGui::TableSetupColumn("3d", ImGuiTableColumnFlags_WidthFixed, col_w);
-            ImGui::TableSetupColumn("2d", ImGuiTableColumnFlags_WidthFixed, col_w);
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            heading("3D");
-            ImGui::Dummy({0, 4 * sc});
-            if (dbutton((icon(ico::Statics) + "  STATICS").c_str(), bw)) open_tab(TabStatics);
-            ImGui::SetItemTooltip("静的メッシュをライブ 3D サムネイルで一覧し、ゲームのシェーダで表示");
-            if (dbutton((icon(ico::Entities) + "  ENTITIES").c_str(), bw)) open_tab(TabEntities);
-            ImGui::SetItemTooltip("エンティティのダイナミックモデル (剛体・スキン) をエンティティのマテリアルで表示");
-            if (dbutton((icon(ico::Maps) + "  MAPS").c_str(), bw)) open_tab(TabMaps);
-            ImGui::SetItemTooltip("マップの配置済み静的ジオメトリを読み込んで歩き回る");
-            ImGui::TableNextColumn();
-            heading("2D");
-            ImGui::Dummy({0, 4 * sc});
-            if (dbutton((icon(ico::Text) + "  TEXT").c_str(), bw)) open_tab(TabText);
-            ImGui::SetItemTooltip("ローカライズ文字列 (全言語)");
-            if (dbutton((icon(ico::Dialogue) + "  DIALOGUE").c_str(), bw)) open_tab(TabDialogue);
-            ImGui::SetItemTooltip("台詞を全言語で表示し、音声を再生・話者ごとに書き出す");
-            if (dbutton((icon(ico::Movies) + "  MOVIES").c_str(), bw)) open_tab(TabMovies);
-            ImGui::SetItemTooltip("ムービー (USM) を音声トラック・字幕の言語を選んで再生");
-            if (dbutton((icon(ico::Packages) + "  PACKAGES").c_str(), bw)) open_tab(TabPackages);
-            ImGui::SetItemTooltip("パッケージとエントリの生データ");
-            ImGui::EndTable();
-        }
-        ImGui::EndGroup();
+        const float card_w = 288 * sc, card_h = 120 * sc, gap = 14 * sc;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const size_t cols = size_t(std::max(1.0f, std::floor((avail + gap) / (card_w + gap))));
 
-        // footer
-        const float fh = ImGui::GetFrameHeightWithSpacing() * 2;
-        ImGui::SetCursorPos({ImGui::GetCursorPosX() + 115 * sc, ImGui::GetWindowHeight() - fh - 24 * sc});
-        ImGui::TextDisabled("nim %s  —  Marathon asset viewer", kVersion);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 115 * sc);
-        ImGui::TextDisabled("%s", pm ? to_utf8(install.wstring()).c_str() : "インストール未選択");
+        // install line
+        const float install_w = std::min(avail, 760 * sc);
+        ImGui::BeginChild("##install", {install_w, 74 * sc}, ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        ImGui::SetCursorPos({16 * sc, 13 * sc});
+        ImGui::TextDisabled("%s", ui::tr(ui::S::HomeInstall));
+        ImGui::SetCursorPos({16 * sc, 36 * sc});
+        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
+        ImGui::SetCursorPos({ImGui::GetWindowWidth() - 150 * sc, 18 * sc});
+        if (dbutton(ui::tr(pm ? ui::S::HomeChange : ui::S::SelectFolder), 128 * sc, pm != nullptr))
+            if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
+        ImGui::EndChild();
+
+        auto group = [&](ui::S label, std::initializer_list<Tab> tabs) {
+            ImGui::Dummy({0, 14 * sc});
+            ImGui::TextDisabled("%s", ui::tr(label));
+            size_t i = 0;
+            for (Tab t : tabs) {
+                const TabInfo& info = kTabs[t];
+                if (card(ui::tr(info.name), info.icon, ui::tr(info.name), ui::tr(info.desc), card_w, card_h)) open_tab(t);
+                if ((i + 1) % cols != 0 && i + 1 < tabs.size()) ImGui::SameLine(0, gap);
+                ++i;
+            }
+        };
+        group(ui::S::GroupModels3D, {TabStatics, TabEntities, TabMaps});
+        group(ui::S::Group2D, {TabText, TabDialogue, TabMovies});
+        group(ui::S::GroupData, {TabPackages});
+
+        ImGui::Dummy({0, 24 * sc});
+        ImGui::TextDisabled("%s", ui::trf(ui::S::HomeFooter, kVersion).c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton((icon(ico::Link) + " GitHub").c_str()))
             ShellExecuteW(nullptr, L"open", L"https://github.com/bata-san/nim", nullptr, nullptr, SW_SHOWNORMAL);
     }
 
-    // -- settings --
+    // -- SETTINGS --
     void settings_tab() {
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        ImGui::SetCursorPos({ImGui::GetCursorPosX() + 115 * sc, ImGui::GetCursorPosY() + 48 * sc});
-        ImGui::BeginGroup();
-        heading("SETTINGS");
-        ImGui::PushItemWidth(320 * sc);
-        ImGui::SeparatorText("インストール");
-        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : "(未選択)");
-        if (ImGui::Button("フォルダを選択…"))
+        const float col = std::min(ImGui::GetContentRegionAvail().x, 640 * sc);
+        ImGui::PushItemWidth(std::min(360 * sc, col));
+        ImGui::SeparatorText(ui::tr(ui::S::SettingsInstall));
+        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::SettingsNoInstall));
+        if (ImGui::Button(ui::tr(ui::S::SettingsSelectFolder)))
             if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
-        ImGui::SeparatorText("表示");
-        ImGui::TextUnformatted("ゲームのシェーダのみ (代替描画なし)");
-        ImGui::Checkbox("3D サムネイルを生成", &thumbnails_enabled);
-        ImGui::Checkbox("FPS / VRAM を表示", &show_fps);
-        if (ImGui::BeginCombo("第 2 言語", std::string(language_code(TextLanguage(language))).c_str())) {
+
+        ImGui::SeparatorText(ui::tr(ui::S::SettingsLanguage));
+        if (ImGui::BeginCombo(ui::tr(ui::S::SettingsUiLanguage), ui::native_name(ui::lang()))) {
+            for (uint8_t i = 0; i < uint8_t(ui::Lang::Count); ++i) {
+                const ui::Lang l = ui::Lang(i);
+                if (ImGui::Selectable(ui::native_name(l), ui::lang() == l)) set_ui_language(l);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + col);
+        ImGui::TextDisabled("%s", ui::tr(ui::S::SettingsLanguageNote));
+        ImGui::PopTextWrapPos();
+        if (ImGui::BeginCombo(ui::tr(ui::S::SettingsSecondLang), std::string(language_code(TextLanguage(language))).c_str())) {
             for (int l = 1; l < int(kTextLanguageCount); ++l)
                 if (ImGui::Selectable(std::string(language_code(TextLanguage(l))).c_str(), language == l)) language = l;
             ImGui::EndCombo();
         }
-        ImGui::SeparatorText("情報");
+
+        ImGui::SeparatorText(ui::tr(ui::S::SettingsDisplay));
+        ImGui::TextUnformatted(ui::tr(ui::S::SettingsShaders));
+        ImGui::Checkbox(ui::tr(ui::S::SettingsThumbnails), &thumbnails_enabled);
+        ImGui::Checkbox(ui::tr(ui::S::SettingsShowFps), &show_fps);
+
+        ImGui::SeparatorText(ui::tr(ui::S::SettingsInfo));
         ImGui::Text("nim %s", kVersion);
-        ImGui::Text("GPU: %s", gpu.adapter_name().c_str());
-        ImGui::Text("VRAM: %s / %s", format_bytes(gpu.vram_usage()).c_str(), format_bytes(gpu.vram_budget()).c_str());
-        ImGui::Text("フォント: %s", g_fonts.from_game ? "ゲームのフォント (インストールから読込)" : "システムフォント");
-        ImGui::Text("サムネイル: %zu 枚", thumbs.size());
+        ImGui::Text("%s", ui::trf(ui::S::SettingsGpu, gpu.adapter_name()).c_str());
+        ImGui::Text("%s", ui::trf(ui::S::SettingsVram, format_bytes(gpu.vram_usage()), format_bytes(gpu.vram_budget())).c_str());
+        ImGui::Text("%s", ui::trf(ui::S::SettingsFonts, ui::tr(g_fonts.from_game ? ui::S::FontsGame : ui::S::FontsSystem)).c_str());
+        ImGui::Text("%s", ui::trf(ui::S::SettingsThumbs, thumbs.size()).c_str());
         ImGui::PopItemWidth();
-        ImGui::EndGroup();
     }
 
     // -- STATICS --
@@ -2305,7 +2534,7 @@ public:
     void statics_tab(bool dynamic) {
         if (!catalog || !catalog->meshes_ready) {
             ImGui::SetCursorPos({20, 20});
-            ImGui::TextDisabled("メッシュを列挙中…");
+            ImGui::TextDisabled(ui::tr(ui::S::MeshesListing));
             return;
         }
         Browser& B = browsers[dynamic ? 1 : 0];
@@ -2336,14 +2565,14 @@ public:
         ImGui::BeginChild("pkgs", {left_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         ImGui::SetCursorPos({10 * sc, 10 * sc});
         ImGui::SetNextItemWidth(left_w - 20 * sc);
-        ImGui::InputTextWithHint("##sfilter", (icon(ico::Search) + "  タグ / パッケージ名").c_str(), static_filter,
+        ImGui::InputTextWithHint("##sfilter", (icon(ico::Search) + ui::tr(ui::S::StaticFilterHint)).c_str(), static_filter,
                                  sizeof(static_filter));
         ImGui::SetCursorPosX(10 * sc);
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("並び順");
+        ImGui::TextUnformatted(ui::tr(ui::S::SortLabel));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(left_w - 20 * sc - ImGui::GetCursorPosX() + 10 * sc);
-        const char* sorts[] = {"ID", "名前", "数"};
+        const char* sorts[] = {"ID", ui::tr(ui::S::SortName), ui::tr(ui::S::SortCount)};
         ImGui::Combo("##sort", &sort_mode, sorts, 3);
         ImGui::BeginChild("pkglist", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         const std::string f = lower_ascii(static_filter);
@@ -2455,7 +2684,7 @@ public:
             dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(200, 80, 80, 255), t);
             if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
         } else if (it != thumbs.end() && it->second.no_drawable) {
-            const char* t = "未対応パス";
+            const char* t = ui::tr(ui::S::NoPath);
             ImVec2 ts = ImGui::CalcTextSize(t);
             dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(170, 170, 170, 255), t);
             if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
@@ -2505,68 +2734,68 @@ public:
         ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 120));
         if (ImGui::Button(icon(ico::Tune).c_str())) ImGui::OpenPopup("tune");
-        ImGui::SetItemTooltip("ライト・露出");
+        ImGui::SetItemTooltip(ui::tr(ui::S::LightExposure));
         if (ImGui::BeginPopup("tune")) {
-            ImGui::SliderFloat("露出", &light.exposure, 0.1f, 4.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderAngle("太陽の方位", &light.sun_azimuth, -180, 180);
-            ImGui::SliderAngle("太陽の高度", &light.sun_elevation, -10, 90);
-            ImGui::SliderFloat("太陽の強さ", &light.sun_intensity, 0, 10);
-            ImGui::Checkbox("太陽の影", &shadows);
-            ImGui::SetItemTooltip("nim のシャドウマップ (ゲームのカスケードは未解読のため推定)");
+            ImGui::SliderFloat(ui::tr(ui::S::Exposure), &light.exposure, 0.1f, 4.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderAngle(ui::tr(ui::S::SunAzimuth), &light.sun_azimuth, -180, 180);
+            ImGui::SliderAngle(ui::tr(ui::S::SunElevation), &light.sun_elevation, -10, 90);
+            ImGui::SliderFloat(ui::tr(ui::S::SunIntensity), &light.sun_intensity, 0, 10);
+            ImGui::Checkbox(ui::tr(ui::S::SunShadows), &shadows);
+            ImGui::SetItemTooltip(ui::tr(ui::S::SunShadowsTip));
             ImGui::Checkbox("SSAO", &light.ssao);
-            ImGui::SetItemTooltip("ゲームの hdao と apply_ssao_to_light_buffers (調整値は推定)");
-            ImGui::Checkbox("スクリーンスペース反射", &light.ssr);
-            ImGui::SetItemTooltip("ゲームの hi_z_generate_* / ssr_* コンピュートパス (設定値は推定)");
-            ImGui::Checkbox("ライトシャフト", &light.volumetrics);
-            ImGui::SetItemTooltip("ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)");
-            ImGui::Checkbox("ポストプロセス", &light.post);
-            ImGui::SetItemTooltip("ゲームの screen_area_global_lut3d (トーンマップ・グレーディング)。オフで final_combine");
+            ImGui::SetItemTooltip(ui::tr(ui::S::SSAOTip));
+            ImGui::Checkbox(ui::tr(ui::S::SSR), &light.ssr);
+            ImGui::SetItemTooltip(ui::tr(ui::S::SSRTip));
+            ImGui::Checkbox(ui::tr(ui::S::LightShafts), &light.volumetrics);
+            ImGui::SetItemTooltip(ui::tr(ui::S::LightShaftsTip));
+            ImGui::Checkbox(ui::tr(ui::S::PostProcess), &light.post);
+            ImGui::SetItemTooltip(ui::tr(ui::S::PostProcessTip));
             ImGui::BeginDisabled(!light.post);
-            ImGui::Checkbox("自動露出", &light.auto_exposure);
-            ImGui::SetItemTooltip("autoexposure_sample_columns の読み戻し (キー値・適応速度は推定)。露出スライダーは補正");
+            ImGui::Checkbox(ui::tr(ui::S::AutoExposure), &light.auto_exposure);
+            ImGui::SetItemTooltip(ui::tr(ui::S::AutoExposureTip));
             ImGui::SameLine();
-            ImGui::Checkbox("ブルーム", &light.bloom);
-            ImGui::SetItemTooltip("ゲームの縮小・ガウスぼかし・加算パス (強さ・カーネルは推定)");
+            ImGui::Checkbox(ui::tr(ui::S::Bloom), &light.bloom);
+            ImGui::SetItemTooltip(ui::tr(ui::S::BloomTip));
             ImGui::Checkbox("TAA", &light.temporal_aa);
-            ImGui::SetItemTooltip("ゲームの resolve_taa (ジッター + 動きベクトル + 履歴)。重み・ジッター列は推定。オンの間は FXAA の代わり");
+            ImGui::SetItemTooltip(ui::tr(ui::S::TAATip));
             ImGui::SameLine();
             ImGui::Checkbox("FXAA", &light.antialias);
             ImGui::EndDisabled();
-            if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("露出 %.3f", game_lighting.exposure());
-            ImGui::ColorEdit3("太陽の色", &light.sun_color.x);
-            ImGui::SliderFloat("空の強さ", &light.sky_intensity, 0, 4);
-            ImGui::ColorEdit3("空 (天頂)", &light.sky_top.x);
-            ImGui::ColorEdit3("空 (地平)", &light.sky_horizon.x);
-            ImGui::ColorEdit3("地面", &light.ground.x);
-            ImGui::ColorEdit3("背景 (上)", &light.background_top.x);
-            ImGui::ColorEdit3("背景 (下)", &light.background_bottom.x);
-            ImGui::SeparatorText("大気 (マップの空とフォグ)");
+            if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("%s %.3f", ui::tr(ui::S::Exposure), game_lighting.exposure());
+            ImGui::ColorEdit3(ui::tr(ui::S::SunColor), &light.sun_color.x);
+            ImGui::SliderFloat(ui::tr(ui::S::SkyIntensity), &light.sky_intensity, 0, 4);
+            ImGui::ColorEdit3(ui::tr(ui::S::SkyZenith), &light.sky_top.x);
+            ImGui::ColorEdit3(ui::tr(ui::S::SkyHorizon), &light.sky_horizon.x);
+            ImGui::ColorEdit3(ui::tr(ui::S::GroundColor), &light.ground.x);
+            ImGui::ColorEdit3(ui::tr(ui::S::BackgroundTop), &light.background_top.x);
+            ImGui::ColorEdit3(ui::tr(ui::S::BackgroundBottom), &light.background_bottom.x);
+            ImGui::SeparatorText(ui::tr(ui::S::AtmosphereSection));
             ImGui::BeginDisabled(!game_lighting.has_atmosphere());
-            ImGui::Checkbox("大気", &light.atmosphere);
-            ImGui::SetItemTooltip("ゲームの sky_lookup_generate_near/far と sky。フォグ値はグローバルチャンネルの写し (推定)");
-            ImGui::Checkbox("フロクセル大気", &light.froxel_fog);
-            ImGui::SetItemTooltip("ゲームの密度計算・散乱積分CS。格子の解像度・距離・時間履歴は推定");
-            ImGui::Checkbox(std::format("マップ環境 ({} チャンネル)", game_lighting.environment_channels()).c_str(), &light.environment);
-            ImGui::SetItemTooltip("マップの環境エンティティのチャンネル式 (太陽・環境光・霧の時刻カーブ) を時刻で評価");
-            ImGui::Checkbox("空の環境光", &light.sky_ambient);
-            ImGui::SetItemTooltip("ゲームの空半球マップ (hemisphere_sky_color_generate ほか) と cubemap_apply_sky_copy_ao。日陰の環境光");
-            ImGui::Checkbox("頭上の遮蔽", &light.overhead_occlusion);
-            ImGui::SetItemTooltip("cubemap_apply_sky_copy_ao_with_overhead_occlusion: 屋根の下などで空の環境光を弱める。真上からの深度は nim の描画 (推定)、分散マップはゲームの sample_and_blur_variance_map_9x9");
-            ImGui::Checkbox("プローブの距離フェード (推定)", &light.probe_distance_fade);
-            ImGui::SetItemTooltip("既定では全域の原プローブ照明を描画。オンでカメラ距離によるフェードを使用 (エンジンの判定条件は未解明)。各プローブの空間範囲・色・強度は元データのまま");
+            ImGui::Checkbox(ui::tr(ui::S::Atmosphere), &light.atmosphere);
+            ImGui::SetItemTooltip(ui::tr(ui::S::AtmosphereTip));
+            ImGui::Checkbox(ui::tr(ui::S::FroxelFog), &light.froxel_fog);
+            ImGui::SetItemTooltip(ui::tr(ui::S::FroxelFogTip));
+            ImGui::Checkbox(ui::trf(ui::S::MapEnvironment, game_lighting.environment_channels()).c_str(), &light.environment);
+            ImGui::SetItemTooltip(ui::tr(ui::S::MapEnvironmentTip));
+            ImGui::Checkbox(ui::tr(ui::S::SkyAmbient), &light.sky_ambient);
+            ImGui::SetItemTooltip(ui::tr(ui::S::SkyAmbientTip));
+            ImGui::Checkbox(ui::tr(ui::S::OverheadOcclusion), &light.overhead_occlusion);
+            ImGui::SetItemTooltip(ui::tr(ui::S::OverheadOcclusionTip));
+            ImGui::Checkbox(ui::tr(ui::S::ProbeFade), &light.probe_distance_fade);
+            ImGui::SetItemTooltip(ui::tr(ui::S::ProbeFadeTip));
             {
                 bool own = light.time_of_day < 0;
-                if (ImGui::Checkbox("初期時刻を使う (推定)", &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
-                ImGui::SetItemTooltip("太陽パス成分 +0x08 の値を時刻と仮定。アクティビティ実行時の開始時刻は未特定のため、ゲーム本来の時刻を保証しない");
+                if (ImGui::Checkbox(ui::tr(ui::S::TimeOwn), &own)) light.time_of_day = own ? -1.0f : game_lighting.default_time_of_day();
+                ImGui::SetItemTooltip(ui::tr(ui::S::TimeOwnTip));
                 ImGui::BeginDisabled(own);
                 float t = own ? game_lighting.default_time_of_day() : light.time_of_day;
                 const int minutes = int(t * 24 * 60 + 0.5f);
-                if (ImGui::SliderFloat("時刻", &t, 0.0f, 1.0f, std::format("{:02}:{:02}", minutes / 60 % 24, minutes % 60).c_str()))
+                if (ImGui::SliderFloat(ui::tr(ui::S::Time), &t, 0.0f, 1.0f, std::format("{:02}:{:02}", minutes / 60 % 24, minutes % 60).c_str()))
                     light.time_of_day = t;
                 ImGui::EndDisabled();
             }
             ImGui::EndDisabled();
-            if (ImGui::Button("既定値に戻す")) {
+            if (ImGui::Button(ui::tr(ui::S::ResetDefault))) {
                 ViewMode m = light.mode;
                 light = LightingParams{};
                 light.mode = m;
@@ -2585,10 +2814,10 @@ public:
         ImGui::TextUnformatted("GAME SHADING / STRICT");
         ImGui::SameLine(0, 4 * sc);
         if (ImGui::Button(icon(ico::Frame).c_str())) frame_scene();
-        ImGui::SetItemTooltip("全体を表示 (F)");
+        ImGui::SetItemTooltip(ui::tr(ui::S::FrameAll));
         ImGui::SameLine(0, 4 * sc);
         if (ImGui::Button(icon(ico::Save).c_str()) && scene.loaded()) capture_requested = true;
-        ImGui::SetItemTooltip("PNG で保存 (Ctrl+S)");
+        ImGui::SetItemTooltip(ui::tr(ui::S::SavePng));
         ImGui::PopStyleColor(2);
 
         // FPS / VRAM, top right (goriath: green monospace with a shadow)
@@ -2602,7 +2831,7 @@ public:
         }
         if (!render_error.empty()) {
             hud_text(dl, {origin.x + 12 * sc, origin.y + bar_h + 12 * sc}, IM_COL32(255, 100, 100, 255),
-                     "描画停止: ゲーム由来の入力が不足しています (代替描画なし)");
+                     ui::tr(ui::S::RenderStopped));
             ImGui::TextWrapped("%s", render_error.c_str());
         }
         // bottom-left HUD / messages
@@ -2621,13 +2850,13 @@ public:
             hud_text(dl, {origin.x + 10 * sc, origin.y + size.y - ImGui::GetTextLineHeight() - 8 * sc},
                      IM_COL32(235, 235, 235, 230), hud.c_str());
         } else if (!loading) {
-            const char* msg = pm ? "カードをクリックすると、ゲームのシェーダで描画します" : "Marathon のインストールを開いてください";
+            const char* msg = pm ? ui::tr(ui::S::ClickCardHint) : ui::tr(ui::S::OpenInstallHint);
             ImVec2 ts = ImGui::CalcTextSize(msg);
             hud_text(dl, {origin.x + (size.x - ts.x) * 0.5f, origin.y + size.y * 0.5f}, IM_COL32(200, 200, 200, 200), msg);
         }
         if (loading) {
             spinner(dl, {origin.x + size.x * 0.5f, origin.y + size.y * 0.5f}, 20 * sc, kGreen);
-            std::string t = std::format("{} を読込中…", loading->str());
+            std::string t = ui::trf(ui::S::LoadingItem, loading->str());
             ImVec2 ts = ImGui::CalcTextSize(t.c_str());
             hud_text(dl, {origin.x + (size.x - ts.x) * 0.5f, origin.y + size.y * 0.5f + 32 * sc}, IM_COL32_WHITE, t.c_str());
         }
@@ -2710,27 +2939,27 @@ public:
         if (!scene.loaded()) {
             if (no_drawable_tag) {
                 ImGui::Text("ENTITY %s", no_drawable_tag->str().c_str());
-                ImGui::TextDisabled("未対応パス: %s", no_drawable_reason.c_str());
+                ImGui::TextDisabled(ui::tr(ui::S::UnsupportedPath), no_drawable_reason.c_str());
                 return;
             }
-            ImGui::TextDisabled("メッシュ未選択");
+            empty_state(ico::Entities, ui::tr(ui::S::NothingSelected), ui::tr(ui::S::ClickCardHint));
             return;
         }
         ImGui::PushFont(g_fonts.bold, 0);
         ImGui::Text("%s %s", scene.dynamic() ? "DYNAMIC" : "STATIC", scene.tag().str().c_str());
         ImGui::PopFont();
         ImGui::SameLine();
-        if (ImGui::SmallButton("コピー")) ImGui::SetClipboardText(scene.tag().str().c_str());
-        ImGui::TextDisabled("LOD %u   グループ %zu   半径 %.3f", scene.lod(), scene.groups().size(), scene.radius());
+        if (ImGui::SmallButton(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(scene.tag().str().c_str());
+        ImGui::TextDisabled(ui::tr(ui::S::LodLine), scene.lod(), scene.groups().size(), scene.radius());
         if (scene.dynamic()) {
             if (scene_component.is_none()) {
-                ImGui::TextDisabled("エンティティコンポーネント: なし (パート自身のテクニックのみ)");
+                ImGui::TextDisabled(ui::tr(ui::S::NoEntityComponent));
             } else {
-                ImGui::TextDisabled("エンティティコンポーネント %s", scene_component.str().c_str());
+                ImGui::TextDisabled(ui::tr(ui::S::EntityComponent), scene_component.str().c_str());
                 if (scene_permutation_count > 1) {
                     int perm = int(scene_permutation);
                     ImGui::SetNextItemWidth(200 * ImGui::GetStyle().FontScaleDpi);
-                    if (ImGui::SliderInt("マテリアル バリアント", &perm, 0, int(scene_permutation_count) - 1) &&
+                    if (ImGui::SliderInt(ui::tr(ui::S::MaterialVariant), &perm, 0, int(scene_permutation_count) - 1) &&
                         perm != int(scene_permutation)) {
                         loading = scene.tag();
                         worker.request_live(scene.tag(), perm, channel_overrides);
@@ -2741,32 +2970,32 @@ public:
             for (const auto& n : scene.notes()) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "%s", n.c_str());
         }
         animation_panel();
-        if (ImGui::CollapsingHeader("マテリアルのアニメーション", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("再生##material", &material_playing);
+        if (ImGui::CollapsingHeader(ui::tr(ui::S::MaterialAnimation), ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox((std::string(ui::tr(ui::S::Play)) + "##material").c_str(), &material_playing);
             ImGui::SameLine();
-            if (ImGui::SmallButton("先頭に戻す##material")) material_time = 0;
+            if (ImGui::SmallButton(ui::tr(ui::S::Rewind2))) material_time = 0;
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::DragFloat("##material_time", &material_time, 0.01f, 0, 86400, "時刻 %.2f 秒")) material_playing = false;
+            if (ImGui::DragFloat("##material_time", &material_time, 0.01f, 0, 86400, ui::tr(ui::S::TimeFmt))) material_playing = false;
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, "速度 %.2fx");
+            ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, ui::tr(ui::S::SpeedFmt));
         }
         channels_panel();
         estimates_panel();
         if (engine == Engine::Game && game_ready)
-            ImGui::TextDisabled("シェーディング: %s (ゲームの global_lighting_and_shading)",
+            ImGui::TextDisabled(ui::tr(ui::S::ShadingLine),
                                 game_lighting.shading_technique().str().c_str());
         for (size_t i = 0; i < scene.groups().size(); ++i) {
             const auto& g = scene.groups()[i];
             ImGui::PushID(int(i));
-            if (ImGui::CollapsingHeader(std::format("パート {}  ({} インデックス)", g.part, g.index_count).c_str())) {
-                ImGui::Text("テクニック  %s", g.technique.str().c_str());
+            if (ImGui::CollapsingHeader(ui::trf(ui::S::PartHeader, g.part, g.index_count).c_str())) {
+                ImGui::Text(ui::tr(ui::S::Technique), g.technique.str().c_str());
                 ImGui::Text("VS %s   PS %s", g.vs.str().c_str(), g.ps.str().c_str());
-                ImGui::Text("cbuffer %zu レジスタ   TFX %zu 命令", g.cbuffer_regs, g.vm_instructions);
-                for (const auto& s : g.stubbed_ops) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "未実装 TFX op: %s", s.c_str());
+                ImGui::Text(ui::tr(ui::S::CbufferLine), g.cbuffer_regs, g.vm_instructions);
+                for (const auto& s : g.stubbed_ops) ImGui::TextColored({1, 0.75f, 0.3f, 1}, ui::tr(ui::S::StubbedOp), s.c_str());
                 if (ImGui::BeginTable("tex", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
                     ImGui::TableSetupColumn("slot", ImGuiTableColumnFlags_WidthFixed, 40);
-                    ImGui::TableSetupColumn("テクスチャ", ImGuiTableColumnFlags_WidthFixed, 90);
-                    ImGui::TableSetupColumn("形式");
+                    ImGui::TableSetupColumn(ui::tr(ui::S::ColTexture), ImGuiTableColumnFlags_WidthFixed, 90);
+                    ImGui::TableSetupColumn(ui::tr(ui::S::ColFormat));
                     for (const auto& t : g.textures) {
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
@@ -2784,7 +3013,7 @@ public:
                         ImGui::TableNextColumn();
                         ImGui::TextDisabled("extern %u", e.extern_id);
                         ImGui::TableNextColumn();
-                        ImGui::TextDisabled("エンジン側 (+0x%X)", e.offset * 8);
+                        ImGui::TextDisabled(ui::tr(ui::S::EngineSide), e.offset * 8);
                     }
                     ImGui::EndTable();
                 }
@@ -2795,10 +3024,10 @@ public:
 
     // -- TEXT --
     void strings_tab() {
-        if (!catalog || !catalog->strings_ready) { ImGui::TextDisabled("読込中…"); return; }
+        if (!catalog || !catalog->strings_ready) { ImGui::TextDisabled(ui::tr(ui::S::Loading)); return; }
         const auto& all = catalog->strings.strings();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##strfilter", (icon(ico::Search) + "  検索 (英語・選択中の言語・ハッシュ)").c_str(),
+        ImGui::InputTextWithHint("##strfilter", (icon(ico::Search) + ui::tr(ui::S::TextFilterHint)).c_str(),
                                  string_filter, sizeof(string_filter));
         std::string f = lower_ascii(string_filter);
         if (f != string_filter_applied || string_filter_lang != language) {
@@ -2812,12 +3041,12 @@ public:
                     string_view.push_back(i);
             }
         }
-        ImGui::TextDisabled("%zu / %zu 件  (右クリックでコピー)", string_view.size(), all.size());
+        ImGui::TextDisabled(ui::tr(ui::S::TextCount), string_view.size(), all.size());
         const std::string lang_col(language_code(TextLanguage(language)));
         if (ImGui::BeginTable("strings", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                                 ImGuiTableFlags_BordersOuter)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("HASH", ImGuiTableColumnFlags_WidthFixed, 100);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColHash), ImGuiTableColumnFlags_WidthFixed, 100);
             ImGui::TableSetupColumn("EN");
             ImGui::TableSetupColumn(lower_ascii(lang_col).c_str());
             ImGui::TableHeadersRow();
@@ -2831,9 +3060,9 @@ public:
                     ImGui::TableNextColumn();
                     ImGui::Selectable(std::format("{:08X}", s.hash).c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
                     if (ImGui::BeginPopupContextItem("ctx")) {
-                        if (ImGui::MenuItem("英語をコピー")) ImGui::SetClipboardText(s.text[0].c_str());
-                        if (ImGui::MenuItem((lang_col + " をコピー").c_str())) ImGui::SetClipboardText(s.text[size_t(language)].c_str());
-                        if (ImGui::MenuItem("ハッシュをコピー")) ImGui::SetClipboardText(std::format("{:08X}", s.hash).c_str());
+                        if (ImGui::MenuItem(ui::tr(ui::S::CopyEnglish))) ImGui::SetClipboardText(s.text[0].c_str());
+                        if (ImGui::MenuItem(ui::trf(ui::S::CopyLanguage, lang_col).c_str())) ImGui::SetClipboardText(s.text[size_t(language)].c_str());
+                        if (ImGui::MenuItem(ui::tr(ui::S::CopyHash))) ImGui::SetClipboardText(std::format("{:08X}", s.hash).c_str());
                         ImGui::EndPopup();
                     }
                     ImGui::TableNextColumn();
@@ -2859,11 +3088,11 @@ public:
     size_t dialogue_lang() const { return size_t(dialogue_text_lang < 0 ? language : dialogue_text_lang); }
 
     std::string speaker_name(uint32_t hash, size_t lang) {
-        if (hash == 0 || hash == 0x811C9DC5) return "(話者なし)";
+        if (hash == 0 || hash == 0x811C9DC5) return ui::tr(ui::S::NoSpeaker);
         const std::string& t = text(hash, lang);
         if (!t.empty()) return t;
         const std::string& en = text(hash, 0);
-        return en.empty() ? std::format("(不明 {:08X})", hash) : en;
+        return en.empty() ? ui::trf(ui::S::UnknownSpeaker, hash) : en;
     }
 
     void ensure_audio_languages() {
@@ -2874,11 +3103,13 @@ public:
                 const auto us = p.name.rfind('_');
                 found[p.language] = us == std::string::npos ? std::to_string(p.language) : p.name.substr(us + 1);
             }
-        for (auto& [id, suffix] : found) audio_langs.emplace_back(id, audio_language_name(suffix));
+        for (auto& [id, suffix] : found) {
+            audio_langs.emplace_back(id, audio_language_name(suffix));
+            audio_suffixes.push_back(suffix);
+        }
         // default to the voice that matches the second text language, else English
-        const std::string want = text_language_name(size_t(language));
-        for (size_t i = 0; i < audio_langs.size(); ++i)
-            if (audio_langs[i].second == want) audio_lang = int(i);
+        for (size_t i = 0; i < audio_suffixes.size(); ++i)
+            if (audio_language_slot(audio_suffixes[i]) == language) audio_lang = int(i);
     }
 
     media::AudioEngine* audio_engine() {
@@ -2956,7 +3187,7 @@ public:
                 std::sort(counts.begin(), counts.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 std::string who;
                 for (size_t k = 0; k < counts.size() && k < 2; ++k) who += (k ? ", " : "") + speaker_name(counts[k].second, lang);
-                if (counts.size() > 2) who += " 他";
+                if (counts.size() > 2) who += ui::tr(ui::S::Others);
                 g.name += "  " + who;
             }
         std::sort(dialogue_groups.begin(), dialogue_groups.end(), [&](const DialogueGroup& a, const DialogueGroup& b) {
@@ -3010,7 +3241,7 @@ public:
         export_running = true;
         {
             std::lock_guard lk(export_mutex);
-            export_message = std::format("{} 本を {} 音声で書き出し中…", jobs->size(), lang_name);
+            export_message = ui::trf(ui::S::ExportRunning, jobs->size(), lang_name);
         }
         std::shared_ptr<PackageManager> fork(pm->fork());
         const uint16_t lid = lang_id;
@@ -3026,7 +3257,7 @@ public:
                 try {
                     fs::create_directories(j.file.parent_path());
                     const auto pcm = decode_wem(fork->read(j.wem));
-                    if (!write_wav_file(j.file, pcm)) throw std::runtime_error("書き込み失敗");
+                    if (!write_wav_file(j.file, pcm)) throw std::runtime_error(ui::tr(ui::S::ErrWriteFailed));
                 } catch (const std::exception& ex) {
                     if (std::string_view(ex.what()).find("no recording") != std::string_view::npos) export_missing++;
                     else export_failed++;
@@ -3034,8 +3265,8 @@ public:
                 export_done++;
             }
             std::lock_guard lk(export_mutex);
-            export_message = std::format("{}{} / {} 本を書き出しました ({} 音声, 未収録 {}, 失敗 {}): {}",
-                                         export_cancel ? "中止: " : "",
+            export_message = ui::trf(ui::S::ExportDone, 
+                                         export_cancel ? ui::tr(ui::S::ExportAborted) : "",
                                          export_done.load() - export_failed.load() - export_missing.load(),
                                          export_total.load(), lang_name, export_missing.load(), export_failed.load(), to_utf8(dir.wstring()));
             export_running = false;
@@ -3043,7 +3274,7 @@ public:
     }
 
     void dialogue_tab() {
-        if (!catalog || !catalog->dialogue_ready) { ImGui::TextDisabled("読込中…"); return; }
+        if (!catalog || !catalog->dialogue_ready) { ImGui::TextDisabled(ui::tr(ui::S::Loading)); return; }
         ensure_audio_languages();
         const auto& lines = catalog->dialogue;
         const float sc = ImGui::GetStyle().FontScaleDpi;
@@ -3051,39 +3282,39 @@ public:
 
         // toolbar
         ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x * 0.35f));
-        ImGui::InputTextWithHint("##dlgfilter", (icon(ico::Search) + "  話者・台詞で検索").c_str(), dialogue_filter,
+        ImGui::InputTextWithHint("##dlgfilter", (icon(ico::Search) + ui::tr(ui::S::DialogueFilterHint)).c_str(), dialogue_filter,
                                  sizeof(dialogue_filter));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(170 * sc);
-        if (ImGui::BeginCombo("字幕", text_language_name(lang))) {
+        if (ImGui::BeginCombo(ui::tr(ui::S::Subtitles), text_language_name(lang))) {
             for (int l = 0; l < int(kTextLanguageCount); ++l)
                 if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) dialogue_text_lang = l;
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        ImGui::Checkbox("英語を併記", &dialogue_show_english);
+        ImGui::Checkbox(ui::tr(ui::S::ShowEnglish), &dialogue_show_english);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(130 * sc);
         if (audio_langs.empty()) {
-            ImGui::TextDisabled("音声パッケージなし");
-        } else if (ImGui::BeginCombo("音声", audio_langs[size_t(audio_lang)].second.c_str())) {
+            ImGui::TextDisabled(ui::tr(ui::S::NoVoicePackages));
+        } else if (ImGui::BeginCombo(ui::tr(ui::S::Voice), audio_langs[size_t(audio_lang)].second.c_str())) {
             for (int i = 0; i < int(audio_langs.size()); ++i)
                 if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
             ImGui::EndCombo();
         }
-        ImGui::SetItemTooltip("インストール済みの音声言語パッケージ (Steam の言語設定で追加できます)");
+        ImGui::SetItemTooltip(ui::tr(ui::S::VoiceTip));
         ImGui::SameLine();
         ImGui::BeginDisabled(export_running || dialogue_view.empty() || audio_langs.empty());
-        if (ImGui::Button((icon(ico::Save) + "  書き出し…").c_str()))
+        if (ImGui::Button((icon(ico::Save) + (std::string("  ") + ui::tr(ui::S::Export))).c_str()))
             if (auto dir = pick_folder(g_win.hwnd)) start_dialogue_export(*dir);
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("表示中の台詞を WAV で話者ごとのフォルダに書き出し (index.csv に全言語のテキスト)");
+        ImGui::SetItemTooltip(ui::tr(ui::S::ExportTip));
         if (export_running) {
             ImGui::SameLine();
             ImGui::ProgressBar(export_total ? float(export_done) / float(export_total) : 0, {140 * sc, 0},
                                std::format("{} / {}", export_done.load(), export_total.load()).c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("中止")) export_cancel = true;
+            if (ImGui::SmallButton(ui::tr(ui::S::Abort))) export_cancel = true;
         } else {
             std::lock_guard lk(export_mutex);
             if (!export_message.empty()) {
@@ -3091,19 +3322,19 @@ public:
                 ImGui::TextDisabled("%s", export_message.c_str());
             }
         }
-        if (!audio_error.empty()) ImGui::TextColored({1, 0.4f, 0.4f, 1}, "音声エラー: %s", audio_error.c_str());
+        if (!audio_error.empty()) ImGui::TextColored({1, 0.4f, 0.4f, 1}, ui::tr(ui::S::AudioError), audio_error.c_str());
 
         if (dialogue_groups_mode != dialogue_group_mode || dialogue_groups_lang != int(lang)) rebuild_dialogue_groups();
 
         // left: filing by speaker / table
         ImGui::BeginChild("dlggroups", {280 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
-        if (ImGui::RadioButton("話者", dialogue_group_mode == 0)) dialogue_group_mode = 0;
+        if (ImGui::RadioButton(ui::tr(ui::S::BySpeaker), dialogue_group_mode == 0)) dialogue_group_mode = 0;
         ImGui::SameLine();
-        if (ImGui::RadioButton("会話テーブル", dialogue_group_mode == 1)) dialogue_group_mode = 1;
+        if (ImGui::RadioButton(ui::tr(ui::S::ByTable), dialogue_group_mode == 1)) dialogue_group_mode = 1;
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##grpfilter", "絞り込み", dialogue_group_filter, sizeof(dialogue_group_filter));
+        ImGui::InputTextWithHint("##grpfilter", ui::tr(ui::S::Filter), dialogue_group_filter, sizeof(dialogue_group_filter));
         const std::string gf = lower_ascii(dialogue_group_filter);
-        if (ImGui::Selectable(std::format("すべて  ({})", lines.size()).c_str(), dialogue_group < 0)) dialogue_group = -1;
+        if (ImGui::Selectable(ui::trf(ui::S::AllLines, lines.size()).c_str(), dialogue_group < 0)) dialogue_group = -1;
         for (int g = 0; g < int(dialogue_groups.size()); ++g) {
             const auto& grp = dialogue_groups[size_t(g)];
             if (!gf.empty() && !contains_ci(grp.name, gf) && grp.name.find(dialogue_group_filter) == std::string::npos) continue;
@@ -3136,16 +3367,16 @@ public:
 
         ImGui::BeginGroup();
         const float details_h = dialogue_selected >= 0 ? std::min(330 * sc, ImGui::GetContentRegionAvail().y * 0.45f) : 0;
-        ImGui::TextDisabled("%zu / %zu 行", dialogue_view.size(), lines.size());
+        ImGui::TextDisabled(ui::tr(ui::S::RowCount), dialogue_view.size(), lines.size());
         const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
         if (ImGui::BeginTable("dialogue", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                                  ImGuiTableFlags_BordersOuter,
                               {0, ImGui::GetContentRegionAvail().y - details_h})) {
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 30 * sc);
-            ImGui::TableSetupColumn("SPEAKER", ImGuiTableColumnFlags_WidthFixed, 150 * sc);
-            ImGui::TableSetupColumn("LINE");
-            ImGui::TableSetupColumn("TABLE", ImGuiTableColumnFlags_WidthFixed, 80 * sc);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColSpeaker), ImGuiTableColumnFlags_WidthFixed, 150 * sc);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColLine));
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColTable), ImGuiTableColumnFlags_WidthFixed, 80 * sc);
             ImGui::TableHeadersRow();
             ImGuiListClipper clip_rows;
             clip_rows.Begin(int(dialogue_view.size()));
@@ -3166,8 +3397,8 @@ public:
                     const std::string& en = text(l.subtitle_hash, 0);
                     const std::string& tr = text(l.subtitle_hash, lang);
                     if (ImGui::BeginPopupContextItem("ctx")) {
-                        if (ImGui::MenuItem("表示言語をコピー")) ImGui::SetClipboardText(tr.c_str());
-                        if (ImGui::MenuItem("英語をコピー")) ImGui::SetClipboardText(en.c_str());
+                        if (ImGui::MenuItem(ui::tr(ui::S::CopyDisplayed))) ImGui::SetClipboardText(tr.c_str());
+                        if (ImGui::MenuItem(ui::tr(ui::S::CopyEnglish))) ImGui::SetClipboardText(en.c_str());
                         ImGui::EndPopup();
                     }
                     ImGui::TableNextColumn();
@@ -3195,12 +3426,12 @@ public:
         ImGui::TextUnformatted(speaker_name(l.speaker_hash, lang).c_str());
         ImGui::PopFont();
         ImGui::SameLine();
-        ImGui::TextDisabled("行 %08X  テーブル %s  音声イベント %s", l.line_id, l.table.str().c_str(),
+        ImGui::TextDisabled(ui::tr(ui::S::LineInfo), l.line_id, l.table.str().c_str(),
                             l.audio_event.is_none() ? "-" : l.audio_event.str().c_str());
         ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 24 * ImGui::GetStyle().FontScaleDpi);
         if (ImGui::SmallButton("×")) dialogue_selected = -1;
         if (l.wem.empty()) {
-            ImGui::TextDisabled("音声なし");
+            ImGui::TextDisabled(ui::tr(ui::S::NoAudio));
         } else {
             for (size_t w = 0; w < l.wem.size(); ++w) {
                 ImGui::TextDisabled("%s", l.wem[w].str().c_str());
@@ -3218,22 +3449,22 @@ public:
                             const auto pcm = decode_wem(fork->read(l.wem[w]));
                             const fs::path file = *dir / to_wide(safe_file_name(std::format(
                                 "{}_{:08X}_{}.wav", speaker_name(l.speaker_hash, lang), l.line_id, audio_langs[size_t(audio_lang)].second)));
-                            if (!write_wav_file(file, pcm)) throw std::runtime_error("書き込めません");
-                            info("保存しました: " + to_utf8(file.wstring()));
+                            if (!write_wav_file(file, pcm)) throw std::runtime_error(ui::tr(ui::S::ErrWriteWav));
+                            info(ui::trf(ui::S::LogSaved, to_utf8(file.wstring())));
                         } catch (const std::exception& ex) {
-                            error(std::string("WAV を保存できません: ") + ex.what());
+                            error(ui::trf(ui::S::ErrWav, ex.what()));
                         }
                     }
-                ImGui::SetItemTooltip("選択中の音声言語で WAV に保存");
+                ImGui::SetItemTooltip(ui::tr(ui::S::SaveWavTip));
                 ImGui::PopID();
             }
             if (clip && clip->playing() && (clip->id() & 0xFFFFFFFF) == uint64_t(li) + 1)
                 ImGui::ProgressBar(float(clip->position() / std::max(0.001, clip->length())), {-1, 4 * ImGui::GetStyle().FontScaleDpi}, "");
         }
         if (ImGui::BeginTable("langs", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY)) {
-            ImGui::TableSetupColumn("言語", ImGuiTableColumnFlags_WidthFixed, 150 * ImGui::GetStyle().FontScaleDpi);
-            ImGui::TableSetupColumn("話者", ImGuiTableColumnFlags_WidthFixed, 140 * ImGui::GetStyle().FontScaleDpi);
-            ImGui::TableSetupColumn("台詞");
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColLanguage), ImGuiTableColumnFlags_WidthFixed, 150 * ImGui::GetStyle().FontScaleDpi);
+            ImGui::TableSetupColumn(ui::tr(ui::S::BySpeaker), ImGuiTableColumnFlags_WidthFixed, 140 * ImGui::GetStyle().FontScaleDpi);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColLine));
             for (size_t t = 0; t < kTextLanguageCount; ++t) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
@@ -3245,7 +3476,7 @@ public:
                 ImGui::PushID(int(t));
                 ImGui::TextWrapped("%s", s.c_str());
                 if (ImGui::BeginPopupContextItem("c")) {
-                    if (ImGui::MenuItem("コピー")) ImGui::SetClipboardText(s.c_str());
+                    if (ImGui::MenuItem(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(s.c_str());
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
@@ -3253,7 +3484,7 @@ public:
             if (l.caption_hash && l.caption_hash != 0x811C9DC5 && !text(l.caption_hash, 0).empty()) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::TextDisabled("キャプション");
+                ImGui::TextDisabled(ui::tr(ui::S::Caption));
                 ImGui::TableNextColumn();
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("%s", text(l.caption_hash, lang).c_str());
@@ -3280,11 +3511,11 @@ public:
     static std::string movie_track_label(const MovieEntry& m, const UsmInfo::Audio& a) {
         std::string name;
         if (m.info.audio.size() > 1 && a.channel >= 1 && size_t(a.channel) <= kTextLanguageCount)
-            name = std::format("{} (推定)", text_language_name(size_t(a.channel - 1)));
+            name = ui::trf(ui::S::TrackEstimated, text_language_name(size_t(a.channel - 1)));
         else
-            name = m.info.audio.size() > 1 ? "既定" : "音声";
+            name = m.info.audio.size() > 1 ? ui::tr(ui::S::Default) : ui::tr(ui::S::Voice);
         name += std::format("  ch{} {} {}ch", a.channel, usm_audio_codec_name(a.codec), a.channels);
-        if (a.codec != 2) name += " 未対応";
+        if (a.codec != 2) name += std::string(" ") + ui::tr(ui::S::Unsupported);
         return name;
     }
 
@@ -3312,8 +3543,8 @@ public:
                 audio_error.clear();
             } catch (const std::exception& ex) {
                 audio_error = ex.what();
-                if (audio_error.find("no recording") != std::string::npos) audio_error = "この言語の音声は収録されていません";
-                error("音声を再生できません: " + audio_error);
+                if (audio_error.find("no recording") != std::string::npos) audio_error = ui::tr(ui::S::NoRecording);
+                error(ui::trf(ui::S::ErrPlayAudio, audio_error));
             }
             audio_request.reset();
         }
@@ -3363,7 +3594,7 @@ public:
             movie.tex_readable = true;
             movie.has_frame = true;
         } catch (const std::exception& ex) {
-            error(std::string("ムービーのフレームを転送できません: ") + ex.what());
+            error(ui::trf(ui::S::MovieFrameError, ex.what()));
         }
     }
 
@@ -3375,16 +3606,16 @@ public:
     size_t movie_sub_lang() const { return size_t(movie.sub_lang < 0 ? language : movie.sub_lang); }
 
     void movies_tab() {
-        if (!catalog || !catalog->movies_ready) { ImGui::TextDisabled("読込中…"); return; }
+        if (!catalog || !catalog->movies_ready) { ImGui::TextDisabled(ui::tr(ui::S::Loading)); return; }
         const auto& movies = catalog->movies;
         const float sc = ImGui::GetStyle().FontScaleDpi;
 
         // left: movie list
         ImGui::BeginChild("movielist", {330 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##moviefilter", (icon(ico::Search) + "  ファイル名で検索").c_str(), movie.filter, sizeof(movie.filter));
+        ImGui::InputTextWithHint("##moviefilter", (icon(ico::Search) + ui::tr(ui::S::MovieFilterHint)).c_str(), movie.filter, sizeof(movie.filter));
         const std::string mf = lower_ascii(movie.filter);
-        ImGui::TextDisabled("%zu 本 (多言語音声 %zu)", movies.size(),
+        ImGui::TextDisabled(ui::tr(ui::S::MovieCount), movies.size(),
                             size_t(std::count_if(movies.begin(), movies.end(), [](const MovieEntry& m) { return m.info.audio.size() > 1; })));
         for (int i = 0; i < int(movies.size()); ++i) {
             const auto& m = movies[size_t(i)];
@@ -3397,7 +3628,7 @@ public:
             ImGui::TextUnformatted(m.info.filename.empty() ? m.usm.str().c_str() : m.info.filename.c_str());
             if (m.info.audio.size() > 1) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "多言語");
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), ui::tr(ui::S::Multilingual));
             }
             ImGui::TextDisabled("%s  %ux%u  %s  %s", m.usm.str().c_str(), m.info.width, m.info.height,
                                 clock_text(m.info.duration()).c_str(), format_bytes(m.size).c_str());
@@ -3409,7 +3640,7 @@ public:
 
         ImGui::BeginGroup();
         if (movie.selected < 0 || size_t(movie.selected) >= movies.size()) {
-            ImGui::TextDisabled("左の一覧からムービーを選ぶと再生します。");
+            empty_state(ico::Movies, ui::tr(ui::S::NavMovies), ui::tr(ui::S::PickMovie));
             ImGui::EndGroup();
             return;
         }
@@ -3475,7 +3706,7 @@ public:
         const UsmInfo::Audio* cur = nullptr;
         for (const auto& t : m.info.audio)
             if (t.channel == movie.channel) cur = &t;
-        if (ImGui::BeginCombo("音声トラック", cur ? movie_track_label(m, *cur).c_str() : "なし")) {
+        if (ImGui::BeginCombo(ui::tr(ui::S::AudioTrack), cur ? movie_track_label(m, *cur).c_str() : ui::tr(ui::S::None))) {
             for (const auto& t : m.info.audio)
                 if (ImGui::Selectable(movie_track_label(m, t).c_str(), t.channel == movie.channel)) {
                     movie.channel = t.channel;
@@ -3485,11 +3716,11 @@ public:
             ImGui::EndCombo();
         }
         if (m.info.audio.size() > 1)
-            ImGui::SetItemTooltip("言語トラックの割り当てはゲームデータに無いため推定です\n(チャンネル番号 = 文字列の言語スロット + 1。繁体字中国語の ch9 は欠番)");
+            ImGui::SetItemTooltip(ui::tr(ui::S::TrackTip));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(200 * sc);
-        if (ImGui::BeginCombo("字幕", movie.sub_lang == kSubtitlesOff ? "オフ" : text_language_name(sub_lang))) {
-            if (ImGui::Selectable("オフ", movie.sub_lang == kSubtitlesOff)) movie.sub_lang = kSubtitlesOff;
+        if (ImGui::BeginCombo(ui::tr(ui::S::Subtitles), movie.sub_lang == kSubtitlesOff ? ui::tr(ui::S::Off) : text_language_name(sub_lang))) {
+            if (ImGui::Selectable(ui::tr(ui::S::Off), movie.sub_lang == kSubtitlesOff)) movie.sub_lang = kSubtitlesOff;
             for (int l = 0; l < int(kTextLanguageCount); ++l)
                 if (ImGui::Selectable(text_language_name(size_t(l)), movie.sub_lang != kSubtitlesOff && size_t(l) == sub_lang))
                     movie.sub_lang = l;
@@ -3501,7 +3732,7 @@ public:
                 ImGui::TextColored({1, 0.4f, 0.4f, 1}, "%s", e.c_str());
             } else if (cur && !p->audio_supported()) {
                 ImGui::SameLine();
-                ImGui::TextDisabled(cur->codec != 2 ? "この音声 (%s) は未対応のため映像のみ" : "音声出力を開けません",
+                ImGui::TextDisabled(cur->codec != 2 ? ui::tr(ui::S::VideoOnlyUnsupported) : ui::tr(ui::S::AudioOutputError),
                                     usm_audio_codec_name(cur->codec));
             }
         }
@@ -3510,15 +3741,15 @@ public:
         if (ImGui::BeginTable("subs", 3, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter,
                               {0, ImGui::GetContentRegionAvail().y})) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("時刻", ImGuiTableColumnFlags_WidthFixed, 60 * sc);
+            ImGui::TableSetupColumn(ui::tr(ui::S::Time), ImGuiTableColumnFlags_WidthFixed, 60 * sc);
             ImGui::TableSetupColumn(text_language_name(sub_lang));
-            ImGui::TableSetupColumn("英語 / キー");
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColEnglishKey));
             ImGui::TableHeadersRow();
             if (subs.empty()) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TableNextColumn();
-                ImGui::TextDisabled("字幕は再生に合わせて読み込まれます (このムービーにはまだ字幕がありません)");
+                ImGui::TextDisabled(ui::tr(ui::S::NoSubtitlesYet));
             }
             for (size_t i = 0; i < subs.size(); ++i) {
                 const auto& s = subs[i];
@@ -3563,7 +3794,7 @@ public:
                                                     en.reference, en.file_size});
                         }
                     } catch (const std::exception& ex) {
-                        error(std::format("パッケージを開けません: {}", ex.what()));
+                        error(ui::trf(ui::S::ErrOpenPackage, ex.what()));
                     }
                 }
             }
@@ -3571,15 +3802,15 @@ public:
         ImGui::SameLine();
         ImGui::BeginGroup();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##entfilter", "種別 (例 8, 32/1) またはクラス", entry_filter, sizeof(entry_filter));
+        ImGui::InputTextWithHint("##entfilter", ui::tr(ui::S::EntryFilterHint), entry_filter, sizeof(entry_filter));
         std::string f = lower_ascii(entry_filter);
         ImGui::BeginChild("entries", {0, ImGui::GetContentRegionAvail().y * 0.55f}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY);
         if (ImGui::BeginTable("entrytable", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("TAG", ImGuiTableColumnFlags_WidthFixed, 90);
-            ImGui::TableSetupColumn("TYPE", ImGuiTableColumnFlags_WidthFixed, 60);
-            ImGui::TableSetupColumn("CLASS", ImGuiTableColumnFlags_WidthFixed, 90);
-            ImGui::TableSetupColumn("SIZE");
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColTag), ImGuiTableColumnFlags_WidthFixed, 90);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColType), ImGuiTableColumnFlags_WidthFixed, 60);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColClass), ImGuiTableColumnFlags_WidthFixed, 90);
+            ImGui::TableSetupColumn(ui::tr(ui::S::ColSize));
             ImGui::TableHeadersRow();
             std::vector<int> rows;
             for (int i = 0; i < int(package_rows.size()); ++i) {
@@ -3627,7 +3858,7 @@ public:
         ImGui::BeginChild("hex", {0, 0}, ImGuiChildFlags_Borders);
         if (!entry_preview_error.empty()) ImGui::TextColored({1, 0.4f, 0.4f, 1}, "%s", entry_preview_error.c_str());
         else if (!entry_preview.empty()) {
-            ImGui::TextDisabled("%zu バイト", entry_preview.size());
+            ImGui::TextDisabled(ui::tr(ui::S::Bytes), entry_preview.size());
             ImGuiListClipper c3;
             c3.Begin(int((entry_preview.size() + 15) / 16));
             while (c3.Step())
@@ -3649,6 +3880,10 @@ public:
     }
 
     void log_tab() {
+        if (log.empty()) {
+            empty_state(ico::Log, ui::tr(ui::S::LogEmpty), "");
+            return;
+        }
         for (const auto& l : log) {
             if (l.error) ImGui::TextColored({1, 0.45f, 0.45f, 1}, "%s", l.text.c_str());
             else ImGui::TextUnformatted(l.text.c_str());
@@ -3705,7 +3940,7 @@ int run(const std::wstring& cmdline) {
         init_swapchain(app->gpu);
         app->lighting.init(app->gpu);
     } catch (const std::exception& ex) {
-        MessageBoxW(g_win.hwnd, to_wide(std::string("D3D12 の初期化に失敗しました:\n") + ex.what()).c_str(), L"nim", MB_ICONERROR);
+        MessageBoxW(g_win.hwnd, to_wide(ui::trf(ui::S::ErrD3D12, ex.what())).c_str(), L"nim", MB_ICONERROR);
         return 1;
     }
 
@@ -3724,13 +3959,15 @@ int run(const std::wstring& cmdline) {
         LocalFree(argv);
     }
 
+    // The interface language is read before anything that shows text (fonts, the first messages).
+    ui::set_lang(load_ui_language());
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    static std::string ini = (exe_dir() / "nim_layout.ini").string();
-    io.IniFilename = ini.c_str();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
-    io.ConfigDockingWithShift = false;
+    // The layout is fixed (a rail and a page), so there is no window layout to remember.
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     apply_style(scale);
 
     // Open the install before building fonts: the UI is set in the game's own fonts.
@@ -3738,7 +3975,7 @@ int run(const std::wstring& cmdline) {
     UpdateWindow(g_win.hwnd);
     if (install_arg) app->open_install(*install_arg);
     else if (auto found = PackageManager::find_install()) app->open_install(*found);
-    else app->error("Marathon の Steam インストールが見つかりません。SETTINGS からフォルダを選んでください。");
+    else app->error(ui::tr(ui::S::ErrNoSteamInstall));
     load_fonts(app->pm.get());
 
     ImGui_ImplWin32_Init(g_win.hwnd);
@@ -3767,10 +4004,10 @@ int run(const std::wstring& cmdline) {
         const Entry* e = app->pm->entry(*tag_arg);
         if (e && e->reference == kClassBubbleParent) {
             app->pending_map = *tag_arg;
-            app->focus_tab = TabMaps;
+            app->tab = TabMaps;
         } else {
             app->request_load(*tag_arg);
-            app->focus_tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
+            app->tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
         }
     }
 
@@ -3809,7 +4046,7 @@ int run(const std::wstring& cmdline) {
             app->record_uploads(cl, fi);
             if (app->viewport_visible) app->record(cl);
         } catch (const std::exception& ex) {
-            app->error(std::string("描画エラー: ") + ex.what());
+            app->error(ui::trf(ui::S::ErrRender, ex.what()));
         }
         const UINT bb = g_win.swapchain->GetCurrentBackBufferIndex();
         Gpu::barrier(cl, g_win.back[bb].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -3833,8 +4070,7 @@ int run(const std::wstring& cmdline) {
                 why = ex.what();
             }
             MessageBoxW(g_win.hwnd,
-                        to_wide("GPU がエラーで停止したため終了します (device removed)。\n"
-                                "NIM_D3D_DEBUG=1 を設定して起動すると nim_d3d.log に詳細が出ます。\n\n" + why)
+                        to_wide(ui::trf(ui::S::ErrDeviceRemoved, why))
                             .c_str(),
                         L"nim", MB_ICONERROR);
             break;
