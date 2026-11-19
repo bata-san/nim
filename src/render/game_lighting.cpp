@@ -726,7 +726,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     if (!validated) validate(ext, scopes);
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
-    const TfxEnvironment env = ext.environment();
+    std::optional<TfxEnvironment> env;  // only when a stage was not evaluated ahead
     // Identical resolved views share an immutable table for this frame. Per-light constants
     // still change independently; different cubemap textures never alias a mutable table.
 
@@ -769,16 +769,18 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         auto& st = stages_[stage_index];
         const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
         const auto& textures = st.extern_textures;
-        if (geometry && geometry->constants) {
-            st.constants = (*geometry->constants)[stage_index];  // evaluated ahead (evaluate_stages)
-        } else {
+        const bool ahead = geometry && geometry->constants;  // evaluated ahead (evaluate_stages)
+        if (!ahead) {
             auto& cb = st.constants;
             cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
             cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
             // The authored resource bindings were decoded at pipeline creation.
-            if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env, nullptr, false);
+            if (!tfx.bytecode.empty()) {
+                if (!env) env = ext.environment();
+                run_tfx(tfx.bytecode, tfx.constants, cb, *env, nullptr, false);
+            }
         }
-        const auto& cb = st.constants;
+        const auto& cb = ahead ? (*geometry->constants)[stage_index] : st.constants;
         D3D12_GPU_VIRTUAL_ADDRESS own_cb = 0;
         for (auto [reg, param] : st.cbvs) {
             if (int32_t(reg) == tfx.cbuffer_slot && !own_cb) {
@@ -922,6 +924,14 @@ std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const E
     std::vector<float4> cb(ss.cbuffer_init.begin(), ss.cbuffer_init.end());
     cb.resize(std::max<size_t>(cb.size(), 64));
     if (!ss.bytecode.empty()) run_tfx(ss.bytecode, ss.constants, cb, ext.environment());
+    return cb;
+}
+
+std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const TfxEnvironment& env) {
+    const auto& ss = scope.stages[size_t(stage)];
+    std::vector<float4> cb(ss.cbuffer_init.begin(), ss.cbuffer_init.end());
+    cb.resize(std::max<size_t>(cb.size(), 64));
+    if (!ss.bytecode.empty()) run_tfx(ss.bytecode, ss.constants, cb, env);
     return cb;
 }
 
@@ -2673,8 +2683,8 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
             if (!d.error.empty()) throw std::runtime_error(d.error);
             gp.draw_volume(gpu, cl, ext_, scopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
             if (light_debug && lights_drawn_ < 2) {
-                const auto& vs = gp.stage_constants(0);
-                const auto& ps = gp.stage_constants(1);
+                const auto& vs = d.constants[0];  // evaluated ahead (draw_volume does not copy them)
+                const auto& ps = d.constants[1];
                 std::string t = std::format("light {} mirrored {}\n", ll.technique->tag.str(), ll.mirrored);
                 for (size_t k = 0; k < 4; ++k) t += std::format(" vs{:2} {:.3g} {:.3g} {:.3g} {:.3g}\n", 0x23 + k, vs[0x23 + k][0], vs[0x23 + k][1], vs[0x23 + k][2], vs[0x23 + k][3]);
                 for (size_t k = 0; k < 0x2B && k < ps.size(); ++k) t += std::format(" ps{:2X} {:.4g} {:.4g} {:.4g} {:.4g}\n", k, ps[k][0], ps[k][1], ps[k][2], ps[k][3]);
@@ -2690,16 +2700,32 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
 // Evaluates the TFX of the first `count` volume draws on the worker pool. Each sees the store as it
 // is now plus its own recorded writes (the overlay), which is the store's state at its draw: the
 // draws in between only write the overlay's words.
-void GameLighting::evaluate_volume_draws(size_t count) {
+void GameLighting::evaluate_volume_draws(size_t count, std::span<const Scope* const> scopes) {
     WorkerPool::instance().parallel_for(count, [&](size_t k) {
         auto& d = volume_draws_[k];
         d.error.clear();
+        const auto env = ext_.environment(&d.overlay);
         try {
-            d.pipeline->evaluate_stages(ext_.environment(&d.overlay), d.technique, d.constants);
+            d.pipeline->evaluate_stages(env, d.technique, d.constants);
         } catch (const std::exception& ex) {
             d.error = ex.what();
         }
-    }, 8);
+        for (size_t s = 0; s < scopes.size() && s * 2 + 1 < d.scopes.size(); ++s)
+            for (const ScopeStage ss : {ScopeStage::Vertex, ScopeStage::Pixel}) {
+                const size_t slot = s * 2 + (ss == ScopeStage::Pixel ? 1 : 0);
+                d.scopes[slot].clear();
+                d.scope_errors[slot].clear();
+                const auto& scope_stage_data = scopes[s]->stages[size_t(ss)];
+                if (scope_stage_data.cbuffer_init.empty() || scope_stage_data.cbuffer_slot < 0) continue;
+                if (!d.pipeline->binds_shared_cbuffer(ss == ScopeStage::Vertex ? ShaderStage::Vertex : ShaderStage::Pixel,
+                                                      uint32_t(scope_stage_data.cbuffer_slot))) continue;
+                try {
+                    d.scopes[slot] = evaluate_scope(*scopes[s], ss, env);
+                } catch (const std::exception& ex) {
+                    d.scope_errors[slot] = ex.what();
+                }
+            }
+    }, 4);
 }
 
 // ---- Volumetrics -------------------------------------------------------------------------------
@@ -2753,13 +2779,21 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     const auto q12v = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
     const auto q12p = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
     const Scope* extra_scopes[] = {&rigid_scope_, &transparent_scope_, &transparent_adv_scope_};
+    const VolumeDraw* current_draw = nullptr;  // its object scopes were evaluated ahead
     ScopeBufferFn qscopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
         if (reg == 12) return stage == ShaderStage::Vertex ? q12v : q12p;
         if (reg == 13) return full_scopes(stage, 13);
         const ScopeStage ss = scope_stage(stage);
-        for (const Scope* s : extra_scopes) {
+        for (size_t i = 0; i < std::size(extra_scopes); ++i) {
+            const Scope* s = extra_scopes[i];
             const auto& st = s->stages[size_t(ss)];
-            if (st.cbuffer_slot == int32_t(reg) && !st.cbuffer_init.empty()) return upload(evaluate_scope(*s, ss, ext_));
+            if (st.cbuffer_slot != int32_t(reg) || st.cbuffer_init.empty()) continue;
+            if (current_draw && (ss == ScopeStage::Vertex || ss == ScopeStage::Pixel)) {
+                const size_t slot = i * 2 + (ss == ScopeStage::Pixel ? 1 : 0);
+                if (!current_draw->scope_errors[slot].empty()) throw std::runtime_error(current_draw->scope_errors[slot]);
+                if (!current_draw->scopes[slot].empty()) return upload(current_draw->scopes[slot]);
+            }
+            return upload(evaluate_scope(*s, ss, ext_));
         }
         return 0;
     };
@@ -2843,7 +2877,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         volume_overlay_.snapshot(d.overlay);
         shafts.push_back(&vl);
     }
-    evaluate_volume_draws(draws);
+    evaluate_volume_draws(draws, extra_scopes);
     for (size_t k = 0; k < draws; ++k) {
         const auto& d = volume_draws_[k];
         const VolumetricLight& vl = *shafts[k];
@@ -2856,9 +2890,12 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         }
         try {
             if (!d.error.empty()) throw std::runtime_error(d.error);
+            current_draw = &d;
             d.pipeline->draw_volume(gpu, cl, ext_, qscopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
+            current_draw = nullptr;
             ++vol_drawn_;
         } catch (const std::exception& ex) {
+            current_draw = nullptr;
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));
         }
     }
@@ -2962,10 +2999,44 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
     make_cube(gpu);
     const Scope* scopes[] = {&frame_scope_, &view_scope_};
     std::map<std::string, size_t> failures;
+    // The textures not loaded yet are read and decoded ahead on worker threads (one package
+    // reader each); the uploads stay in order on this thread. A texture that fails here is read
+    // again below, so its error is reported where it was before.
+    std::unordered_map<uint32_t, Texture> prefetched;
+    {
+        ProfileScope profile("load.cubemaps.prefetch");
+        std::vector<uint32_t> tags;
+        for (const uint32_t t : required_textures)
+            if (!probe_textures_.contains(t)) tags.push_back(t);
+        std::vector<std::optional<Texture>> loaded(tags.size());
+        const size_t readers = std::min<size_t>(tags.size(), WorkerPool::instance().threads());
+        if (readers > 1) {
+            std::vector<std::unique_ptr<PackageManager>> forks;
+            for (size_t i = 0; i < readers; ++i) forks.push_back(pm.fork());
+            WorkerPool::instance().parallel_for(readers, [&](size_t r) {
+                for (size_t i = r; i < tags.size(); i += readers) {
+                    try {
+                        loaded[i] = load_texture(*forks[r], TagHash(tags[i]));
+                    } catch (const std::exception&) {
+                    }
+                }
+            }, 1);
+            for (size_t i = 0; i < tags.size(); ++i)
+                if (loaded[i]) prefetched.emplace(tags[i], std::move(*loaded[i]));
+        }
+    }
+    auto load = [&](TagHash t) {
+        if (auto p = prefetched.find(t.value); p != prefetched.end()) {
+            Texture texture = std::move(p->second);
+            prefetched.erase(p);
+            return texture;
+        }
+        return load_texture(pm, t);
+    };
     auto texture = [&](TagHash t, bool volume = false) -> ComPtr<ID3D12Resource> {
         if (t.is_none()) return nullptr;
         auto& slot = probe_textures_[t.value];
-        if (!slot) slot = gpu.texture(load_texture(pm, t), volume);
+        if (!slot) slot = gpu.texture(load(t), volume);
         if (volume && slot->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
             throw std::runtime_error("Diffuse probe texture was cached with the wrong dimension");
         return slot;
@@ -2985,13 +3056,25 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             if (!m->specular.is_none() && !filtered_cubes_.contains(m->specular.value)) wanted.push_back(m->specular.value);
         std::ranges::sort(wanted);
         wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+        // The specular cubes the filter reads (2D cube arrays).
+        for (const uint32_t t : wanted)
+            if (auto p = prefetched.find(t); p != prefetched.end() && !probe_textures_[t]) {
+                try {
+                    probe_textures_[t] = gpu.texture(p->second);
+                } catch (const std::exception&) {
+                    probe_textures_.erase(t);  // read and reported again by the filter
+                }
+                prefetched.erase(p);
+            }
         try {
+            ProfileScope profile("load.cubemaps.filter");
             filter_specular_cubes(pm, gpu, wanted);
         } catch (const std::exception& ex) {
             cubemap_notes_.push_back(std::format("specular cube filtering failed: {}", ex.what()));
             return; // never silently substitute the unfiltered chain for a failed original pass
         }
     }
+    ProfileScope profile_volumes("load.cubemaps.volumes");
     for (const MapCubemap* m : cubemaps) {
         try {
             // The volume's permutation, as goriath's get_specialized_cubemap_pipeline (box shape).

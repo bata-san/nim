@@ -469,7 +469,9 @@ private:
         ComPtr<ID3D12GraphicsCommandList> list;
         uint64_t fence = 0;
     };
-    std::array<DrawBundle, 3 * Gpu::kFramesInFlight> draw_bundles_;
+    // Opaque draws are recorded into kDrawBundles bundles in parallel (a few draw calls per frame).
+    static constexpr size_t kDrawBundles = 6;
+    std::array<DrawBundle, kDrawBundles * 4 * Gpu::kFramesInFlight> draw_bundles_;
     void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow = false);
     uint32_t item_instances(const Item& it) const;  // this frame's, after cull()
     struct ScopeDef { const Scope* scope; ShaderStage stage; uint32_t reg; };

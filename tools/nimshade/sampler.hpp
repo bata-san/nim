@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <thread>
@@ -67,8 +68,11 @@ public:
         };
         std::map<std::string, size_t> self, total;
         size_t n = 0;
+        // NIM_SAMPLE_FOCUS=name: only the stacks through that function.
+        const char* focus = std::getenv("NIM_SAMPLE_FOCUS");
         for (const auto& st : stacks_) {
             if (st.empty()) continue;
+            if (focus && std::none_of(st.begin(), st.end(), [&](uint64_t a) { return name(a) == focus; })) continue;
             ++n;
             ++self[name(st[0])];
             std::vector<std::string> seen;

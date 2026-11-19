@@ -6,11 +6,14 @@
 #include "nim/content/map.hpp"
 #include "nim/render/scene.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <stdexcept>
 #include <unordered_set>
 #include <functional>
 #include <map>
 #include <optional>
+#include <span>
 #include <unordered_map>
 
 namespace nim {
@@ -27,18 +30,45 @@ constexpr uint8_t Frame = 1, View = 2, Deferred = 3, DeferredLight = 4, Atmosphe
 // unchanged. Reads of other words fall through to the store.
 class ExternOverlay {
 public:
-    void set(uint8_t id, uint32_t byte_offset, float v) { words_[key(id, byte_offset)] = v; }
+    void set(uint8_t id, uint32_t byte_offset, float v) {
+        if (byte_offset >= kBlockBytes) throw std::out_of_range("ExternOverlay: offset beyond the extern block");
+        const uint32_t i = uint32_t(id) * kWords + (byte_offset >> 2);
+        if (values_.empty()) values_.resize(size_t(256) * kWords), stamps_.resize(size_t(256) * kWords);
+        if (stamps_[i] != epoch_) {
+            stamps_[i] = epoch_;
+            touched_.push_back(i);
+            sorted_ = false;
+        }
+        values_[i] = v;
+    }
     void set(uint8_t id, uint32_t byte_offset, const std::array<float, 4>& v) {
         for (uint32_t i = 0; i < 4; ++i) set(id, byte_offset + i * 4, v[i]);
     }
     void set(uint8_t id, uint32_t byte_offset, const M4& m);
-    // The current values, sorted, for find().
-    void snapshot(std::vector<std::pair<uint32_t, float>>& out) const { out.assign(words_.begin(), words_.end()); }
-    void clear() { words_.clear(); }
+    // The current values, sorted by key(), for find().
+    void snapshot(std::vector<std::pair<uint32_t, float>>& out) {
+        if (!sorted_) std::sort(touched_.begin(), touched_.end()), sorted_ = true;
+        out.resize(touched_.size());
+        for (size_t k = 0; k < touched_.size(); ++k) {
+            const uint32_t i = touched_[k];
+            out[k] = {key(uint8_t(i / kWords), (i % kWords) * 4), values_[i]};
+        }
+    }
+    void clear() {
+        touched_.clear();
+        sorted_ = true;
+        if (++epoch_ == 0) std::fill(stamps_.begin(), stamps_.end(), 0), epoch_ = 1;
+    }
     static uint32_t key(uint8_t id, uint32_t byte_offset) { return uint32_t(id) << 16 | (byte_offset >> 2); }
 
 private:
-    std::map<uint32_t, float> words_;
+    // Dense words of all 256 blocks: the same words are written by every light of a pass.
+    static constexpr uint32_t kBlockBytes = 0x800, kWords = kBlockBytes / 4;
+    std::vector<float> values_;
+    std::vector<uint32_t> stamps_;
+    std::vector<uint32_t> touched_;
+    uint32_t epoch_ = 1;
+    bool sorted_ = true;
 };
 
 // Byte-addressed extern blocks. Unprovided values are errors (offsets match the bytecode:
@@ -216,6 +246,14 @@ public:
     // The TFX of each stage (with `materials`' programs when given) against `env`: what draw_volume
     // would evaluate. Thread-safe; draw_volume then takes the result instead of evaluating again.
     void evaluate_stages(const TfxEnvironment& env, const Technique* materials, StageConstants& out) const;
+    // Whether a stage of `which` binds shared cbuffer b`reg` (not its own constants).
+    bool binds_shared_cbuffer(ShaderStage which, uint32_t reg) const {
+        for (const auto& st : stages_)
+            if (st.which == which)
+                for (const auto& [r, param] : st.cbvs)
+                    if (r == reg && int32_t(r) != st.tfx.cbuffer_slot) return true;
+        return false;
+    }
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
                   std::span<const std::pair<uint32_t, ID3D12Resource*>> textures = {});
@@ -224,7 +262,7 @@ public:
                            ID3D12CommandSignature* signature, ID3D12Resource* args);
 
     std::vector<std::string> notes;  // binding diagnostics, for the UI / nimshade
-    const std::vector<float4>& stage_constants(size_t i) const { return stages_.at(i).constants; }  // last draw's cbuffer
+    const std::vector<float4>& stage_constants(size_t i) const { return stages_.at(i).constants; }  // last draw's cbuffer (not for draws given evaluated constants)
 
 private:
     struct Stage {
@@ -268,6 +306,7 @@ private:
 
 // Runs a scope's bytecode for one stage into a cbuffer (cbuffer_init patched by the program).
 std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const ExternStore& ext);
+std::vector<float4> evaluate_scope(const Scope& scope, ScopeStage stage, const TfxEnvironment& env);
 
 // Original game DXIL only. Engine-owned inputs must be supplied through externs();
 // missing producers are reported instead of being approximated.
@@ -469,10 +508,14 @@ private:
         std::vector<std::pair<uint32_t, float>> overlay;
         GamePipeline::StageConstants constants;
         std::string error;
+        // The volumetrics pass's per-draw object scopes (rigid, transparent, transparent_advanced
+        // x VS / PS), evaluated ahead with the draw's writes; an error is raised only if bound.
+        std::array<std::vector<float4>, 6> scopes;
+        std::array<std::string, 6> scope_errors;
     };
     std::vector<VolumeDraw> volume_draws_;
     ExternOverlay volume_overlay_;
-    void evaluate_volume_draws(size_t count);
+    void evaluate_volume_draws(size_t count, std::span<const Scope* const> scopes = {});
     struct LocalLight {
         uint32_t pipeline = 0;
         std::shared_ptr<const Technique> technique;

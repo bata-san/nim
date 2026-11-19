@@ -2616,7 +2616,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         }
     };
     const std::span<const size_t> opaque(visible_opaque_);
-    std::array<DrawBundle*, 3> bundles{};
+    std::array<DrawBundle*, kDrawBundles> bundles{};
     size_t available = 0;
     if (opaque.size() >= 1800) {
         const auto completed = gpu.completed();
@@ -2627,7 +2627,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         }
     }
     if (available == bundles.size()) {
-        const size_t chunk = opaque.size() / 3;
+        const size_t chunk = opaque.size() / bundles.size();
         for (auto* bundle : bundles) {
             if (!bundle->allocator) {
                 check_hr(gpu.device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle->allocator)), "draw bundle allocator");
@@ -2638,17 +2638,16 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             check_hr(bundle->allocator->Reset(), "reset draw bundle allocator");
             check_hr(bundle->list->Reset(bundle->allocator.Get(), nullptr), "reset draw bundle");
         }
+        std::array<const char*, kDrawBundles> bundle_errors{};
         auto fill_bundle = [&](size_t i) {
             auto* commands = bundles[i]->list.Get();
             commands->SetDescriptorHeaps(1, heaps);
-            record(commands, opaque.subspan(i * chunk, i == 2 ? opaque.size() - 2 * chunk : chunk), false);
-            check_hr(commands->Close(), "close draw bundle");
+            record(commands, opaque.subspan(i * chunk, i + 1 == bundles.size() ? opaque.size() - i * chunk : chunk), false);
+            bundle_errors[i] = FAILED(commands->Close()) ? "close draw bundle" : nullptr;
         };
-        auto first = std::async(std::launch::async, fill_bundle, 0);
-        auto second = std::async(std::launch::async, fill_bundle, 1);
-        fill_bundle(2);
-        first.get();
-        second.get();
+        WorkerPool::instance().parallel_for(bundles.size(), fill_bundle, 1);
+        for (const char* error : bundle_errors)
+            if (error) throw std::runtime_error(error);
         for (auto* bundle : bundles) {
             cl->ExecuteBundle(bundle->list.Get());
             bundle->fence = gpu.pending_fence();
