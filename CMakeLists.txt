@@ -34,6 +34,8 @@ add_library(nim_core STATIC
   src/content/weather.cpp
   src/content/audio.cpp
   src/content/usm.cpp
+  src/content/mpeg1.cpp
+  src/content/hca.cpp
   src/content/movies.cpp
 )
 target_include_directories(nim_core PUBLIC include)
@@ -42,7 +44,7 @@ target_link_libraries(nim_core PUBLIC bcrypt)
 # ---- nimcli: headless inspection / extraction --------------------------------
 add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp tools/nimcli/environment.cpp tools/nim/media.cpp)
 target_include_directories(nimcli PRIVATE tools/nim)
-target_link_libraries(nimcli PRIVATE nim_core xaudio2 mfplat mfuuid)
+target_link_libraries(nimcli PRIVATE nim_core xaudio2)
 
 # ---- nim_render: D3D12 renderer running the game's own shaders --------------
 add_library(nim_render STATIC
@@ -71,7 +73,7 @@ add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_tex
 target_include_directories(nim PRIVATE ${IMGUI_DIR})
 file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
-target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2 mfplat mfuuid)
+target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2)
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()

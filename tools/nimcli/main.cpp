@@ -41,6 +41,7 @@
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/movies.hpp"
+#include "nim/content/hca.hpp"
 #include "media.hpp"
 #include "nim/content/audio.hpp"
 #include "nim/content/fonts.hpp"
@@ -1222,6 +1223,8 @@ int cmd_movie_audio(PackageManager& pm, TagHash usm, const char* out, int channe
     const Entry* e = pm.entry(usm);
     if (!e) throw std::runtime_error("no such entry");
     AdxDecoder adx;
+    HcaDecoder hca;
+    bool is_hca = false;
     PcmAudio pcm;
     std::vector<uint8_t> buf;
     uint64_t pos = 0;
@@ -1234,7 +1237,18 @@ int cmd_movie_audio(PackageManager& pm, TagHash usm, const char* out, int channe
         }
         size_t used = for_each_usm_chunk(buf, [&](const UsmChunk& c) {
             if (c.data_type != 0) return;
-            if (c.stream == UsmStream::Audio && c.channel == channel) adx.feed(c.payload, pcm.samples);
+            if (c.stream == UsmStream::Audio && c.channel == channel) {
+                if (!hca.ready() && !adx.channels && c.payload.size() >= 8 && (c.payload[0] & 0x7F) == 'H' &&
+                    (c.payload[1] & 0x7F) == 'C' && (c.payload[2] & 0x7F) == 'A') {
+                    hca.parse_header(c.payload);
+                    is_hca = true;
+                    if (c.payload.size() > hca.header_size()) hca.feed(c.payload.subspan(hca.header_size()), pcm.samples);
+                } else if (is_hca) {
+                    hca.feed(c.payload, pcm.samples);
+                } else {
+                    adx.feed(c.payload, pcm.samples);
+                }
+            }
             if (c.stream == UsmStream::Subtitle) {
                 if (auto s = parse_usm_subtitle(c.payload); s && subs++ < 20)
                     std::println("subtitle ch{} lang {} {}ms +{}: {}", c.channel, s->language, s->start, s->duration, s->text);
@@ -1242,6 +1256,17 @@ int cmd_movie_audio(PackageManager& pm, TagHash usm, const char* out, int channe
         });
         if (used == 0 && pos >= e->file_size) break;
         buf.erase(buf.begin(), buf.begin() + std::ptrdiff_t(used));
+    }
+    if (is_hca) {
+        pcm.sample_rate = hca.sample_rate();
+        pcm.channels = uint16_t(hca.channels());
+        int peak = 0;
+        double sum = 0;
+        for (int16_t v : pcm.samples) peak = std::max(peak, std::abs(int(v))), sum += double(v) * v;
+        std::println("HCA {} Hz x{}, {} samples ({} frames, {} errors), peak {}, rms {:.0f}", hca.sample_rate(), hca.channels(),
+                     pcm.samples.size() / std::max(1u, hca.channels()), hca.frame_count(), hca.frame_errors(), peak,
+                     std::sqrt(sum / std::max<size_t>(1, pcm.samples.size())));
+        return write_wav(out, pcm) ? 0 : 1;
     }
     pcm.sample_rate = adx.sample_rate;
     pcm.channels = uint16_t(adx.channels);
@@ -1266,6 +1291,33 @@ void write_bmp(const fs::path& path, uint32_t w, uint32_t h, const std::vector<u
             q[0] = p[2], q[1] = p[1], q[2] = p[0];
         }
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
+}
+
+// Writes the raw video elementary stream (the concatenated video chunk payloads) of a USM.
+int cmd_movie_video(PackageManager& pm, TagHash usm, const char* out, uint64_t limit) {
+    const Entry* e = pm.entry(usm);
+    if (!e) throw std::runtime_error("no such entry");
+    std::ofstream f(out, std::ios::binary);
+    std::vector<uint8_t> buf;
+    uint64_t pos = 0, written = 0;
+    size_t chunks = 0;
+    while ((pos < e->file_size || !buf.empty()) && written < limit) {
+        if (pos < e->file_size) {
+            auto more = pm.read_range(usm, pos, 0x400000);
+            pos += more.size();
+            buf.insert(buf.end(), more.begin(), more.end());
+        }
+        size_t used = for_each_usm_chunk(buf, [&](const UsmChunk& c) {
+            if (c.data_type != 0 || c.stream != UsmStream::Video || written >= limit) return;
+            f.write(reinterpret_cast<const char*>(c.payload.data()), std::streamsize(c.payload.size()));
+            written += c.payload.size();
+            ++chunks;
+        });
+        if (used == 0 && pos >= e->file_size) break;
+        buf.erase(buf.begin(), buf.begin() + std::ptrdiff_t(used));
+    }
+    std::println("{} video chunks, {} bytes", chunks, written);
+    return 0;
 }
 
 int cmd_movie_frames(PackageManager& pm, TagHash usm, const fs::path& dir, double start, int count) {
@@ -2082,6 +2134,8 @@ int main(int argc, char** argv) {
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "wem-audit") return cmd_wem_audit(pm, args.size() >= 2 ? std::stoul(args[1]) : 0);
         if (cmd == "movies") return cmd_movies(pm, args.size() >= 2 && args[1] == "-v");
+        if (cmd == "movie-video" && args.size() >= 3)
+            return cmd_movie_video(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoull(args[3]) << 20 : ~0ull);
         if (cmd == "movie-audio" && args.size() >= 3)
             return cmd_movie_audio(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoi(args[3]) : 0);
         if (cmd == "movie-frames" && args.size() >= 3)

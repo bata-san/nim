@@ -3,6 +3,8 @@
 // for the nim GUI. Nothing here touches the GPU: the player hands out RGBA frames to upload.
 #include "nim/content/audio.hpp"
 #include "nim/content/movies.hpp"
+#include "nim/content/mpeg1.hpp"
+#include "nim/content/hca.hpp"
 #include "nim/core/package_manager.hpp"
 
 #include <atomic>

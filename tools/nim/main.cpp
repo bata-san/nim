@@ -3515,7 +3515,7 @@ public:
         else
             name = m.info.audio.size() > 1 ? ui::tr(ui::S::Default) : ui::tr(ui::S::Voice);
         name += std::format("  ch{} {} {}ch", a.channel, usm_audio_codec_name(a.codec), a.channels);
-        if (a.codec != 2) name += std::string(" ") + ui::tr(ui::S::Unsupported);
+        if (a.codec != 2 && a.codec != 4) name += std::string(" ") + ui::tr(ui::S::Unsupported);
         return name;
     }
 
@@ -3732,7 +3732,7 @@ public:
                 ImGui::TextColored({1, 0.4f, 0.4f, 1}, "%s", e.c_str());
             } else if (cur && !p->audio_supported()) {
                 ImGui::SameLine();
-                ImGui::TextDisabled(cur->codec != 2 ? ui::tr(ui::S::VideoOnlyUnsupported) : ui::tr(ui::S::AudioOutputError),
+                ImGui::TextDisabled(cur->codec != 2 && cur->codec != 4 ? ui::tr(ui::S::VideoOnlyUnsupported) : ui::tr(ui::S::AudioOutputError),
                                     usm_audio_codec_name(cur->codec));
             }
         }

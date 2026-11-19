@@ -88,7 +88,8 @@ build/Release/nimcli weather 80AF9550    # a map's world channel controllers (we
 build/Release/nimcli wem 80A1B2C3 out/line.wav   # decode a WEM stream or a dialogue audio event to WAV (NIM_LANGUAGE=6 for Japanese)
 build/Release/nimcli wem-audit         # decode every dialogue WEM and report failures
 build/Release/nimcli movies -v         # list movies (USM): size, codecs, audio tracks, subtitles
-build/Release/nimcli movie-audio USM out/m.wav 1   # decode one ADX track of a movie
+build/Release/nimcli movie-audio USM out/m.wav 1   # decode one ADX/HCA track of a movie
+build/Release/nimcli movie-video USM out/m.m1v 8   # dump the MPEG-1 elementary stream (first 8 MB)
 build/Release/nimcli movie-frames USM out/frames 60 30   # decode frames from 60 s as BMP, plus subtitles
 ```
 
