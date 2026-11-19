@@ -201,6 +201,10 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
         rig.bind_relative.push_back(space == 1 && identity);
         rig.default_pose.push_back(rest);
     }
+    // Only weapon / mechanism rigs, which pose (nearly) everything parent-relative, store bind
+    // offsets. Body rigs (many object-space nodes) keep their identity-rest local nodes (hand,
+    // foot and prop sockets) on the regular path. A threshold estimate.
+    if (std::ranges::count(rig.object_space, uint8_t(1)) > 3) std::ranges::fill(rig.bind_relative, uint8_t(0));
     return rig;
 }
 
