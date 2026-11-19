@@ -412,6 +412,9 @@ int run(int argc, char** argv) {
             Skeleton sk = load_skeleton(pm, r->second.skeleton);
             AnimationRig rig = load_animation_rig(pm, r->second.rig);
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
+            const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups};
+            if (compatible_animation_clips(pm, rigs, rig, std::span(&info, 1)).empty())
+                throw std::runtime_error(std::format("clip {} is incompatible with rig {}", clip.tag.str(), rig.component.str()));
             std::vector<BoneTransform> bones;
             pose_skeleton(sk, rig, clip, clip_frame, bones);
             for (size_t b = 0; b < bones.size(); ++b) bones[b] = bones[b] * sk.inverse_bind[b];

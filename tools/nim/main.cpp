@@ -569,9 +569,11 @@ private:
             if (f == rigs_->end() || f->second.rig.is_none()) return;
             r.skeleton = load_skeleton(pm, f->second.skeleton);
             r.rig = load_animation_rig(pm, f->second.rig);
+            for (const auto& b : r.mesh->buffers)
+                if (!b.skin.bones.empty() && b.skin.max_bone >= r.skeleton->size())
+                    throw std::runtime_error("スキンのボーン番号がスケルトンの範囲外です");
             if (!clips_) clips_ = index_animation_clips(pm);
-            for (const auto& c : *clips_)
-                if (c.bones == r.rig->size()) r.clips.push_back(c);
+            r.clips = compatible_animation_clips(pm, *rigs_, *r.rig, *clips_);
         } catch (const std::exception& ex) {
             r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
             r.skeleton.reset();
@@ -587,7 +589,7 @@ private:
     int live_permutation_ = -1;
     ChannelValues live_channels_;
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
-    std::optional<std::unordered_map<uint32_t, ModelRig>> rigs_;
+    std::optional<ModelRigIndex> rigs_;
     std::optional<std::vector<ClipInfo>> clips_;
     PrepareCache thumbnail_cache_{512};
     std::deque<TagHash> thumbs_;
@@ -1847,13 +1849,13 @@ public:
     void update_animation(float dt) {
         if (!anim || !scene.skinned()) return;
         Animation& a = *anim;
-        if (a.clip < 0 || a.loaded.rotations.empty()) {
+        if (a.clip < 0 || !a.loaded.has_tracks()) {
             if (a.dirty) scene.set_skin_pose({});
             a.dirty = false;
             return;
         }
-        const float frames = float(std::max(1u, a.loaded.frame_count - 1));
-        if (a.playing && frames > 0) {
+        const float frames = float(a.loaded.frame_count);
+        if (a.playing && frames > 1 && !a.dirty) {
             a.frame = std::fmod(a.frame + dt * kClipFps * a.speed, frames);
             if (a.frame < 0) a.frame += frames;
             a.dirty = true;
@@ -1875,6 +1877,12 @@ public:
             return;
         ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", a.skeleton.component.str().c_str(), a.skeleton.size(),
                             a.rig.component.str().c_str());
+        if (a.clips.empty()) {
+            ImGui::TextDisabled("対応するクリップが見つかりません");
+            return;
+        }
+        if (a.clips.front().bone_groups != a.rig.bone_groups)
+            ImGui::TextDisabled("ボーン構成が同じリグのクリップを使用");
         const float em = ImGui::GetFontSize();
         ImGui::SetNextItemWidth(-1);
         const std::string preview = a.clip < 0 ? std::string("バインドポーズ")

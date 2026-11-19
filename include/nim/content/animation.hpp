@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +24,7 @@ struct BoneTransform {
     std::array<float, 4> rotation{0, 0, 0, 1};
     std::array<float, 3> translation{};
     float scale = 1;
+    bool operator==(const BoneTransform&) const = default;
 };
 BoneTransform operator*(const BoneTransform& parent, const BoneTransform& child);
 BoneTransform inverse(const BoneTransform& t);
@@ -49,22 +51,29 @@ Skeleton load_skeleton(PackageManager& pm, TagHash component);
 // rig order; the rig maps each to a skeleton bone and says in which space the clip's rotation is:
 // 0xA8 Vec of 72-byte nodes (i16 at +8: 0/1 parent-relative, 2/6 object space), 0xB8 a default
 // pose (32 B transforms, rig order), 0xE0 skeleton -> rig and 0xF0 rig -> skeleton (u16).
+struct AnimationBoneGroup {
+    uint32_t hash = 0, bones = 0;
+    bool operator==(const AnimationBoneGroup&) const = default;
+};
+
 struct AnimationRig {
     TagHash component;
     std::vector<uint16_t> skeleton_bone;      // rig bone -> skeleton bone
     std::vector<uint8_t> object_space;        // rig bone: rotation is object space, not parent-relative
     std::vector<BoneTransform> default_pose;  // rig order
+    std::vector<AnimationBoneGroup> bone_groups;
+    std::vector<uint8_t> node_layout;         // full authored node records for layout comparisons
     size_t size() const { return skeleton_bone.size(); }
 };
 AnimationRig load_animation_rig(PackageManager& pm, TagHash component);
 
-// Model tag -> skeleton and rig components, from the entities (8080BAAD) that list a component
-// that places the model and a skeleton component (the rig is none when the entity has none).
+// Model tag -> skeleton and rig components, from the model's entity or an unambiguous parent.
 struct ModelRig {
     TagHash skeleton, rig;
+    bool operator==(const ModelRig&) const = default;
 };
-std::unordered_map<uint32_t, ModelRig> index_model_skeletons(PackageManager& pm,
-                                                             const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
+using ModelRigIndex = std::unordered_map<uint32_t, ModelRig>;
+ModelRigIndex index_model_skeletons(PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
 // ---- Animation clips (8080AE01) -----------------------------------------------------------------
 // Constant tracks (8080B13B at 0x10) plus one animated block at 0x18:
@@ -79,20 +88,27 @@ struct AnimationClip {
     uint32_t name_hash = 0;
     uint32_t frame_count = 1;
     uint32_t bone_count = 0;
+    std::vector<AnimationBoneGroup> bone_groups;
     ClipCodec codec = ClipCodec::Static;
     template <typename T> struct Track { uint16_t bone = 0; std::vector<T> frames; };  // one entry = constant
     std::vector<Track<std::array<float, 4>>> rotations;
     std::vector<Track<std::array<float, 3>>> translations;
     std::vector<Track<float>> scales;
+    bool has_tracks() const { return !rotations.empty() || !translations.empty() || !scales.empty(); }
 };
 AnimationClip load_animation_clip(PackageManager& pm, TagHash tag);
 
 struct ClipInfo {
     TagHash tag;
     uint16_t frames = 0, bones = 0;
+    std::vector<AnimationBoneGroup> bone_groups;
 };
-// Every clip in the install with its frame and bone counts (header only).
+// Every clip in the install with its frame and bone counts and ordered bone groups.
 std::vector<ClipInfo> index_animation_clips(PackageManager& pm);
+// Prefer the rig's own groups. If the install has none, use groups from a rig with identical
+// node records, default pose, and skeleton mapping.
+std::vector<ClipInfo> compatible_animation_clips(PackageManager& pm, const ModelRigIndex& models,
+                                                const AnimationRig& rig, std::span<const ClipInfo> clips);
 
 // Overwrites the bones the clip animates in `pose` (indexed by clip bone = rig bone) with the
 // pose at `frame` (fractional frames interpolate; quaternions are blended with nlerp).

@@ -1231,21 +1231,27 @@ int cmd_skeleton(PackageManager& pm, TagHash tag) {
     return 0;
 }
 
-// Skinned models with the skeleton and rig of their entity, and how many clips have the rig's bone count.
+// Skinned models with their skeleton, rig and compatible clips.
 int cmd_skeletons(PackageManager& pm) {
+    pm.build_hash64_index();
     auto materials = index_dynamic_model_materials(pm);
     auto skeletons = index_model_skeletons(pm, materials);
-    std::map<uint32_t, size_t> clips_by_bones;
-    for (const auto& c : index_animation_clips(pm)) clips_by_bones[c.bones]++;
+    const auto clips = index_animation_clips(pm);
     std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> by_skeleton;
     for (const auto& [model, mr] : skeletons) by_skeleton[{mr.skeleton.value, mr.rig.value}].push_back(model);
     for (auto& [key, models] : by_skeleton) {
-        size_t bones = 0, rig_bones = 0;
+        size_t bones = 0, rig_bones = 0, compatible = 0;
         try { bones = load_skeleton(pm, TagHash(key.first)).size(); } catch (...) {}
-        try { if (!TagHash(key.second).is_none()) rig_bones = load_animation_rig(pm, TagHash(key.second)).size(); } catch (...) {}
+        try {
+            if (!TagHash(key.second).is_none()) {
+                const auto rig = load_animation_rig(pm, TagHash(key.second));
+                rig_bones = rig.size();
+                compatible = compatible_animation_clips(pm, skeletons, rig, clips).size();
+            }
+        } catch (...) {}
         std::sort(models.begin(), models.end());
         std::print("{}  bones {:3}  rig {} ({:3})  clips {:4}  models", TagHash(key.first).str(), bones, TagHash(key.second).str(),
-                   rig_bones, rig_bones ? clips_by_bones[uint32_t(rig_bones)] : 0);
+                   rig_bones, compatible);
         for (uint32_t m : models) std::print(" {}", TagHash(m).str());
         std::println("");
     }
@@ -1327,10 +1333,11 @@ int cmd_rig(PackageManager& pm, TagHash tag) {
     return 0;
 }
 
-// Poses a model's skeleton with every clip of its rig's bone count and reports, per codec, how
+// Poses a model's skeleton with every compatible clip and reports, per codec, how
 // far bones move from the bind pose and how low the lowest bone goes (a wrong decoder or rig
 // mapping shows up as large displacements and bones far below the ground).
 int cmd_clipfit(PackageManager& pm, TagHash model) {
+    pm.build_hash64_index();
     auto skeletons = index_model_skeletons(pm, index_dynamic_model_materials(pm));
     auto f = skeletons.find(model.value);
     if (f == skeletons.end() || f->second.rig.is_none()) {
@@ -1344,8 +1351,7 @@ int cmd_clipfit(PackageManager& pm, TagHash model) {
     std::map<std::string, std::vector<float>> moved, lowest, to_default;
     size_t additive = 0;
     std::vector<BoneTransform> object;
-    for (const auto& info : index_animation_clips(pm)) {
-        if (info.bones != rig.size()) continue;
+    for (const auto& info : compatible_animation_clips(pm, skeletons, rig, index_animation_clips(pm))) {
         AnimationClip c;
         try { c = load_animation_clip(pm, info.tag); } catch (...) { continue; }
         float sum = 0, low = 1e9f;

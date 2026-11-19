@@ -72,6 +72,32 @@ std::pair<size_t, uint32_t> resource_at(const TagReader& r, size_t off) {
     return {target, r.u32_at(target - 4)};
 }
 
+std::vector<AnimationBoneGroup> read_bone_groups(const TagReader& r, size_t offset) {
+    const auto groups = r.vec_at(offset);
+    std::vector<AnimationBoneGroup> result;
+    if (groups.element_class != 0x8080AE7F) return result;
+    for (uint64_t i = 0; i < groups.count; ++i) {
+        const size_t row = groups.data + size_t(i) * 8;
+        result.push_back({r.u32_at(row), r.u32_at(row + 4)});
+    }
+    return result;
+}
+
+// S808032B3 holds named child entities (S808032BA, 0x40-byte rows).
+std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r, size_t resource) {
+    const auto children = r.vec_at(resource + 0x118);
+    std::vector<TagHash> result;
+    if (children.element_class != 0x808032BA) return result;
+    for (uint64_t i = 0; i < children.count; ++i) {
+        const size_t row = children.data + size_t(i) * 0x40;
+        const auto child = resolve_wide_hash(pm, r.u32_at(row + 0x10), r.u64_at(row + 0x18));
+        if (!child) continue;
+        const Entry* entry = pm.entry(*child);
+        if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+    }
+    return result;
+}
+
 BoneTransform read_transform(const TagReader& r, size_t o) {
     BoneTransform t;
     for (int c = 0; c < 4; ++c) t.rotation[c] = r.f32_at(o + c * 4);
@@ -129,6 +155,11 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
     if (pose.count != nodes.count || to_skeleton.count != nodes.count) throw std::runtime_error("rig: array sizes differ");
     AnimationRig rig;
     rig.component = component;
+    rig.bone_groups = read_bone_groups(r, a + 0x98);
+    if (nodes.data > r.size() || nodes.count > (r.size() - nodes.data) / 72)
+        throw std::runtime_error("rig: node array out of bounds");
+    const auto layout = r.span().subspan(nodes.data, size_t(nodes.count) * 72);
+    rig.node_layout.assign(layout.begin(), layout.end());
     for (uint64_t i = 0; i < nodes.count; ++i) {
         rig.skeleton_bone.push_back(r.u16_at(to_skeleton.data + size_t(i) * 2));
         const int16_t space = int16_t(r.u16_at(nodes.data + size_t(i) * 72 + 8));
@@ -138,11 +169,12 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
     return rig;
 }
 
-std::unordered_map<uint32_t, ModelRig> index_model_skeletons(
+ModelRigIndex index_model_skeletons(
     PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {
     std::unordered_map<uint32_t, std::vector<uint32_t>> models_of;  // component -> models it places
     for (const auto& [model, m] : materials) models_of[m.component.value].push_back(model);
     std::unordered_set<uint32_t> skeletons, rigs;
+    std::unordered_map<uint32_t, std::vector<TagHash>> children_of_component;
     std::vector<TagHash> entities;
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
@@ -155,35 +187,71 @@ std::unordered_map<uint32_t, ModelRig> index_model_skeletons(
             try {
                 auto bytes = pm.read(tag);
                 TagReader r(bytes);
-                const uint32_t cls = resource_at(r, 0x18).second;
+                const auto [resource, cls] = resource_at(r, 0x18);
                 if (cls == kClassSkeleton) skeletons.insert(tag.value);
                 else if (cls == kClassAnimationRig) rigs.insert(tag.value);
+                else if (cls == 0x808032B3)
+                    children_of_component.emplace(tag.value, read_child_entities(pm, r, resource));
             } catch (...) {
             }
         }
     }
+    struct EntityBinding {
+        ModelRig binding;
+        std::vector<uint32_t> models;
+        std::vector<TagHash> children;
+    };
+    std::unordered_map<uint32_t, EntityBinding> bindings;
     std::unordered_map<uint32_t, ModelRig> out;
     for (TagHash ent : entities) {
         try {
             auto bytes = pm.read(ent);
             TagReader r(bytes);
             auto comps = r.vec_at(0x08);
-            ModelRig mr;
-            std::vector<uint32_t> models;
+            EntityBinding node;
             for (uint64_t k = 0; k < comps.count; ++k) {
                 const uint32_t c = r.u32_at(comps.data + size_t(k) * 12);
-                if (skeletons.count(c)) mr.skeleton = TagHash(c);
-                if (rigs.count(c)) mr.rig = TagHash(c);
-                if (auto f = models_of.find(c); f != models_of.end()) models.insert(models.end(), f->second.begin(), f->second.end());
+                if (skeletons.count(c)) node.binding.skeleton = TagHash(c);
+                if (rigs.count(c)) node.binding.rig = TagHash(c);
+                if (auto f = models_of.find(c); f != models_of.end())
+                    node.models.insert(node.models.end(), f->second.begin(), f->second.end());
+                if (auto f = children_of_component.find(c); f != children_of_component.end())
+                    node.children.insert(node.children.end(), f->second.begin(), f->second.end());
             }
-            if (mr.skeleton.is_none()) continue;
-            for (uint32_t m : models) {
-                auto [it, fresh] = out.emplace(m, mr);
-                if (!fresh && it->second.rig.is_none()) it->second = mr;  // prefer an entity that also has a rig
+            if (!node.binding.skeleton.is_none()) {
+                for (uint32_t m : node.models) {
+                    auto [it, fresh] = out.emplace(m, node.binding);
+                    if (!fresh && it->second.rig.is_none()) it->second = node.binding;
+                }
             }
+            if (!node.models.empty() || !node.children.empty() || !node.binding.skeleton.is_none())
+                bindings.emplace(ent.value, std::move(node));
         } catch (...) {
         }
     }
+    std::unordered_map<uint32_t, ModelRig> inherited;
+    std::unordered_set<uint32_t> ambiguous;
+    for (const auto& [entity, node] : bindings) {
+        if (node.binding.skeleton.is_none() || node.binding.rig.is_none() || node.children.empty()) continue;
+        std::unordered_set<uint32_t> seen;
+        std::vector<TagHash> pending = node.children;
+        while (!pending.empty()) {
+            const auto child = pending.back();
+            pending.pop_back();
+            if (!seen.insert(child.value).second) continue;
+            const auto it = bindings.find(child.value);
+            if (it == bindings.end() || !it->second.binding.skeleton.is_none() || !it->second.binding.rig.is_none()) continue;
+            const auto& child_node = it->second;
+            for (uint32_t model : child_node.models) {
+                if (out.contains(model)) continue;
+                const auto [found, fresh] = inherited.emplace(model, node.binding);
+                if (!fresh && found->second != node.binding) ambiguous.insert(model);
+            }
+            pending.insert(pending.end(), child_node.children.begin(), child_node.children.end());
+        }
+    }
+    for (const auto& [model, binding] : inherited)
+        if (!ambiguous.contains(model)) out.emplace(model, binding);
     return out;
 }
 
@@ -401,6 +469,7 @@ AnimationClip load_animation_clip(PackageManager& pm, TagHash tag) {
     clip.name_hash = r.u32_at(0x120);
     clip.frame_count = std::max<uint32_t>(1, r.u16_at(0x140));
     clip.bone_count = r.u16_at(0x142);
+    clip.bone_groups = read_bone_groups(r, 0x170);
     BoneLists constant{u16_vec(r, 0xA8), u16_vec(r, 0xB8), u16_vec(r, 0xC8)};
     BoneLists animated{u16_vec(r, 0xD8), u16_vec(r, 0xE8), u16_vec(r, 0xF8)};
     // A few clips carry no tracks at all (only the 8080B146 block at 0x28).
@@ -433,13 +502,42 @@ std::vector<ClipInfo> index_animation_clips(PackageManager& pm) {
             const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
             try {
                 auto bytes = pm.read(tag);
-                BinaryReader r(bytes);
-                out.push_back({tag, r.u16_at(0x140), r.u16_at(0x142)});
+                TagReader r(bytes);
+                out.push_back({tag, r.u16_at(0x140), r.u16_at(0x142), read_bone_groups(r, 0x170)});
             } catch (...) {
             }
         }
     }
     return out;
+}
+
+std::vector<ClipInfo> compatible_animation_clips(PackageManager& pm, const ModelRigIndex& models,
+                                                const AnimationRig& rig, std::span<const ClipInfo> clips) {
+    std::vector<ClipInfo> result;
+    for (const auto& clip : clips)
+        if (clip.bones == rig.size() && !clip.bone_groups.empty() && clip.bone_groups == rig.bone_groups)
+            result.push_back(clip);
+    if (!result.empty() || rig.node_layout.empty() ||
+        std::none_of(clips.begin(), clips.end(), [&](const ClipInfo& clip) {
+            return clip.bones == rig.size() && !clip.bone_groups.empty();
+        })) return result;
+
+    std::unordered_set<TagHash> seen{rig.component};
+    std::vector<std::vector<AnimationBoneGroup>> equivalent_groups;
+    for (const auto& [model, binding] : models) {
+        if (binding.rig.is_none() || !seen.insert(binding.rig).second) continue;
+        try {
+            const auto candidate = load_animation_rig(pm, binding.rig);
+            if (!candidate.bone_groups.empty() && candidate.node_layout == rig.node_layout &&
+                candidate.skeleton_bone == rig.skeleton_bone && candidate.default_pose == rig.default_pose)
+                equivalent_groups.push_back(candidate.bone_groups);
+        } catch (const std::exception&) {
+        }
+    }
+    for (const auto& clip : clips)
+        if (clip.bones == rig.size() && std::ranges::find(equivalent_groups, clip.bone_groups) != equivalent_groups.end())
+            result.push_back(clip);
+    return result;
 }
 
 void sample_clip(const AnimationClip& clip, float frame, std::vector<BoneTransform>& local) {
