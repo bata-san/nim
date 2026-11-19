@@ -1,7 +1,10 @@
 #include "nim/render/game_lighting.hpp"
+#include "nim/core/profile.hpp"
+#include "nim/core/parallel.hpp"
 #include "nim/content/weather.hpp"
 
 #include <d3dcompiler.h>
+#include <mutex>
 
 
 #include <algorithm>
@@ -279,7 +282,8 @@ void ExternStore::require(uint8_t id, uint32_t off, uint32_t size) const {
     const size_t base = size_t(id) * kBlockSize + off;
     if (!std::all_of(present_.begin() + base, present_.begin() + base + size, [](uint8_t v) { return v != 0; })) {
         if (auto it = zero_policy_.find(id); it != zero_policy_.end()) {  // data_ is zero there
-            note_estimate(std::format("extern {} +0x{:X} = 0 ({} bytes)", id, off, size), it->second);
+            if (first_note(uint64_t(id) << 40 | uint64_t(off) << 16 | size))
+                note_estimate(std::format("extern {} +0x{:X} = 0 ({} bytes)", id, off, size), it->second);
             return;
         }
         throw std::runtime_error(std::format("Missing game extern {} at byte 0x{:X} ({} bytes); no replacement is permitted", id, off, size));
@@ -292,12 +296,25 @@ bool ExternStore::has(uint8_t id, uint32_t off, uint32_t size) const {
     return std::all_of(present_.begin() + base, present_.begin() + base + size, [](uint8_t v) { return v != 0; });
 }
 
-void ExternStore::note_estimate(std::string what, std::string_view why) const { estimates_.try_emplace(std::move(what), why); }
+namespace {
+// Material constants evaluate on worker threads and report through the same stores.
+std::mutex g_estimate_mutex;
+}
+void ExternStore::note_estimate(std::string what, std::string_view why) const {
+    std::lock_guard lock(g_estimate_mutex);
+    estimates_.try_emplace(std::move(what), why);
+}
+// Repeated per-frame reports of the same missing value skip formatting the same text again.
+bool ExternStore::first_note(uint64_t key) const {
+    std::lock_guard lock(g_estimate_mutex);
+    return noted_.insert(key).second;
+}
 
 bool ExternStore::estimate_null_texture(uint8_t id, uint32_t off) const {
     auto it = zero_policy_.find(id);
     if (it == zero_policy_.end()) return false;
-    note_estimate(std::format("extern {} +0x{:X} texture (null view)", id, off), it->second);
+    if (first_note(uint64_t(1) << 63 | tex_key(id, off)))
+        note_estimate(std::format("extern {} +0x{:X} texture (null view)", id, off), it->second);
     return true;
 }
 
@@ -388,6 +405,43 @@ void ExternStore::set_channel(std::string_view name, float4 v) {
     for (size_t i = 0; i < channel_ids.size() && i < channels.size(); ++i)
         if (channel_ids[i] == h) channels[i] = v;
 }
+void ExternOverlay::set(uint8_t id, uint32_t off, const M4& m) {
+    for (int c = 0; c < 4; ++c) set(id, off + uint32_t(c) * 16, m.c[c]);
+}
+
+TfxEnvironment ExternStore::environment(const std::vector<std::pair<uint32_t, float>>* overlay) const {
+    TfxEnvironment env = environment();
+    if (!overlay || overlay->empty()) return env;
+    auto find = [overlay](uint8_t id, uint32_t off) -> const float* {
+        const uint32_t k = ExternOverlay::key(id, off);
+        const auto it = std::lower_bound(overlay->begin(), overlay->end(), k, [](const auto& e, uint32_t v) { return e.first < v; });
+        return it != overlay->end() && it->first == k ? &it->second : nullptr;
+    };
+    env.extern_float = [this, find](uint8_t id, uint8_t off) {
+        if (const float* v = find(id, uint32_t(off) * 4)) return *v;
+        return get_f(id, uint32_t(off) * 4);
+    };
+    env.extern_vec4 = [this, find](uint8_t id, uint8_t off16) {
+        const uint32_t off = uint32_t(off16) * 16;
+        float4 r{};
+        uint32_t mask = 0;
+        for (uint32_t w = 0; w < 4; ++w)
+            if (const float* v = find(id, off + w * 4)) r[w] = *v, mask |= 1u << w;
+        if (mask == 0) return get_v(id, off);
+        if (mask == 0xF) return r;
+        // Partly written by the draw: the store's words for the rest, checked as one vec4 read
+        // (the same report or error as reading it after the draw's writes).
+        bool present = true;
+        for (uint32_t w = 0; w < 4; ++w)
+            if (!(mask >> w & 1) && !has(id, off + w * 4, 4)) present = false;
+        if (!present) require(id, off, 16);
+        for (uint32_t w = 0; w < 4; ++w)
+            if (!(mask >> w & 1)) std::memcpy(&r[w], data_.data() + size_t(id) * kBlockSize + off + w * 4, 4);
+        return r;
+    };
+    return env;
+}
+
 TfxEnvironment ExternStore::environment() const {
     TfxEnvironment env;
     env.extern_vec4 = [this](uint8_t id, uint8_t off) { return get_v(id, uint32_t(off) * 16); };
@@ -396,22 +450,26 @@ TfxEnvironment ExternStore::environment() const {
         if (ch >= channels.size()) throw std::runtime_error(std::format("Missing game global channel {}", ch));
         return channels[ch];
     };
+    // Reported once each (lock-free check): materials evaluate these on worker threads every frame.
     env.world_channel = [this](uint8_t ch) {
-        note_estimate("TFX 0x64 = scalar world channel registry",
-                      "separate 52-slot script registry; engine opcode implementation is not available");
+        if (first_bit(0))
+            note_estimate("TFX 0x64 = scalar world channel registry",
+                          "separate 52-slot script registry; engine opcode implementation is not available");
         float v = 0;
         if (const auto it = world_channels.find(ch); it != world_channels.end()) v = it->second;
-        else note_estimate(std::format("world channel {} = 0", ch), "no active script state supplied");
+        else if (first_bit(256 + ch)) note_estimate(std::format("world channel {} = 0", ch), "no active script state supplied");
         return float4{v, v, v, v};
     };
     // nim loads every mip of a texture: the streaming state is "fully resident" (min mip 0).
     env.texture_tiling = [this](uint8_t texture) {
-        note_estimate(std::format("texture {} tiling params = 0", texture), "nim loads all mips: fully resident (min resident mip 0)");
+        if (first_bit(512 + texture))
+            note_estimate(std::format("texture {} tiling params = 0", texture), "nim loads all mips: fully resident (min resident mip 0)");
         return float4{0, 0, 0, 0};
     };
     // nim binds every texture as a plain (single-layer, untiled) resource.
     env.texture_layer_count = [this](uint8_t texture) {
-        note_estimate(std::format("texture {} layer count = 1", texture), "nim binds textures untiled with a single layer");
+        if (first_bit(768 + texture))
+            note_estimate(std::format("texture {} layer count = 1", texture), "nim binds textures untiled with a single layer");
         return float4{1, 1, 1, 1};
     };
     return env;
@@ -623,9 +681,22 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
 
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                                const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                               uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures, VolumeBatch* batch) {
-    const Geometry g{materials, &vbv, &ibv, indices, ps_textures, batch};
+                               uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures, VolumeBatch* batch,
+                               const StageConstants* constants) {
+    const Geometry g{materials, &vbv, &ibv, indices, ps_textures, batch, constants};
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
+void GamePipeline::evaluate_stages(const TfxEnvironment& env, const Technique* materials, StageConstants& out) const {
+    if (stages_.size() > out.size()) throw std::logic_error("evaluate_stages: more stages than StageConstants holds");
+    for (size_t i = 0; i < stages_.size(); ++i) {
+        const auto& st = stages_[i];
+        const TechniqueStage& tfx = materials ? materials->stage(st.which) : st.tfx;
+        auto& cb = out[i];
+        cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
+        cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
+        if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env, nullptr, false);
+    }
 }
 
 void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -694,14 +765,20 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         return true;
     };
 
-    for (auto& st : stages_) {
+    for (size_t stage_index = 0; stage_index < stages_.size(); ++stage_index) {
+        auto& st = stages_[stage_index];
         const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
-        auto& cb = st.constants;
-        cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
-        cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
         const auto& textures = st.extern_textures;
-        // The authored resource bindings were decoded at pipeline creation.
-        if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env, nullptr, false);
+        if (geometry && geometry->constants) {
+            st.constants = (*geometry->constants)[stage_index];  // evaluated ahead (evaluate_stages)
+        } else {
+            auto& cb = st.constants;
+            cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
+            cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
+            // The authored resource bindings were decoded at pipeline creation.
+            if (!tfx.bytecode.empty()) run_tfx(tfx.bytecode, tfx.constants, cb, env, nullptr, false);
+        }
+        const auto& cb = st.constants;
         D3D12_GPU_VIRTUAL_ADDRESS own_cb = 0;
         for (auto [reg, param] : st.cbvs) {
             if (int32_t(reg) == tfx.cbuffer_slot && !own_cb) {
@@ -1601,6 +1678,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
                            "the isolated asset does not store a location; it is previewed in the authored interior probe");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
     const bool shadowed = shadow && shadow->valid && shadow->depth;
+    ProfileScope ps_setup("frame.light.setup");
     update_global_channels(p);
     update_exposure(gpu, p);
     fill_externs(gb, vm, p, shadowed);
@@ -1619,6 +1697,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         if (reg == 12) return stage == ShaderStage::Vertex ? cb12_vs : cb12_ps;
         return 0;
     };
+    ps_setup.stop();
     ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
     const bool atmosphere = atm_.valid && p.atmosphere;
     shading_.validate(ext_, scopes);
@@ -1712,6 +1791,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
     if (atmosphere) {
+        ProfileScope ps_("frame.light.atmosphere");
         render_sky_lookups(gpu, cl, scopes);
         render_atmosphere_density(gpu, cl);
         render_froxels(gpu, cl, vm, p, shadow);
@@ -1740,7 +1820,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
     if ((p.ssao && hdao_.loaded()) || volumetrics || transparents) render_linear_depth(gpu, cl, gb, vm);
-    if (p.ssao && hdao_.loaded()) render_ssao(gpu, cl, gb, vm, scopes);
+    if (p.ssao && hdao_.loaded()) { ProfileScope ps_("frame.light.ssao"); render_ssao(gpu, cl, gb, vm, scopes); }
     lights_drawn_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
     vol_drawn_ = 0;
     if (own_env) {
@@ -1770,11 +1850,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             (overhead ? sky_apply_overhead_ : sky_apply_).draw(gpu, cl, ext_, scopes);
         }
         if (!cubemaps_.empty() && own_env) {
-            draw_cubemaps(gpu, cl, gb, vm, scopes, p.probe_distance_fade);
+            { ProfileScope ps_("frame.light.cubemaps"); draw_cubemaps(gpu, cl, gb, vm, scopes, p.probe_distance_fade); }
             ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
                                "engine pass order not in game data; the cubemap alpha replaces what is under it");
         }
-        if (!lights_.empty()) draw_lights(gpu, cl, gb, vm, scopes);
+        if (!lights_.empty()) { ProfileScope ps_("frame.light.draw_lights"); draw_lights(gpu, cl, gb, vm, scopes); }
         if (p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {
             constexpr uint8_t kApply = 0x26;
             // Extern 38 is the full-screen input shared with final_combine: its own store here.
@@ -1792,6 +1872,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     const auto* preview_probe = p.entity_preview && !cubemaps_.empty() ? &cubemaps_.front() : nullptr;
     if (transparents && (sky_ambient || preview_probe) && needs_light_grid) {
         try {
+            ProfileScope ps_("frame.light.grid");
             render_light_grid(gpu, cl, vm, scopes, sky_ambient, overhead_occlusion_on(p), preview_probe);
         } catch (const std::exception& ex) {
             ext_.note_estimate("transparent light grid is unavailable", ex.what());
@@ -1799,15 +1880,17 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     // Screen-space reflections replace the specular IBL where a ray hits what is on screen.
     ssr_drawn_ = false;
+    ProfileScope ps_ssr("frame.light.ssr");
     if (own_env && render_ssr(gpu, cl, gb, vm, p)) {
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
+    ps_ssr.stop();
     if (own_env) Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
     cl->SetGraphicsRootSignature(nullptr);
-    shading_.draw(gpu, cl, ext_, scopes, true);
+    { ProfileScope ps_("frame.light.shading"); shading_.draw(gpu, cl, ext_, scopes, true); }
     if (atmosphere) {
         // The sky pipeline puts its triangle at the view's far depth (cb12[13].x): with the depth
         // test it covers only the pixels no surface was drawn to.
@@ -1827,18 +1910,18 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         // compare cb2[0].y * t10.x + cb2[0].x directly with distance in metres.
         ext_.set(ext::Deferred, 0x00, float4{0, 1, 0, 0});
         ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
-        transparents(cl, hdr);
+        { ProfileScope ps_("frame.light.transparents"); transparents(cl, hdr); }
         ext_.set(ext::Deferred, 0x00, depth_decode);
         ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
-    if (volumetrics) render_volumetrics(gpu, cl, gb, vm, hdr, scopes);
+    if (volumetrics) { ProfileScope ps_("frame.light.volumetrics"); render_volumetrics(gpu, cl, gb, vm, hdr, scopes); }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
     else ssr_history_valid_ = false;  // a later frame must not reflect an image this old
     if (post) {
-        render_post(gpu, cl, gb, p, scopes);
+        { ProfileScope ps_("frame.light.post"); render_post(gpu, cl, gb, p, scopes); }
     } else {
         Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
@@ -2019,7 +2102,9 @@ void GameLighting::render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
 // PS SV_Position minus 0.5: first texel = distance 0 / elevation -1; last = 50km / +1.
 void GameLighting::render_atmosphere_density(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
     if (!atmo_density_.loaded()) throw std::runtime_error("Atmosphere density LUT pipeline is unavailable");
-    ExternStore lut;
+    // Kept between frames: a fresh store allocates and clears 1 MB. Every block it reads is
+    // replaced below.
+    auto& lut = atmo_lut_;
     for (uint8_t id : {ext::Atmosphere, ext::View, ext::Frame}) lut.copy_block_from(id, ext_);
     M4 identity;
     for (int a = 0; a < 4; ++a) identity.c[a][a] = 1;
@@ -2525,34 +2610,68 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
     GamePipeline::VolumeBatch batch;
     const bool light_debug = std::getenv("NIM_LIGHT_DEBUG") != nullptr;
     light_shadows_used_ = 0;
-    for (auto& ll : lights_) {
+    M4 from_rel;  // camera-relative world -> world (bind_light_shadow's +0xC0)
+    from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
+    from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
+    // The extern writes of one light, to the store (when drawing) or to the overlay (ahead).
+    auto write_light = [&](auto& sink, const LocalLight& ll, bool shadowed) {
         const MapLight& l = ll.light;
-        if (frustum.outside(l.lo, l.hi)) continue;
         const M4 node_rel = mul(to_rel, m4(l.node));
         const M4 volume = mul(to_rel, ll.world_volume);  // unit cube -> camera-relative world
-        ext_.set(15, 0x00, mul(vm.vp_rel, volume));
-        ext_.set(ext::DeferredLight, 0x00, 0.0f);
+        sink.set(15, 0x00, mul(vm.vp_rel, volume));
+        sink.set(ext::DeferredLight, 0x00, 0.0f);
         M4 relative_to_box = ll.world_to_box;
         for (size_t i = 0; i < 4; ++i)
             relative_to_box.c[3][i] += vm.eye.x * relative_to_box.c[0][i] + vm.eye.y * relative_to_box.c[1][i] +
                 vm.eye.z * relative_to_box.c[2][i];
-        ext_.set(ext::DeferredLight, 0x40, relative_to_box);
-        ext_.set(ext::DeferredLight, 0xC0, node_rel);
-        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
-        ext_.set(ext::DeferredLight, 0x150, 1.0f);
+        sink.set(ext::DeferredLight, 0x40, relative_to_box);
+        sink.set(ext::DeferredLight, 0xC0, node_rel);
+        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
+        sink.set(ext::DeferredLight, 0x150, 1.0f);
         // +0x154: weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
+        sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+        if (shadowed) {  // bind_light_shadow's values
+            sink.set(6, 0x18, float(ll.shadow->size));
+            sink.set(6, 0x1C, float(ll.shadow->size));
+            sink.set(6, 0x30, float4{-7000, 0, 1, 0});
+            sink.set(6, 0xB0, float4{0, 0, 1, 1});
+            sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
+            sink.set(6, 0x180, 2.0f);
+        }
+        sink.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
+    };
+    size_t draws = 0;
+    volume_overlay_.clear();  // this pass's writes only, over the store as it is now
+    for (size_t index = 0; index < lights_.size(); ++index) {
+        auto& ll = lights_[index];
+        if (frustum.outside(ll.light.lo, ll.light.hi)) continue;
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && ll.shadow_technique;
-        ext_.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+        if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
+        if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
+        auto& d = volume_draws_[draws++];
+        d.light = index;
+        d.shadowed = shadowed;
+        // Only the far side of the volume is drawn (the camera may be inside it); the cube's
+        // winding on screen flips with the handedness of its transform.
+        d.pipeline = light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (ll.mirrored ? 1 : 0)].get();
+        d.technique = shadowed ? ll.shadow_technique.get() : ll.technique.get();
+        write_light(volume_overlay_, ll, shadowed);
+        volume_overlay_.snapshot(d.overlay);
+    }
+    evaluate_volume_draws(draws);
+    for (size_t k = 0; k < draws; ++k) {
+        const auto& d = volume_draws_[k];
+        auto& ll = lights_[d.light];
+        const bool shadowed = d.shadowed;
+        write_light(ext_, ll, shadowed);
         if (shadowed) {
             bind_light_shadow(cl, ll, vm);
             ++light_shadows_used_;
         }
-        ext_.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
-        // Only the far side of the volume is drawn (the camera may be inside it); the cube's
-        // winding on screen flips with the handedness of its transform.
-        GamePipeline& gp = *light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (ll.mirrored ? 1 : 0)];
+        GamePipeline& gp = *d.pipeline;
         try {
-            gp.draw_volume(gpu, cl, ext_, scopes, shadowed ? ll.shadow_technique.get() : ll.technique.get(), cube_vbv_, cube_ibv_, 36, {}, &batch);
+            if (!d.error.empty()) throw std::runtime_error(d.error);
+            gp.draw_volume(gpu, cl, ext_, scopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
             if (light_debug && lights_drawn_ < 2) {
                 const auto& vs = gp.stage_constants(0);
                 const auto& ps = gp.stage_constants(1);
@@ -2566,6 +2685,21 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));
         }
     }
+}
+
+// Evaluates the TFX of the first `count` volume draws on the worker pool. Each sees the store as it
+// is now plus its own recorded writes (the overlay), which is the store's state at its draw: the
+// draws in between only write the overlay's words.
+void GameLighting::evaluate_volume_draws(size_t count) {
+    WorkerPool::instance().parallel_for(count, [&](size_t k) {
+        auto& d = volume_draws_[k];
+        d.error.clear();
+        try {
+            d.pipeline->evaluate_stages(ext_.environment(&d.overlay), d.technique, d.constants);
+        } catch (const std::exception& ex) {
+            d.error = ex.what();
+        }
+    }, 8);
 }
 
 // ---- Volumetrics -------------------------------------------------------------------------------
@@ -2657,37 +2791,72 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     vol_shadows_used_ = 0;
     const LightFrustum frustum(vm);
     GamePipeline::VolumeBatch batch;
-    for (const auto& vl : vol_lights_) {
-        LocalLight& ll = lights_[vl.light];
+    M4 from_rel;  // camera-relative world -> world (bind_light_shadow's +0xC0)
+    from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
+    from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
+    // The extern writes of one shaft, to the store (when drawing) or to the overlay (ahead).
+    auto write_shaft = [&](auto& sink, const LocalLight& ll, bool shadowed) {
         const MapLight& l = ll.light;
-        if (frustum.outside(l.lo, l.hi)) continue;
         // +0xE0: each march sample is looked up in the light's depth map (t2) through the light
         // box, weighted by +0x154 (cb0[41]).
-        const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
         const M4 node = m4(l.node), space = m4(l.light_space);
         const M4 node_rel = mul(to_rel, node);
         const M4 volume = mul(node_rel, space);
         const M4 box = light_box_to_world(node, space);  // light box [0,1]^3 -> world
         const M4 rel_to_box = inverse(mul(to_rel, box));
-        ext_.set(15, 0x00, mul(vm.vp_rel, volume));
-        ext_.set(ext::DeferredLight, 0x00, 0.0f);
-        ext_.set(ext::DeferredLight, 0x40, rel_to_box);
-        ext_.set(ext::DeferredLight, 0xC0, node_rel);
-        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) ext_.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
-        ext_.set(ext::DeferredLight, 0x150, 1.0f);
-        ext_.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
-        ext_.set(ext::DeferredLight, 0x160, 1.0f);
+        sink.set(15, 0x00, mul(vm.vp_rel, volume));
+        sink.set(ext::DeferredLight, 0x00, 0.0f);
+        sink.set(ext::DeferredLight, 0x40, rel_to_box);
+        sink.set(ext::DeferredLight, 0xC0, node_rel);
+        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
+        sink.set(ext::DeferredLight, 0x150, 1.0f);
+        sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+        sink.set(ext::DeferredLight, 0x160, 1.0f);
+        if (shadowed) {  // bind_light_shadow's values
+            sink.set(6, 0x18, float(ll.shadow->size));
+            sink.set(6, 0x1C, float(ll.shadow->size));
+            sink.set(6, 0x30, float4{-7000, 0, 1, 0});
+            sink.set(6, 0xB0, float4{0, 0, 1, 1});
+            sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
+            sink.set(6, 0x180, 2.0f);
+        }
+        sink.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
+        sink.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
+        sink.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
+        return det4(volume) > 0;  // mirrored
+    };
+    std::vector<const VolumetricLight*> shafts;
+    size_t draws = 0;
+    volume_overlay_.clear();  // this pass's writes only, over the store as it is now
+    for (const auto& vl : vol_lights_) {
+        LocalLight& ll = lights_[vl.light];
+        if (frustum.outside(ll.light.lo, ll.light.hi)) continue;
+        const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
+        if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
+        if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
+        auto& d = volume_draws_[draws++];
+        d.light = vl.light;
+        d.shadowed = shadowed;
+        const bool mirrored = write_shaft(volume_overlay_, ll, shadowed);
+        d.pipeline = vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (mirrored ? 1 : 0)].get();
+        d.technique = shadowed ? vl.shadow_technique.get() : vl.technique.get();
+        volume_overlay_.snapshot(d.overlay);
+        shafts.push_back(&vl);
+    }
+    evaluate_volume_draws(draws);
+    for (size_t k = 0; k < draws; ++k) {
+        const auto& d = volume_draws_[k];
+        const VolumetricLight& vl = *shafts[k];
+        LocalLight& ll = lights_[vl.light];
+        const bool shadowed = d.shadowed;
+        write_shaft(ext_, ll, shadowed);
         if (shadowed) {
             bind_light_shadow(cl, ll, vm);
             ++vol_shadows_used_;
         }
-        ext_.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
-        ext_.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
-        ext_.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
-        const bool mirrored = det4(volume) > 0;
-        GamePipeline& gp = *vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (mirrored ? 1 : 0)];
         try {
-            gp.draw_volume(gpu, cl, ext_, qscopes, shadowed ? vl.shadow_technique.get() : vl.technique.get(), cube_vbv_, cube_ibv_, 36, {}, &batch);
+            if (!d.error.empty()) throw std::runtime_error(d.error);
+            d.pipeline->draw_volume(gpu, cl, ext_, qscopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
             ++vol_drawn_;
         } catch (const std::exception& ex) {
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));

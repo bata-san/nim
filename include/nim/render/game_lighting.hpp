@@ -6,6 +6,8 @@
 #include "nim/content/map.hpp"
 #include "nim/render/scene.hpp"
 
+#include <atomic>
+#include <unordered_set>
 #include <functional>
 #include <map>
 #include <optional>
@@ -19,6 +21,25 @@ constexpr uint8_t Frame = 1, View = 2, Deferred = 3, DeferredLight = 4, Atmosphe
                   Particle = 27, Postprocess = 38, Transparent = 40, GlobalLighting = 42, ShadowMask = 43,
                   VolumeFog = 50;
 }
+
+// Per-draw extern values over a shared ExternStore: the 4-byte words a light volume writes before
+// its draw, recorded so its TFX can be evaluated on a worker thread while the store stays
+// unchanged. Reads of other words fall through to the store.
+class ExternOverlay {
+public:
+    void set(uint8_t id, uint32_t byte_offset, float v) { words_[key(id, byte_offset)] = v; }
+    void set(uint8_t id, uint32_t byte_offset, const std::array<float, 4>& v) {
+        for (uint32_t i = 0; i < 4; ++i) set(id, byte_offset + i * 4, v[i]);
+    }
+    void set(uint8_t id, uint32_t byte_offset, const M4& m);
+    // The current values, sorted, for find().
+    void snapshot(std::vector<std::pair<uint32_t, float>>& out) const { out.assign(words_.begin(), words_.end()); }
+    void clear() { words_.clear(); }
+    static uint32_t key(uint8_t id, uint32_t byte_offset) { return uint32_t(id) << 16 | (byte_offset >> 2); }
+
+private:
+    std::map<uint32_t, float> words_;
+};
 
 // Byte-addressed extern blocks. Unprovided values are errors (offsets match the bytecode:
 // float/u32 ops address 4-byte units, vec4/mat4 ops 16-byte units, texture views 8-byte units).
@@ -45,6 +66,8 @@ public:
     std::map<uint32_t, float> world_channels; // script registry slots, never render-globals indices
     void set_channel(std::string_view name, float4 v);
     TfxEnvironment environment() const;
+    // The same environment with `overlay` (sorted ExternOverlay words) over this store's values.
+    TfxEnvironment environment(const std::vector<std::pair<uint32_t, float>>* overlay) const;
     // Engine-produced cb13, including its temporal seeds and exposure state.
     void set_frame_constants(const std::array<float4, 16>& constants) { frame_ = constants; has_frame_ = true; frame_estimated_ = false; }
     bool has_frame_constants() const { return has_frame_; }
@@ -61,6 +84,8 @@ public:
     void estimate_texture(uint8_t id, uint32_t byte_offset, ID3D12Resource* r, std::string_view why);
     void estimate_frame_constants(const std::array<float4, 16>& constants, std::string_view why);
     void note_estimate(std::string what, std::string_view why) const;
+    // True the first time `key` is passed: repeated per-frame reports skip formatting their text.
+    bool first_note(uint64_t key) const;
     // World state blocks (atmosphere, overhead visibility ...) that only a loaded map would
     // supply: unsupplied reads give zeros (texture views a null SRV, which reads zero) and are
     // recorded as estimates instead of failing.
@@ -83,6 +108,24 @@ private:
     std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> stage_scopes_;
     std::map<uint64_t, Tex> textures_;
     mutable std::map<std::string, std::string> estimates_;  // what -> why
+    mutable std::unordered_set<uint64_t> noted_;              // zero-policy reports already made
+    // Fixed reports of the TFX environment (registry, per-channel and per-texture notes).
+    struct NoteBits {
+        std::array<std::atomic<uint32_t>, 32> v{};
+        NoteBits() = default;
+        NoteBits(const NoteBits& o) { *this = o; }
+        NoteBits& operator=(const NoteBits& o) {
+            for (size_t i = 0; i < v.size(); ++i) v[i].store(o.v[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    mutable NoteBits note_bits_;
+    bool first_bit(uint32_t bit) const {
+        const uint32_t mask = 1u << (bit & 31);
+        auto& word = note_bits_.v[bit >> 5];
+        if (word.load(std::memory_order_relaxed) & mask) return false;
+        return !(word.fetch_or(mask) & mask);
+    }
     std::map<uint8_t, std::string> zero_policy_;
 };
 
@@ -164,9 +207,15 @@ public:
         const D3D12_INDEX_BUFFER_VIEW* indices = nullptr;
         std::array<uint64_t, 64> root_bindings{};
     };
+    // Each stage's evaluated cbuffer, in stage order (evaluate_stages).
+    using StageConstants = std::array<std::vector<float4>, 2>;
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                      const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
-                     uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {}, VolumeBatch* batch = nullptr);
+                     uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {}, VolumeBatch* batch = nullptr,
+                     const StageConstants* constants = nullptr);
+    // The TFX of each stage (with `materials`' programs when given) against `env`: what draw_volume
+    // would evaluate. Thread-safe; draw_volume then takes the result instead of evaluating again.
+    void evaluate_stages(const TfxEnvironment& env, const Technique* materials, StageConstants& out) const;
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                   uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
                   std::span<const std::pair<uint32_t, ID3D12Resource*>> textures = {});
@@ -199,6 +248,7 @@ private:
         uint32_t indices;
         std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures;
         VolumeBatch* batch = nullptr;
+        const StageConstants* constants = nullptr;
     };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
@@ -349,6 +399,7 @@ private:
     // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
     GamePipeline hdao_, apply_ssao_;
     ExternStore hdao_ext_;
+    ExternStore atmo_lut_;  // the atmosphere density pass's inputs
     ComPtr<ID3D12Resource> ao_, linear_depth_;
     ComPtr<ID3D12PipelineState> linear_depth_pso_;
     void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
@@ -408,6 +459,20 @@ private:
     uint32_t w_ = 0, h_ = 0;
 
     void draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
+    // A light volume draw of this frame: its extern writes (recorded in order, so each sees the
+    // values every earlier draw left), and its TFX evaluated ahead on the worker pool.
+    struct VolumeDraw {
+        size_t light = 0;
+        bool shadowed = false;
+        GamePipeline* pipeline = nullptr;
+        const Technique* technique = nullptr;
+        std::vector<std::pair<uint32_t, float>> overlay;
+        GamePipeline::StageConstants constants;
+        std::string error;
+    };
+    std::vector<VolumeDraw> volume_draws_;
+    ExternOverlay volume_overlay_;
+    void evaluate_volume_draws(size_t count);
     struct LocalLight {
         uint32_t pipeline = 0;
         std::shared_ptr<const Technique> technique;

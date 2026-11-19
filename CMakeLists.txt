@@ -62,7 +62,7 @@ target_link_libraries(nimcli PRIVATE nim_render)
 
 # ---- nimshade: headless shading test -----------------------------------------
 add_executable(nimshade tools/nimshade/main.cpp)
-target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32)
+target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32 dbghelp winmm)
 
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)

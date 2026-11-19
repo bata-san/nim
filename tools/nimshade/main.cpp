@@ -16,6 +16,7 @@
 //            [--verify-static-motion] (16 frozen TAA frames must have < 0.1 px motion)
 //            [--no-froxel-noise] (compare the original uniform-density atmosphere permutation)
 //            [--dump-lighting] (light/depth/sky/froxel buffers and camera metadata)
+#include "sampler.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/object_channels.hpp"
 #include "nim/core/package_manager.hpp"
@@ -373,6 +374,14 @@ int run(int argc, char** argv) {
         size_t terrain_ok = 0, entity_models_loaded = 0;
         const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         auto tb = std::chrono::steady_clock::now();
+        std::unique_ptr<Sampler> load_sampler;
+        if (const char* e = std::getenv("NIM_SAMPLE"); e && e[0] == '2') {
+            Sampler::init_symbols();
+            HANDLE self = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            load_sampler = std::make_unique<Sampler>();
+            load_sampler->start(self);
+        }
         for (size_t j = 0; j < jobs; ++j) {
             const bool is_terrain = j < terrain.size();
             const std::string what = is_terrain ? terrain[j]->tag.str() : region[j - terrain.size()].mesh.str();
@@ -391,6 +400,7 @@ int run(int argc, char** argv) {
             }
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
+        if (load_sampler) load_sampler->stop_and_print();
         std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
         std::println("placed entity models added: {}", entity_models_loaded);
         scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, std::min(map_radius, geometry_extent) * 0.6f);
@@ -731,6 +741,14 @@ int run(int argc, char** argv) {
         std::array<double, 3> cpu{}, gpu_pass{};
         std::vector<double> budget_samples;
         budget_samples.reserve(benchmark_frames);
+        std::unique_ptr<Sampler> sampler;
+        if (const char* e = std::getenv("NIM_SAMPLE"); e && e[0] == '1') {
+            Sampler::init_symbols();
+            HANDLE self = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            sampler = std::make_unique<Sampler>();
+            sampler->start(self);
+        }
         const auto start = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < benchmark_frames + 8; ++i) {
             gpu.begin_frame(i);
@@ -771,6 +789,7 @@ int run(int argc, char** argv) {
             const D3D12_RANGE written{0, 0};
             readback->Unmap(0, &written);
         }
+        if (sampler) sampler->stop_and_print();
         const double cpu_ms = cpu[0] + cpu[1] + cpu[2], gpu_ms = gpu_pass[0] + gpu_pass[1] + gpu_pass[2];
         std::println("benchmark {} frames at {}x{}: CPU record {:.4f} ms/frame, GPU {:.4f} ms/frame (wall {:.2f}s, 8 warmup frames)",
                      benchmark_frames, width, height, cpu_ms / benchmark_frames, gpu_ms / benchmark_frames,

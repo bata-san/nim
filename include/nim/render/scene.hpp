@@ -330,6 +330,12 @@ public:
 
 private:
     struct Item {
+        // Moved, not copied, when items_ grows (std::map's move is not declared noexcept).
+        Item() = default;
+        Item(Item&&) noexcept = default;
+        Item& operator=(Item&&) noexcept = default;
+        Item(const Item&) = default;
+        Item& operator=(const Item&) = default;
         StaticMeshPart part;
         uint32_t buffers = 0;
         uint8_t stage = 0;
@@ -388,6 +394,10 @@ private:
     float material_time_ = 0, material_delta_ = 0, material_exposure_ = 1;
     float material_time_of_day_ = 0.5f;
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
+    // update_materials' per-call working sets, kept between frames so they are not reallocated.
+    struct MaterialScratch;
+    static void retire_prepared(PreparedMesh&& mesh);
+    std::unique_ptr<MaterialScratch> material_scratch_;
     TagHash tag_;
     size_t world_transparent_draws_ = 0;
     size_t sky_transparent_draws_ = 0;
@@ -447,6 +457,8 @@ private:
         uint8_t levels = 1;  // LOD levels the mesh has (bit n = LOD n)
         uint32_t visible = 0;
         std::array<uint32_t, 8> first{}, count{};  // visible instances per LOD level, in that order
+        std::vector<uint32_t> visible_indices;  // this view's compacted instance stream (static groups)
+        uint8_t visible_lods = 0;
     };
     std::array<std::vector<uint32_t>, 8> cull_scratch_;
     std::vector<uint32_t> visible_static_indices_, visible_static_groups_;

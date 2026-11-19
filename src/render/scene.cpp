@@ -1,5 +1,6 @@
 #include "nim/render/scene.hpp"
 #include "nim/core/profile.hpp"
+#include "nim/core/parallel.hpp"
 #include "nim/content/map.hpp"
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/object_channels.hpp"
@@ -12,6 +13,10 @@
 #include <cstring>
 #include <format>
 #include <future>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -545,8 +550,6 @@ void create_buffer_srv(ID3D12Device* dev, const GpuBuffer& b, DXGI_FORMAT fmt, D
 
 D3D12_RENDER_TARGET_BLEND_DESC engine_blend_desc(int index, int rt) { return blend_desc(index, rt); }
 
-StaticMeshScene::StaticMeshScene() = default;
-StaticMeshScene::~StaticMeshScene() = default;
 
 const std::map<std::string, std::string>& StaticMeshScene::estimates() const {
     static const std::map<std::string, std::string> none;
@@ -642,12 +645,23 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
         if (!value) {
             // No component default and no override: the channel is set at run time by gameplay.
             if (!cc.estimates) throw std::runtime_error(std::format("Missing engine object channel {:08X}", h));
-            cc.estimates->note_estimate(std::format("object channel {:08X} ({}) = 1", h, object_channel_name(h) ? object_channel_name(h) : "unnamed"),
+            if (!cc.estimates->first_note(uint64_t(1) << 62 | h)) value = &unset;
+            else cc.estimates->note_estimate(std::format("object channel {:08X} ({}) = 1", h, object_channel_name(h) ? object_channel_name(h) : "unnamed"),
                                         "run-time object state with no authored default: 1 (goriath's unset channel)");
             value = &unset;
         }
         const float4 v = *value;
         if (cc.uses) {
+            // Materials evaluate on worker threads (update_materials): one writer at a time.
+            static std::shared_mutex uses_mutex;
+            {
+                // Already recorded with this stage and value (every frame after the first): no change.
+                std::shared_lock read(uses_mutex);
+                if (const auto it = cc.uses->find(h); it != cc.uses->end() && (vs ? it->second.vs : it->second.ps) &&
+                    (it->second.value == v || (vs && it->second.ps)))
+                    return v;
+            }
+            std::lock_guard lock(uses_mutex);
             ChannelUse& u = (*cc.uses)[h];
             if (vs) u.vs = true;
             else u.ps = true;
@@ -1438,6 +1452,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
     const size_t uncullable = uncullable_opaque_.size();
     try {
         add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
+        retire_prepared(std::move(mesh));
         ++shadow_generation_;
     } catch (...) {
         try { gpu.flush(); } catch (...) {}
@@ -1641,7 +1656,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             bool committed = false;
             ~FlushFailedUpload() {
                 if (committed) return;
-                try { gpu.flush(); } catch (...) {}
+                // No flush: nothing recorded refers to this item's descriptors, and its textures
+                // (and their staging) stay alive in the scene's texture cache or Gpu::keep_.
                 if (item.srv_first != UINT32_MAX && item.owns_srv) {
                     gpu.srv().free(item.srv_first, kItemSrvs * item.srv_copies);
                     std::erase_if(cache, [&](const auto& entry) { return entry.second == item.srv_first; });
@@ -2004,6 +2020,85 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     }
 }
 
+namespace {
+// Freeing a prepared mesh's CPU copies (vertex, index and texture bytes) costs as much as adding
+// it to the scene; a background thread frees them while loading continues.
+class PreparedRetirer {
+public:
+    static PreparedRetirer& instance() {
+        static PreparedRetirer r;
+        return r;
+    }
+    void retire(PreparedMesh&& mesh) {
+        auto owned = std::make_unique<PreparedMesh>(std::move(mesh));
+        {
+            std::lock_guard lock(mutex_);
+            queue_.push_back(std::move(owned));
+        }
+        wake_.notify_one();
+    }
+    ~PreparedRetirer() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    PreparedRetirer() : thread_([this] { loop(); }) {}
+    void loop() {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            wake_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (queue_.empty() && stop_) return;
+            auto batch = std::move(queue_);
+            queue_.clear();
+            lock.unlock();
+            batch.clear();
+            lock.lock();
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::vector<std::unique_ptr<PreparedMesh>> queue_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+}  // namespace
+
+void StaticMeshScene::retire_prepared(PreparedMesh&& mesh) { PreparedRetirer::instance().retire(std::move(mesh)); }
+
+struct StaticMeshScene::MaterialScratch {
+    struct Job {
+        size_t item;
+        bool vs;
+        ChannelContext channels;
+        float4 origin_storage{0, 0, 0, 1};
+        bool origin = false;
+        uint64_t key;
+        std::string error;
+    };
+    struct Chunk {
+        std::vector<std::string> notes;
+        std::vector<std::tuple<size_t, bool, uint64_t, bool>> requests;
+        std::vector<size_t> placements;
+        std::vector<std::pair<uint32_t, std::string>> table_errors;
+    };
+    std::vector<Chunk> chunks;
+    std::vector<std::atomic<uint32_t>> table_stamps;
+    uint32_t epoch = 0;
+    std::vector<std::atomic<uint64_t>> scope_ready;
+    std::vector<Job> jobs;
+    std::unordered_map<uint64_t, size_t> pending;
+    std::vector<std::tuple<size_t, bool, size_t>> job_users;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> job_addresses;
+};
+
+StaticMeshScene::StaticMeshScene() = default;
+StaticMeshScene::~StaticMeshScene() = default;
+
 void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage,
                                        const ExternStore* frame_inputs) {
     if (!material_externs_) return;
@@ -2120,10 +2215,96 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     };
     const bool transparent = render_stage == kStageTransparent;
     const auto& candidates = transparent ? transparent_items_ : visible_opaque_;
-    for (const auto index : candidates) {
+    if (!material_scratch_) material_scratch_ = std::make_unique<MaterialScratch>();
+    // Material constants are evaluated after the walk, on the worker pool when the scene is a map
+    // (no per-item extern writes): each live (object, technique, stage) once, into its first
+    // item's constants, then uploaded in order. Results do not depend on the evaluation order.
+    using MaterialJob = MaterialScratch::Job;
+    auto& jobs = material_scratch_->jobs;
+    auto& pending = material_scratch_->pending;
+    auto& job_users = material_scratch_->job_users;  // (item, vs, job)
+    jobs.clear();
+    pending.clear();
+    job_users.clear();
+    // A single entity preview writes per-model externs and replaces the evaluated address per
+    // placement: evaluated in place, in order, on this thread. A map's items are walked on the
+    // worker pool in fixed chunks whose results are merged in item order.
+    const bool deferred_evaluation = !assembled_ && !dynamic_;
+    using Chunk = MaterialScratch::Chunk;  // requests: (item, vs, key, origin)
+    auto& chunks = material_scratch_->chunks;
+    // Shared tables are claimed by the first item that reaches them in this call.
+    auto& stamps = material_scratch_->table_stamps;
+    {
+        size_t need = 0;
+        for (const auto index : candidates)
+            need = std::max<size_t>(need, items_[index].srv_first + size_t(items_[index].srv_copies) * kItemSrvs);
+        if (stamps.size() < need) {
+            stamps = std::vector<std::atomic<uint32_t>>(need + need / 2);
+            material_scratch_->epoch = 0;
+        }
+    }
+    const uint32_t epoch = ++material_scratch_->epoch;
+    // Shared scopes are produced at most once per call, by whichever item needs them first.
+    std::mutex scope_mutex;
+    auto& scope_ready = material_scratch_->scope_ready;
+    scope_ready = std::vector<std::atomic<uint64_t>>(scope_defs_.size());
+    auto shared_scope = [&](uint32_t slot) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        if (const auto a = scope_ready[slot].load(std::memory_order_acquire)) return a;
+        std::lock_guard lock(scope_mutex);
+        if (const auto a = scope_ready[slot].load(std::memory_order_relaxed)) return a;
+        const auto a = scope_address(slot);
+        scope_ready[slot].store(a, std::memory_order_release);
+        return a;
+    };
+    auto material_env = [&](const Item& it, const ChannelContext& channels, bool vs) {
+        auto env = with_channels(base, channels, vs);
+        if (!vs && it.ps_atlas) {
+            const auto& atlas = *it.ps_atlas;
+            env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
+            env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
+            ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
+                              "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
+        }
+        return env;
+    };
+    // The object's position is per placement: one set of constants for each (on this thread).
+    auto placement_constants = [&](size_t index, const ChannelContext& model_cc) {
+        auto& it = items_[index];
+        const auto& set = sets_[it.buffers];
+        it.vs_placement_addresses.clear();
+        it.ps_placement_addresses.clear();
+        if (!it.vs_reads_position && !it.ps_reads_position) return;
+        auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
+            ChannelContext pc = model_cc;
+            pc.world_position = &position;
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, pc, vs));
+            const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+            std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+            return a.gpu;
+        };
+        if (set.dynamic) {
+            if (it.vs_reads_position) it.vs_placement_addresses.resize(set.placements.size());
+            if (it.ps_reads_position) it.ps_placement_addresses.resize(set.placements.size());
+            auto placement = [&](uint32_t i) {
+                const auto& p = set.placements[i];
+                const float4 position{p[3], p[7], p[11], 1};
+                if (it.vs_reads_position) it.vs_placement_addresses[i] = at(it.vs_material, it.vs_constants, position, true);
+                if (it.ps_reads_position) it.ps_placement_addresses[i] = at(it.ps_material, it.ps_constants, position, false);
+            };
+            if (set.cull == UINT32_MAX)
+                for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
+            else
+                for (const auto i : cull_groups_[set.cull].visible_placements) placement(i);
+        } else if (dynamic_) {
+            const float4 position{model_cb_[3][0], model_cb_[3][1], model_cb_[3][2], 1};
+            if (it.vs_reads_position) it.vs_address = at(it.vs_material, it.vs_constants, position, true);
+            if (it.ps_reads_position) it.ps_address = at(it.ps_material, it.ps_constants, position, false);
+        }
+    };
+    auto process = [&](size_t index, Chunk& chunk) {
         auto& it = items_[index];
         if (it.light_grid) it.light_grid_ready = frame_inputs && frame_inputs->texture(ext::Transparent, 0x28).resource;
-        if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
+        if (!item_instances(it)) return;  // culled this frame: not drawn, nothing to evaluate
       try {
         const auto& set = sets_[it.buffers];
         ChannelContext model_cc = cc;
@@ -2134,34 +2315,34 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         }
         it.scope_addresses.resize(it.scope_slots.size());
         for (size_t k = 0; k < it.scope_slots.size(); ++k)
-            it.scope_addresses[k] = {it.scope_slots[k].first, scope_address(it.scope_slots[k].second)};
-        auto material_env = [&](const ChannelContext& channels, bool vs) {
-            auto env = with_channels(base, channels, vs);
-            if (!vs && it.ps_atlas) {
-                const auto& atlas = *it.ps_atlas;
-                env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
-                env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
-                ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
-                                  "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
-            }
-            return env;
-        };
+            it.scope_addresses[k] = {it.scope_slots[k].first, shared_scope(it.scope_slots[k].second)};
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
             const uint64_t object = assembled_ ? set.model.value - TagHash::kBase : 0;
             const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
+            if (deferred_evaluation) {
+                const bool origin = (vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic);
+                chunk.requests.emplace_back(index, vs, key, origin);
+                return D3D12_GPU_VIRTUAL_ADDRESS(0);
+            }
             // A placed object's position is filled in per placement below: not reported as unset here.
             static const float4 origin{0, 0, 0, 1};
             ChannelContext ec = model_cc;
-            if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || sets_[it.buffers].dynamic)) ec.world_position = &origin;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(ec, vs));
+            if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic)) ec.world_position = &origin;
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             material_addresses_.emplace(key, a.gpu);
             return a.gpu;
         };
+        // Static parts with the same views share one descriptor table (add_mesh_parts): its
+        // engine views are written once per call. A failure to resolve them fails every sharer
+        // (applied after the walk).
+        const uint32_t table = it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs;
+        const bool shared_table = stamps[table].exchange(epoch, std::memory_order_relaxed) == epoch;
         auto bind_shared = [&](const StageResourceSources& sources, const auto& kinds, bool vs) {
+            if (shared_table) return;
             for (const auto& [slot, source] : sources.extern_textures) {
                 const auto kind = kinds.find(slot);
                 if (kind == kinds.end()) continue;
@@ -2184,49 +2365,123 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                     gpu.srv().cpu(it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs + (vs ? kPsSrvs : 0) + slot));
             }
         };
-        bind_shared(it.vs_sources, it.vs_kinds, true);
-        bind_shared(it.ps_sources, it.ps_kinds, false);
+        try {
+            bind_shared(it.vs_sources, it.vs_kinds, true);
+            bind_shared(it.ps_sources, it.ps_kinds, false);
+        } catch (const std::exception& ex) {
+            chunk.table_errors.emplace_back(table, ex.what());
+            throw;
+        }
         if (it.vs_reads_position < 0) it.vs_reads_position = reads_object_position(it.vs_material);
         if (it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
         it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0, true);
         it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
-        // The object's position is per placement: one set of constants for each.
-        it.vs_placement_addresses.clear();
-        it.ps_placement_addresses.clear();
-        if (it.vs_reads_position || it.ps_reads_position) {
-            auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
-                ChannelContext pc = model_cc;
-                pc.world_position = &position;
-                evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(pc, vs));
-                const auto a = gpu.dynamic(cb.size() * sizeof(float4));
-                std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
-                return a.gpu;
-            };
-            if (set.dynamic) {
-                if (it.vs_reads_position) it.vs_placement_addresses.resize(set.placements.size());
-                if (it.ps_reads_position) it.ps_placement_addresses.resize(set.placements.size());
-                auto placement = [&](uint32_t i) {
-                    const auto& p = set.placements[i];
-                    const float4 position{p[3], p[7], p[11], 1};
-                    if (it.vs_reads_position) it.vs_placement_addresses[i] = at(it.vs_material, it.vs_constants, position, true);
-                    if (it.ps_reads_position) it.ps_placement_addresses[i] = at(it.ps_material, it.ps_constants, position, false);
-                };
-                if (set.cull == UINT32_MAX)
-                    for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
-                else
-                    for (const auto i : cull_groups_[set.cull].visible_placements) placement(i);
-            } else if (dynamic_) {
-                const float4 position{model_cb_[3][0], model_cb_[3][1], model_cb_[3][2], 1};
-                if (it.vs_reads_position) it.vs_address = at(it.vs_material, it.vs_constants, position, true);
-                if (it.ps_reads_position) it.ps_address = at(it.ps_material, it.ps_constants, position, false);
-            }
+        if (deferred_evaluation) {
+            it.vs_placement_addresses.clear();
+            it.ps_placement_addresses.clear();
+            if (it.vs_reads_position || it.ps_reads_position) chunk.placements.push_back(index);
+        } else {
+            placement_constants(index, model_cc);
         }
       } catch (const std::exception& ex) {
         // One part without its game inputs is left out (never drawn with invented values);
         // the rest of the scene still draws.
         it.failed = true;
-        notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), ex.what()));
+        chunk.notes.push_back(std::format("{}: not drawn: {}", it.technique.str(), ex.what()));
       }
+    };
+    constexpr size_t kChunk = 256;
+    const size_t chunk_count = deferred_evaluation ? (candidates.size() + kChunk - 1) / kChunk : 1;
+    if (chunks.size() < chunk_count) chunks.resize(chunk_count);
+    for (size_t c = 0; c < chunk_count; ++c) {
+        auto& chunk = chunks[c];
+        chunk.notes.clear();
+        chunk.requests.clear();
+        chunk.placements.clear();
+        chunk.table_errors.clear();
+    }
+    if (deferred_evaluation) {
+        WorkerPool::instance().parallel_for(chunk_count, [&](size_t c) {
+            const size_t end = std::min(candidates.size(), (c + 1) * kChunk);
+            for (size_t i = c * kChunk; i < end; ++i) process(candidates[i], chunks[c]);
+        });
+    } else {
+        for (const auto index : candidates) process(index, chunks[0]);
+    }
+    // Merge in item order.
+    std::unordered_map<uint32_t, std::string> failed_tables;
+    for (size_t c = 0; c < chunk_count; ++c) {
+        auto& chunk = chunks[c];
+        for (auto& n : chunk.notes) notes_.push_back(std::move(n));
+        for (auto& [table, error] : chunk.table_errors) failed_tables.try_emplace(table, std::move(error));
+        for (const auto& [index, vs, key, origin] : chunk.requests) {
+            auto [job, added] = pending.try_emplace(key, jobs.size());
+            if (added) jobs.push_back(MaterialJob{index, vs, cc, {0, 0, 0, 1}, origin, key, {}});
+            job_users.emplace_back(index, vs, job->second);
+        }
+    }
+    if (!failed_tables.empty())
+        for (const auto index : candidates) {
+            auto& it = items_[index];
+            if (it.failed || !item_instances(it)) continue;
+            const auto f = failed_tables.find(it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs);
+            if (f == failed_tables.end()) continue;
+            it.failed = true;
+            notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), f->second));
+        }
+    for (size_t c = 0; c < chunk_count; ++c)
+        for (const auto index : chunks[c].placements) {
+            auto& it = items_[index];
+            if (it.failed) continue;
+            try {
+                placement_constants(index, cc);
+            } catch (const std::exception& ex) {
+                it.failed = true;
+                notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), ex.what()));
+            }
+        }
+    if (jobs.empty()) return;
+    auto run_job = [&](size_t j) {
+        auto& job = jobs[j];
+        auto& it = items_[job.item];
+        try {
+            ChannelContext ec = job.channels;
+            if (job.origin) ec.world_position = &job.origin_storage;
+            auto env = with_channels(base, ec, job.vs);
+            if (!job.vs && it.ps_atlas) {
+                const auto& atlas = *it.ps_atlas;
+                env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
+                env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
+                ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
+                                  "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
+            }
+            const auto& material = job.vs ? it.vs_material : it.ps_material;
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env);
+        } catch (const std::exception& ex) {
+            job.error = ex.what();
+        }
+    };
+    WorkerPool::instance().parallel_for(jobs.size(), run_job, 8);
+    auto& job_addresses = material_scratch_->job_addresses;
+    job_addresses.assign(jobs.size(), 0);
+    for (size_t j = 0; j < jobs.size(); ++j) {
+        if (!jobs[j].error.empty()) continue;
+        const auto& it = items_[jobs[j].item];
+        const auto& cb = jobs[j].vs ? it.vs_constants : it.ps_constants;
+        const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+        std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+        material_addresses_.emplace(jobs[j].key, a.gpu);
+        job_addresses[j] = a.gpu;
+    }
+    for (const auto& [index, vs, j] : job_users) {
+        auto& it = items_[index];
+        if (it.failed) continue;
+        if (!jobs[j].error.empty()) {
+            it.failed = true;
+            notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), jobs[j].error));
+            continue;
+        }
+        (vs ? it.vs_address : it.ps_address) = job_addresses[j];
     }
 }
 
@@ -2541,16 +2796,22 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
     visible_opaque_.clear();
     visible_static_indices_.clear();
     visible_static_groups_.clear();
-    for (uint32_t group_index = 0; group_index < cull_groups_.size(); ++group_index) {
+    // Each group is tested on the worker pool into its own lists; the streams are then gathered
+    // in group order, so the result does not depend on the threads.
+    auto test_group = [&](size_t group_index) {
         auto& group = cull_groups_[group_index];
         group.visible_depths.clear();
         group.visible_placements.clear();
+        group.visible_indices.clear();
+        group.visible_lods = 0;
         group.first = {};
         group.count = {};
         group.visible = 0;
         float z = 0;
-        if (outside(group.bounds, z)) continue;
-        for (auto& v : cull_scratch_) v.clear();
+        if (outside(group.bounds, z)) return;
+        thread_local std::array<std::vector<uint32_t>, 8> lod_scratch;
+        auto& cull_scratch = lod_scratch;
+        for (auto& v : cull_scratch) v.clear();
         for (uint32_t i = 0; i < group.spheres.size(); ++i) {
             const auto& sp = group.spheres[i];
             if (group.spheres.size() != 1 && outside(sp, z)) continue;
@@ -2570,27 +2831,33 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
             while (!near_camera && level < int(detail_radii.size()) && px < detail_radii[size_t(level)]) ++level;
             while (level > 0 && !((group.levels >> level) & 1)) --level;
             while (level < 7 && !((group.levels >> level) & 1)) ++level;
-            cull_scratch_[size_t(level)].push_back(i);
+            cull_scratch[size_t(level)].push_back(i);
         }
+        if (!group.visible || group.dynamic) return;
+        uint32_t first = 0;
+        for (size_t l = 0; l < group.count.size(); ++l) {
+            group.first[l] = first;
+            group.count[l] = uint32_t(cull_scratch[l].size());
+            if (cull_scratch[l].empty()) continue;
+            group.visible_lods |= uint8_t(1u << l);
+            group.visible_indices.insert(group.visible_indices.end(), cull_scratch[l].begin(), cull_scratch[l].end());
+            if (group.has_transparency)
+                for (uint32_t i : cull_scratch[l]) {
+                    const auto& s = group.spheres[i];
+                    group.visible_depths.push_back(dot(V3{s[0], s[1], s[2]} - vm.eye, vm.fwd));
+                }
+            first += group.count[l];
+        }
+    };
+    WorkerPool::instance().parallel_for(cull_groups_.size(), test_group, 256);
+    for (uint32_t group_index = 0; group_index < cull_groups_.size(); ++group_index) {
+        auto& group = cull_groups_[group_index];
         if (!group.visible) continue;
-        uint8_t lods = 0;
+        const uint8_t lods = group.visible_lods;
         if (!group.dynamic) {
             visible_static_groups_.push_back(group_index);
             group.stream_offset = uint32_t(visible_static_indices_.size());
-            uint32_t first = 0;
-            for (size_t l = 0; l < group.count.size(); ++l) {
-                group.first[l] = first;
-                group.count[l] = uint32_t(cull_scratch_[l].size());
-                if (cull_scratch_[l].empty()) continue;
-                lods |= uint8_t(1u << l);
-                visible_static_indices_.insert(visible_static_indices_.end(), cull_scratch_[l].begin(), cull_scratch_[l].end());
-                if (group.has_transparency)
-                    for (uint32_t i : cull_scratch_[l]) {
-                        const auto& s = group.spheres[i];
-                        group.visible_depths.push_back(dot(V3{s[0], s[1], s[2]} - vm.eye, vm.fwd));
-                    }
-                first += group.count[l];
-            }
+            visible_static_indices_.insert(visible_static_indices_.end(), group.visible_indices.begin(), group.visible_indices.end());
         }
         const uint8_t stage = shadow && group.authored_shadow ? kStageShadow : 0;
         for (size_t index = group.first_item; index < group.end_item; ++index)
@@ -2615,8 +2882,13 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
 
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
     srv_frame_ = (srv_frame_ + 1) % kSrvCopies;
+    ProfileScope ps_cull("frame.gbuffer.cull");
     cull(gpu, vm, gb.height());
+    ps_cull.stop();
+    ProfileScope ps_mat("frame.gbuffer.materials");
     update_materials(gpu, gb.width(), gb.height(), vm);
+    ps_mat.stop();
+    ProfileScope ps_draw("frame.gbuffer.draw");
     if (skin_dirty_) update_skin(cl);
     const float clear[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) cl->ClearRenderTargetView(gb.rtv[i], clear, 0, nullptr);
@@ -2630,8 +2902,13 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
     shadow.valid = false;
     if (!shadow.depth || items_.size() == transparent_count()) return;
     if (skin_dirty_) update_skin(cl);
+    ProfileScope ps_cull("frame.shadow.cull");
     cull(gpu, shadow.vm, shadow.size, true);
+    ps_cull.stop();
+    ProfileScope ps_mat("frame.shadow.materials");
     update_materials(gpu, shadow.size, shadow.size, shadow.vm);
+    ps_mat.stop();
+    ProfileScope ps_draw("frame.shadow.draw");
     cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
     cl->OMSetRenderTargets(0, nullptr, FALSE, &shadow.dsv);
     draw_items(gpu, cl, 0, shadow.size, shadow.size, shadow.vm, true);
@@ -2681,7 +2958,9 @@ void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl
     material_exposure_ = inputs.get_f(ext::Frame, 0x1C);  // lighting's newly adapted exposure
     // Supply cb13 for this pass without freezing the scene's own frame constants next frame.
     // Reevaluate only transparents: descriptors used by recorded G-buffer/shadow draws stay intact.
+    ProfileScope ps_mat("frame.transparent.materials");
     update_materials(gpu, gb.width(), gb.height(), vm, kStageTransparent, &inputs);
+    ps_mat.stop();
     Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {rtv, gb.null_rtv, gb.null_rtv, gb.null_rtv, gb.rtv[3]};
     cl->OMSetRenderTargets(5, targets, FALSE, &gb.dsv_ro);
