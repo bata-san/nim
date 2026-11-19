@@ -1,4 +1,5 @@
 // Unit tests that do not need a game install.
+#include "nim/content/animation.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/content/weather.hpp"
@@ -188,6 +189,42 @@ int main() {
         const auto d = a.path_direction(0, 0.25f);  // half way between the two entries
         CHECK(std::fabs(d[0] - d[1]) < 1e-6f && std::fabs(d[0] * d[0] + d[1] * d[1] - 1) < 1e-5f);
         CHECK(a.path_direction(1, 0.5f)[2] == 1);  // an empty path points up
+    }
+
+    {
+        // A local mechanical joint slides and scales. Its child follows the resulting transform.
+        Skeleton mechanism;
+        mechanism.parents = {-1, 0, 1};
+        mechanism.hashes = {1, 2, 3};
+        mechanism.bind.resize(3);
+        mechanism.bind[1].translation = {0, 0, 1};
+        mechanism.bind[2].translation = {0, 0, 2};
+        mechanism.local_bind = mechanism.bind;
+        mechanism.local_bind[2].translation = {0, 0, 1};
+        AnimationRig rig;
+        rig.skeleton_bone = {0, 1};
+        rig.object_space = {0, 0};
+        rig.default_pose.assign(mechanism.local_bind.begin(), mechanism.local_bind.begin() + 2);
+        AnimationClip clip;
+        clip.frame_count = 2;
+        clip.translations = {{1, {{0, 0, 1}, {0, 0, 2}}}};
+        clip.scales = {{1, {1, 2}}};
+        std::vector<BoneTransform> posed;
+        pose_skeleton(mechanism, rig, clip, 1, posed);
+        CHECK(posed[1].translation[2] == 2);
+        CHECK(posed[2].translation[2] == 4);
+        CHECK(posed[2].scale == 2);
+        rig.default_pose[1].translation[2] = 3;
+        pose_skeleton(mechanism, rig, clip, 1, posed);
+        CHECK(posed[1].translation[2] == 1);
+
+        // A matching joint follows by name and bind transform even when the part's bone order differs.
+        Skeleton attachment;
+        attachment.parents = {-1, 0, 1, 1, -1};
+        attachment.hashes = {1, 3, 4, 2, 5};
+        attachment.bind.resize(5);
+        attachment.bind[1] = mechanism.bind[2];
+        CHECK((assembly_pose_map(mechanism, attachment) == std::vector<int32_t>{0, 2, 2, 2, -1}));
     }
 
     if (g_failures) return 1;

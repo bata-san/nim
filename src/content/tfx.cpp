@@ -153,6 +153,7 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
     auto bytes = pm.read(tag);
     TagReader r(bytes);
     auto meshes = r.vec_at(0x10);
+    m.bone_count = r.u32_at(0x98);
     for (uint64_t i = 0; i < meshes.count; ++i) {
         const size_t o = meshes.data + size_t(i) * 0x88;
         DynamicMesh dm;

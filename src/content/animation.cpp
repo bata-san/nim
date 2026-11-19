@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -98,6 +99,22 @@ std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r,
     return result;
 }
 
+// S8080A313 groups optional equipment parts. A slot with one choice has a unique preview.
+std::vector<TagHash> read_equipment_entities(PackageManager& pm, const TagReader& r, size_t resource) {
+    const auto slots = r.vec_at(resource + 0x98);
+    std::vector<TagHash> result;
+    if (slots.element_class != 0x8080A320) return result;
+    for (uint64_t i = 0; i < slots.count; ++i) {
+        const auto choices = r.vec_at(slots.data + size_t(i) * 0x18 + 8);
+        if (choices.count != 1 || choices.element_class != 0x8080A322) continue;
+        const auto child = resolve_wide_hash(pm, r.u32_at(choices.data + 8), r.u64_at(choices.data + 0x10));
+        if (!child) continue;
+        const Entry* entry = pm.entry(*child);
+        if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+    }
+    return result;
+}
+
 BoneTransform read_transform(const TagReader& r, size_t o) {
     BoneTransform t;
     for (int c = 0; c < 4; ++c) t.rotation[c] = r.f32_at(o + c * 4);
@@ -106,6 +123,15 @@ BoneTransform read_transform(const TagReader& r, size_t o) {
     if (!(t.scale > 0)) t.scale = 1;
     t.rotation = qnormalize(t.rotation);
     return t;
+}
+
+bool same_skeleton(const Skeleton& a, const Skeleton& b) {
+    return a.hashes == b.hashes && a.parents == b.parents && a.bind == b.bind && a.inverse_bind == b.inverse_bind;
+}
+
+bool same_rig(const AnimationRig& a, const AnimationRig& b) {
+    return a.node_layout == b.node_layout && a.skeleton_bone == b.skeleton_bone &&
+           a.default_pose == b.default_pose && a.bone_groups == b.bone_groups;
 }
 
 } // namespace
@@ -170,11 +196,12 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
 }
 
 ModelRigIndex index_model_skeletons(
-    PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {
+    PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials, ModelAssemblyIndex* assemblies) {
     std::unordered_map<uint32_t, std::vector<uint32_t>> models_of;  // component -> models it places
     for (const auto& [model, m] : materials) models_of[m.component.value].push_back(model);
     std::unordered_set<uint32_t> skeletons, rigs;
     std::unordered_map<uint32_t, std::vector<TagHash>> children_of_component;
+    std::unordered_map<uint32_t, std::vector<TagHash>> equipment_of_component;
     std::vector<TagHash> entities;
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
@@ -192,6 +219,8 @@ ModelRigIndex index_model_skeletons(
                 else if (cls == kClassAnimationRig) rigs.insert(tag.value);
                 else if (cls == 0x808032B3)
                     children_of_component.emplace(tag.value, read_child_entities(pm, r, resource));
+                else if (cls == 0x8080A313 && assemblies)
+                    equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource));
             } catch (...) {
             }
         }
@@ -200,9 +229,12 @@ ModelRigIndex index_model_skeletons(
         ModelRig binding;
         std::vector<uint32_t> models;
         std::vector<TagHash> children;
+        std::vector<TagHash> equipment;
     };
     std::unordered_map<uint32_t, EntityBinding> bindings;
     std::unordered_map<uint32_t, ModelRig> out;
+    std::unordered_map<TagHash, TagHash> rig_for_skeleton;
+    std::unordered_set<TagHash> shared_skeletons;
     for (TagHash ent : entities) {
         try {
             auto bytes = pm.read(ent);
@@ -217,14 +249,20 @@ ModelRigIndex index_model_skeletons(
                     node.models.insert(node.models.end(), f->second.begin(), f->second.end());
                 if (auto f = children_of_component.find(c); f != children_of_component.end())
                     node.children.insert(node.children.end(), f->second.begin(), f->second.end());
+                if (auto f = equipment_of_component.find(c); f != equipment_of_component.end())
+                    node.equipment.insert(node.equipment.end(), f->second.begin(), f->second.end());
             }
             if (!node.binding.skeleton.is_none()) {
+                if (!node.binding.rig.is_none()) {
+                    const auto [it, fresh] = rig_for_skeleton.emplace(node.binding.skeleton, node.binding.rig);
+                    if (!fresh && it->second != node.binding.rig) shared_skeletons.insert(node.binding.skeleton);
+                }
                 for (uint32_t m : node.models) {
                     auto [it, fresh] = out.emplace(m, node.binding);
                     if (!fresh && it->second.rig.is_none()) it->second = node.binding;
                 }
             }
-            if (!node.models.empty() || !node.children.empty() || !node.binding.skeleton.is_none())
+            if (!node.models.empty() || !node.children.empty() || !node.equipment.empty() || !node.binding.skeleton.is_none())
                 bindings.emplace(ent.value, std::move(node));
         } catch (...) {
         }
@@ -252,7 +290,148 @@ ModelRigIndex index_model_skeletons(
     }
     for (const auto& [model, binding] : inherited)
         if (!ambiguous.contains(model)) out.emplace(model, binding);
+    std::unordered_map<TagHash, Skeleton> known_skeletons;
+    std::unordered_map<TagHash, TagHash> rig_for_copy;
+    for (auto& [model, binding] : out) {
+        if (!binding.rig.is_none() || shared_skeletons.contains(binding.skeleton)) continue;
+        const auto it = rig_for_skeleton.find(binding.skeleton);
+        if (it != rig_for_skeleton.end()) {
+            binding.rig = it->second;
+            continue;
+        }
+        if (const auto cached = rig_for_copy.find(binding.skeleton); cached != rig_for_copy.end()) {
+            binding.rig = cached->second;
+            continue;
+        }
+        TagHash selected;
+        try {
+            const auto target = load_skeleton(pm, binding.skeleton);
+            for (const auto& [candidate, rig] : rig_for_skeleton) {
+                if (shared_skeletons.contains(candidate)) continue;
+                try {
+                    auto cached = known_skeletons.find(candidate);
+                    if (cached == known_skeletons.end())
+                        cached = known_skeletons.emplace(candidate, load_skeleton(pm, candidate)).first;
+                    if (!same_skeleton(target, cached->second)) continue;
+                    if (!selected.is_none() && selected != rig &&
+                        !same_rig(load_animation_rig(pm, selected), load_animation_rig(pm, rig))) {
+                        selected = {};
+                        break;
+                    }
+                    if (selected.is_none() || rig < selected) selected = rig;
+                } catch (const std::exception&) {
+                }
+            }
+        } catch (const std::exception&) {
+        }
+        binding.rig = selected;
+        rig_for_copy.emplace(binding.skeleton, selected);
+    }
+    if (assemblies) {
+        assemblies->clear();
+        std::unordered_map<uint32_t, std::vector<TagHash>> by_root;
+        std::unordered_map<uint32_t, std::unordered_set<uint32_t>> roots_of;
+        std::unordered_set<uint32_t> ambiguous_roots;
+        for (const auto& [entity, node] : bindings) {
+            if (node.models.size() != 1 || node.equipment.empty()) continue;
+            const uint32_t root = node.models.front();
+            std::vector<TagHash> pending = node.equipment;
+            std::unordered_set<uint32_t> seen{entity};
+            std::vector<TagHash> parts;
+            while (!pending.empty()) {
+                const auto child = pending.back();
+                pending.pop_back();
+                if (!seen.insert(child.value).second) continue;
+                const auto it = bindings.find(child.value);
+                if (it == bindings.end()) continue;
+                for (uint32_t model : it->second.models) {
+                    if (model == root) continue;
+                    parts.emplace_back(model);
+                }
+                pending.insert(pending.end(), it->second.equipment.begin(), it->second.equipment.end());
+            }
+            std::ranges::sort(parts);
+            parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+            const auto [found, fresh] = by_root.try_emplace(root, parts);
+            if (!fresh && found->second != parts) ambiguous_roots.insert(root);
+        }
+        for (auto& [root, parts] : by_root) {
+            if (parts.empty() || ambiguous_roots.contains(root)) continue;
+            for (TagHash model : parts) roots_of[model.value].insert(root);
+            parts.insert(parts.begin(), TagHash(root));
+            assemblies->emplace(root, parts);
+        }
+        for (const auto& [model, roots] : roots_of) {
+            if (roots.size() == 1) assemblies->try_emplace(model, assemblies->at(*roots.begin()));
+        }
+    }
     return out;
+}
+
+namespace {
+
+int32_t matching_bind_joint(const Skeleton& source, const Skeleton& target, size_t bone) {
+    const auto it = std::ranges::find(source.hashes, target.hashes[bone]);
+    if (it == source.hashes.end()) return -1;
+    if (std::find(it + 1, source.hashes.end(), *it) != source.hashes.end()) return -1;
+    const auto index = size_t(it - source.hashes.begin());
+    const auto& a = source.bind[index];
+    const auto& b = target.bind[bone];
+    float rotation_dot = 0;
+    for (size_t i = 0; i < 4; ++i) rotation_dot += a.rotation[i] * b.rotation[i];
+    if (std::fabs(rotation_dot) < 0.99999f || std::fabs(a.scale - b.scale) > 0.0001f) return -1;
+    for (size_t i = 0; i < 3; ++i)
+        if (std::fabs(a.translation[i] - b.translation[i]) > 0.0001f) return -1;
+    return int32_t(index);
+}
+
+} // namespace
+
+std::vector<int32_t> assembly_pose_map(const Skeleton& source, const Skeleton& target) {
+    std::vector<int32_t> direct;
+    for (size_t b = 0; b < target.size(); ++b) direct.push_back(matching_bind_joint(source, target, b));
+    std::vector<int32_t> result = direct;
+    for (size_t b = 0; b < target.size(); ++b) {
+        int32_t p = int32_t(b);
+        for (size_t depth = 0; p >= 0 && depth < target.size(); ++depth) {
+            if (direct[size_t(p)] >= 0) {
+                result[b] = direct[size_t(p)];
+                break;
+            }
+            p = target.parents[size_t(p)];
+        }
+    }
+    return result;
+}
+
+std::optional<ModelRig> find_assembly_rig(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
+                                           const Skeleton& other) {
+    if (!bones) return std::nullopt;
+    std::optional<ModelRig> result;
+    Skeleton matched_skeleton;
+    AnimationRig matched_rig;
+    std::set<std::pair<TagHash, TagHash>> seen;
+    for (const auto& [model, binding] : models) {
+        if (binding.rig.is_none() || !seen.emplace(binding.skeleton, binding.rig).second) continue;
+        try {
+            auto skeleton = load_skeleton(pm, binding.skeleton);
+            if (skeleton.size() != bones) continue;
+            size_t shared = 0;
+            for (size_t b = 0; b < other.size(); ++b)
+                if (other.parents[b] >= 0 && matching_bind_joint(skeleton, other, b) >= 0) ++shared;
+            if (shared < 3) continue;
+            auto rig = load_animation_rig(pm, binding.rig);
+            if (!result) {
+                result = binding;
+                matched_skeleton = std::move(skeleton);
+                matched_rig = std::move(rig);
+            } else if (!same_skeleton(matched_skeleton, skeleton) || !same_rig(matched_rig, rig)) {
+                return std::nullopt;
+            } else if (std::pair(binding.skeleton, binding.rig) < std::pair(result->skeleton, result->rig)) result = binding;
+        } catch (const std::exception&) {
+        }
+    }
+    return result;
 }
 
 // ---- clips ---------------------------------------------------------------------------------------
@@ -598,6 +777,7 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         for (size_t i = 0; i < rig.size(); ++i) {
             pose[i].rotation = qnormalize(qmul(pose[i].rotation, delta[i].rotation));
             for (int k = 0; k < 3; ++k) pose[i].translation[k] += delta[i].translation[k];
+            pose[i].scale *= delta[i].scale;
         }
     } else {
         sample_clip(clip, frame, pose);
@@ -625,11 +805,25 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 if (ri >= 0) o.rotation = pose[size_t(ri)].rotation;
             } else {
                 const BoneTransform& po = object[size_t(p)];
-                o = po * sk.local_bind[b];
-                if (ri >= 0) {
-                    const BoneTransform& c = pose[size_t(ri)];
-                    o.rotation = rig.object_space[size_t(ri)] ? c.rotation : qnormalize(qmul(po.rotation, c.rotation));
-                    if (sk.parents[size_t(p)] < 0 && rig.object_space[size_t(ri)])
+                auto local = sk.local_bind[b];
+                if (ri >= 0 && !rig.object_space[size_t(ri)]) {
+                    const auto& c = pose[size_t(ri)];
+                    const auto& rest = rig.default_pose[size_t(ri)];
+                    local.rotation = c.rotation;
+                    // A matching rest offset establishes that this track uses the local
+                    // skeleton space and units. Variant rigs can have different proportions.
+                    float rest_error = 0;
+                    for (int k = 0; k < 3; ++k)
+                        rest_error = std::max(rest_error, std::fabs(rest.translation[k] - local.translation[k]));
+                    if (rest_error <= 0.0001f) local.translation = c.translation;
+                    if (std::fabs(local.scale - rest.scale) <= 0.001f && c.scale > 0 && std::isfinite(c.scale))
+                        local.scale = c.scale;
+                }
+                o = po * local;
+                if (ri >= 0 && rig.object_space[size_t(ri)]) {
+                    const auto& c = pose[size_t(ri)];
+                    o.rotation = c.rotation;
+                    if (sk.parents[size_t(p)] < 0)
                         for (int k = 0; k < 3; ++k) o.translation[k] = sk.bind[b].translation[k] + c.translation[k];
                 }
             }

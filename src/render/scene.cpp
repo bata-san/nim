@@ -605,9 +605,9 @@ void StaticMeshScene::release(Gpu& gpu) {
     material_externs_.reset();
     sets_.clear();
     notes_.clear();
-    dynamic_ = dynamic_parts_ = false;
+    dynamic_ = dynamic_parts_ = assembled_ = false;
     skinned_ = skin_dirty_ = false;
-    skin_pose_.clear();
+    skin_poses_.clear();
     tag_ = TagHash();
 }
 
@@ -921,6 +921,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         out.permutation_count = materials->permutation_count;
     }
     DynamicModel model = load_dynamic_model(pm, tag);
+    out.bone_count = model.bone_count;
     const V3 scale{model.model_scale[0], model.model_scale[1], model.model_scale[2]};
     const V3 offset{model.model_offset[0], model.model_offset[1], model.model_offset[2]};
     V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
@@ -1034,6 +1035,122 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     cb[12] = cb[13] = {offset.x, offset.y, offset.z, s1 * kSkinRange};
     cb[15] = {1, 0, 0, 0}; cb[16] = {0, 1, 0, 0}; cb[17] = {0, 0, 1, 0}; cb[18] = {0, 0, 0, 1};
     return out;
+}
+
+PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
+                                    const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
+                                    const ModelAssemblyIndex& assemblies, int permutation,
+                                    const ChannelValues* channels, PrepareCache* cache) {
+    auto prepare = [&](TagHash tag, int variant) {
+        const auto it = materials.find(tag.value);
+        return prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache);
+    };
+    auto result = prepare(model, permutation);
+    const auto assembly = assemblies.find(model.value);
+    if (assembly == assemblies.end() || result.no_drawable) return result;
+    result.assembly_root = assembly->second.front();
+    for (TagHash tag : assembly->second) {
+        if (tag == model) continue;
+        try {
+            auto part = prepare(tag, -1);
+            if (part.no_drawable) {
+                result.notes.push_back(std::format("{}: {}", tag.str(), part.notes.front()));
+                continue;
+            }
+            result.attachments.push_back(std::move(part));
+        } catch (const std::exception& ex) {
+            result.notes.push_back(std::format("{}: {}", tag.str(), ex.what()));
+        }
+    }
+    return result;
+}
+
+std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, float frame) const {
+    std::vector<ModelSkinPose> result;
+    result.reserve(followers.size() + 1);
+    result.push_back({model, {}});
+    auto& source = result.front().bones;
+    pose_skeleton(skeleton, rig, clip, frame, source);
+    for (size_t b = 0; b < source.size(); ++b) source[b] = source[b] * skeleton.inverse_bind[b];
+    for (const auto& follower : followers) {
+        ModelSkinPose part{follower.model, {}};
+        for (int32_t b : follower.bone_map)
+            part.bones.push_back(b < 0 ? BoneTransform{} : result.front().bones[size_t(b)]);
+        result.push_back(std::move(part));
+    }
+    return result;
+}
+
+std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
+                                                          const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
+                                                          TagHash preferred) {
+    struct Part {
+        const PreparedMesh* mesh;
+        std::optional<Skeleton> skeleton;
+        TagHash rig;
+        bool inferred = false;
+    };
+    std::vector<Part> parts;
+    auto add = [&](const PreparedMesh& candidate) {
+        if (std::ranges::none_of(candidate.buffers, [](const auto& b) { return !b.skin.bones.empty(); })) return;
+        Part part{&candidate, {}, {}, false};
+        if (const auto found = rigs.find(candidate.tag.value); found != rigs.end()) {
+            try {
+                part.skeleton = load_skeleton(pm, found->second.skeleton);
+                part.rig = found->second.rig;
+            } catch (const std::exception&) {
+            }
+        }
+        parts.push_back(std::move(part));
+    };
+    add(mesh);
+    for (const auto& attachment : mesh.attachments) add(attachment);
+    auto root = std::ranges::find_if(parts, [&](const Part& p) { return p.mesh->tag == mesh.assembly_root; });
+    if (root != parts.end()) {
+        if (!root->skeleton) {
+            std::optional<ModelRig> inferred;
+            for (const auto& part : parts) {
+                if (!part.skeleton) continue;
+                const auto match = find_assembly_rig(pm, rigs, root->mesh->bone_count, *part.skeleton);
+                if (!match) continue;
+                if (inferred && inferred != match) {
+                    inferred.reset();
+                    break;
+                }
+                inferred = match;
+            }
+            if (inferred) {
+                root->skeleton = load_skeleton(pm, inferred->skeleton);
+                root->rig = inferred->rig;
+                root->inferred = true;
+            }
+        }
+        std::rotate(parts.begin(), root, root + 1);
+    }
+    auto valid_skin = [](const Part& part) {
+        return part.skeleton && std::ranges::none_of(part.mesh->buffers, [&](const auto& b) {
+            return !b.skin.bones.empty() && b.skin.max_bone >= part.skeleton->size();
+        });
+    };
+    std::optional<PreviewAnimation> result;
+    for (const auto& part : parts) {
+        if (!preferred.is_none() && part.mesh->tag != preferred) continue;
+        if (!valid_skin(part) || part.rig.is_none()) continue;
+        auto rig = load_animation_rig(pm, part.rig);
+        auto matches = compatible_animation_clips(pm, rigs, rig, clips);
+        if (result && matches.empty()) continue;
+        result = PreviewAnimation{part.mesh->tag, *part.skeleton, std::move(rig), std::move(matches), {}, part.inferred};
+        if (!result->clips.empty()) break;
+    }
+    if (result && result->model == mesh.assembly_root) {
+        for (const auto& part : parts) {
+            if (part.mesh->tag == result->model || !valid_skin(part)) continue;
+            auto map = assembly_pose_map(result->skeleton, *part.skeleton);
+            if (std::ranges::any_of(map, [](int32_t index) { return index > 0; }))
+                result->followers.push_back({part.mesh->tag, std::move(map)});
+        }
+    }
+    return result;
 }
 
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials,
@@ -1228,9 +1345,46 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     dynamic_ = mesh.dynamic;
     const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     const TagHash tag = mesh.tag;
-    const V3 center = mesh.center;
-    const float radius = mesh.radius;
+    auto parts = std::move(mesh.attachments);
+    assembled_ = !parts.empty();
+    if (assembled_) {
+        auto packed = mesh.model_cb[13];
+        for (const auto& part : parts)
+            if (part.model_cb[13][3] > packed[3]) packed = part.model_cb[13];
+        auto use_common_range = [&](PreparedMesh& part) {
+            // Only replace the parameters for streams re-packed by the CPU.
+            if (std::ranges::none_of(part.buffers, [](const auto& b) {
+                    return !b.skin_pos.empty() && b.skin.bones.empty();
+                })) part.model_cb[12] = part.model_cb[13] = packed;
+        };
+        use_common_range(mesh);
+        for (auto& part : parts) use_common_range(part);
+    }
+    std::vector<std::pair<V3, float>> bounds{{mesh.center, mesh.radius}};
+    V3 lo = mesh.center - V3{mesh.radius, mesh.radius, mesh.radius};
+    V3 hi = mesh.center + V3{mesh.radius, mesh.radius, mesh.radius};
     add_mesh(gpu, std::move(mesh), layouts, std::span(&identity, 1));
+    for (auto& part : parts) {
+        const TagHash part_tag = part.tag;
+        const V3 r{part.radius, part.radius, part.radius};
+        const V3 a = part.center - r, b = part.center + r;
+        try {
+            const float radius = part.radius;
+            const V3 center = part.center;
+            add_mesh(gpu, std::move(part), layouts, std::span(&identity, 1));
+            bounds.emplace_back(center, radius);
+            lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+            hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+        } catch (const std::exception& ex) {
+            notes_.push_back(std::format("{}: {}", part_tag.str(), ex.what()));
+        }
+    }
+    const V3 center = (hi + lo) * 0.5f;
+    float radius = 0;
+    for (const auto& [part_center, part_radius] : bounds) {
+        const V3 offset = part_center - center;
+        radius = std::max(radius, std::sqrt(dot(offset, offset)) + part_radius);
+    }
     finish(gpu, tag, center, radius);
 }
 
@@ -1280,19 +1434,18 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     ProfileScope profile_total("add.mesh_parts.total");
     ID3D12Device* dev = gpu.device();
     const bool first_mesh = sets_.empty();
-    if (dynamic_ && !first_mesh) throw std::runtime_error("a dynamic model scene holds that model alone");
-    if (dynamic_ && placements.size() != 1) throw std::runtime_error("a dynamic model view places it once");
+    if (dynamic_ && (!mesh.dynamic || placements.size() != 1))
+        throw std::runtime_error("each model in an entity preview needs one placement");
     if (placements.empty()) throw std::runtime_error("mesh has no placements");
     const uint32_t set_base = uint32_t(sets_.size());
+    std::shared_ptr<const ChannelValues> model_channels;
+    if (assembled_) model_channels = std::make_shared<ChannelValues>(mesh.channel_defaults);
     if (first_mesh) {
         center_ = mesh.center;
         radius_ = mesh.radius;
         lod_ = mesh.lod;
         dynamic_parts_ = mesh.dynamic && !dynamic_;
         model_cb_ = mesh.model_cb;
-        skin_scale_ = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
-        skin_offset_ = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
-        skin_range_ = mesh.model_cb[13][3] > 1e-8f ? mesh.model_cb[13][3] : 1.0f;
         notes_ = mesh.notes;
         channels_ = mesh.channels;
         channel_overrides_ = mesh.channel_overrides;
@@ -1301,7 +1454,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (mesh.global_channels) material_externs_->channels = *mesh.global_channels;
         global_base_ = material_externs_->channels;
     } else {
-        dynamic_parts_ |= mesh.dynamic;
+        dynamic_parts_ |= mesh.dynamic && !dynamic_;
         for (const auto& n : mesh.notes) notes_.push_back(n);
         for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
         for (auto& [h, u] : mesh.channels) channels_.emplace(h, u);
@@ -1395,10 +1548,15 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         set.vbv[2] = {inst.gpu, n * 4, 4};
         set.dynamic = mesh.dynamic;
         if (mesh.dynamic) {
+            set.model = mesh.tag;
             set.object_cb = placement_constants;
             set.model_center = mesh.center;
             set.placements.assign(placements.begin(), placements.end());
             set.sky_order.assign(sky_order.begin(), sky_order.end());
+            if (assembled_) {
+                std::copy_n(mesh.model_cb.begin(), set.model_parameters.size(), set.model_parameters.begin());
+                set.model_channels = model_channels;
+            }
         }
         if (mesh.dynamic) {
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
@@ -1412,6 +1570,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 for (auto& u : set.skin_upload) u = gpu.buffer(bytes * 2, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
                 set.vb0_cpu = b.vb0.data;
                 set.skin = b.skin;
+                set.skin_scale = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
+                set.skin_offset = {mesh.model_cb[5][0], mesh.model_cb[5][1], mesh.model_cb[5][2]};
+                set.skin_pack_offset = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
+                set.skin_range = mesh.model_cb[13][3];
                 skinned_ = skin_dirty_ = true;
             } else {
                 set.skin_pos = up(b.skin_pos);
@@ -1935,6 +2097,13 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         if (it.light_grid) it.light_grid_ready = frame_inputs && frame_inputs->texture(ext::Transparent, 0x28).resource;
         if (!item_instances(it)) continue;  // culled this frame: not drawn, nothing to evaluate
       try {
+        const auto& set = sets_[it.buffers];
+        ChannelContext model_cc = cc;
+        if (assembled_) {
+            for (uint32_t row = 0; row < set.model_parameters.size(); ++row)
+                ext.set(ext::RigidModel, row * 16, set.model_parameters[row]);
+            model_cc.defaults = set.model_channels.get();
+        }
         it.scope_addresses.resize(it.scope_slots.size());
         for (size_t k = 0; k < it.scope_slots.size(); ++k)
             it.scope_addresses[k] = {it.scope_slots[k].first, scope_address(it.scope_slots[k].second)};
@@ -1950,12 +2119,13 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             return env;
         };
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
-            const uint64_t key = (uint64_t(it.technique.value) << 1) | uint64_t(vs);
+            const uint64_t object = assembled_ ? set.model.value - TagHash::kBase : 0;
+            const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
             // A placed object's position is filled in per placement below: not reported as unset here.
             static const float4 origin{0, 0, 0, 1};
-            ChannelContext ec = cc;
+            ChannelContext ec = model_cc;
             if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || sets_[it.buffers].dynamic)) ec.world_position = &origin;
             evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(ec, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
@@ -1996,9 +2166,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         it.vs_placement_addresses.clear();
         it.ps_placement_addresses.clear();
         if (it.vs_reads_position || it.ps_reads_position) {
-            const auto& set = sets_[it.buffers];
             auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
-                ChannelContext pc = cc;
+                ChannelContext pc = model_cc;
                 pc.world_position = &position;
                 evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(pc, vs));
                 const auto a = gpu.dynamic(cb.size() * sizeof(float4));
@@ -2208,8 +2377,8 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     if (!shadow) record(cl, opaque, true);
 }
 
-void StaticMeshScene::set_skin_pose(std::vector<BoneTransform> bones) {
-    skin_pose_ = std::move(bones);
+void StaticMeshScene::set_skin_poses(std::vector<ModelSkinPose> poses) {
+    skin_poses_ = std::move(poses);
     skin_dirty_ = skinned_;
     ++shadow_generation_;
 }
@@ -2221,27 +2390,36 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     skin_dirty_ = false;
     const uint32_t slot = skin_frame_++ % Gpu::kFramesInFlight;
     struct Mat { float m[12]; };  // rows: rotation * scale | translation
-    std::vector<Mat> mats(skin_pose_.size());
-    for (size_t b = 0; b < mats.size(); ++b) {
-        const auto& t = skin_pose_[b];
-        const float x = t.rotation[0], y = t.rotation[1], z = t.rotation[2], w = t.rotation[3], s = t.scale;
-        mats[b] = {{(1 - 2 * (y * y + z * z)) * s, 2 * (x * y - z * w) * s, 2 * (x * z + y * w) * s, t.translation[0],
-                    2 * (x * y + z * w) * s, (1 - 2 * (x * x + z * z)) * s, 2 * (y * z - x * w) * s, t.translation[1],
-                    2 * (x * z - y * w) * s, 2 * (y * z + x * w) * s, (1 - 2 * (x * x + y * y)) * s, t.translation[2]}};
+    std::unordered_map<TagHash, std::vector<Mat>> matrices;
+    for (const auto& pose : skin_poses_) {
+        auto& mats = matrices[pose.model];
+        mats.reserve(pose.bones.size());
+        for (const auto& t : pose.bones) {
+            const float x = t.rotation[0], y = t.rotation[1], z = t.rotation[2], w = t.rotation[3], s = t.scale;
+            mats.push_back({{(1 - 2 * (y * y + z * z)) * s, 2 * (x * y - z * w) * s, 2 * (x * z + y * w) * s, t.translation[0],
+                             2 * (x * y + z * w) * s, (1 - 2 * (x * x + z * z)) * s, 2 * (y * z - x * w) * s, t.translation[1],
+                             2 * (x * z - y * w) * s, 2 * (y * z + x * w) * s, (1 - 2 * (x * x + y * y)) * s, t.translation[2]}});
+        }
     }
     for (auto& set : sets_) {
         if (!set.skin_upload[0]) continue;
+        const auto pose = matrices.find(set.model);
+        const bool posed = pose != matrices.end();
+        if (!posed && !set.skin_posed && set.skin_readable) continue;
+        set.skin_posed = posed;
         const size_t n = set.skin.bones.size();
         ID3D12Resource* upload = set.skin_upload[slot].Get();
         uint32_t* dst = nullptr;
         const D3D12_RANGE none{0, 0};
         check_hr(upload->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
+        const float inv_range = 1.0f / set.skin_range;
         for (size_t i = 0; i < n; ++i) {
             const uint8_t* v = set.vb0_cpu.data() + i * 24;
-            V3 p{s16(v) * skin_scale_.x + skin_offset_.x, s16(v + 2) * skin_scale_.y + skin_offset_.y,
-                 s16(v + 4) * skin_scale_.z + skin_offset_.z};
+            V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
+                 s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
             V3 nr{s16(v + 8), s16(v + 10), s16(v + 12)}, tg{s16(v + 16), s16(v + 18), s16(v + 20)};
-            if (!mats.empty()) {
+            if (posed) {
+                const auto& mats = pose->second;
                 float m[12]{};
                 float total = 0;
                 for (int k = 0; k < 4; ++k) {
@@ -2261,7 +2439,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
                     tg = xf(tg, 0);
                 }
             }
-            pack_skin_vertex((p - skin_offset_) * (1.0f / skin_range_), normalize(nr), normalize(tg), dst + i * 2, dst + n * 2 + i * 2);
+            pack_skin_vertex((p - set.skin_pack_offset) * inv_range, normalize(nr), normalize(tg), dst + i * 2, dst + n * 2 + i * 2);
         }
         upload->Unmap(0, nullptr);
         constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -2423,6 +2601,7 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {
     shadow.valid = false;
     if (!shadow.depth || items_.size() == transparent_count()) return;
+    if (skin_dirty_) update_skin(cl);
     cull(gpu, shadow.vm, shadow.size, true);
     update_materials(gpu, shadow.size, shadow.size, shadow.vm);
     cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);

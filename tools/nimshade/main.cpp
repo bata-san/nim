@@ -81,6 +81,7 @@ int run(int argc, char** argv) {
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
+    bool single_model = false;
     float clip_frame = 0;
     float material_time = 0;
     ChannelValues channel_values;
@@ -170,6 +171,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
+        else if (args[i] == "--single-model") single_model = true;
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
         else if (args[i] == "--benchmark" && i + 1 < args.size()) benchmark_frames = std::stoul(args[++i]);
@@ -399,29 +401,31 @@ int run(int argc, char** argv) {
     } else if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
+        ModelAssemblyIndex assemblies;
+        ModelRigIndex rigs;
+        if (!single_model || clip_tag) rigs = index_model_skeletons(pm, mats, single_model ? nullptr : &assemblies);
         auto it = mats.find(mesh_tag.value);
         std::println("dynamic model: {} components indexed in {:.1f}s, materials {}", mats.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                      it == mats.end() ? "none" : it->second.component.str());
-        scene.upload(gpu, prepare_dynamic_model(pm, mesh_tag, it == mats.end() ? nullptr : &it->second), layouts);
-        for (const auto& n : scene.notes()) std::println("  note: {}", n);
+        auto mesh = prepare_entity_preview(pm, mesh_tag, mats, assemblies);
+        for (const auto& part : mesh.attachments) std::println("assembled part {}", part.tag.str());
+        std::vector<ModelSkinPose> poses;
         if (clip_tag) {
-            auto rigs = index_model_skeletons(pm, mats);
-            auto r = rigs.find(mesh_tag.value);
-            if (r == rigs.end() || r->second.rig.is_none()) throw std::runtime_error("--clip: the model has no skeleton with a rig");
-            Skeleton sk = load_skeleton(pm, r->second.skeleton);
-            AnimationRig rig = load_animation_rig(pm, r->second.rig);
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
             const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups};
-            if (compatible_animation_clips(pm, rigs, rig, std::span(&info, 1)).empty())
-                throw std::runtime_error(std::format("clip {} is incompatible with rig {}", clip.tag.str(), rig.component.str()));
-            std::vector<BoneTransform> bones;
-            pose_skeleton(sk, rig, clip, clip_frame, bones);
-            for (size_t b = 0; b < bones.size(); ++b) bones[b] = bones[b] * sk.inverse_bind[b];
-            scene.set_skin_pose(std::move(bones));
-            std::println("posed with clip {} ({}, {} frames{}) at frame {}", clip_tag->str(), clip_codec_name(clip.codec), clip.frame_count,
-                         is_additive(rig, clip) ? ", additive" : "", clip_frame);
+            const auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1));
+            if (!anim || anim->clips.empty())
+                throw std::runtime_error(std::format("clip {} is incompatible with the preview's skinned models", clip.tag.str()));
+            poses = anim->poses(clip, clip_frame);
+            std::println("posed model {} and {} linked parts with clip {} ({}, {} frames{}) at frame {}{}",
+                         anim->model.str(), poses.size() - 1, clip.tag.str(), clip_codec_name(clip.codec), clip.frame_count,
+                         is_additive(anim->rig, clip) ? ", additive" : "", clip_frame,
+                         anim->inferred_binding ? " (estimated rig binding)" : "");
         }
+        scene.upload(gpu, std::move(mesh), layouts);
+        if (!poses.empty()) scene.set_skin_poses(std::move(poses));
+        for (const auto& n : scene.notes()) std::println("  note: {}", n);
     } else {
         scene.load(pm, gpu, mesh_tag, layouts);
     }

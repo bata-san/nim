@@ -73,7 +73,16 @@ struct ModelRig {
     bool operator==(const ModelRig&) const = default;
 };
 using ModelRigIndex = std::unordered_map<uint32_t, ModelRig>;
-ModelRigIndex index_model_skeletons(PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
+using ModelAssemblyIndex = std::unordered_map<uint32_t, std::vector<TagHash>>;
+ModelRigIndex index_model_skeletons(PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
+                                   ModelAssemblyIndex* assemblies = nullptr);
+// For an assembled part missing a direct binding, require a unique skeleton and rig layout
+// of the declared size which shares several authored bind joints with another part.
+std::optional<ModelRig> find_assembly_rig(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
+                                           const Skeleton& other);
+// Each secondary bone follows the corresponding source bind joint or its own nearest
+// ancestor with a matching bind transform. Unmatched bones stay in bind pose (-1).
+std::vector<int32_t> assembly_pose_map(const Skeleton& source, const Skeleton& target);
 
 // ---- Animation clips (8080AE01) -----------------------------------------------------------------
 // Constant tracks (8080B13B at 0x10) plus one animated block at 0x18:

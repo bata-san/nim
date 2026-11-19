@@ -180,10 +180,12 @@ struct PreparedMesh {
         std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_cbuffers;
     };
     TagHash tag;
+    TagHash assembly_root;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no GenerateGbuffer parts
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
+    std::vector<PreparedMesh> attachments;  // authored equipment parts, in the same preview space
     std::vector<uint8_t> instance;  // static meshes: t2 instance data
     // Dynamic models: the rigid_model scope cbuffer (cb1). c0-c3 mesh-to-world, c4 position scale, c5 offset, c6 texcoord scale/offset.
     std::array<float4, 20> model_cb{};
@@ -199,6 +201,24 @@ struct PreparedMesh {
     std::shared_ptr<const std::vector<Scope>> scopes;
     TagHash component;               // dynamic models: the component the materials came from
     uint32_t permutation = 0, permutation_count = 0;
+    uint32_t bone_count = 0;  // declared by the dynamic model header
+};
+struct ModelSkinPose {
+    TagHash model;
+    std::vector<BoneTransform> bones;
+};
+struct PreviewAnimation {
+    struct Follower {
+        TagHash model;
+        std::vector<int32_t> bone_map;
+    };
+    TagHash model;
+    Skeleton skeleton;
+    AnimationRig rig;
+    std::vector<ClipInfo> clips;
+    std::vector<Follower> followers;
+    bool inferred_binding = false;
+    std::vector<ModelSkinPose> poses(const AnimationClip& clip, float frame) const;
 };
 // Shared across many prepare_static_mesh calls (maps): render globals / scopes read once,
 // textures shared by tag and capped at max_texture_dim (0 = full size), G-buffer parts only.
@@ -222,7 +242,7 @@ struct Terrain;
 PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
                              PrepareCache* cache = nullptr);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
-// material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_pose.
+// material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_poses.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
@@ -230,6 +250,13 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const Dyna
 // Either of the above, by the tag's class.
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr,
                           const ChannelValues* channels = nullptr);
+PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
+                                    const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
+                                    const ModelAssemblyIndex& assemblies, int permutation = -1,
+                                    const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
+std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
+                                                          const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
+                                                          TagHash preferred = {});
 
 class StaticMeshScene {
 public:
@@ -273,10 +300,10 @@ public:
                             const ViewMatrices& vm, const ExternStore& inputs);
     bool has_transparent() const { return !transparent_items_.empty(); }
     bool has_visible_light_grid() const;
-    // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
-    // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
+    // CPU skinning, per model. Each pose holds pose * inverse bind in skeleton order.
+    // Models without a supplied pose use the bind pose.
     bool skinned() const { return skinned_; }
-    void set_skin_pose(std::vector<BoneTransform> bones);
+    void set_skin_poses(std::vector<ModelSkinPose> poses);
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }
@@ -382,12 +409,18 @@ private:
         // upload buffer (positions, then normals) into the default-heap skin_pos / skin_normal.
         std::vector<uint8_t> vb0_cpu;
         SkinWeights skin;
+        TagHash model;
+        V3 skin_scale, skin_offset, skin_pack_offset;
+        float skin_range = 1;
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
+        bool skin_posed = false;
         // Dynamic models: the object constants (rigid_model / skinning scope, local_to_world in
         // rows 0-3) and the placements; this frame's constants per placement.
         bool dynamic = false;
         V3 model_center{};
+        std::array<float4, 7> model_parameters{};
+        std::shared_ptr<const ChannelValues> model_channels;
         std::vector<std::array<float, 12>> placements;
         std::vector<float> sky_order;
         GpuBuffer object_cb;
@@ -439,13 +472,12 @@ private:
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
     std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
-    bool dynamic_ = false;          // the scene is one dynamic model (entity view)
+    bool dynamic_ = false;          // models in a single entity preview
+    bool assembled_ = false;
     bool dynamic_parts_ = false;    // dynamic models placed among static meshes (map entities)
     bool skinned_ = false, skin_dirty_ = false;
-    std::vector<BoneTransform> skin_pose_;
+    std::vector<ModelSkinPose> skin_poses_;
     uint32_t skin_frame_ = 0;
-    V3 skin_scale_, skin_offset_;
-    float skin_range_ = 1;  // packed positions are (p - offset) / range
     uint32_t srv_count_ = 0;
     V3 center_;
     float radius_ = 1;

@@ -105,6 +105,7 @@ struct DynamicMesh {
 struct DynamicModel {
     TagHash tag;
     std::vector<DynamicMesh> meshes;
+    uint32_t bone_count = 0;
     std::array<float, 4> model_scale{1, 1, 1, 0}, model_offset{};
     std::array<float, 2> texcoord_scale{1, 1}, texcoord_offset{};
 };

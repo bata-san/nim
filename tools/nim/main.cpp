@@ -434,10 +434,9 @@ public:
         std::optional<PreparedMesh> mesh;
         std::string error;
         double ms = 0;
-        // Skinned live models: the entity's skeleton and rig, and the clips with the rig's bone count.
-        std::optional<Skeleton> skeleton;
-        std::optional<AnimationRig> rig;
-        std::vector<ClipInfo> clips;
+        // A preview may hold more than one model. Each clip belongs to one model's rig.
+        std::optional<PreviewAnimation> animation;
+        std::optional<PreviewAnimation> part_animation;
     };
 
     void start(const fs::path& install) {
@@ -456,6 +455,10 @@ public:
         thumbs_.clear();
         results_.clear();
         thumbnail_cache_ = PrepareCache{512};
+        materials_.reset();
+        rigs_.reset();
+        clips_.reset();
+        assemblies_.clear();
     }
     void request_live(TagHash t, int permutation = -1, ChannelValues channels = {}) {
         {
@@ -540,10 +543,21 @@ private:
                 if (e && e->reference == kClassDynamicModel) {
                     // The entity components hold the materials; index them once.
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
-                    auto it = materials_->find(tag.value);
-                    r.mesh = prepare_dynamic_model(*pm, tag, it == materials_->end() ? nullptr : &it->second, permutation,
-                                                   channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
-                    if (!thumb) find_animation(*pm, r);
+                    if (!rigs_) rigs_ = index_model_skeletons(*pm, *materials_, &assemblies_);
+                    r.mesh = prepare_entity_preview(*pm, tag, *materials_, assemblies_, permutation,
+                                                    channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
+                    if (!thumb && !r.mesh->no_drawable && (rigs_->contains(tag.value) || !r.mesh->attachments.empty())) {
+                        try {
+                            if (!clips_) clips_ = index_animation_clips(*pm);
+                            r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_);
+                            if (r.animation && r.animation->model != tag) {
+                                auto local = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, tag);
+                                if (local && !local->clips.empty()) r.part_animation = std::move(local);
+                            }
+                        } catch (const std::exception& ex) {
+                            r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
+                        }
+                    }
                 } else {
                     r.mesh = prepare_static_mesh(*pm, tag, channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
                 }
@@ -558,29 +572,6 @@ private:
         }
     }
 
-    // Skeleton, rig and clips for a skinned dynamic model (the indexes are built on first use).
-    void find_animation(PackageManager& pm, Result& r) {
-        bool skinned = false;
-        for (const auto& b : r.mesh->buffers) skinned |= !b.skin.bones.empty();
-        if (!skinned) return;
-        try {
-            if (!rigs_) rigs_ = index_model_skeletons(pm, *materials_);
-            auto f = rigs_->find(r.tag.value);
-            if (f == rigs_->end() || f->second.rig.is_none()) return;
-            r.skeleton = load_skeleton(pm, f->second.skeleton);
-            r.rig = load_animation_rig(pm, f->second.rig);
-            for (const auto& b : r.mesh->buffers)
-                if (!b.skin.bones.empty() && b.skin.max_bone >= r.skeleton->size())
-                    throw std::runtime_error("スキンのボーン番号がスケルトンの範囲外です");
-            if (!clips_) clips_ = index_animation_clips(pm);
-            r.clips = compatible_animation_clips(pm, *rigs_, *r.rig, *clips_);
-        } catch (const std::exception& ex) {
-            r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
-            r.skeleton.reset();
-            r.rig.reset();
-        }
-    }
-
     std::thread thread_;
     std::mutex m_;
     std::condition_variable cv_;
@@ -590,6 +581,7 @@ private:
     ChannelValues live_channels_;
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
     std::optional<ModelRigIndex> rigs_;
+    ModelAssemblyIndex assemblies_;
     std::optional<std::vector<ClipInfo>> clips_;
     PrepareCache thumbnail_cache_{512};
     std::deque<TagHash> thumbs_;
@@ -1123,9 +1115,9 @@ public:
     // Skeletal animation of the live model (clips are sampled at 30 fps).
     struct Animation {
         TagHash model;
-        Skeleton skeleton;
-        AnimationRig rig;
-        std::vector<ClipInfo> clips;
+        PreviewAnimation binding;
+        std::optional<PreviewAnimation> alternate;
+        bool part_only = false;
         int clip = -1;  // index into clips
         AnimationClip loaded;
         std::string error;
@@ -1366,10 +1358,10 @@ public:
                     apply_weather();
                     scene.upload(g, std::move(*r->mesh), layouts);
                     if (game_ready) set_entity_preview(game_lighting, entity_preview_active);
-                    if (!r->skeleton || !r->rig) {
+                    if (!r->animation) {
                         anim.reset();
                     } else if (!anim || anim->model != r->tag) {
-                        anim = Animation{r->tag, std::move(*r->skeleton), std::move(*r->rig), std::move(r->clips)};
+                        anim = Animation{r->tag, std::move(*r->animation), std::move(r->part_animation)};
                     } else {
                         anim->dirty = true;  // same model reloaded (variant / channels): pose it again
                     }
@@ -1832,12 +1824,12 @@ public:
     }
 
     void select_clip(int i) {
-        if (!anim || i < 0 || i >= int(anim->clips.size())) return;
+        if (!anim || i < 0 || i >= int(anim->binding.clips.size())) return;
         anim->clip = i;
         anim->frame = 0;
         anim->error.clear();
         try {
-            anim->loaded = load_animation_clip(*pm, anim->clips[size_t(i)].tag);
+            anim->loaded = load_animation_clip(*pm, anim->binding.clips[size_t(i)].tag);
         } catch (const std::exception& ex) {
             anim->loaded = AnimationClip{};
             anim->error = ex.what();
@@ -1850,7 +1842,7 @@ public:
         if (!anim || !scene.skinned()) return;
         Animation& a = *anim;
         if (a.clip < 0 || !a.loaded.has_tracks()) {
-            if (a.dirty) scene.set_skin_pose({});
+            if (a.dirty) scene.set_skin_poses({});
             a.dirty = false;
             return;
         }
@@ -1862,42 +1854,50 @@ public:
         }
         if (!a.dirty) return;
         a.dirty = false;
-        std::vector<BoneTransform> object;
-        pose_skeleton(a.skeleton, a.rig, a.loaded, a.frame, object);
-        for (size_t b = 0; b < object.size(); ++b) object[b] = object[b] * a.skeleton.inverse_bind[b];
-        scene.set_skin_pose(std::move(object));
+        scene.set_skin_poses(a.binding.poses(a.loaded, a.frame));
     }
 
     void animation_panel() {
         if (!anim || !scene.skinned()) return;
         Animation& a = *anim;
         ImGui::Spacing();
-        if (!ImGui::CollapsingHeader(std::format("アニメーション (クリップ {})###anim", a.clips.size()).c_str(),
+        if (!ImGui::CollapsingHeader(std::format("アニメーション (クリップ {})###anim", a.binding.clips.size()).c_str(),
                                      ImGuiTreeNodeFlags_DefaultOpen))
             return;
-        ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", a.skeleton.component.str().c_str(), a.skeleton.size(),
-                            a.rig.component.str().c_str());
-        if (a.clips.empty()) {
+        if (a.alternate && ImGui::Checkbox("選択パーツのクリップ", &a.part_only)) {
+            std::swap(a.binding, *a.alternate);
+            a.clip = -1;
+            a.error.clear();
+            a.dirty = true;
+        }
+        const auto& binding = a.binding;
+        const auto& clips = binding.clips;
+        ImGui::TextDisabled("スケルトン %s (%zu ボーン)   リグ %s", binding.skeleton.component.str().c_str(), binding.skeleton.size(),
+                            binding.rig.component.str().c_str());
+        if (binding.inferred_binding) ImGui::TextDisabled("胴体リグの対応は共通ボーンから推定");
+        if (!binding.followers.empty()) ImGui::TextDisabled("連動パーツ %zu", binding.followers.size());
+        if (binding.model != a.model) ImGui::TextDisabled("再生元パーツ %s", binding.model.str().c_str());
+        if (clips.empty()) {
             ImGui::TextDisabled("対応するクリップが見つかりません");
             return;
         }
-        if (a.clips.front().bone_groups != a.rig.bone_groups)
+        if (clips.front().bone_groups != binding.rig.bone_groups)
             ImGui::TextDisabled("ボーン構成が同じリグのクリップを使用");
         const float em = ImGui::GetFontSize();
         ImGui::SetNextItemWidth(-1);
         const std::string preview = a.clip < 0 ? std::string("バインドポーズ")
-                                               : std::format("{}  ({} フレーム)", a.clips[size_t(a.clip)].tag.str(),
-                                                             a.clips[size_t(a.clip)].frames);
+                                               : std::format("{}  ({} フレーム)", clips[size_t(a.clip)].tag.str(),
+                                                             clips[size_t(a.clip)].frames);
         if (ImGui::BeginCombo("##clip", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
             if (ImGui::Selectable("バインドポーズ", a.clip < 0)) {
                 a.clip = -1;
                 a.dirty = true;
             }
             ImGuiListClipper clip;
-            clip.Begin(int(a.clips.size()));
+            clip.Begin(int(clips.size()));
             while (clip.Step())
                 for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
-                    const auto& c = a.clips[size_t(i)];
+                    const auto& c = clips[size_t(i)];
                     if (ImGui::Selectable(std::format("{}  {} フレーム##{}", c.tag.str(), c.frames, i).c_str(), a.clip == i)) select_clip(i);
                 }
             ImGui::EndCombo();
@@ -1906,11 +1906,11 @@ public:
         if (a.clip < 0) return;
         if (ImGui::Button(a.playing ? "一時停止" : "再生", {em * 5, 0})) a.playing = !a.playing;
         ImGui::SameLine();
-        if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(a.clips.size()) - 1);
+        if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(clips.size()) - 1);
         ImGui::SameLine();
-        if (ImGui::Button(">")) select_clip((a.clip + 1) % int(a.clips.size()));
+        if (ImGui::Button(">")) select_clip((a.clip + 1) % int(clips.size()));
         ImGui::SameLine();
-        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(a.rig, a.loaded) ? "加算  " : "",
+        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(binding.rig, a.loaded) ? "加算  " : "",
                             std::format("{:.1f} 秒", float(a.loaded.frame_count) / kClipFps).c_str());
         ImGui::SetNextItemWidth(-1);
         const float last = float(std::max(1u, a.loaded.frame_count) - 1);
