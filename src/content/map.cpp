@@ -501,10 +501,20 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
     return out;
 }
 
-MapAtmosphere load_entity_preview_atmosphere(PackageManager& pm) {
-    const TagHash outpost{0x80AF9550};
-    if (!pm.entry(outpost)) return {};
-    return load_map_atmosphere(pm, load_map_layout(pm, outpost));
+std::vector<MapCubemap> load_entity_preview_probes(PackageManager& pm) {
+    const TagHash orbit{0x80A76433};  // orbit_goliath_013b interior
+    const auto* entry = pm.entry(orbit);
+    if (!entry || entry->reference != kClassBubbleParent) return {};
+    MapLayout preview;
+    preview.bubble = orbit;
+    find_instance_tags(pm, orbit, nullptr, &preview.node_tables);
+    auto probes = load_map_cubemaps(pm, preview);
+    const auto at_origin = std::find_if(probes.begin(), probes.end(), [](const MapCubemap& probe) {
+        for (size_t i = 0; i < 3; ++i) if (probe.lo[i] > 0 || probe.hi[i] < 0) return false;
+        return probe.use_probes() && !probe.use_relighting() && !probe.specular.is_none() && !probe.diffuse.is_none();
+    });
+    if (at_origin == probes.end()) return {};
+    return {*at_origin};
 }
 
 std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map) {

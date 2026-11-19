@@ -168,7 +168,8 @@ public:
                      const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
                      uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {}, VolumeBatch* batch = nullptr);
     void dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                  uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+                  uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+                  std::span<const std::pair<uint32_t, ID3D12Resource*>> textures = {});
     // The group counts come from the first three words of `args` (INDIRECT_ARGUMENT state).
     void dispatch_indirect(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                            ID3D12CommandSignature* signature, ID3D12Resource* args);
@@ -235,7 +236,7 @@ public:
     // `shadow`: a sun shadow map rendered this frame (StaticMeshScene::render_shadow), resolved
     // into the shading pass's sun shadow mask; without one the mask is white (unshadowed).
     void render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const LightingParams& p,
-                const TransparentFn& transparents = {}, SunShadow* shadow = nullptr);
+                const TransparentFn& transparents = {}, SunShadow* shadow = nullptr, bool needs_light_grid = true);
     void release(Gpu& gpu);
 
     // A map's local lights (load_map_lights), drawn each frame with their own lighting-apply
@@ -274,6 +275,7 @@ public:
     // before the local lights. Volumes that cannot be loaded are left out and listed.
     void set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg = false);
     void clear_cubemaps(Gpu& gpu);
+    bool set_entity_preview(PackageManager& pm, Gpu& gpu);
     size_t filtered_cube_count() const { return filtered_cubes_.size(); }
     size_t cubemap_count() const { return cubemaps_.size(); }
     size_t cubemaps_drawn() const { return cubemaps_drawn_; }
@@ -522,8 +524,8 @@ private:
     void load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
     void release_light_grid(Gpu& gpu);
     void render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
-                           const ScopeBufferFn& scopes, bool overhead);
-    GamePipeline grid_sky_, grid_blend_, grid_encode_;
+                           const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview);
+    GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_;
     ExternStore grid_ext_;
     std::array<ComPtr<ID3D12Resource>, 3> grid_basis_, grid_sh_;
     ComPtr<ID3D12DescriptorHeap> grid_clear_heap_;
@@ -553,7 +555,7 @@ private:
     uint32_t froxel_w_ = 0, froxel_h_ = 0;
     // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice
     // depth = near + (far - near) t^(1 / curve).
-    static constexpr uint32_t kFroxelDepth = 64, kFroxelTile = 8;
+    static constexpr uint32_t kFroxelDepth = 96, kFroxelTile = 8;
     static constexpr float kFroxelNear = 0.5f, kFroxelFar = 256.0f, kFroxelCurve = 0.5f;
     static constexpr uint32_t kHemiSize = 256, kHemiMips = 9, kHemiFace = 128;
     ComPtr<ID3D12Resource> hemi_, hemi_face_, hemi_untinted_;

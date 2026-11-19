@@ -39,6 +39,7 @@ void synchronize_uavs(ID3D12GraphicsCommandList* cl) {
 void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes) {
     try {
         for (auto [pipeline, name] : {std::pair{&grid_sky_, "light_sample_sky_hemisphere_grid"},
+                                      std::pair{&grid_probe_, "light_sample_local_cubemaps_grid"},
                                       std::pair{&grid_blend_, "light_sample_blend_grid_cascades"},
                                       std::pair{&grid_encode_, "light_sample_encode_from_rgba_to_rgb"}}) {
             const auto tag = globals_.pipeline(name);
@@ -56,7 +57,7 @@ void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const
 }
 
 void GameLighting::release_light_grid(Gpu& gpu) {
-    for (auto* pipeline : {&grid_sky_, &grid_blend_, &grid_encode_}) pipeline->release(gpu);
+    for (auto* pipeline : {&grid_sky_, &grid_probe_, &grid_blend_, &grid_encode_}) pipeline->release(gpu);
     for (auto& resource : grid_basis_) resource.Reset();
     for (auto& resource : grid_sh_) resource.Reset();
     grid_clear_heap_.Reset();
@@ -65,9 +66,10 @@ void GameLighting::release_light_grid(Gpu& gpu) {
 }
 
 void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
-                                     const ScopeBufferFn& scopes, bool overhead) {
-    if (!grid_clear_heap_ || !hemi_inputs_) return;
-    const float4 center{std::floor(vm.eye.x / kCell) * kCell, std::floor(vm.eye.y / kCell) * kCell,
+                                     const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview) {
+    if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && !preview)) return;
+    const float cell = preview ? 0.5f : kCell;
+    const float4 center = preview ? float4{} : float4{std::floor(vm.eye.x / kCell) * kCell, std::floor(vm.eye.y / kCell) * kCell,
                         std::floor(vm.eye.z / kCell) * kCell, 0};
     const float4 cover_scale = overhead ? overhead_scale_ : float4{};
     const float4 cover_offset = overhead ? overhead_offset_ : float4{};
@@ -84,8 +86,8 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     cb[3] = {kX * 0.5f, kY * 0.5f, kZ * 0.5f, 0};
     cb[4] = {float(kX), float(kY), float(kSlices), 0};
     cb[5] = {kX + 0.5f, kY + 0.5f, kSlices + 0.5f, 0};
-    cb[6] = {kCell, kCell, kCell, 0};
-    cb[7][0] = kCell;
+    cb[6] = {cell, cell, cell, 0};
+    cb[7][0] = cell;
     cb[8][0] = float(kCascades);
     cb[9][0] = 1;
     cb[10][0] = std::min({kX, kY, kZ}) * 0.5f;
@@ -113,9 +115,11 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
         view[7] = {center[0], center[1], center[2] - 1024, 1};
         const auto view_gpu = upload(view);
         auto cb3 = upload(cb);
+        D3D12_GPU_VIRTUAL_ADDRESS cb11 = 0;
         const ScopeBufferFn grid_scopes = [&](ShaderStage stage, uint32_t reg) {
             if (stage == ShaderStage::Compute && reg == 12) return view_gpu;
             if (reg == 3) return cb3;
+            if (reg == 11) return cb11;
             return scopes(stage, reg);
         };
         const auto first = gpu.transient_descriptors(3);
@@ -139,12 +143,53 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
         }
         synchronize_uavs(cl);
         constexpr auto kPixel = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        Gpu::barrier(cl, hemi_.Get(), kPixel, kRead);
-        // The white texture is uploaded to GENERIC_READ, which already includes compute access.
-        if (overhead) Gpu::barrier(cl, cover, kPixel, kRead);
+        if (sky) {
+            Gpu::barrier(cl, hemi_.Get(), kPixel, kRead);
+            Gpu::barrier(cl, cover, kPixel, kRead);
+        }
         try {
-            grid_sky_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices - 1);
-            synchronize_uavs(cl);
+            if (sky) {
+                grid_sky_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices - 1);
+                synchronize_uavs(cl);
+            }
+            if (preview) {
+                const auto& probe = preview->volume;
+                std::array<float4, 32> constants{};
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    constants[0][axis] = 1 / std::max(probe.blend_neg[axis], 0.001f);
+                    constants[1][axis] = 1 / std::max(probe.blend_pos[axis], 0.001f);
+                    std::copy_n(probe.axes.begin() + 4 * axis, 4, constants[9 + axis].begin());
+                    constants[14][axis] = 1 / float(probe.probes[axis]);
+                }
+                constants[0][3] = 1;  // baked diffuse samples
+                constants[2][3] = probe.unk30;
+                constants[3][3] = preview->max_mip;
+                constants[13] = {1, 1, 1, 1};
+                constants[14][3] = 1;
+                constants[15] = {probe.probe_params[0], probe.probe_params[1], 1, probe.probe_params[3]};
+                constants[18] = {0, 0, preview->alpha ? 1.0f : 0.0f, preview->squared ? 0.0f : 1.0f};
+                constants[20] = {1, 1, 1, 0};  // this authored probe has no relighting
+                M4 local;
+                for (size_t c = 0; c < 4; ++c) std::copy_n(probe.local_to_world.begin() + c * 4, 4, local.c[c].begin());
+                const auto inverse_box = inverse_matrix(local);
+                for (size_t c = 0; c < 4; ++c) constants[24 + c] = inverse_box.c[c];
+                cb11 = upload(constants);
+                for (uint32_t off = 0xD0; off <= 0x160; off += 16) e.set(kSampling, off, float4{});
+                const std::pair<uint32_t, ID3D12Resource*> textures[] = {
+                    {0, preview->specular.Get()}, {1, preview->alpha.Get()}, {2, preview->diffuse.Get()}};
+                for (const auto& [slot, resource] : textures)
+                    if (resource) Gpu::barrier(cl, resource, kPixel, kRead);
+                try {
+                    grid_probe_.dispatch(gpu, cl, e, grid_scopes, (kX * kY * kSlices + 63) / 64, 1, 1, textures);
+                } catch (...) {
+                    for (const auto& [slot, resource] : textures)
+                        if (resource) Gpu::barrier(cl, resource, kRead, kPixel);
+                    throw;
+                }
+                for (const auto& [slot, resource] : textures)
+                    if (resource) Gpu::barrier(cl, resource, kRead, kPixel);
+                synchronize_uavs(cl);
+            }
             for (uint32_t cascade = kCascades - 1; cascade-- > 0;) {
                 cb[11][0] = float(cascade);
                 cb3 = upload(cb);
@@ -153,12 +198,16 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
             }
         } catch (...) {
             for (auto& basis : grid_basis_) Gpu::barrier(cl, basis.Get(), kWrite, kRead);
-            Gpu::barrier(cl, hemi_.Get(), kRead, kPixel);
-            if (overhead) Gpu::barrier(cl, cover, kRead, kPixel);
+            if (sky) {
+                Gpu::barrier(cl, hemi_.Get(), kRead, kPixel);
+                Gpu::barrier(cl, cover, kRead, kPixel);
+            }
             throw;
         }
-        Gpu::barrier(cl, hemi_.Get(), kRead, kPixel);
-        if (overhead) Gpu::barrier(cl, cover, kRead, kPixel);
+        if (sky) {
+            Gpu::barrier(cl, hemi_.Get(), kRead, kPixel);
+            Gpu::barrier(cl, cover, kRead, kPixel);
+        }
         cb[11] = {};
         cb3 = upload(cb);
         for (uint32_t i = 0; i < 3; ++i) {
@@ -182,11 +231,22 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     ext_.set_scope_constants(ShaderStage::Vertex, 3, cb);
     std::array<float4, 37> advanced{};
     advanced[6][3] = 1;
+    if (preview) {
+        advanced[10][3] = preview->volume.unk30;
+        advanced[11][3] = preview->max_mip;
+        advanced[14][3] = 1;
+        advanced[15][3] = preview->squared ? 0.0f : 1.0f;
+        advanced[16] = {1, 1, 1, 0};
+        ext_.set_texture(ext::Transparent, 0xE0, preview->specular.Get());
+        ext_.note_estimate("transparent preview: orbit_goliath_013b probe SH and reflection cube",
+                           "the fixed preview uses the room probe for all materials; variable per-object reflection selection is unresolved");
+    } else {
+        ext_.note_estimate("transparent lighting: sky SH on six 16x16x8 cascades, base cell 2 m, current overhead occlusion when available",
+                           "grid size and update cadence are estimates; map local lighting and object probes are pending");
+        ext_.note_estimate("transparent_advanced: sky reflection, t26 volume weight zero, object occlusion one",
+                           "object-level specular cubemap selection is unavailable on maps");
+    }
     ext_.set_scope_constants(ShaderStage::Pixel, 8, advanced);
-    ext_.note_estimate("transparent lighting: sky SH on six 16x16x8 cascades, base cell 2 m, current overhead occlusion when available",
-                       "grid size, all-cell visibility and update cadence are estimates; local light, local probe and per-object producers are pending");
-    ext_.note_estimate("transparent_advanced: sky reflection, t26 volume weight zero, object occlusion one",
-                       "object-level specular cubemap selection is unavailable");
     grid_ready_ = true;
 }
 }

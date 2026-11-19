@@ -12,6 +12,7 @@
 #include <cstring>
 #include <format>
 #include <future>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -592,6 +593,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     pipeline_cache_.clear();
     info_.clear();
     world_transparent_draws_ = 0;
+    sky_transparent_draws_ = 0;
     channels_.clear();
     channel_overrides_.clear();
     channel_defaults_.clear();
@@ -676,16 +678,34 @@ std::shared_ptr<const Texture> cached_texture(PackageManager& pm, TagHash tag, T
     ProfileScope profile("prepare.texture_cache");
     if (cache.shared) {
         auto& map = cache.shared->textures;
-        std::shared_lock lk(*cache.shared->texture_mutex);
-        if (auto it = map.find(tag.value); it != map.end()) {
-            Profile::instance().count("prepare.texture_cache_hits");
-            return it->second;
+        std::shared_future<std::shared_ptr<const Texture>> result;
+        {
+            std::shared_lock lock(*cache.shared->texture_mutex);
+            if (auto it = map.find(tag.value); it != map.end()) result = it->second;
         }
-        lk.unlock();
+        if (result.valid()) {
+            Profile::instance().count("prepare.texture_cache_hits");
+            return result.get();
+        }
+        std::promise<std::shared_ptr<const Texture>> pending;
+        {
+            std::unique_lock lock(*cache.shared->texture_mutex);
+            const auto [it, first] = map.try_emplace(tag.value, pending.get_future().share());
+            if (!first) result = it->second;
+        }
+        if (result.valid()) {
+            Profile::instance().count("prepare.texture_cache_hits");
+            return result.get();
+        }
         Profile::instance().count("prepare.texture_cache_misses");
-        auto texture = std::make_shared<const Texture>(load_texture(pm, tag, cache.shared->max_texture_dim));
-        std::unique_lock write(*cache.shared->texture_mutex);
-        return map.emplace(tag.value, texture).first->second;
+        try {
+            auto texture = std::make_shared<const Texture>(load_texture(pm, tag, cache.shared->max_texture_dim));
+            pending.set_value(texture);
+            return texture;
+        } catch (...) {
+            pending.set_exception(std::current_exception());
+            throw;
+        }
     }
     if (auto it = cache.local.find(tag.value); it != cache.local.end()) return it->second;
     auto texture = std::make_shared<const Texture>(load_texture(pm, tag));
@@ -982,7 +1002,14 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     }
     if (out.groups.empty() && !has_gbuffer_parts) {
         out.no_drawable = true;
-        out.notes.push_back("no G-buffer or transparent parts; other render stages are not drawable in this viewer");
+        std::set<size_t> authored_stages;
+        for (const auto& mesh : model.meshes)
+            for (size_t stage = 0; stage + 1 < mesh.part_range.size(); ++stage)
+                if (mesh.part_range[stage] < std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size()))
+                    authored_stages.insert(stage);
+        std::string stages;
+        for (const auto stage : authored_stages) stages += std::format("{}{}", stages.empty() ? "" : ", ", stage);
+        out.notes.push_back(stages.empty() ? "描画用パーツなし" : std::format("専用レンダーステージ {} のみ", stages));
         return out;
     }
     if (out.groups.empty())
@@ -1304,6 +1331,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         CullGroup group;
         group.dynamic = mesh.dynamic;
         group.first_item = items_.size();
+        group.first_set = set_base;
+        group.set_count = uint32_t(mesh.buffers.size());
         group.spheres.reserve(n);
         V3 lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
         for (const auto& m : placements) {
@@ -1485,6 +1514,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             return item.light_grid && slot == 26 && kind == BindingKind::TextureCube &&
                 std::find(item.ps_cbvs.begin(), item.ps_cbvs.end(), 8u) != item.ps_cbvs.end();
         };
+        if (const auto cube = ps_kinds.find(26); cube != ps_kinds.end() && advanced_cube(26, cube->second) &&
+            !item.textures.contains(26))
+            item.ps_sources.extern_textures.try_emplace(26, TfxExternTexture{26, ext::Transparent, 0xE0 / 8});
         item.ps_kinds = ps_kinds;
         item.vs_kinds = vs_kinds;
         auto kind_of = [](const std::map<uint32_t, BindingKind>& m, uint32_t r) {
@@ -1594,6 +1626,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
 
         // Input layout straight from the game's vertex layout table.
         std::vector<D3D12_INPUT_ELEMENT_DESC> ied;
+        const auto vs_inputs = shader_inputs(g.vs);
         for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
             if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0)
@@ -1607,12 +1640,33 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             d.InstanceDataStepRate = e.instanced ? 1 : 0;
             ied.push_back(d);
         }
-        for (const auto& input : shader_inputs(g.vs)) {
+        for (const auto& input : vs_inputs) {
             const bool found = std::any_of(ied.begin(), ied.end(), [&](const auto& desc) {
                 return desc.SemanticIndex == input.index && _stricmp(desc.SemanticName, input.semantic.c_str()) == 0;
             });
-            if (!found) throw UnsupportedMeshPart(std::format("{}: original vertex layout {} lacks {}{}; no zero stream is substituted",
-                item.technique.str(), g.input_layout, input.semantic, input.index));
+            if (found) continue;
+            if (input.never_read && input.component_type >= 1 && input.component_type <= 3) {
+                // D3D12 still requires a declaration for an unread DXIL input. Alias bytes
+                // within an authored vertex stream; the shader never fetches this attribute.
+                constexpr DXGI_FORMAT formats[3][4] = {
+                    {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32B32_UINT, DXGI_FORMAT_R32G32B32A32_UINT},
+                    {DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32G32_SINT, DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32A32_SINT},
+                    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT}};
+                const auto& buffers = sets_[item.buffers].vbv;
+                const auto source = std::find_if(ied.begin(), ied.end(), [&](const auto& desc) {
+                    return desc.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA &&
+                        buffers[desc.InputSlot].StrideInBytes >= 4;
+                });
+                if (source != ied.end()) {
+                    const auto slot = source->InputSlot;
+                    const uint32_t lanes = std::min<uint32_t>(std::bit_width(input.component_mask), buffers[slot].StrideInBytes / 4);
+                    ied.push_back({input.semantic.c_str(), input.index, formats[input.component_type - 1][lanes - 1],
+                                   slot, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+                    continue;
+                }
+            }
+            throw UnsupportedMeshPart(std::format("{}: original vertex layout {} lacks {}{}", item.technique.str(),
+                                                  g.input_layout, input.semantic, input.index));
         }
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
@@ -1682,7 +1736,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         }
         if (const HRESULT hr = pipeline_hr; FAILED(hr)) {
             std::string vs_in, layout;
-            for (const auto& in : shader_inputs(g.vs)) vs_in += std::format(" {}{}", in.semantic, in.index);
+            for (const auto& in : vs_inputs) vs_in += std::format(" {}{}", in.semantic, in.index);
             for (const auto& d : ied) layout += std::format(" {}{}@{}", d.SemanticName, d.SemanticIndex, d.InputSlot);
             auto binds = [](std::span<const uint8_t> code) {
                 std::string o;
@@ -2081,10 +2135,12 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             return a.sky ? a.depth < b.depth : a.depth > b.depth;
         });
         world_transparent_draws_ = 0;
+        sky_transparent_draws_ = 0;
         DrawState state;
         for (const auto& entry : ordered) {
             draw(cl, state, *entry.item, 1, entry.instance);
-            if (!entry.sky) ++world_transparent_draws_;
+            if (entry.sky) ++sky_transparent_draws_;
+            else ++world_transparent_draws_;
         }
         return;
     }
@@ -2245,6 +2301,20 @@ std::array<size_t, 3> StaticMeshScene::visibility_counts() const {
     return counts;
 }
 
+bool StaticMeshScene::has_visible_light_grid() const {
+    return std::any_of(transparent_items_.begin(), transparent_items_.end(), [&](size_t index) {
+        const auto& item = items_[index];
+        if (!item.light_grid || item.failed) return false;
+        const auto& set = sets_[item.buffers];
+        if (set.cull == UINT32_MAX) return set.instances != 0;
+        const auto& group = cull_groups_[set.cull];
+        if (item.dynamic) return group.visible != 0;
+        for (size_t i = 0; i < group.count.size(); ++i)
+            if (group.count[i] && (item.lod_mask & (1u << i))) return true;
+        return false;
+    });
+}
+
 void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow) {
     // Test the bounds against the projection. Leave room for subpixel camera jitter.
     const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
@@ -2263,7 +2333,10 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
                y * vm.fy > std::max(0.0f, z) * (1 + margin_y) + r * ky;
     };
     visible_opaque_.clear();
-    for (auto& group : cull_groups_) {
+    visible_static_indices_.clear();
+    visible_static_groups_.clear();
+    for (uint32_t group_index = 0; group_index < cull_groups_.size(); ++group_index) {
+        auto& group = cull_groups_[group_index];
         group.visible_depths.clear();
         group.visible_placements.clear();
         group.first = {};
@@ -2296,16 +2369,15 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
         if (!group.visible) continue;
         uint8_t lods = 0;
         if (!group.dynamic) {
-            const auto upload = gpu.dynamic(group.visible * sizeof(uint32_t));
-            auto* out = reinterpret_cast<uint32_t*>(upload.cpu);
-            group.visible_address = upload.gpu;
+            visible_static_groups_.push_back(group_index);
+            group.stream_offset = uint32_t(visible_static_indices_.size());
             uint32_t first = 0;
             for (size_t l = 0; l < group.count.size(); ++l) {
                 group.first[l] = first;
                 group.count[l] = uint32_t(cull_scratch_[l].size());
                 if (cull_scratch_[l].empty()) continue;
                 lods |= uint8_t(1u << l);
-                std::memcpy(out + first, cull_scratch_[l].data(), cull_scratch_[l].size() * sizeof(uint32_t));
+                visible_static_indices_.insert(visible_static_indices_.end(), cull_scratch_[l].begin(), cull_scratch_[l].end());
                 if (group.has_transparency)
                     for (uint32_t i : cull_scratch_[l]) {
                         const auto& s = group.spheres[i];
@@ -2323,10 +2395,15 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
     if (first_uncullable && !uncullable_opaque_.empty() &&
         visible_opaque_[first_uncullable - 1] > uncullable_opaque_.front())
         std::inplace_merge(visible_opaque_.begin(), visible_opaque_.begin() + first_uncullable, visible_opaque_.end());
-    for (auto& set : sets_) {
-        if (set.cull == UINT32_MAX || set.dynamic) continue;
-        const auto& group = cull_groups_[set.cull];
-        if (group.visible) set.vbv[2] = {group.visible_address, group.visible * 4, 4};
+    if (!visible_static_indices_.empty()) {
+        const size_t bytes = visible_static_indices_.size() * sizeof(uint32_t);
+        const auto upload = gpu.dynamic(bytes);
+        std::memcpy(upload.cpu, visible_static_indices_.data(), bytes);
+        for (const auto group_index : visible_static_groups_) {
+            const auto& group = cull_groups_[group_index];
+            for (uint32_t i = 0; i < group.set_count; ++i)
+                sets_[group.first_set + i].vbv[2] = {upload.gpu + uint64_t(group.stream_offset) * 4, group.visible * 4, 4};
+        }
     }
 }
 

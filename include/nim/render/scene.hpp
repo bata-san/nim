@@ -5,6 +5,7 @@
 #include "nim/render/gpu.hpp"
 
 #include <array>
+#include <future>
 #include <map>
 #include <mutex>
 #include <span>
@@ -207,7 +208,7 @@ struct PrepareCache {
     bool ready = false;
     std::shared_ptr<const std::vector<float4>> global_channels;
     std::shared_ptr<const std::vector<Scope>> scopes;
-    std::unordered_map<uint32_t, std::shared_ptr<const Texture>> textures;
+    std::unordered_map<uint32_t, std::shared_future<std::shared_ptr<const Texture>>> textures;
     // Shared by the threads preparing a map's meshes in parallel (each with its own PackageManager).
     std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
     std::shared_ptr<std::shared_mutex> texture_mutex = std::make_shared<std::shared_mutex>();
@@ -271,12 +272,14 @@ public:
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                             const ViewMatrices& vm, const ExternStore& inputs);
     bool has_transparent() const { return !transparent_items_.empty(); }
+    bool has_visible_light_grid() const;
     // Skinned dynamic models: poses the meshes on the CPU. `bones` (skeleton order) take bone space
     // to object space, i.e. pose * inverse bind; empty = bind pose. Uploaded by the next render_gbuffer.
     bool skinned() const { return skinned_; }
     void set_skin_pose(std::vector<BoneTransform> bones);
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
+    size_t sky_transparent_draws() const { return sky_transparent_draws_; }
     std::array<size_t, 3> visibility_counts() const;  // visible statics, LOD0 statics, visible placed entities
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
@@ -360,6 +363,7 @@ private:
     std::unordered_map<uint64_t, D3D12_GPU_VIRTUAL_ADDRESS> material_addresses_;
     TagHash tag_;
     size_t world_transparent_draws_ = 0;
+    size_t sky_transparent_draws_ = 0;
     uint64_t shadow_generation_ = 0;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
@@ -401,16 +405,18 @@ private:
         float4 bounds{};
         std::vector<uint32_t> visible_placements;
         size_t first_item = 0, end_item = 0;
+        uint32_t first_set = 0, set_count = 0;
+        uint32_t stream_offset = 0;
         bool dynamic = false;
         bool authored_shadow = false;
         bool has_transparency = false;
         std::vector<float> visible_depths;  // follows the compacted instance stream, including LOD order
         uint8_t levels = 1;  // LOD levels the mesh has (bit n = LOD n)
-        D3D12_GPU_VIRTUAL_ADDRESS visible_address = 0;
         uint32_t visible = 0;
         std::array<uint32_t, 8> first{}, count{};  // visible instances per LOD level, in that order
     };
     std::array<std::vector<uint32_t>, 8> cull_scratch_;
+    std::vector<uint32_t> visible_static_indices_, visible_static_groups_;
     std::vector<CullGroup> cull_groups_;
     std::vector<size_t> uncullable_opaque_, visible_opaque_;
     struct DrawBundle {

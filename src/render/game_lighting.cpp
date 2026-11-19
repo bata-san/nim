@@ -629,10 +629,11 @@ void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Ex
 }
 
 void GamePipeline::dispatch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                            uint32_t x, uint32_t y, uint32_t z) {
+                            uint32_t x, uint32_t y, uint32_t z, std::span<const std::pair<uint32_t, ID3D12Resource*>> textures) {
     if (!compute_ || !x || !y || !z || x > 65535 || y > 65535 || z > 65535)
         throw std::invalid_argument("Invalid original compute dispatch");
-    execute(gpu, cl, ext, scopes, false, x, y, z);
+    const Geometry bindings{nullptr, nullptr, nullptr, 0, textures};
+    execute(gpu, cl, ext, scopes, !textures.empty(), x, y, z, textures.empty() ? nullptr : &bindings);
 }
 
 void GamePipeline::dispatch_indirect(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -730,7 +731,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             uint64_t first_element = 0;
             if (auto it = st.static_textures.find(s); it != st.static_textures.end()) r = it->second.Get();
             bool engine_bound = false;  // a view the caller binds wins over the TFX's extern
-            if (geometry && st.which == ShaderStage::Pixel)
+            if (geometry && (st.which == ShaderStage::Pixel || st.which == ShaderStage::Compute))
                 for (const auto& [slot, res] : geometry->ps_textures)
                     if (slot == s) r = res, engine_bound = true;
             for (const auto& et : textures) {
@@ -743,7 +744,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 elements = t.elements;
                 first_element = t.first_element;
             }
-            bool null_view = false;
+            bool null_view = engine_bound && !r;
             if (!r)
                 for (const auto& et : textures)
                     if (et.slot == s && ext.estimate_null_texture(et.extern_id, uint32_t(et.offset) * 8)) null_view = true;
@@ -1503,7 +1504,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     }
     constexpr std::string_view viewer_light = "viewer light set-up (no map lighting loaded)";
     const V3 sun = p.sun_color * (p.sun_intensity * 4.0f);
-    const float ka = 4.0f * p.sky_intensity;
+    const float ka = p.entity_preview ? 0.0f : 4.0f * p.sky_intensity;
     ext_.estimate(ext::GlobalLighting, 0x10, v4(sun, 0), viewer_light);
     ext_.estimate(ext::GlobalLighting, 0x30, v4(sun_dir, 0), viewer_light);
     ext_.estimate(ext::GlobalLighting, 0x70, v4(p.sky_top * ka, 0), viewer_light);
@@ -1593,11 +1594,11 @@ void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) 
 }
 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                          const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow) {
+                          const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow, bool needs_light_grid) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (p.entity_preview)
-        ext_.note_estimate("entity preview: Outpost's authored sky and lighting channels",
-                           "an isolated model does not specify a map environment");
+        ext_.note_estimate("entity preview: orbit_goliath_013b room probe near the origin",
+                           "the isolated asset does not store a location; it is previewed in the authored interior probe");
     if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
     const bool shadowed = shadow && shadow->valid && shadow->depth;
     update_global_channels(p);
@@ -1659,8 +1660,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ec.sky_top = p.sky_top; ec.inv_h = 1.0f / float(h_);
     ec.sky_horizon = p.sky_horizon; ec.sky_intensity = p.sky_intensity;
     ec.ground = p.ground;
-    ec.bg_top = p.background_top;
-    ec.bg_bottom = p.background_bottom;
+    ec.bg_top = p.entity_preview ? V3{0.20f, 0.20f, 0.20f} : p.background_top;
+    ec.bg_bottom = p.entity_preview ? V3{0.11f, 0.11f, 0.11f} : p.background_bottom;
     const auto ecb = gpu.dynamic(sizeof(ec));
     std::memcpy(ecb.cpu, &ec, sizeof(ec));
     auto env_pass = [&](ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE target) {
@@ -1729,6 +1730,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
     grid_ready_ = false;
     for (uint32_t off : {0x28u, 0x30u, 0x38u, 0x40u}) ext_.set_texture(ext::Transparent, off, nullptr);
+    ext_.set_texture(ext::Transparent, 0xE0, nullptr);  // engine-bound reflection cube of an isolated preview
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
     if (sky_ambient) {
@@ -1743,7 +1745,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     vol_drawn_ = 0;
     if (own_env) {
         Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        if (!sky_ambient) env_pass(env_ibl_pso_.Get(), env_rtv);
+        if (p.entity_preview) cl->ClearRenderTargetView(env_rtv, clear, 0, nullptr);
+        else if (!sky_ambient) env_pass(env_ibl_pso_.Get(), env_rtv);
     }
     if (!lights_.empty() || !cubemaps_.empty() || sky_ambient) {
         // Light buffers: first the cubemap volumes (diffuse probes + specular IBL over the sky's).
@@ -1786,9 +1789,10 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, light_diffuse_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
-    if (transparents && sky_ambient) {
+    const auto* preview_probe = p.entity_preview && !cubemaps_.empty() ? &cubemaps_.front() : nullptr;
+    if (transparents && (sky_ambient || preview_probe) && needs_light_grid) {
         try {
-            render_light_grid(gpu, cl, vm, scopes, overhead_occlusion_on(p));
+            render_light_grid(gpu, cl, vm, scopes, sky_ambient, overhead_occlusion_on(p), preview_probe);
         } catch (const std::exception& ex) {
             ext_.note_estimate("transparent light grid is unavailable", ex.what());
         }
@@ -1959,16 +1963,18 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     // ship interior (Marathon Deck) authors 10 .. 10000, which only reads as metres. The
     // in-scatter CS scales the extinction by saturate((d - start) / (end - start)) and the sun
     // in-scatter by the second pair (docs/PROGRESS.md 3.2.4).
-    // An unset pair (0, 0) is 1/0 and 0/0 in that TFX; the engine's guard is not in game data:
-    // a zero-width range is passed as a step at `start` (full strength beyond it).
+    // The shader divides by the width. Give an undefined range a finite transition
+    // when the source supplies no positive width.
     auto range = [&](uint32_t off, float start, float end, std::string_view name) {
         ext_.set(A, off, start);
         if (end > start) {
             ext_.set(A, off + 4, end);
         } else {
-            ext_.set(A, off + 4, start + 1e-3f);
-            ext_.note_estimate(std::format("extern 7 +0x{:X} / +0x{:X} = {:g} m step ({} unset)", off, off + 4, start, name),
-                               "zero-width lookup range: full strength beyond the start (engine guard unknown)");
+            constexpr float width = 1.0f;
+            ext_.set(A, off + 4, start + width);
+            ext_.note_estimate(std::format("extern 7 +0x{:X} / +0x{:X} = {:g}..{:g} m ({} unset)",
+                                           off, off + 4, start, start + width, name),
+                               "one metre for an undefined fog transition; engine guard unknown");
         }
     };
     range(0x178, ch(0x10)[0], ch(0x11)[0], "fog_density_lookup_start / _end");
@@ -2743,6 +2749,7 @@ float cubemap_alpha_exponent(float z) {
 }
 
 void GameLighting::clear_cubemaps(Gpu& gpu) {
+    grid_key_.reset();
     // Old frames can still hold views of these resources. Retire them before freeing the
     // cache, instead of retaining every previously visited map for the process lifetime.
     if (!probe_textures_.empty() || !filtered_cubes_.empty() || !probe_shapes_.empty()) gpu.wait_idle();
@@ -2752,6 +2759,16 @@ void GameLighting::clear_cubemaps(Gpu& gpu) {
     probe_shapes_.clear();
     cubemap_notes_.clear();
     cubemaps_requested_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
+}
+
+bool GameLighting::set_entity_preview(PackageManager& pm, Gpu& gpu) {
+    const auto authored = load_entity_preview_probes(pm);
+    std::vector<const MapCubemap*> probes;
+    for (const auto& probe : authored) probes.push_back(&probe);
+    set_cubemaps(pm, gpu, probes);
+    ae_valid_ = taa_valid_ = false;
+    ae_fence_ = {};
+    return !cubemaps_.empty();
 }
 
 void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const MapCubemap* const> cubemaps, bool diagnostic_csg) {

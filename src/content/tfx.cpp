@@ -630,6 +630,9 @@ std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> bc) {
             for (size_t c = base + name; c < bc.size() && bc[c]; ++c) in.semantic += char(bc[c]);
             in.index = u32(o + 8);
             in.reg = u32(o + 20);
+            in.component_type = uint8_t(u32(o + 16));
+            in.component_mask = bc[o + 24] & 0x0F;
+            in.never_read = in.component_mask != 0 && (in.component_mask & bc[o + 25]) == 0;
             out.push_back(std::move(in));
         }
     }

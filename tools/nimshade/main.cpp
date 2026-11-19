@@ -223,7 +223,6 @@ int run(int argc, char** argv) {
     std::vector<const MapCubemap*> region_cubemaps;
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
-    bool is_entity = false;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -398,8 +397,6 @@ int run(int argc, char** argv) {
         std::println("  prepare {:.1f}s, add {:.1f}s", prep_s, add_s);
         for (const auto& [why, n] : failures) std::println("  skipped {}: {}", n, why);
     } else if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
-        is_entity = true;
-        if (!no_atmosphere) atmosphere = load_entity_preview_atmosphere(pm);
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
         auto it = mats.find(mesh_tag.value);
@@ -470,7 +467,6 @@ int run(int argc, char** argv) {
     lp.volumetrics = !no_volumetrics;
     lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;
-    lp.entity_preview = is_entity && atmosphere.valid();
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
@@ -520,6 +516,7 @@ int run(int argc, char** argv) {
     };
     if (game) {
         gl.init(pm, gpu);
+        if (!is_map && !no_environment) lp.entity_preview = gl.set_entity_preview(pm, gpu);
         if (rain.valid) gl.set_overhead_occlusion(&rain);
         if (!weather_channels.empty()) gl.set_global_channels(weather_channels);
         std::println("game shading: technique {}", gl.shading_technique().str());
@@ -574,7 +571,7 @@ int run(int argc, char** argv) {
                 const auto maps = gl.light_shadows_to_render(gpu, gpu.immediate(), vm, scene.item_count(), frame_light_shadows);
                 for (SunShadow* s : maps) scene.render_shadow(gpu, gpu.immediate(), *s);
                 scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-                gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+                gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
                 gpu.flush();
                 drawn += maps.size();
                 if (maps.empty()) break;
@@ -607,13 +604,13 @@ int run(int argc, char** argv) {
                 scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             }
         }
-        gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+        gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
         gpu.flush();
         // Screen-space reflections trace the previous frame's image: one more frame gives them one.
         if (lp.ssr && !gl.ssr_drawn()) {
             gpu.begin_frame(1);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
             gpu.flush();
         }
         std::println("screen-space reflections: {}", gl.ssr_drawn() ? "traced" : "not drawn");
@@ -623,7 +620,7 @@ int run(int argc, char** argv) {
             gpu.begin_frame(uint32_t(k + 1));  // the previous frame was flushed: its transient space is free
             scene.set_exposure(gl.exposure());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
             gpu.flush();
         }
         // TAA: a still camera converges over the jitter sequence (16 frames: two passes of 8).
@@ -632,7 +629,7 @@ int run(int argc, char** argv) {
             gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
             vm = gl.temporal_view(view, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
             gpu.flush();
             if (verify_static_motion) {
                 const auto motion = gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8);
@@ -656,7 +653,8 @@ int run(int argc, char** argv) {
         if (verify_static_motion && (!gl.temporal_aa_on(lp) || stationary_motion_max > 0.1f))
             throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
         std::println("world transparent draws: {}", scene.world_transparent_draws());
-        if (scene.has_transparent())
+        if (is_map) std::println("sky transparent draws: {}", scene.sky_transparent_draws());
+        if (scene.has_visible_light_grid())
             std::println("transparent light grid: {}", gl.light_grid_drawn() ? "ready" : "unavailable");
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
@@ -742,7 +740,7 @@ int run(int argc, char** argv) {
             const auto after_geometry = std::chrono::steady_clock::now();
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
             if (game) gl.render(gpu, list, gb, vm, lp,
-                                scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+                                scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
             else lighting.render(gpu, list, gb, vm, lp);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
             list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, readback.Get(), 0);
@@ -1009,7 +1007,7 @@ int run(int argc, char** argv) {
             moved.target = moved.eye + normalize(V3{1, 0, 1});  // mostly empty sky, rotated from the previous view
             vm = gl.temporal_view(moved, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow);
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
             gpu.flush();
             verify_lut(vm);
             const auto depth = gl.externs().texture(ext::Deferred, 0x98);

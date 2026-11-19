@@ -34,6 +34,7 @@
 #include <deque>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -791,11 +792,18 @@ private:
                 for (auto& model : entity_region) region.push_back(std::move(model));
                 float extent = 1;
                 std::vector<float> distances;
-                for (const auto& st : region)
+                std::vector<std::pair<float, size_t>> world_jobs;
+                world_jobs.reserve(region.size());
+                for (size_t j = 0; j < region.size(); ++j) {
+                    const auto& st = region[j];
+                    float nearest = std::numeric_limits<float>::infinity();
                     for (const auto& r : st.rows) {
                         distances.push_back(std::hypot(r[3] - center[0], r[7] - center[1], r[11] - center[2]));
                         extent = std::max(extent, distances.back());
+                        nearest = std::min(nearest, distances.back());
                     }
+                    world_jobs.emplace_back(nearest, j + terrain.size());
+                }
                 float typical = extent;
                 if (!distances.empty()) {
                     const auto k = distances.begin() + std::ptrdiff_t(distances.size() * 8 / 10);
@@ -805,7 +813,15 @@ private:
                 // Authored sky collections are independent of the world streaming radius.
                 // Append after framing statistics so kilometre-distant scenery cannot move
                 // the user's initial camera.
+                const size_t first_sky = region.size();
                 for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
+                std::sort(world_jobs.begin(), world_jobs.end());
+                std::vector<size_t> jobs;
+                jobs.reserve(terrain.size() + region.size());
+                // The skyline must be visible while the thousands of world meshes are loading.
+                for (size_t i = first_sky; i < region.size(); ++i) jobs.push_back(terrain.size() + i);
+                for (size_t i = 0; i < terrain.size(); ++i) jobs.push_back(i);
+                for (const auto& [distance, index] : world_jobs) jobs.push_back(index);
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
                     const auto all = load_map_lights(*pm, *layout);
@@ -843,19 +859,18 @@ private:
                     progress_.lights = std::move(lights);
                     progress_.cubemaps = std::move(cubemaps);
                 }
-                // Prepared in parallel (one PackageManager per thread), terrain first, then the
-                // statics nearest first; pieces arrive roughly in that order.
+                // Prepare sky, terrain and then nearby world assets in parallel.
                 // Every core but the UI thread's.
                 if (helpers.empty()) {
                     const unsigned n = std::max(std::thread::hardware_concurrency(), 2u) - 2;
                     for (unsigned i = 0; i < n; ++i) helpers.push_back(pm->fork());
                 }
                 std::atomic<size_t> next{0};
-                const size_t jobs = terrain.size() + region.size();
                 auto work = [&](PackageManager& wpm) {
                     for (;;) {
-                        const size_t j = next.fetch_add(1);
-                        if (j >= jobs || stale()) return;
+                        const size_t slot = next.fetch_add(1);
+                        if (slot >= jobs.size() || stale()) return;
+                        const size_t j = jobs[slot];
                         Piece piece{req.generation};
                         std::string failure;
                         try {
@@ -1186,7 +1201,6 @@ public:
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
-            entity_preview_atmosphere.reset();
             entity_preview_active = thumb_preview_active = false;
             init_game_lighting();
             return true;
@@ -1221,11 +1235,7 @@ public:
     bool set_entity_preview(GameLighting& renderer, bool& active) {
         if (active) return true;
         try {
-            if (!entity_preview_atmosphere) entity_preview_atmosphere = load_entity_preview_atmosphere(*pm);
-            if (entity_preview_atmosphere->valid()) {
-                renderer.set_atmosphere(*pm, gpu, &*entity_preview_atmosphere);
-                active = renderer.has_atmosphere();
-            }
+            active = renderer.set_entity_preview(*pm, gpu);
         } catch (const std::exception& ex) {
             error(std::format("エンティティの環境光: {}", ex.what()));
         }
@@ -1343,9 +1353,8 @@ public:
                     stop_map();
                     map_scene = false;
                     game_lighting.clear_lights(g);
-                    game_lighting.clear_cubemaps(g);
-                    const bool entity = r->mesh->dynamic;
-                    if (!entity || !entity_preview_active) {
+                    if (!entity_preview_active) {
+                        game_lighting.clear_cubemaps(g);
                         game_lighting.clear_atmosphere();
                         entity_preview_active = false;
                     }
@@ -1354,7 +1363,7 @@ public:
                     weather_states.clear();
                     apply_weather();
                     scene.upload(g, std::move(*r->mesh), layouts);
-                    if (entity && game_ready) set_entity_preview(game_lighting, entity_preview_active);
+                    if (game_ready) set_entity_preview(game_lighting, entity_preview_active);
                     if (!r->skeleton || !r->rig) {
                         anim.reset();
                     } else if (!anim || anim->model != r->tag) {
@@ -1435,8 +1444,9 @@ public:
         if (!map.streaming) return;
         const auto t0 = std::chrono::steady_clock::now();
         bool added = false;
+        const auto upload_budget = std::chrono::milliseconds(map.framed ? 6 : 12);
         // Only new GPU objects are created (nothing the frame in flight uses), so no GPU wait.
-        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(24)) {
+        while (std::chrono::steady_clock::now() - t0 < upload_budget) {
             auto piece = map_worker.take(map.generation);
             if (!piece) break;
             added = true;
@@ -1504,7 +1514,6 @@ public:
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
-    std::optional<MapAtmosphere> entity_preview_atmosphere;
     bool entity_preview_active = false, thumb_preview_active = false;
     // Weather: the map's world channel controllers and the state chosen for each (-1 = none,
     // the render-globals defaults).
@@ -1752,9 +1761,8 @@ public:
         }
         try {
             g.wait_idle();
-            const bool entity = r->mesh->dynamic;
             thumb_scene.upload(g, std::move(*r->mesh), layouts);
-            const bool preview = entity && thumb_game_ready && set_entity_preview(thumb_lighting, thumb_preview_active);
+            const bool preview = thumb_game_ready && set_entity_preview(thumb_lighting, thumb_preview_active);
             thumb_gb.resize(g, kThumbSize, kThumbSize);
             ViewMatrices vm = make_view(frame_sphere(thumb_scene.center(), thumb_scene.radius(), kThumbSize, kThumbSize));
             auto* cl = g.immediate();
@@ -1762,13 +1770,16 @@ public:
             LightingParams lp = light;
             lp.mode = ViewMode::Lit;
             lp.time = lp.delta_time = 0;
-            lp.atmosphere = lp.entity_preview = preview;
+            lp.atmosphere = false;
+            lp.entity_preview = preview;
             lp.auto_exposure = lp.temporal_aa = false;
-            if (thumb_game_ready)
-                thumb_lighting.render(g, cl, thumb_gb, vm, lp, [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+            if (thumb_game_ready) {
+                GameLighting::TransparentFn transparents;
+                if (thumb_scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                     thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm, thumb_lighting.externs());
-                });
-            else throw std::runtime_error("Original game lighting is unavailable; thumbnail rendering stopped");
+                };
+                thumb_lighting.render(g, cl, thumb_gb, vm, lp, transparents, nullptr, thumb_scene.has_visible_light_grid());
+            } else throw std::runtime_error("Original game lighting is unavailable; thumbnail rendering stopped");
             if (!t.tex) {
                 t.tex = g.texture2d(kThumbSize, kThumbSize, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
@@ -1945,7 +1956,7 @@ public:
                 if (scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                     scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
                 };
-                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow);
+                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow, scene.has_visible_light_grid());
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {
@@ -2315,7 +2326,7 @@ public:
             dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(200, 80, 80, 255), t);
             if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
         } else if (it != thumbs.end() && it->second.no_drawable) {
-            const char* t = "NO G-BUFFER";
+            const char* t = "未対応パス";
             ImVec2 ts = ImGui::CalcTextSize(t);
             dl->AddText({p.x + (card - ts.x) * 0.5f, p.y + (card - ts.y) * 0.5f}, IM_COL32(170, 170, 170, 255), t);
             if (hovered) ImGui::SetTooltip("%s", it->second.error.c_str());
@@ -2570,7 +2581,7 @@ public:
         if (!scene.loaded()) {
             if (no_drawable_tag) {
                 ImGui::Text("ENTITY %s", no_drawable_tag->str().c_str());
-                ImGui::TextDisabled("No G-buffer geometry: %s", no_drawable_reason.c_str());
+                ImGui::TextDisabled("未対応パス: %s", no_drawable_reason.c_str());
                 return;
             }
             ImGui::TextDisabled("メッシュ未選択");

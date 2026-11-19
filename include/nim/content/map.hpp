@@ -208,7 +208,7 @@ struct MapAtmosphere {
     float slice_coordinate(float t) const;
 };
 MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map);
-MapAtmosphere load_entity_preview_atmosphere(PackageManager& pm);
+std::vector<MapCubemap> load_entity_preview_probes(PackageManager& pm);
 
 // ---- entities ------------------------------------------------------------------------------
 // A selection's placed entities: only its MapLayout.node_tables (bubble, or bubble plus the

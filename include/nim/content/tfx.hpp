@@ -211,12 +211,14 @@ struct ShaderBinding {
     uint32_t space = 0, lower = 0, upper = 0;
 };
 std::vector<ShaderBinding> shader_bindings(std::span<const uint8_t> dxbc);
-// Vertex inputs a shader declares (DXBC ISG1 part), system values excluded. D3D12 refuses a PSO
-// whose input layout lacks any of them, even unused ones.
+// Vertex inputs a shader declares (DXBC ISG1 part), system values excluded.
 struct ShaderInput {
     std::string semantic;
     uint32_t index = 0, reg = 0;
     bool never_written = false;  // outputs: declared, but no component is ever written
+    bool never_read = false;     // inputs: declared, but no component is ever read
+    uint8_t component_type = 0;  // DXBC register component type (uint32, sint32, float32)
+    uint8_t component_mask = 0;
 };
 std::vector<ShaderInput> shader_inputs(std::span<const uint8_t> dxbc);
 // Output attachments must match the original PS signature, including non-contiguous targets.
