@@ -663,6 +663,9 @@ private:
                            const SunShadow* shadow);
     // light_sample_points_shadow_compute: the sun visibility of each grid cell from the sun shadow
     // map (extern 6), read by the transparent shaders as extern 40 +0x40.
+    // Render-global channel slot -> value chosen for the map's lights (LightingParams::assume_lights_on).
+    std::map<size_t, float> light_state_;
+    void choose_light_state();
     void render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow);
     GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_, grid_sun_;
     std::array<ComPtr<ID3D12Resource>, 2> grid_sun_vis_;  // [0] result, [1] the "previous" input, all 1

@@ -581,6 +581,11 @@ struct LightingParams {
     // Froxel interior classification (extern 81) from the same top-down depth: froxels under geometry
     // take fog_density_interior. The engine's interior visibility map producer is unknown (estimate).
     bool interior_fog = true;
+    // Light state channels: render-global channels that map lights read, that default to 0 and that
+    // no map data sets (script state: the light group dimmers ECA86879..ECA86870, Marathon Deck's
+    // blue fill 07806276, ...). On: each is set to whichever of 0 / 1 lights more of the map's
+    // lights (Outpost's lights go dark at 1, Marathon Deck's at 0). Estimate; off keeps the defaults.
+    bool assume_lights_on = true;
     // With the atmosphere: the engine's froxel volume (cascade_raymarch_atmosphere_volume and
     // its _inscatter pass) for the height fog's density, sun shadowing and in-scatter.
     bool froxel_fog = true;

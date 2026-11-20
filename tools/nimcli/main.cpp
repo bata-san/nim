@@ -1604,6 +1604,7 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     std::map<uint32_t, uint32_t> slot_hash;
     for (const auto& [hash, slot] : registry.slots) slot_hash[slot] = hash;
     std::map<uint8_t, size_t> world, global;
+    std::map<uint8_t, TagHash> global_example;  // one technique per render-global channel
     std::map<uint32_t, std::array<size_t, 2>> light_floats;  // deferred_light (extern 4) float offset -> lights reading it (all, shadowing)
     size_t failed = 0, shadow_world3 = 0;
     for (const auto& l : lights) {
@@ -1620,7 +1621,10 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
             std::vector<float4> out;
             evaluate_tfx(ps.bytecode, ps.constants, ps.cbuffer_init, out, env);
             for (auto c : w) ++world[c];
-            for (auto c : g) ++global[c];
+            for (auto c : g) {
+                ++global[c];
+                global_example.try_emplace(c, l.technique);
+            }
             for (auto i : f) { ++light_floats[uint32_t(i) * 4][0]; light_floats[uint32_t(i) * 4][1] += l.shadowing; }
             if (l.shadowing && w.contains(3)) ++shadow_world3;
         } catch (const std::exception&) { ++failed; }
@@ -1630,7 +1634,8 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
         const auto it = slot_hash.find(c);
         std::println("  world channel {:2} ({:08X}): {} lights", c, it == slot_hash.end() ? 0u : it->second, n);
     }
-    for (const auto& [c, n] : global) std::println("  render-global channel {:02X}: {} lights", c, n);
+    for (const auto& [c, n] : global)
+        std::println("  render-global channel {:02X}: {} lights, e.g. technique {}", c, n, global_example[c].str());
     std::println("  shadowing lights reading world channel 3: {}", shadow_world3);
     for (const auto& [off, n] : light_floats) std::println("  deferred_light +0x{:X} (float): {} lights, {} of them shadowing", off, n[0], n[1]);
     return 0;

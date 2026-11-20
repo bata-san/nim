@@ -1660,6 +1660,18 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
 const std::vector<float4>& GameLighting::update_global_channels(const LightingParams& p) {
     ext_.channels.assign(globals_.channel_defaults.begin(), globals_.channel_defaults.end());
     env_channels_ = 0;
+    if (p.assume_lights_on && !light_state_.empty()) {
+        std::string list;
+        for (const auto& [slot, v] : light_state_) {
+            if (slot >= ext_.channels.size()) continue;
+            ext_.channels[slot] = {v, v, v, v};
+            list += std::format("{}{:02X} ({:08X}) = {:g}", list.empty() ? "" : ", ", slot,
+                                slot < ext_.channel_ids.size() ? ext_.channel_ids[slot] : 0u, v);
+        }
+        ext_.note_estimate("light state channels: " + list,
+                           "render-global channels the map's lights read that default to 0 and no map data sets (script state); "
+                           "each set to the one of 0 / 1 under which the map's lights give more light; map environment expressions still override");
+    }
     if (atm_.valid && p.atmosphere && p.environment && !atm_.data.channel_expressions.empty()) {
         // The sequencer inputs (docs/PROGRESS.md 3.6.1): the sequence component's slot table
         // names them. A sequence parameter (input 0) is the time of day; the others are world
@@ -2388,6 +2400,63 @@ void GameLighting::clear_lights(Gpu& gpu) {
     ssr_history_valid_ = false;  // another map's image
 }
 
+// Light state channels (LightingParams::assume_lights_on): for every render-global channel that
+// defaults to 0 and that some light's pixel expression reads, the summed magnitude of those lights'
+// evaluated constants with the channel at 0 and at 1; the larger one is taken. Other inputs are
+// the render-global defaults, extern and per-object values 1 (as `nimcli lights` evaluates them).
+void GameLighting::choose_light_state() {
+    light_state_.clear();
+    const auto& defaults = globals_.channel_defaults;
+    auto zero = [&](size_t c) { return c < defaults.size() && defaults[c] == float4{}; };
+    std::unordered_map<const Technique*, size_t> uses;
+    for (const auto& ll : lights_)
+        if (ll.technique) ++uses[ll.technique.get()];
+    std::map<size_t, std::array<double, 2>> totals;
+    for (const auto& [tech, count] : uses) {
+        const auto& ps = tech->stage(ShaderStage::Pixel);
+        std::set<size_t> read;
+        int forced = -1;
+        float forced_value = 0;
+        TfxEnvironment env;
+        env.extern_vec4 = [](uint8_t, uint8_t) { return float4{1, 1, 1, 1}; };
+        env.extern_float = [](uint8_t, uint8_t) { return 1.0f; };
+        env.world_channel = [](uint8_t) { return float4{1, 1, 1, 1}; };
+        env.object_channel = [](uint32_t) { return float4{1, 1, 1, 1}; };
+        env.global_channel = [&](uint8_t c) {
+            read.insert(c);
+            if (int(c) == forced) return float4{forced_value, forced_value, forced_value, forced_value};
+            return c < defaults.size() ? defaults[c] : float4{};
+        };
+        auto magnitude = [&]() {
+            std::vector<float4> out;
+            try {
+                evaluate_tfx(ps.bytecode, ps.constants, ps.cbuffer_init, out, env);
+            } catch (const std::exception&) { return -1.0; }
+            double sum = 0;
+            for (const auto& v : out)
+                for (float x : v)
+                    if (std::isfinite(x)) sum += std::abs(x);
+            return sum;
+        };
+        if (magnitude() < 0) continue;
+        const std::set<size_t> first = read;
+        for (size_t c : first) {
+            if (!zero(c)) continue;
+            forced = int(c);
+            forced_value = 0;
+            const double off = magnitude();
+            forced_value = 1;
+            const double on = magnitude();
+            forced = -1;
+            if (off < 0 || on < 0) continue;
+            totals[c][0] += off * double(count);
+            totals[c][1] += on * double(count);
+        }
+    }
+    for (const auto& [c, t] : totals)
+        if (t[1] > t[0] * 1.000001) light_state_[c] = 1;
+}
+
 void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapLight* const> lights) {
     clear_lights(gpu);
     light_notes_.clear();
@@ -2485,6 +2554,7 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
         }
     }
     for (const auto& [why, n] : failures) light_notes_.push_back(std::format("{} lights left out: {}", n, why));
+    choose_light_state();
     // Light shafts: the same per-shader pipeline sharing, four quarter-resolution targets added
     // into (far, near, slices 0-3, slices 4-7). The techniques also read the rigid_model,
     // transparent and transparent_advanced scopes.

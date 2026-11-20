@@ -110,6 +110,7 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
     float exposure_arg = 1;
+    bool assume_lights_on = true;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
@@ -189,6 +190,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
         else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
         else if (args[i] == "--no-interior-fog") no_interior_fog = true;
+        else if (args[i] == "--no-assumed-light-state") assume_lights_on = false;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--equipment" && i + 1 < args.size()) equipment_model = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
@@ -216,7 +218,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--fx-radius M]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--fx-radius M]");
         return 2;
     }
     if (install.empty()) {
@@ -550,6 +552,7 @@ int run(int argc, char** argv) {
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
     lp.interior_fog = !no_interior_fog;
+    lp.assume_lights_on = assume_lights_on;
     lp.froxel_fog = !no_froxels;
     lp.froxel_noise = !no_froxel_noise;
     lp.probe_distance_fade = probe_distance_fade;
