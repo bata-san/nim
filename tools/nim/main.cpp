@@ -29,6 +29,8 @@
 #include <shobjidl.h>
 #include <wincodec.h>
 #include <windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <array>
@@ -61,7 +63,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kVersion = "0.3.1";
-constexpr ImU32 kGreen = IM_COL32(255, 179, 64, 255);  // nim amber (the accent; the name predates it)
+constexpr ImU32 kGreen = IM_COL32(201, 254, 0, 255);  // Marathon green
 constexpr uint32_t kThumbSize = 256;
 
 // ---- small utilities ------------------------------------------------------------------------------
@@ -228,10 +230,11 @@ void write_png(const fs::path& path, uint32_t w, uint32_t h, const std::vector<u
 
 // ---- fonts ----------------------------------------------------------------------------------------
 struct Fonts {
-    ImFont* body = nullptr;     // PP Fraktion Mono + Noto Sans JP/KR/SC/TC + icons
+    ImFont* body = nullptr;     // Noto Sans JP + KR/SC/TC + icons
     ImFont* bold = nullptr;
-    ImFont* heading = nullptr;  // MarathonShapiro Wide 65
-    ImFont* button = nullptr;   // KH Interference
+    ImFont* heading = nullptr;  // titles (the bold face)
+    ImFont* button = nullptr;   // labels and buttons (medium)
+    ImFont* mono = nullptr;     // PP Fraktion Mono: tags and numbers
     bool from_game = false;
 };
 Fonts g_fonts;
@@ -260,7 +263,7 @@ void load_fonts(PackageManager* pm) {
         }
     }
     const fs::path sys = "C:/Windows/Fonts";
-    auto add = [&](std::vector<uint8_t> data, float size, ImFont* merge_into, float extra = 1.0f) -> ImFont* {
+    auto add = [&](std::vector<uint8_t> data, float size, ImFont* merge_into, float extra = 1.0f, float dy = 0) -> ImFont* {
         if (data.empty()) return nullptr;
         g_font_data.push_back(std::move(data));
         auto& d = g_font_data.back();
@@ -269,6 +272,7 @@ void load_fonts(PackageManager* pm) {
         cfg.MergeMode = merge_into != nullptr;
         cfg.DstFont = merge_into;
         cfg.ExtraSizeScale = extra;
+        cfg.GlyphOffset = {0, dy};
         return io.Fonts->AddFontFromMemoryTTF(d.data(), int(d.size()), size, &cfg);
     };
     auto game_font = [&](const char* ps) -> std::vector<uint8_t> {
@@ -300,141 +304,216 @@ void load_fonts(PackageManager* pm) {
         add(first_sys({"segoeui.ttf"}), 0, f);
     };
 
-    g_fonts.from_game = game.count("PPFraktionMono-Regular") != 0;
-    g_fonts.body = add(game_font("PPFraktionMono-Regular"), 17, nullptr);
-    if (!g_fonts.body) g_fonts.body = add(first_sys({"segoeui.ttf"}), 17, nullptr);
+    // shadcn-like: one sans family (the game's Noto Sans JP, which also covers Latin) in three weights,
+    // the game's mono face for tags and numbers.
+    auto sans = [&](const char* jp, float size, std::initializer_list<const char*> sys_fallback) -> ImFont* {
+        ImFont* f = add(game_font(jp), size, nullptr);
+        const bool game_face = f != nullptr;
+        if (!f) f = add(first_sys(sys_fallback), size, nullptr);
+        if (!f) return nullptr;
+        if (game_face) {
+            add(game_font("NotoSansKR-Regular"), 0, f);
+            add(game_font("NotoSansSC-Regular"), 0, f);
+            add(game_font("NotoSansTC-Regular"), 0, f);
+            add(first_sys({"malgun.ttf"}), 0, f);
+        } else {
+            add(first_sys({"YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"}), 0, f);
+            add(first_sys({"malgun.ttf"}), 0, f);
+            add(first_sys({"msyh.ttc"}), 0, f);
+        }
+        add(icons(), 0, f, 1.0f, 3.0f);  // Segoe icons sit high next to Noto's tall line
+        add(first_sys({"segoeui.ttf"}), 0, f);
+        return f;
+    };
+    g_fonts.from_game = game.count("NotoSansJP-Regular") != 0;
+    g_fonts.body = sans("NotoSansJP-Regular", 17, {"segoeui.ttf"});
     if (!g_fonts.body) g_fonts.body = io.Fonts->AddFontDefault();
-    cjk(g_fonts.body, "NotoSansJP-Regular");
-    g_fonts.bold = add(game_font("PPFraktionMono-Bold"), 17, nullptr);
-    if (!g_fonts.bold) g_fonts.bold = add(first_sys({"segoeuib.ttf"}), 17, nullptr);
-    cjk(g_fonts.bold, "NotoSansJP-Bold");
-    g_fonts.heading = add(game_font("MarathonShapiro-Wide65"), 42, nullptr);
-    if (!g_fonts.heading) g_fonts.heading = add(first_sys({"segoeuib.ttf"}), 42, nullptr);
-    cjk(g_fonts.heading, "NotoSansJP-Bold");
-    g_fonts.button = add(game_font("KHInterference-Regular"), 24, nullptr);
-    if (!g_fonts.button) g_fonts.button = add(first_sys({"segoeuisl.ttf", "segoeui.ttf"}), 24, nullptr);
-    cjk(g_fonts.button, "NotoSansJP-Medium");
+    g_fonts.button = sans("NotoSansJP-Medium", 17, {"seguisb.ttf", "segoeui.ttf"});
+    g_fonts.bold = sans("NotoSansJP-Bold", 17, {"segoeuib.ttf"});
+    g_fonts.heading = g_fonts.bold;
+    g_fonts.mono = add(game_font("PPFraktionMono-Regular"), 15, nullptr);
+    if (!g_fonts.mono) g_fonts.mono = add(first_sys({"consola.ttf"}), 15, nullptr);
+    cjk(g_fonts.mono, "NotoSansJP-Regular");
     if (!g_fonts.bold) g_fonts.bold = g_fonts.body;
     if (!g_fonts.heading) g_fonts.heading = g_fonts.bold;
     if (!g_fonts.button) g_fonts.button = g_fonts.body;
+    if (!g_fonts.mono) g_fonts.mono = g_fonts.body;
     io.FontDefault = g_fonts.body;
 }
 
-// The interface theme: terminal-like. Black, one text colour, one accent, square corners.
+// The interface theme, after shadcn/ui's dark zinc palette: near-black background, hairline borders,
+// 6-8 px corners, white primary buttons, grey "accent" fills for hover and selection.
 namespace theme {
-constexpr ImU32 kRail = IM_COL32(8, 8, 8, 255);
-constexpr ImU32 kBg = IM_COL32(8, 8, 8, 255);
-constexpr ImU32 kSurface = IM_COL32(8, 8, 8, 255);
-constexpr ImU32 kSurfaceHi = IM_COL32(20, 20, 20, 255);
-constexpr ImU32 kHover = IM_COL32(28, 28, 28, 255);
-constexpr ImU32 kActive = IM_COL32(36, 36, 36, 255);
-constexpr ImU32 kBorder = IM_COL32(48, 48, 48, 255);
-constexpr ImU32 kText = IM_COL32(214, 214, 214, 255);
-constexpr ImU32 kMuted = IM_COL32(118, 118, 118, 255);
-constexpr ImU32 kError = IM_COL32(255, 110, 110, 255);
-constexpr ImU32 kAccentHi = IM_COL32(255, 206, 128, 255);
+constexpr ImU32 kBg = IM_COL32(9, 9, 11, 255);           // background
+constexpr ImU32 kRail = IM_COL32(17, 17, 19, 255);       // sidebar, title bar and status line
+constexpr ImU32 kSurface = IM_COL32(14, 14, 16, 255);    // cards
+constexpr ImU32 kSurfaceHi = IM_COL32(39, 39, 42, 255);  // secondary / accent
+constexpr ImU32 kHover = IM_COL32(32, 32, 35, 255);
+constexpr ImU32 kActive = IM_COL32(39, 39, 42, 255);
+constexpr ImU32 kBorder = IM_COL32(39, 39, 42, 255);
+constexpr ImU32 kRing = IM_COL32(113, 113, 122, 255);
+constexpr ImU32 kText = IM_COL32(250, 250, 250, 255);
+constexpr ImU32 kMuted = IM_COL32(161, 161, 170, 255);
+constexpr ImU32 kError = IM_COL32(248, 113, 113, 255);
+constexpr ImU32 kAccentHi = IM_COL32(250, 250, 250, 255);
+constexpr ImU32 kPrimaryText = IM_COL32(24, 24, 27, 255);
 } // namespace theme
+
+ImVec4 col4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 
 void apply_style(float scale) {
     ImGui::StyleColorsDark();
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 0;
-    s.ChildRounding = 0;
-    s.FrameRounding = 0;
-    s.PopupRounding = 0;
-    s.TabRounding = 0;
-    s.ScrollbarRounding = 0;
-    s.GrabRounding = 0;
+    s.ChildRounding = 8;
+    s.FrameRounding = 6;
+    s.PopupRounding = 8;
+    s.TabRounding = 6;
+    s.ScrollbarRounding = 8;
+    s.GrabRounding = 6;
     s.WindowBorderSize = 0;
     s.ChildBorderSize = 1;
     s.PopupBorderSize = 1;
     s.FrameBorderSize = 1;
     s.TabBorderSize = 0;
-    s.WindowPadding = {10, 8};
-    s.FramePadding = {6, 3};
-    s.ItemSpacing = {8, 4};
-    s.ItemInnerSpacing = {6, 4};
-    s.CellPadding = {6, 2};
-    s.IndentSpacing = 14;
-    s.ScrollbarSize = 8;
-    s.GrabMinSize = 8;
+    s.WindowPadding = {14, 12};
+    s.FramePadding = {10, 6};
+    s.ItemSpacing = {8, 8};
+    s.ItemInnerSpacing = {8, 6};
+    s.CellPadding = {8, 5};
+    s.IndentSpacing = 16;
+    s.ScrollbarSize = 10;
+    s.GrabMinSize = 10;
+    s.SelectableTextAlign = {0, 0.5f};
     s.SeparatorTextBorderSize = 1;
-    s.DockingSeparatorSize = 2;
-    s.TabBarOverlineSize = 2;
-    s.TabBarBorderSize = 0;
+    s.SeparatorTextPadding = {0, 4};
+    s.DockingSeparatorSize = 1;
+    s.TabBarOverlineSize = 0;
+    s.TabBarBorderSize = 1;
     ImVec4* c = s.Colors;
     auto rgb = [](int r, int g, int b, float a = 1) { return ImVec4{r / 255.0f, g / 255.0f, b / 255.0f, a}; };
-    const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(kGreen);
-    c[ImGuiCol_Text] = ImGui::ColorConvertU32ToFloat4(theme::kText);
-    c[ImGuiCol_TextDisabled] = ImGui::ColorConvertU32ToFloat4(theme::kMuted);
-    c[ImGuiCol_WindowBg] = ImGui::ColorConvertU32ToFloat4(theme::kBg);
-    c[ImGuiCol_ChildBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurface);
-    c[ImGuiCol_PopupBg] = rgb(12, 12, 12, 0.98f);
-    c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
+    c[ImGuiCol_Text] = col4(theme::kText);
+    c[ImGuiCol_TextDisabled] = col4(theme::kMuted);
+    c[ImGuiCol_WindowBg] = col4(theme::kBg);
+    c[ImGuiCol_ChildBg] = {0, 0, 0, 0};
+    c[ImGuiCol_PopupBg] = rgb(12, 12, 14, 0.99f);
+    c[ImGuiCol_Border] = col4(theme::kBorder);
     c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
-    c[ImGuiCol_FrameBg] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
-    c[ImGuiCol_FrameBgHovered] = rgb(30, 30, 30);
-    c[ImGuiCol_FrameBgActive] = rgb(40, 40, 40);
-    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
-    c[ImGuiCol_MenuBarBg] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
-    c[ImGuiCol_Header] = {accent.x, accent.y, accent.z, 0.16f};
-    c[ImGuiCol_HeaderHovered] = {accent.x, accent.y, accent.z, 0.24f};
-    c[ImGuiCol_HeaderActive] = {accent.x, accent.y, accent.z, 0.32f};
-    c[ImGuiCol_Button] = rgb(8, 8, 8);
-    c[ImGuiCol_ButtonHovered] = {accent.x, accent.y, accent.z, 0.18f};
-    c[ImGuiCol_ButtonActive] = {accent.x, accent.y, accent.z, 0.32f};
-    c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = accent;
-    c[ImGuiCol_SliderGrabActive] = ImGui::ColorConvertU32ToFloat4(theme::kAccentHi);
-    c[ImGuiCol_Tab] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
-    c[ImGuiCol_TabHovered] = rgb(30, 30, 30);
-    c[ImGuiCol_TabSelected] = ImGui::ColorConvertU32ToFloat4(theme::kSurfaceHi);
-    c[ImGuiCol_TabSelectedOverline] = accent;
-    c[ImGuiCol_TabDimmed] = ImGui::ColorConvertU32ToFloat4(theme::kRail);
-    c[ImGuiCol_TabDimmedSelected] = ImGui::ColorConvertU32ToFloat4(theme::kSurface);
+    c[ImGuiCol_FrameBg] = rgb(9, 9, 11);
+    c[ImGuiCol_FrameBgHovered] = rgb(24, 24, 27);
+    c[ImGuiCol_FrameBgActive] = rgb(32, 32, 35);
+    c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = col4(theme::kRail);
+    c[ImGuiCol_MenuBarBg] = col4(theme::kRail);
+    c[ImGuiCol_Header] = col4(theme::kActive);
+    c[ImGuiCol_HeaderHovered] = rgb(39, 39, 42, 0.6f);
+    c[ImGuiCol_HeaderActive] = rgb(52, 52, 56);
+    c[ImGuiCol_Button] = col4(theme::kSurfaceHi);
+    c[ImGuiCol_ButtonHovered] = rgb(52, 52, 56);
+    c[ImGuiCol_ButtonActive] = rgb(63, 63, 70);
+    c[ImGuiCol_CheckMark] = col4(theme::kText);
+    c[ImGuiCol_SliderGrab] = rgb(212, 212, 216);
+    c[ImGuiCol_SliderGrabActive] = col4(theme::kText);
+    c[ImGuiCol_Tab] = {0, 0, 0, 0};
+    c[ImGuiCol_TabHovered] = rgb(39, 39, 42, 0.6f);
+    c[ImGuiCol_TabSelected] = col4(theme::kActive);
+    c[ImGuiCol_TabSelectedOverline] = {0, 0, 0, 0};
+    c[ImGuiCol_TabDimmed] = {0, 0, 0, 0};
+    c[ImGuiCol_TabDimmedSelected] = col4(theme::kActive);
     c[ImGuiCol_TabDimmedSelectedOverline] = {0, 0, 0, 0};
-    c[ImGuiCol_DockingPreview] = {accent.x, accent.y, accent.z, 0.5f};
-    c[ImGuiCol_DockingEmptyBg] = ImGui::ColorConvertU32ToFloat4(theme::kBg);
-    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
-    c[ImGuiCol_SeparatorActive] = accent;
+    c[ImGuiCol_DockingPreview] = rgb(250, 250, 250, 0.3f);
+    c[ImGuiCol_DockingEmptyBg] = col4(theme::kBg);
+    c[ImGuiCol_Separator] = c[ImGuiCol_SeparatorHovered] = col4(theme::kBorder);
+    c[ImGuiCol_SeparatorActive] = col4(theme::kRing);
     c[ImGuiCol_ResizeGrip] = {0, 0, 0, 0};
-    c[ImGuiCol_ResizeGripHovered] = c[ImGuiCol_ResizeGripActive] = {accent.x, accent.y, accent.z, 0.4f};
+    c[ImGuiCol_ResizeGripHovered] = c[ImGuiCol_ResizeGripActive] = rgb(250, 250, 250, 0.2f);
     c[ImGuiCol_ScrollbarBg] = {0, 0, 0, 0};
-    c[ImGuiCol_ScrollbarGrab] = rgb(48, 48, 48);
-    c[ImGuiCol_ScrollbarGrabHovered] = rgb(70, 70, 70);
-    c[ImGuiCol_ScrollbarGrabActive] = rgb(90, 90, 90);
-    c[ImGuiCol_TableHeaderBg] = rgb(16, 16, 16);
-    c[ImGuiCol_TableBorderStrong] = ImGui::ColorConvertU32ToFloat4(theme::kBorder);
-    c[ImGuiCol_TableBorderLight] = rgb(28, 28, 28);
+    c[ImGuiCol_ScrollbarGrab] = rgb(39, 39, 42);
+    c[ImGuiCol_ScrollbarGrabHovered] = rgb(63, 63, 70);
+    c[ImGuiCol_ScrollbarGrabActive] = rgb(82, 82, 91);
+    c[ImGuiCol_TableHeaderBg] = rgb(17, 17, 19);
+    c[ImGuiCol_TableBorderStrong] = col4(theme::kBorder);
+    c[ImGuiCol_TableBorderLight] = rgb(28, 28, 31);
     c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.02f};
-    c[ImGuiCol_TextSelectedBg] = {accent.x, accent.y, accent.z, 0.26f};
-    c[ImGuiCol_NavCursor] = accent;
+    c[ImGuiCol_TextSelectedBg] = rgb(250, 250, 250, 0.18f);
+    c[ImGuiCol_NavCursor] = col4(theme::kRing);
+    c[ImGuiCol_PlotHistogram] = c[ImGuiCol_PlotLines] = rgb(212, 212, 216);
     s.ScaleAllSizes(scale);
     s.FontScaleDpi = scale;
 }
 
-// An action: a bracketed text button, accent-coloured for the primary one. Returns true on click.
-bool dbutton(const char* label, float min_w, bool secondary = false) {
-    (void)min_w;
-    const std::string text = std::string("[ ") + label + " ]";
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-    if (!secondary) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kGreen));
-    const bool pressed = ImGui::Button(text.c_str());
-    if (!secondary) ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+// Text drawn at `pos` and cut with "..." at `max_x` (list rows, labels in narrow columns).
+void text_fit(ImDrawList* dl, ImVec2 pos, ImU32 col, const char* text, float max_x) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    if (pos.x + ts.x <= max_x) {
+        dl->AddText(pos, col, text);
+        return;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::RenderTextEllipsis(dl, pos, {max_x, pos.y + ts.y}, max_x, text, nullptr, &ts);
+    ImGui::PopStyleColor();
+}
+
+// A line of text that ends in "..." instead of running past the available width; the full text is
+// the tooltip when it was cut.
+void text_line_fit(const char* text, ImU32 col = theme::kText) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    ImGui::Dummy({std::min(w, ts.x), ts.y});
+    text_fit(ImGui::GetWindowDrawList(), p, col, text, p.x + w);
+    if (ts.x > w && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+// A button: primary (white, dark text) or `secondary` (grey fill, hairline border). `tall` is the
+// larger size used on the start page.
+bool dbutton(const char* label, float min_w, bool secondary = false, bool tall = false) {
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    ImGui::PushFont(g_fonts.button, 0);
+    const ImVec2 ts = ImGui::CalcTextSize(label, nullptr, true);
+    const float pad_x = (tall ? 18 : 14) * sc;
+    const ImVec2 size{std::max(min_w, ts.x + 2 * pad_x), (tall ? 40 : 32) * sc};
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(label, size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    const bool disabled = (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) != 0;
+    auto* dl = ImGui::GetWindowDrawList();
+    const float r = 6 * sc;
+    const ImVec2 q{p.x + size.x, p.y + size.y};
+    ImU32 fill, text;
+    if (secondary) {
+        fill = held ? IM_COL32(63, 63, 70, 255) : hovered ? IM_COL32(52, 52, 56, 255) : theme::kSurfaceHi;
+        text = theme::kText;
+    } else {
+        fill = held ? IM_COL32(212, 212, 216, 255) : hovered ? IM_COL32(228, 228, 231, 255) : theme::kText;
+        text = theme::kPrimaryText;
+    }
+    if (disabled) {
+        fill = (fill & 0x00FFFFFF) | (IM_COL32_A_MASK & IM_COL32(0, 0, 0, 110));
+        text = (text & 0x00FFFFFF) | (IM_COL32_A_MASK & IM_COL32(0, 0, 0, 140));
+    }
+    dl->AddRectFilled(p, q, fill, r);
+    if (secondary) dl->AddRect(p, q, theme::kBorder, r);
+    const float tx = std::max(p.x + pad_x, p.x + (size.x - ts.x) * 0.5f);
+    const std::string shown(label, ImGui::FindRenderedTextEnd(label));
+    text_fit(dl, {tx, p.y + (size.y - ts.y) * 0.5f}, text, shown.c_str(), q.x - pad_x * 0.5f);
+    if (hovered && !disabled) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImGui::PopFont();
     return pressed;
 }
 
-// A page title: the heading face in a given pixel size.
-void heading(const char* text, float size = 0) {
-    (void)size;
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "# %s", text);
+// A title in the bold face at a given pixel size.
+void heading(const char* text, float size = 24) {
+    ImGui::PushFont(g_fonts.heading, size);
+    ImGui::TextUnformatted(text);
+    ImGui::PopFont();
 }
 
 // Text centred on a line within `w` pixels (single line).
 void centered_text(const char* text, float w, ImU32 col = theme::kText) {
     const ImVec2 ts = ImGui::CalcTextSize(text);
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (w - ts.x) * 0.5f));
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s", text);
+    ImGui::TextColored(col4(col), "%s", text);
 }
 
 // Shadowed text, for HUDs drawn over the 3D view.
@@ -455,40 +534,36 @@ void spinner(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
     dl->PathStroke(col, 0, r * 0.25f);
 }
 
-// "Nothing here yet": one muted line with what to do.
+// A centred block for "nothing here yet": glyph, title, and a short hint that says what to do.
 void empty_state(uint32_t glyph, const char* title, const char* hint) {
-    (void)glyph;
-    ImGui::TextUnformatted(title);
-    ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", hint);
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float wrap = std::min(avail.x, 440 * sc);
+    const ImVec2 hs = ImGui::CalcTextSize(hint, nullptr, false, wrap);
+    const float block = ImGui::GetTextLineHeight() * 2 + 14 * sc + hs.y;
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - block) * 0.38f));
+    ImGui::PushFont(g_fonts.bold, 0);
+    centered_text(icon(glyph).c_str(), avail.x, theme::kMuted);
+    centered_text(title, avail.x);
+    ImGui::PopFont();
+    ImGui::Dummy({0, 6 * sc});
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail.x - wrap) * 0.5f));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap);
+    ImGui::PushStyleColor(ImGuiCol_Text, col4(theme::kMuted));
+    ImGui::TextUnformatted(hint);
+    ImGui::PopStyleColor();
     ImGui::PopTextWrapPos();
 }
 
 // A centred spinner and a line of text while something is being read.
 void loading_state(const char* text) {
-    static const char kSpin[4] = {'|', '/', '-', '\\'};
-    ImGui::TextDisabled("%c %s", kSpin[int(ImGui::GetTime() * 8) & 3], text);
-}
-
-// A clickable card for the home page: a glyph, a title and a wrapped description. Returns clicked.
-bool card(const char* id, uint32_t glyph, const char* title, const char* desc, float w, float h) {
     const float sc = ImGui::GetStyle().FontScaleDpi;
-    ImGui::PushID(id);
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (avail.y - 60 * sc) * 0.4f));
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const bool clicked = ImGui::InvisibleButton("card", {w, h});
-    const bool hovered = ImGui::IsItemHovered();
-    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    auto* dl = ImGui::GetWindowDrawList();
-    const ImVec2 q{p.x + w, p.y + h};
-    const float fs = ImGui::GetFontSize();
-    dl->AddRectFilled(p, q, hovered ? theme::kHover : theme::kSurface, 12 * sc);
-    dl->AddRect(p, q, hovered ? kGreen : theme::kBorder, 12 * sc, 0, 1 * sc);
-    dl->AddText(ImGui::GetFont(), fs * 1.5f, {p.x + 18 * sc, p.y + 14 * sc}, kGreen, icon(glyph).c_str());
-    dl->AddText(g_fonts.bold ? g_fonts.bold : ImGui::GetFont(), fs * 1.1f, {p.x + 18 * sc, p.y + 52 * sc}, theme::kText, title);
-    dl->AddText(ImGui::GetFont(), fs * 0.92f, {p.x + 18 * sc, p.y + 52 * sc + fs * 1.5f}, theme::kMuted, desc, nullptr,
-                w - 36 * sc);
-    ImGui::PopID();
-    return clicked;
+    spinner(ImGui::GetWindowDrawList(), {p.x + avail.x * 0.5f, p.y + 12 * sc}, 11 * sc, theme::kMuted);
+    ImGui::Dummy({0, 34 * sc});
+    centered_text(text, avail.x, theme::kMuted);
 }
 
 // ---- data loaded in the background -----------------------------------------------------------------
@@ -1123,12 +1198,57 @@ struct Window {
     ComPtr<ID3D12GraphicsCommandList> list;
     UINT pending_w = 0, pending_h = 0;
     bool tearing = false;
+    // The title bar is drawn by the UI: the top `caption_h` pixels drag the window except over
+    // `caption_hot` (the search box and the window buttons, refreshed every frame).
+    int caption_h = 0;
+    std::vector<RECT> caption_hot;
 };
 Window g_win;
 
 LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     switch (msg) {
+    case WM_NCCALCSIZE:
+        // The whole window is client area (the UI draws its own title bar). Maximized, Windows places
+        // the frame off screen, so take it back off the client rectangle.
+        if (wp == TRUE) {
+            if (IsZoomed(hwnd)) {
+                auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                const UINT dpi = GetDpiForWindow(hwnd);
+                const int fx = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                const int fy = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                p->rgrc[0].left += fx;
+                p->rgrc[0].right -= fx;
+                p->rgrc[0].top += fy;
+                p->rgrc[0].bottom -= fy;
+            }
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        if (!IsZoomed(hwnd)) {
+            const int b = MulDiv(6, int(GetDpiForWindow(hwnd)), 96);
+            const bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, d = pt.y >= rc.bottom - b;
+            if (t && l) return HTTOPLEFT;
+            if (t && r) return HTTOPRIGHT;
+            if (d && l) return HTBOTTOMLEFT;
+            if (d && r) return HTBOTTOMRIGHT;
+            if (l) return HTLEFT;
+            if (r) return HTRIGHT;
+            if (t) return HTTOP;
+            if (d) return HTBOTTOM;
+        }
+        if (pt.y < g_win.caption_h) {
+            for (const RECT& h : g_win.caption_hot)
+                if (PtInRect(&h, pt)) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
             g_win.pending_w = LOWORD(lp);
@@ -1321,7 +1441,7 @@ public:
 
     std::deque<LogLine> log;
     int language = 1;  // second column language (ja by default)
-    Tab tab = TabHome;  // the page shown in the content area
+    Tab tab = TabMaps;  // the page shown in the content area
 
     // statics browser
     struct Browser {
@@ -1853,7 +1973,7 @@ public:
         }
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         const float left_w = 300 * sc, pad = 10 * sc;
-        const auto grey = IM_COL32(150, 150, 156, 255);
+        const auto grey = theme::kMuted;
 
         // left: maps, then the region controls
         ImGui::BeginChild("maps", {left_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
@@ -1885,10 +2005,11 @@ public:
             auto* dl = ImGui::GetWindowDrawList();
             const float lh = ImGui::GetTextLineHeight();
             if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, kGreen);
-            dl->AddText({pos.x + pad, pos.y + 2 * sc}, IM_COL32_WHITE, (m.name.empty() ? m.package : m.name).c_str());
-            dl->AddText({pos.x + pad, pos.y + 2 * sc + lh}, grey,
-                        (m.activity.is_none() ? ui::trf(ui::S::MapRowStats, m.bubble.str(), m.statics, m.instances) :
-                        ui::trf(ui::S::MapActivityRow, m.activity.str(), m.activity_map, m.bubble.str())).c_str());
+            const float row_max = pos.x + ImGui::GetContentRegionAvail().x - pad * 0.5f;
+            text_fit(dl, {pos.x + pad, pos.y + 2 * sc}, theme::kText, (m.name.empty() ? m.package : m.name).c_str(), row_max);
+            text_fit(dl, {pos.x + pad, pos.y + 2 * sc + lh}, grey,
+                     (m.activity.is_none() ? ui::trf(ui::S::MapRowStats, m.bubble.str(), m.statics, m.instances) :
+                      ui::trf(ui::S::MapActivityRow, m.activity.str(), m.activity_map, m.bubble.str())).c_str(), row_max);
             ImGui::PopID();
         }
         if (maps.empty()) {
@@ -1948,7 +2069,7 @@ public:
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         if (ImGui::IsItemActive()) details_h = std::max(40 * sc, details_h - ImGui::GetIO().MouseDelta.y);
         ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                                                  ImGui::IsItemActive() ? kGreen : IM_COL32(4, 4, 4, 255));
+                                                  ImGui::IsItemActive() ? theme::kRing : theme::kBorder);
         ImGui::BeginChild("mapdetails", {0, 0}, ImGuiChildFlags_None);
         map_details_ui();
         ImGui::EndChild();
@@ -2271,43 +2392,117 @@ public:
         viewport_visible = false;
         ImGuiViewport* vp = ImGui::GetMainViewport();
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float line = ImGui::GetFrameHeight();
-        const float bar_h = line + 8 * sc, status_h = line + 4 * sc;
+        const float side_w = 240 * sc, title_h = 44 * sc, status_h = 28 * sc;
         const ImVec2 work = vp->WorkPos, wsize = vp->WorkSize;
         const ImGuiWindowFlags chrome = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
                                         ImGuiWindowFlags_NoNav;
+        g_win.caption_h = int(title_h);
+        g_win.caption_hot.clear();
 
+        // sidebar (full height above the status line; its top is part of the title bar)
         ImGui::SetNextWindowPos(work);
-        ImGui::SetNextWindowSize({wsize.x, bar_h});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10 * sc, 4 * sc});
-        if (ImGui::Begin("##bar", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) tab_bar();
+        ImGui::SetNextWindowSize({side_w, wsize.y - status_h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(theme::kRail));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        if (ImGui::Begin("##side", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) sidebar(title_h);
         ImGui::End();
         ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
 
-        ImGui::SetNextWindowPos({work.x, work.y + bar_h});
-        ImGui::SetNextWindowSize({wsize.x, wsize.y - bar_h - status_h});
+        // title bar: page name and description, search, window buttons
+        ImGui::SetNextWindowPos({work.x + side_w, work.y});
+        ImGui::SetNextWindowSize({wsize.x - side_w, title_h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(theme::kBg));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+        if (ImGui::Begin("##title", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) title_bar(title_h);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+
+        ImGui::SetNextWindowPos({work.x + side_w, work.y + title_h});
+        ImGui::SetNextWindowSize({wsize.x - side_w, wsize.y - title_h - status_h});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(theme::kBg));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
         if (ImGui::Begin("##content", nullptr, chrome | ImGuiWindowFlags_NoScrollbar)) content_frame(sc);
         ImGui::End();
         ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
 
         status_bar(work, wsize, status_h);
         if (!pm) install_picker();
+        if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && (ImGui::IsKeyPressed(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_L)))
+            focus_prompt = true;
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S) && gb.lit && scene.loaded())
             capture_requested = true;
     }
 
-    // The page body under a one-pixel rule.
+    // Marks the last item as clickable inside the title bar (everything else there drags the window).
+    void caption_hot() {
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        g_win.caption_hot.push_back({LONG(a.x), LONG(a.y), LONG(b.x), LONG(b.y)});
+    }
+
+    void title_bar(float h) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const ImVec2 o = ImGui::GetWindowPos();
+        const float w = ImGui::GetWindowWidth();
+        auto* dl = ImGui::GetWindowDrawList();
+        dl->AddLine({o.x, o.y + h - 1}, {o.x + w, o.y + h - 1}, theme::kBorder);
+
+        // window buttons on the right
+        const float bw = 46 * sc;
+        const float buttons_x = w - 3 * bw;
+        struct Btn { uint32_t glyph; int id; };
+        const Btn btns[3] = {{0xE921, 0}, {IsZoomed(g_win.hwnd) ? 0xE923u : 0xE922u, 1}, {0xE8BB, 2}};
+        for (int i = 0; i < 3; ++i) {
+            ImGui::SetCursorPos({buttons_x + i * bw, 0});
+            ImGui::PushID(i);
+            const bool clicked = ImGui::InvisibleButton("##wb", {bw, h - 1});
+            caption_hot();
+            const bool hov = ImGui::IsItemHovered();
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            if (hov) dl->AddRectFilled(a, b, i == 2 ? IM_COL32(196, 43, 28, 255) : theme::kHover);
+            ImGui::PushFont(g_fonts.body, 11);
+            const std::string g = icon(btns[i].glyph);
+            const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
+            dl->AddText({a.x + (bw - gs.x) * 0.5f, a.y + (h - gs.y) * 0.5f}, hov || IsWindowActive() ? theme::kText : theme::kMuted, g.c_str());
+            ImGui::PopFont();
+            ImGui::PopID();
+            if (clicked) {
+                if (i == 0) ShowWindow(g_win.hwnd, SW_MINIMIZE);
+                else if (i == 1) ShowWindow(g_win.hwnd, IsZoomed(g_win.hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+                else PostMessageW(g_win.hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+
+        // search
+        const float search_w = std::min(340 * sc, std::max(160 * sc, buttons_x * 0.42f));
+        const float search_x = buttons_x - search_w - 12 * sc;
+        const float fh = ImGui::GetFrameHeight();
+        ImGui::SetCursorPos({search_x, (h - fh) * 0.5f});
+        search_box(search_w);
+
+        // page name and its description
+        const TabInfo& info = kTabs[tab];
+        const float x0 = 20 * sc, max_x = o.x + search_x - 16 * sc;
+        ImGui::PushFont(g_fonts.button, 0);
+        const float ty = o.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+        const char* name = ui::tr(info.name);
+        text_fit(dl, {o.x + x0, ty}, theme::kText, name, max_x);
+        const float name_w = ImGui::CalcTextSize(name).x;
+        ImGui::PopFont();
+        (void)name_w;
+    }
+
+    static bool IsWindowActive() { return GetForegroundWindow() == g_win.hwnd; }
+
+    // The page body. The 3D pages draw edge to edge; the rest sit inside the page margins.
     void content_frame(float sc) {
-        const ImVec2 origin = ImGui::GetWindowPos();
-        const float width = ImGui::GetWindowWidth();
-        ImGui::GetWindowDrawList()->AddLine(origin, {origin.x + width, origin.y}, theme::kBorder);
-        // The 3D pages draw edge to edge; the rest sit inside a small margin.
         const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps;
-        ImGui::SetCursorPos({0, 1});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{10 * sc, 8 * sc});
-        ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        ImGui::SetCursorPos({0, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{24 * sc, 20 * sc});
+        ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoBackground);
         switch (tab) {
         case TabHome: home_tab(); break;
         case TabFind: find_tab(); break;
@@ -2327,77 +2522,93 @@ public:
         ImGui::PopStyleVar();
     }
 
-    // The page words a prompt line accepts (the English word or the UI-language name).
-    static constexpr Tab kPageOrder[] = {TabHome, TabMaps, TabEntities, TabStatics, TabDialogue, TabCodex,
-                                         TabMovies, TabText, TabFind, TabPackages, TabLog, TabSettings};
-    static const char* page_word(Tab t) {
-        switch (t) {
-        case TabHome: return "start";
-        case TabFind: return "find";
-        case TabMaps: return "places";
-        case TabEntities: return "models";
-        case TabStatics: return "scenery";
-        case TabDialogue: return "voices";
-        case TabCodex: return "codex";
-        case TabMovies: return "films";
-        case TabText: return "text";
-        case TabPackages: return "files";
-        case TabLog: return "log";
-        case TabSettings: return "config";
-        default: return "";
-        }
+    // Sidebar: the name, the pages as plain text in three groups, log and settings at the foot.
+    void sidebar(float title_h) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const ImVec2 o = ImGui::GetWindowPos();
+        const float w = ImGui::GetWindowWidth(), h = ImGui::GetWindowHeight();
+        auto* dl = ImGui::GetWindowDrawList();
+        dl->AddLine({o.x + w - 1, o.y}, {o.x + w - 1, o.y + h}, theme::kBorder);
+        ImGui::PushFont(g_fonts.bold, 0);
+        dl->AddText({o.x + 20 * sc, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, "nim");
+        ImGui::PopFont();
+
+        const float item = 30 * sc + 2 * sc;
+        const float foot_h = 2 * item + 12 * sc;
+        ImGui::SetCursorPos({0, title_h});
+        ImGui::BeginChild("##nav", {w - 1, h - title_h - foot_h}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
+        nav_item(TabMaps);
+        nav_item(TabEntities);
+        nav_item(TabStatics);
+        nav_gap();
+        nav_item(TabDialogue);
+        nav_item(TabCodex);
+        nav_item(TabMovies);
+        nav_item(TabText);
+        nav_gap();
+        nav_item(TabPackages);
+        ImGui::PopStyleVar();
+        ImGui::EndChild();
+
+        ImGui::SetCursorPos({0, h - foot_h + 4 * sc});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
+        nav_item(TabLog);
+        nav_item(TabSettings);
+        ImGui::PopStyleVar();
     }
 
-    // The top line is a prompt: "nim >" then a page word (open it) or anything else (find it
-    // everywhere). The page words follow on the right; the current page is bracketed. Ctrl+L
-    // focuses the prompt.
-    void tab_bar() {
+    // The search box: Enter finds the words in every page with a list and opens the results.
+    void search_box(float width) {
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "nim \xE2\x80\xBA");
-        ImGui::SameLine(0, 6 * sc);
-        float words_w = 0;
-        for (Tab t : kPageOrder) words_w += ImGui::CalcTextSize(page_word(t)).x + 18 * sc;
-        ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x - words_w - 24 * sc));
+        ImGui::SetNextItemWidth(width);
         if (focus_prompt) {
             ImGui::SetKeyboardFocusHere();
             focus_prompt = false;
         }
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4{0, 0, 0, 0});
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-        const bool enter = ImGui::InputTextWithHint("##prompt", ui::tr(ui::S::PromptHint), prompt, sizeof(prompt),
-                                                    ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::PopStyleVar();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, col4(IM_COL32(17, 17, 19, 255)));
+        const std::string hint = ui::tr(ui::S::PromptHint);
+        const bool enter = ImGui::InputTextWithHint("##search", hint.c_str(), prompt, sizeof(prompt), ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::PopStyleColor();
-        if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_L)) focus_prompt = true;
+        caption_hot();
         if (enter) run_prompt();
-        for (Tab t : kPageOrder) {
-            ImGui::SameLine(0, 14 * sc);
-            const bool sel = tab == t;
-            const std::string label = sel ? std::format("[{}]", page_word(t)) : std::string(page_word(t));
-            ImGui::PushID(int(t));
-            ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::ColorConvertU32ToFloat4(kGreen) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {1, ImGui::GetStyle().FramePadding.y});
-            if (ImGui::Button(label.c_str())) open_tab(t);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  %s", ui::tr(kTabs[t].name), ui::tr(kTabs[t].desc));
-            ImGui::PopStyleVar(2);
-            ImGui::PopStyleColor(2);
-            ImGui::PopID();
-        }
     }
 
+    void nav_item(Tab t) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const TabInfo& info = kTabs[t];
+        const float h = 30 * sc, x = 8 * sc;
+        const float w = ImGui::GetWindowWidth() - 2 * x;
+        ImGui::SetCursorPosX(x);
+        ImGui::PushID(int(t));
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("nav", {w, h});
+        const bool hovered = ImGui::IsItemHovered();
+        if (clicked) open_tab(t);
+        const bool sel = tab == t;
+        auto* dl = ImGui::GetWindowDrawList();
+        const ImVec2 q{p.x + w, p.y + h};
+        if (sel) dl->AddRectFilled(p, q, theme::kActive, 4 * sc);
+        else if (hovered) dl->AddRectFilled(p, q, theme::kHover, 4 * sc);
+        const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+        text_fit(dl, {p.x + 12 * sc, ty}, sel || hovered ? theme::kText : theme::kMuted, ui::tr(info.name), q.x - 8 * sc);
+        ImGui::PopID();
+    }
+
+    void nav_gap() {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        ImGui::Dummy({0, 10 * sc});
+    }
+
+    // Runs the search box: a page name opens that page, anything else is found everywhere.
     void run_prompt() {
         std::string q = prompt;
         while (!q.empty() && q.back() == ' ') q.pop_back();
         while (!q.empty() && q.front() == ' ') q.erase(q.begin());
-        prompt[0] = 0;
-        focus_prompt = true;
         if (q.empty()) return;
-        const std::string ql = lower_ascii(q);
-        for (Tab t : kPageOrder)
-            if (ql == page_word(t) || q == ui::tr(kTabs[t].name)) {
+        for (int t = 0; t < TabCount; ++t)
+            if (q == ui::tr(kTabs[t].name) && t != TabFind) {
+                prompt[0] = 0;
                 open_tab(t);
                 return;
             }
@@ -2482,7 +2693,7 @@ public:
             ImGui::TextDisabled("%s", ui::tr(ui::S::FindEmpty));
             return;
         }
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "find \"%s\"", find_query.c_str());
+        heading(("\"" + find_query + "\"").c_str(), 26);
         ImGui::Spacing();
         bool any = false;
         for (const auto& g : find_results) {
@@ -2490,7 +2701,7 @@ public:
             any = true;
             ImGui::PushID(int(g.tab));
             ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s/", page_word(g.tab));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s", ui::tr(kTabs[g.tab].name));
             ImGui::SameLine();
             ImGui::TextDisabled("%s", ui::trf(ui::S::FindHits, g.count).c_str());
             ImGui::SameLine();
@@ -2512,12 +2723,15 @@ public:
         const float sc = ImGui::GetStyle().FontScaleDpi;
         ImGui::SetNextWindowPos({work.x, work.y + size.y - h});
         ImGui::SetNextWindowSize({size.x, h});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10 * sc, 0});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(theme::kRail));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
         if (ImGui::Begin("##status", nullptr,
                          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav)) {
             const ImVec2 o = ImGui::GetWindowPos();
-            ImGui::GetWindowDrawList()->AddLine(o, {o.x + ImGui::GetWindowWidth(), o.y}, theme::kBorder);
+            const float w = ImGui::GetWindowWidth();
+            auto* dl = ImGui::GetWindowDrawList();
+            dl->AddLine(o, {o.x + w, o.y}, theme::kBorder);
             std::string left;
             if (catalog) {
                 std::lock_guard lk(catalog->mutex);
@@ -2525,17 +2739,25 @@ public:
             }
             if (left.empty() && !log.empty()) left = log.back().text;
             if (left.empty()) left = ui::tr(ui::S::LogIdle);
-            ImGui::AlignTextToFramePadding();
             const bool last_error = !log.empty() && log.back().error && left == log.back().text;
-            if (last_error) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "! %s", left.c_str());
-            else ImGui::TextDisabled("-- %s", left.c_str());
-            if (ImGui::IsItemClicked()) open_tab(TabLog);
-            const std::string right = std::format("nim {} | {}", kVersion, gpu.adapter_name());
-            ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(right.c_str()).x - 10 * sc);
-            ImGui::TextDisabled("%s", right.c_str());
+            ImGui::PushFont(g_fonts.body, ImGui::GetFontSize() * 0.85f / sc);
+            const float ty = o.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+            const std::string right = std::format("nim {}  \xC2\xB7  {}", kVersion, gpu.adapter_name());
+            const float rw = ImGui::CalcTextSize(right.c_str()).x;
+            dl->AddText({o.x + w - rw - 14 * sc, ty}, theme::kMuted, right.c_str());
+            const float lx = o.x + 14 * sc;
+            text_fit(dl, {lx, ty}, last_error ? theme::kError : theme::kMuted, left.c_str(), o.x + w - rw - 40 * sc);
+            ImGui::PopFont();
+            ImGui::SetCursorPos({0, 0});
+            if (ImGui::InvisibleButton("##st", {std::max(1.0f, w - rw - 40 * sc), h})) open_tab(TabLog);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", left.c_str());
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
     }
 
     void install_picker() {
@@ -2560,33 +2782,12 @@ public:
     }
 
     // -- HOME --
-    // The start page: the install, then one line per page.
+    // Not in the sidebar (the app opens on the maps); kept for the install line.
     void home_tab() {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("install:");
-        ImGui::SameLine();
-        ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
-        ImGui::SameLine();
+        ImGui::TextDisabled("%s", ui::tr(ui::S::HomeInstall));
+        text_line_fit(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::NoInstallSelected));
         if (dbutton(ui::tr(pm ? ui::S::HomeChange : ui::S::SelectFolder), 0, pm != nullptr))
-            if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
-        ImGui::Spacing();
-        static const Tab order[] = {TabMaps, TabEntities, TabStatics, TabDialogue, TabCodex, TabMovies, TabText, TabFind, TabPackages};
-        float name_w = 0;
-        for (Tab t : order) name_w = std::max(name_w, ImGui::CalcTextSize(std::format("{:<8} {}", page_word(t), ui::tr(kTabs[t].name)).c_str()).x);
-        const float desc_x = ImGui::GetCursorPosX() + name_w + 24;
-        for (Tab t : order) {
-            ImGui::PushID(int(t));
-            const ImVec2 p = ImGui::GetCursorPos();
-            if (ImGui::Selectable("##go", false)) open_tab(t);
-            const bool hovered = ImGui::IsItemHovered();
-            ImGui::SetCursorPos(p);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hovered ? theme::kAccentHi : kGreen), "%s", std::format("{:<8} {}", page_word(t), ui::tr(kTabs[t].name)).c_str());
-            ImGui::SameLine(desc_x);
-            ImGui::TextDisabled("%s", ui::tr(kTabs[t].desc));
-            ImGui::PopID();
-        }
-        ImGui::Spacing();
-        ImGui::TextDisabled("%s", ui::trf(ui::S::HomeFooter, kVersion).c_str());
+            if (auto f = pick_folder(g_win.hwnd)) open_install(*f);
     }
 
     // -- SETTINGS --
@@ -2758,7 +2959,7 @@ public:
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (ImGui::IsItemActive()) right_w -= ImGui::GetIO().MouseDelta.x;
         ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                                                  ImGui::IsItemActive() ? kGreen : IM_COL32(4, 4, 4, 255));
+                                                  ImGui::IsItemActive() ? theme::kRing : theme::kBorder);
 
         // right: live view + details
         ImGui::SameLine(0, 0);
@@ -2770,7 +2971,7 @@ public:
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         if (ImGui::IsItemActive()) details_h = std::max(40 * sc, details_h - ImGui::GetIO().MouseDelta.y);
         ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                                                  ImGui::IsItemActive() ? kGreen : IM_COL32(4, 4, 4, 255));
+                                                  ImGui::IsItemActive() ? theme::kRing : theme::kBorder);
         ImGui::BeginChild("details", {0, 0}, ImGuiChildFlags_None);
         details_ui();
         ImGui::EndChild();
@@ -3800,7 +4001,7 @@ public:
         const auto& c = cx.collections[size_t(codex.collection)];
         const auto& e = c.entries[size_t(codex.entry)];
         ImGui::TextDisabled("%s / %08X", text(c.title, lang).c_str(), e.hash);
-        heading(text(e.title, lang).c_str());
+        heading(text(e.title, lang).c_str(), 28);
         if (e.unlock && !text(e.unlock, lang).empty())
             ImGui::TextDisabled("[%s] %s", ui::tr(ui::S::CodexUnlock), text(e.unlock, lang).c_str());
         if (!e.lines.empty()) {
@@ -4156,11 +4357,12 @@ int run(const std::wstring& cmdline) {
     RegisterClassExW(&wc);
     g_win.hwnd = CreateWindowW(wc.lpszClassName, L"nim — Marathon asset viewer", WS_OVERLAPPEDWINDOW, 80, 60,
                                int(1680 * scale), int(1000 * scale), nullptr, nullptr, wc.hInstance, nullptr);
-    {  // dark title bar
+    {  // dark frame, the shadow and rounded corners kept while the UI draws the title bar
         BOOL dark = TRUE;
-        using DwmSet = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
-        if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll"))
-            if (auto f = reinterpret_cast<DwmSet>(GetProcAddress(dwm, "DwmSetWindowAttribute"))) f(g_win.hwnd, 20, &dark, sizeof(dark));
+        DwmSetWindowAttribute(g_win.hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+        const MARGINS m{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(g_win.hwnd, &m);
+        SetWindowPos(g_win.hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
     }
 
     auto app = std::make_unique<App>();

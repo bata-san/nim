@@ -22,29 +22,29 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
 // X(key, japanese, english, korean)
 #define NIM_UI_STRINGS(X)                                                                                              \
     X(AppSubtitle, "Marathon アセットビューア", "Marathon asset viewer", "Marathon 에셋 뷰어")                              \
-    X(NavFind, "検索", "find", "검색") \
-    X(DescFind, "場所・声・コデックス・映像・文字列をまとめて検索", "Search places, voices, codex, films and text at once", "장소·음성·코덱스·영상·문자열을 한 번에 검색") \
-    X(PromptHint, "ページ名かキーワード (Enter)", "page name or keyword (Enter)", "페이지 이름 또는 키워드 (Enter)") \
-    X(FindEmpty, "上の nim › にキーワードを入れて Enter", "Type a keyword after nim › above and press Enter", "위의 nim › 에 키워드를 넣고 Enter") \
+    X(NavFind, "検索", "Search", "검색") \
+    X(DescFind, "マップ・台詞・コデックス・ムービー・テキストをまとめて検索", "Search maps, dialogue, codex, movies and text at once", "맵·대사·코덱스·영상·텍스트를 한 번에 검색") \
+    X(PromptHint, "検索…", "Search…", "검색…") \
+    X(FindEmpty, "上の検索欄 (Ctrl+K) にキーワードを入れて Enter", "Type a keyword in the search box above (Ctrl+K) and press Enter", "위 검색창 (Ctrl+K) 에 키워드를 넣고 Enter") \
     X(FindHits, "{} 件", "{} hits", "{}건") \
-    X(FindOpen, "このページで絞り込む", "filter this page", "이 페이지에서 걸러 보기") \
+    X(FindOpen, "このページで絞り込む", "Filter this page", "이 페이지에서 걸러 보기") \
     X(FindNone, "見つかりません: {}", "Nothing found: {}", "찾지 못했습니다: {}") \
-    X(MapKindMap, "マップ", "map", "맵") \
-    X(MapKindMode, "モード", "mode", "모드") \
-    X(NavHome, "はじめに", "start", "시작") \
-    X(NavStatics, "背景物", "scenery", "배경물") \
-    X(NavEntities, "モデル", "models", "모델") \
-    X(NavMaps, "場所", "places", "장소") \
-    X(NavText, "文字列", "text", "문자열") \
-    X(NavDialogue, "声", "voices", "음성") \
-    X(NavMovies, "映像", "films", "영상") \
-    X(NavCodex, "コデックス", "codex", "코덱스") \
-    X(NavPackages, "ファイル", "files", "파일") \
-    X(NavLog, "ログ", "log", "로그") \
-    X(NavSettings, "設定", "config", "설정") \
-    X(GroupModels3D, "3D", "3D", "3D")                                                                                    \
-    X(Group2D, "2D", "2D", "2D")                                                                                          \
-    X(GroupData, "データ", "Data", "데이터")                                                                              \
+    X(MapKindMap, "マップ単体", "Map only", "맵 단독") \
+    X(MapKindMode, "ゲームモード", "Game mode", "게임 모드") \
+    X(NavHome, "ホーム", "Home", "홈") \
+    X(NavStatics, "背景物", "Scenery", "배경물") \
+    X(NavEntities, "モデル", "Models", "모델") \
+    X(NavMaps, "マップ", "Maps", "맵") \
+    X(NavText, "テキスト", "Text", "텍스트") \
+    X(NavDialogue, "台詞", "Dialogue", "대사") \
+    X(NavMovies, "ムービー", "Movies", "영상") \
+    X(NavCodex, "コデックス", "Codex", "코덱스") \
+    X(NavPackages, "パッケージ", "Packages", "패키지") \
+    X(NavLog, "ログ", "Log", "로그") \
+    X(NavSettings, "設定", "Settings", "설정") \
+    X(GroupModels3D, "3D ビュー", "3D views", "3D 보기")                                                                                    \
+    X(Group2D, "テキストとメディア", "Text and media", "텍스트·미디어")                                                                                          \
+    X(GroupData, "データとアプリ", "Data and app", "데이터·앱")                                                                              \
     X(DescHome, "Marathon のアセットを 3D と 2D から閲覧します", "Browse Marathon's assets in 3D and 2D",                  \
       "Marathon 에셋을 3D와 2D로 살펴봅니다")                                                                              \
     X(DescStatics, "建物・地形・小物などの背景物を 3D サムネイルで一覧し、ゲームのシェーダで表示", "Buildings, terrain and props, listed as live 3D thumbnails and drawn with the game shaders", "건물·지형·소품을 3D 썸네일로 보고 게임 셰이더로 표시") \
