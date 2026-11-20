@@ -27,8 +27,12 @@ namespace nim {
 //     dialogue table by hash64 and the conversation key of the recording. The spoken lines are
 //     the dialogue lines of that table whose conversation key matches.
 //
-//   No texture is referenced from any of these structures, so the codex has no illustration
-//   that nim can show (listed as unresolved in PROGRESS.md, not substituted).
+//   Illustrations: the display component's u32 at 0x00 indexes the image list (class 808071C0,
+//     one tag) Vec at 0x08 of 0x20-byte elements {u32 name hash, ..., 0x10 tag of an 80805335}.
+//     0xFFFF = no image. The 80805335 entry {0x10 u32 name string hash, 0x18 tag of an 80805350};
+//     the 80805350 nests Vec at 0x20 -> Vec -> texture header tags, largest first. Example: the
+//     record "DIRE MARSH: ALGAE PONDS" has index 0xDF -> 80A664E0 ("Algae Ponds") -> 80A664DF
+//     -> 880x910 RGBA8 texture 80A664DE, the green point-cloud art.
 constexpr uint32_t kClassCodexDefinitions = 0x808029D1;
 constexpr uint32_t kClassCodexDefinition = 0x808029AA;
 constexpr uint32_t kCodexKindCollection = 0x3049EB2C;
@@ -36,6 +40,7 @@ constexpr uint32_t kCodexKindEntry = 0x9F9F7DE7;
 constexpr uint32_t kClassCodexDisplay = 0x808028E9;
 constexpr uint32_t kClassCodexBody = 0x808028E3;
 constexpr uint32_t kClassCodexUnlock = 0x808028E8;
+constexpr uint32_t kClassCodexImageList = 0x808071C0;
 constexpr uint32_t kClassItemTable = 0x80806CAC;
 constexpr uint32_t kClassAssetIndex = 0x8080B61C;
 constexpr uint32_t kClassAssetRecord = 0x8080BAAD;
@@ -57,6 +62,7 @@ std::vector<CodexDefinition> parse_codex_definitions(std::span<const uint8_t> ta
 struct CodexEntry {
     uint32_t hash = 0;
     uint32_t title = 0, body = 0, unlock = 0;  // string hashes (0 = none)
+    TagHash illustration;                      // texture header (type 32), none if the record has no image
     uint32_t asset_key = 0;                    // item table key, 0 = no recording asset
     TagHash asset;                             // 8080BAAD record, if any
     TagHash dialogue_table;
@@ -67,6 +73,7 @@ struct CodexEntry {
 struct CodexCollection {
     uint32_t hash = 0;
     uint32_t title = 0, unlock = 0;
+    TagHash illustration;
     std::vector<CodexEntry> entries;
 };
 
@@ -75,7 +82,8 @@ struct Codex {
     std::vector<CodexCollection> collections;  // in codex order; [0] holds entries before any collection
     size_t entries = 0;
     size_t with_asset = 0;      // entries whose item resolves to a recording asset
-    size_t with_audio = 0;      // entries with at least one spoken line
+    size_t with_audio = 0;
+    size_t with_illustration = 0;  // entries whose display component resolves to a texture      // entries with at least one spoken line
 };
 
 // Builds the codex from the install. `dialogue` is the list from load_all_dialogue.

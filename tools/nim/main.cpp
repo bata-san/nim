@@ -1525,6 +1525,15 @@ public:
         int lang = -1;  // -1: the second-language setting
         bool audio_only = false;
         int collection = -1, entry = -1;
+        // Illustrations, uploaded on first view and kept (183 distinct textures at most).
+        struct Art {
+            ComPtr<ID3D12Resource> tex;
+            uint32_t srv = UINT32_MAX;
+            int w = 0, h = 0;
+            std::string error;
+        };
+        std::unordered_map<uint32_t, Art> art;
+        std::unique_ptr<PackageManager> art_pm;
     } codex;
     int selected_package = -1;
     std::vector<EntryRow> package_rows;
@@ -4005,6 +4014,27 @@ public:
     static constexpr ImU32 kCxRule = IM_COL32(26, 74, 40, 255);
     static constexpr ImU32 kCxPanel = IM_COL32(5, 9, 6, 255);
 
+    // The codex illustration texture, uploaded the first time it is shown.
+    const CodexUi::Art& codex_art(TagHash tag) {
+        auto [it, fresh] = codex.art.try_emplace(tag.value);
+        if (!fresh) return it->second;
+        CodexUi::Art& a = it->second;
+        try {
+            if (!codex.art_pm) codex.art_pm = pm->fork();
+            const Texture t = load_texture(*codex.art_pm, tag);
+            gpu.wait_idle();
+            a.tex = gpu.texture(t);
+            gpu.flush();
+            a.srv = gpu.srv().alloc(1);
+            gpu.device()->CreateShaderResourceView(a.tex.Get(), nullptr, gpu.srv().cpu(a.srv));
+            a.w = t.width, a.h = t.height;
+        } catch (const std::exception& ex) {
+            a.error = ex.what();
+            error(std::format("codex image {}: {}", tag.str(), ex.what()));
+        }
+        return a;
+    }
+
     void codex_tab() {
         if (!catalog || !catalog->codex_ready) {
             if (catalog && catalog->done && !catalog->codex_error.empty())
@@ -4137,7 +4167,7 @@ public:
         const bool two_col = avail > 760 * sc;
         const float meta_w = two_col ? std::min(300 * sc, avail * 0.32f) : avail;
 
-        // meta column: illustration frame (none found in the data) and the record's facts
+        // meta column: the record's illustration (the collection's when the record has none) and its facts
         auto rule = [&](float w) {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             dl->AddLine({p.x, p.y + 4 * sc}, {p.x + w, p.y + 4 * sc}, kCxRule);
@@ -4147,21 +4177,32 @@ public:
         {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float box = two_col ? meta_w : std::min(meta_w, 220 * sc);
-            dl->AddRect(p, {p.x + box, p.y + box}, kCxRule, 0, 0, 1 * sc);
+            const TagHash art_tag = e.illustration.is_none() ? c.illustration : e.illustration;
+            const CodexUi::Art* art = art_tag.is_none() ? nullptr : &codex_art(art_tag);
+            float box_h = box;
+            if (art && art->srv != UINT32_MAX) {
+                // Fit the image to the frame width; the frame grows to the image's aspect.
+                const float pad = 8 * sc, iw = box - 2 * pad;
+                const float ih = iw * float(art->h) / float(std::max(art->w, 1));
+                box_h = ih + 2 * pad;
+                dl->AddImage(ImTextureID(gpu.srv().gpu(art->srv).ptr), {p.x + pad, p.y + pad}, {p.x + pad + iw, p.y + pad + ih});
+            } else {
+                ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
+                const char* none = art ? art->error.c_str() : ui::tr(ui::S::CodexNoIllustration);
+                const float wrap = box - 32 * sc;
+                const ImVec2 ts = ImGui::CalcTextSize(none, nullptr, false, wrap);
+                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {p.x + 16 * sc, p.y + (box - ts.y) * 0.5f}, kCxDim, none, nullptr, wrap);
+                ImGui::PopFont();
+            }
+            dl->AddRect(p, {p.x + box, p.y + box_h}, kCxRule, 0, 0, 1 * sc);
             const float t = 10 * sc;  // corner ticks
             for (int k = 0; k < 4; ++k) {
-                const float x = k & 1 ? p.x + box : p.x, y = k & 2 ? p.y + box : p.y;
+                const float x = k & 1 ? p.x + box : p.x, y = k & 2 ? p.y + box_h : p.y;
                 const float sx = k & 1 ? -t : t, sy = k & 2 ? -t : t;
                 dl->AddLine({x, y}, {x + sx, y}, kCxGreen, 2 * sc);
                 dl->AddLine({x, y}, {x, y + sy}, kCxGreen, 2 * sc);
             }
-            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
-            const char* none = ui::tr(ui::S::CodexNoIllustration);
-            const float wrap = box - 32 * sc;
-            const ImVec2 ts = ImGui::CalcTextSize(none, nullptr, false, wrap);
-            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {p.x + 16 * sc, p.y + (box - ts.y) * 0.5f}, kCxDim, none, nullptr, wrap);
-            ImGui::PopFont();
-            ImGui::Dummy({box, box});
+            ImGui::Dummy({box, box_h});
             ImGui::Dummy({0, 6 * sc});
             ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + meta_w);
@@ -4172,6 +4213,7 @@ public:
             fact("COLLECTION", upper_ascii(text(c.title, lang)));
             fact("RECORD", std::format("{:08X}", e.hash));
             if (e.unlock && !text(e.unlock, lang).empty()) fact(upper_ascii(ui::tr(ui::S::CodexUnlock)).c_str(), text(e.unlock, lang));
+            if (!art_tag.is_none()) fact("IMAGE", art_tag.str());
             if (!e.asset.is_none()) fact("ASSET", e.asset.str());
             ImGui::PopTextWrapPos();
             ImGui::PopFont();

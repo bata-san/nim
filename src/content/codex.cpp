@@ -57,6 +57,27 @@ std::vector<TagHash> find_all(PackageManager& pm, uint32_t cls) {
     return out;
 }
 
+// The display component's first u32 indexes the codex image list (class 808071C0): Vec at 0x08
+// of 0x20-byte elements {u32 name hash, ..., 0x10 tag of an 80805335 image entry}. The entry holds
+// its 80805350 image at 0x18, whose nested Vec (0x20 -> Vec -> tags) lists the texture headers,
+// largest first. Returns the largest texture, or none when the index is 0xFFFF or does not resolve.
+TagHash illustration_of(PackageManager& pm, const std::vector<TagHash>& images, uint32_t index) {
+    if (index >= images.size() || images[index].is_none()) return {};
+    try {
+        const auto entry = pm.read(images[index]);
+        if (entry.size() < 0x1C) return {};
+        const auto image = pm.read(TagReader(entry).tag_at(0x18));
+        TagReader ir(image);
+        const auto outer = ir.vec_at(0x20);
+        if (!outer.count) return {};
+        const auto inner = ir.vec_at(outer.data);
+        if (!inner.count) return {};
+        return ir.tag_at(inner.data);
+    } catch (...) {
+        return {};
+    }
+}
+
 uint32_t field(const TagReader& r, const CodexDefinition& d, uint32_t cls, size_t off, size_t size) {
     for (const auto& c : d.components)
         if (c.cls == cls && c.offset + off + 4 <= size) {
@@ -76,6 +97,24 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
     const auto bytes = pm.read(*defs_tag);
     const auto defs = parse_codex_definitions(bytes);
     TagReader r(bytes);
+
+    // Codex image list: index -> 80805335 image entry.
+    std::vector<TagHash> images;
+    if (const auto list = find_single(pm, kClassCodexImageList)) {
+        const auto b = pm.read(*list);
+        TagReader lr(b);
+        const auto v = lr.vec_at(0x08);
+        for (uint64_t i = 0; i < v.count; ++i) {
+            const size_t e = v.data + size_t(i) * 0x20;
+            if (e + 0x14 > b.size()) break;
+            images.push_back(lr.tag_at(e + 0x10));
+        }
+    }
+    auto illustration = [&](const CodexDefinition& d) {
+        for (const auto& c : d.components)
+            if (c.cls == kClassCodexDisplay && c.offset + 4 <= bytes.size()) return illustration_of(pm, images, r.u32_at(c.offset));
+        return TagHash{};
+    };
 
     // Item hash -> asset key.
     std::unordered_map<uint32_t, uint32_t> asset_key;
@@ -159,6 +198,7 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
             c.hash = d.hash;
             c.title = field(r, d, kClassCodexDisplay, 0x08, bytes.size());
             c.unlock = field(r, d, kClassCodexUnlock, 0x6C, bytes.size());
+            c.illustration = illustration(d);
             codex.collections.push_back(std::move(c));
         } else if (d.kind == kCodexKindEntry) {
             CodexEntry e;
@@ -166,7 +206,9 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
             e.title = field(r, d, kClassCodexDisplay, 0x08, bytes.size());
             e.body = field(r, d, kClassCodexBody, 0x2C, bytes.size());
             e.unlock = field(r, d, kClassCodexUnlock, 0x6C, bytes.size());
+            e.illustration = illustration(d);
             link_recording(e);
+            if (!e.illustration.is_none()) codex.with_illustration++;
             codex.entries++;
             if (!e.asset.is_none()) codex.with_asset++;
             if (!e.lines.empty()) codex.with_audio++;

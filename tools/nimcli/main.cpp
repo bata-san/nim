@@ -641,6 +641,27 @@ int cmd_codex_probe(PackageManager& pm, size_t n) {
     return 0;
 }
 
+// The codex illustrations: how many collections and records resolve to a texture, and which.
+int cmd_codex_art(PackageManager& pm) {
+    auto lines = load_all_dialogue(pm);
+    Codex codex = load_codex(pm, lines);
+    size_t cols = 0, col_art = 0;
+    std::set<uint32_t> distinct;
+    for (const auto& c : codex.collections) {
+        ++cols;
+        if (!c.illustration.is_none()) ++col_art, distinct.insert(c.illustration.value);
+        for (const auto& e : c.entries) {
+            if (e.illustration.is_none()) continue;
+            distinct.insert(e.illustration.value);
+            const Texture t = load_texture(pm, e.illustration);
+            std::println("{:08X} {}  fmt {} {}x{}", e.hash, e.illustration.str(), t.dxgi_format, t.width, t.height);
+        }
+    }
+    std::println("collections {} with art {}  entries {} with art {}  distinct textures {}", cols, col_art, codex.entries,
+                 codex.with_illustration, distinct.size());
+    return 0;
+}
+
 // The in-game codex: collections and their intel entries, with the recording lines of each entry.
 // With OUT, writes a Markdown dump (titles and bodies in LANG, default en).
 int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
@@ -2190,7 +2211,8 @@ int cmd_refs(PackageManager& pm, TagHash tag, uint32_t cls) {
         Package& p = pm.open(info);
         for (uint32_t i = 0; i < p.entries().size(); ++i) {
             const Entry& e = p.entries()[i];
-            if (e.type != 8 || (cls && e.reference != cls)) continue;
+            // cls FFFFFFFF: every tag of type 8 or 16 (16 holds list records such as icon entries)
+            if (cls == 0xFFFFFFFF ? (e.type != 8 && e.type != 16) : (e.type != 8 || (cls && e.reference != cls))) continue;
             const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
             std::vector<uint8_t> d;
             try { d = pm.read(t); } catch (...) { continue; }
@@ -2538,6 +2560,7 @@ int main(int argc, char** argv) {
                                     args.size() >= 5 ? std::stoi(args[4]) : 60);
         if (cmd == "wem" && args.size() >= 3) return cmd_wem(pm, TagHash(parse_hex(args[1])), args[2].c_str());
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
+        if (cmd == "codex-art") return cmd_codex_art(pm);
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "dynamic" && args.size() >= 2) return cmd_dynamic(pm, TagHash(parse_hex(args[1])));
