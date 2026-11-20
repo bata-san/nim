@@ -2584,7 +2584,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         // Preserve the authored part order for equal depths, including parts of one placement.
         std::stable_sort(ordered.begin(), ordered.end(), [](const Draw& a, const Draw& b) {
             if (a.sky != b.sky) return a.sky;
-            return a.sky ? a.depth < b.depth : a.depth > b.depth;
+            // Both back to front. Sky records hold an authored distance at +0x64 (Outpost: stars
+            // -105, clouds 48400, the planet 1e6; Cryo Archive: its fog shell 80000 drawn first).
+            // Ascending order let the far shells cover the whole sky (estimate of the engine rule).
+            return a.depth > b.depth;
         });
         world_transparent_draws_ = 0;
         sky_transparent_draws_ = 0;

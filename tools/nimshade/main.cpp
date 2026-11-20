@@ -100,6 +100,7 @@ int run(int argc, char** argv) {
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
     std::optional<std::pair<size_t, size_t>> entity_range;
+    std::vector<std::pair<size_t, size_t>> sky_ranges;
     TagHash selected_activity;
     uint32_t selected_activity_map = 0;
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
@@ -132,6 +133,17 @@ int run(int argc, char** argv) {
             const auto split = value.find(':');
             if (split == std::string::npos) throw std::runtime_error("--entity-range expects BEGIN:END (exclusive)");
             entity_range = {std::stoull(value.substr(0, split)), std::stoull(value.substr(split + 1))};
+        }
+        else if (args[i] == "--sky-range" && i + 1 < args.size()) {
+            std::string value = args[++i];
+            for (size_t start = 0; start <= value.size();) {
+                const size_t end = std::min(value.find(',', start), value.size());
+                const auto part = value.substr(start, end - start);
+                const auto split = part.find(':');
+                if (split == std::string::npos) throw std::runtime_error("--sky-range expects BEGIN:END[,BEGIN:END...] (exclusive)");
+                sky_ranges.emplace_back(std::stoull(part.substr(0, split)), std::stoull(part.substr(split + 1)));
+                start = end + 1;
+            }
         }
         else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
@@ -310,7 +322,13 @@ int run(int argc, char** argv) {
             size_t n = 0;
             for (const auto& m : sky) n += m.rows.size();
             std::println("sky objects: {} placements of {} models", n, sky.size());
-            for (auto& m : sky) region.push_back(std::move(m));
+            for (size_t i = 0; i < sky.size(); ++i) {
+                if (!sky_ranges.empty() && std::none_of(sky_ranges.begin(), sky_ranges.end(),
+                                                        [&](const auto& r) { return i >= r.first && i < r.second; }))
+                    continue;
+                if (!sky_ranges.empty()) std::println("sky model [{}]: {} ({} placements, order {})", i, sky[i].mesh.str(), sky[i].rows.size(), sky[i].sky_order);
+                region.push_back(std::move(sky[i]));
+            }
         }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;

@@ -71,6 +71,8 @@ struct MapStatic {
     std::vector<std::array<float, 12>> rows;
     std::vector<float> sky_order;  // one authored sort key per row for sky collections
 };
+inline constexpr uint32_t kBubbleOutpost = 0x80AF9550;  // exp_outpost
+
 struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
@@ -200,8 +202,12 @@ struct MapAtmosphere {
     std::array<std::vector<std::array<float, 3>>, 4> paths;
     TagHash lens_glare, lens_upsample;      // techniques from the atmosphere's 80808351 tag
     float default_time = 0.5f;
+    const char* default_time_source = "sun path component +0x08 (estimate)";
     std::vector<MapChannelExpression> channel_expressions;  // the map environment, in data order
     bool valid() const { return !lookups[1].is_none(); }
+    // The sky keyframe time (slice_times) nearest to midnight: half a day after the moving sun's
+    // highest point. The night look.
+    float night_time() const;
     // The direction (toward the sun) of path `i` at time `t` (0..1), interpolated.
     std::array<float, 3> path_direction(int i, float t) const;
     // The lookup slice coordinate (0..1, at texel centres) for time `t`.
@@ -226,7 +232,8 @@ struct MapEntities {
 // collection (8080837C: +0x08 Vec of 0x90-byte objects: +0x00 transform (column-major mat4),
 // +0x40 bounds, +0x60 model ref 80808383 (+0x08 the dynamic model), +0x64 draw order, +0x70 kind).
 // The distant scenery (mountains, terrain far out, celestial shapes) placed kilometres away; per
-// dynamic model, the 3x4 rows of its placements. Kind 5 is left out (goriath: draws solid red).
+// dynamic model, the 3x4 rows of its placements. Kinds 5 (goriath: solid red) and 6 (a greyscale
+// whole-sky capture covering the other layers) are left out.
 std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout& map);
 // Needs the hash64 index (PackageManager::build_hash64_index).
 MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,

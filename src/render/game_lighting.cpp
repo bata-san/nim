@@ -2012,6 +2012,8 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
         return;
     }
     const float t = p.time_of_day >= 0 ? p.time_of_day : atm_.data.default_time;
+    if (p.time_of_day < 0)
+        ext_.note_estimate(std::format("map time of day = {:.3f}", t), atm_.data.default_time_source);
     auto ch = [&](uint32_t i) { return i < ext_.channels.size() ? ext_.channels[i] : float4{}; };
     constexpr std::string_view copied = "global channel copied into extern 7 (order matches; engine copy code not data)";
     constexpr std::string_view chosen = "meaning read from the sky / shading DXIL, value chosen";

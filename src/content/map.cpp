@@ -487,6 +487,13 @@ MapAtmosphere load_map_atmosphere(PackageManager& pm, const MapLayout& map) {
             }
         }
     }
+    // Maps the user confirmed are played at night in the game (Outpost). The sun path component's
+    // +0x08 (0.5 = noon) is not the start time there, and the engine's time source is not in the
+    // data: start such maps at the authored sky keyframe nearest to midnight (estimate).
+    if (map.bubble.value == kBubbleOutpost && !out.paths[0].empty()) {
+        out.default_time = out.night_time();
+        out.default_time_source = "user-confirmed night map: the sky keyframe nearest to midnight (half a day after the sun's highest point; estimate)";
+    }
     // The world channels the inputs name: their slots in the world channel registry.
     std::set<const std::vector<SequencerInput>*> resolved;
     std::optional<WorldChannelRegistry> registry;
@@ -555,7 +562,10 @@ std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout&
         for (uint64_t i = 0; i < objects.count; ++i) {
             const size_t o = objects.data + size_t(i) * 0x90;
             if (o + 0x90 > data.size()) break;
-            if (r.u32_at(o + 0x70) == 5) continue;
+            // Kind 5 never shows in game (goriath / DEIMOS: solid red). Kind 6 is a low-resolution
+            // greyscale capture of the whole sky (Outpost 80AF8E8B, Cryo Archive 80B37FBD) that
+            // covers the authored layers drawn before it; left out as well (estimate).
+            if (const uint32_t kind = r.u32_at(o + 0x70); kind == 5 || kind == 6) continue;
             const TagHash ref = r.tag_at(o + 0x60);
             const Entry* re = pm.entry(ref);
             if (!re || re->reference != kClassSkyModelRef) continue;
@@ -586,6 +596,25 @@ std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout&
     std::vector<MapStatic> out;
     for (auto& [_, m] : models) out.push_back(std::move(m));
     return out;
+}
+
+float MapAtmosphere::night_time() const {
+    // Midnight = half a day after the moving sun's highest point. The authored sky keyframes
+    // (lookup slices) hold the looks the artists made; use the one nearest to midnight. (The lowest
+    // point of the path itself sits next to the t = 0 / 1 wrap, where the environment curves
+    // already blend toward the dawn haze.)
+    const auto& path = paths[0];
+    if (path.empty()) return default_time;
+    size_t high = 0;
+    for (size_t i = 1; i < path.size(); ++i)
+        if (path[i][2] > path[high][2]) high = i;
+    const float midnight = std::fmod(float(high) / float(path.size()) + 0.5f, 1.0f);
+    float best = default_time, gap = 2;
+    for (float t : slice_times) {
+        const float d = std::abs(t - midnight), g = std::min(d, 1 - d);
+        if (g < gap) gap = g, best = t;
+    }
+    return best;
 }
 
 std::array<float, 3> MapAtmosphere::path_direction(int i, float t) const {
