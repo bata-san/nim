@@ -1011,14 +1011,11 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
             }
             const int32_t ri = rig_of[b];
             BoneTransform& o = object[b];
-            // A rig node need not share its bone's frame: feet and hands are animated as targets
-            // aligned to the object axes. The bone keeps its bind offset from the node's default
-            // pose (identity where they agree, as for most bones).
-            auto attached = [&](const Q& clip, const Q& bone_rest) {
-                const Q& node_rest = rig.default_pose[size_t(ri)].rotation;
-                const Q offset = qmul({-node_rest[0], -node_rest[1], -node_rest[2], node_rest[3]}, bone_rest);
-                return qnormalize(qmul(clip, offset));
-            };
+            // The clip rotation is the bone's rotation (local or object space by the node). An
+            // earlier version re-based nodes whose rig default pose differs from the skeleton bind
+            // (clip x rest^-1 x bind); on the 81 / 103 bone humans that bent the wrists backwards
+            // and turned the fingers up, while the feet were unchanged (user report, 2026-11-20).
+            auto attached = [&](const Q& clip, const Q&) { return qnormalize(clip); };
             if (p < 0) {
                 o = sk.bind[b];
                 if (ri >= 0) o.rotation = attached(pose[size_t(ri)].rotation, sk.bind[b].rotation);

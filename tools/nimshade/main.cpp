@@ -82,6 +82,7 @@ int run(int argc, char** argv) {
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
+    bool list_clips = false;
     bool single_model = false;
     float clip_frame = 0;
     float material_time = 0;
@@ -185,6 +186,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--single-model") single_model = true;
+        else if (args[i] == "--list-clips") list_clips = true;
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
         else if (args[i] == "--time" && i + 1 < args.size()) material_time = std::stof(args[++i]);
         else if (args[i] == "--benchmark" && i + 1 < args.size()) benchmark_frames = std::stoul(args[++i]);
@@ -431,7 +433,7 @@ int run(int argc, char** argv) {
         auto mats = index_dynamic_model_materials(pm);
         ModelAssemblyIndex assemblies;
         ModelRigIndex rigs;
-        if (!single_model || clip_tag) rigs = index_model_skeletons(pm, mats, single_model ? nullptr : &assemblies);
+        if (!single_model || clip_tag || list_clips) rigs = index_model_skeletons(pm, mats, single_model ? nullptr : &assemblies);
         auto it = mats.find(mesh_tag.value);
         std::println("dynamic model: {} components indexed in {:.1f}s, materials {}", mats.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
@@ -439,6 +441,12 @@ int run(int argc, char** argv) {
         auto mesh = prepare_entity_preview(pm, mesh_tag, mats, assemblies);
         for (const auto& part : mesh.attachments) std::println("assembled part {}", part.tag.str());
         std::vector<ModelSkinPose> poses;
+        if (list_clips) {
+            const auto all = index_animation_clips(pm);
+            if (const auto anim = prepare_preview_animation(pm, mesh, rigs, all))
+                for (const auto& c : anim->clips) std::println("clip {} ({} frames)", c.tag.str(), c.frames);
+            else std::println("no compatible clips");
+        }
         if (clip_tag) {
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
             const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups};
