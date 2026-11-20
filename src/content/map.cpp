@@ -1042,6 +1042,8 @@ ParticleSystem load_particle_system(PackageManager& pm, TagHash tag) {
         throw std::runtime_error(std::format("{}: unknown particle definition layout", s.definition.str()));
     s.lifetime = dr.f32_at(0x128);
     s.rate = dr.f32_at(0x134);
+    s.state_float4s = dr.u16_at(0x48);
+    s.instance_float4s = dr.u16_at(0x4C);
     return s;
 }
 

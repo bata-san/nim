@@ -44,6 +44,9 @@ public:
         wake_.notify_all();
         run();
         std::unique_lock lock(mutex_);
+        // All indices have been claimed. A worker that has yet to wake cannot contribute to
+        // this job, so wait only for workers that actually started it.
+        wanted_ = claimed_;
         done_.wait(lock, [&] { return finished_ == wanted_; });
         job_ = nullptr;
         wanted_ = 0;

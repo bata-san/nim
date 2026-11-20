@@ -229,9 +229,6 @@ public:
     void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
               std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
-    // Options::instance_float4s pipelines: `instances` 4-vertex strips over the stream `vbv`.
-    void draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                        const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances);
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
     // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
     // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
@@ -242,7 +239,13 @@ public:
         const D3D12_VERTEX_BUFFER_VIEW* vertices = nullptr;
         const D3D12_INDEX_BUFFER_VIEW* indices = nullptr;
         std::array<uint64_t, 64> root_bindings{};
+        std::unordered_map<const GamePipeline*, std::array<std::optional<uint32_t>, 2>> stable_tables;
     };
+    // The per-stage resources must stay identical within a particle batch.
+    void draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                        const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances, VolumeBatch& batch);
+    void dispatch_batch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                        uint32_t groups_x, VolumeBatch& batch);
     // Each stage's evaluated cbuffer, in stage order (evaluate_stages).
     using StageConstants = std::array<std::vector<float4>, 2>;
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -294,6 +297,7 @@ private:
         VolumeBatch* batch = nullptr;
         const StageConstants* constants = nullptr;
         uint32_t instances = 0;  // instanced 4-vertex strips over vbv
+        bool stable_views = false;
     };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);

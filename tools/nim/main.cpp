@@ -2411,7 +2411,8 @@ public:
                     if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
                     if (fx) particles.render(gpu, c, gb, hdr, vm, game_lighting.externs(), light.delta_time);
                 };
-                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow, scene.has_visible_light_grid() || fx);
+                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow,
+                                     scene.has_visible_light_grid() || (fx && particles.has_emitters_near(vm.eye)));
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {

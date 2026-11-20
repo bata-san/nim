@@ -629,6 +629,7 @@ struct ChannelContext {
 // fnv1("interpolated_world_position"): where the object is. Materials rotate / scale their
 // vertices about it; unset, the pivot is somewhere else and the object swings around it.
 constexpr uint32_t kInterpolatedWorldPosition = 0xA7A7FE43;
+constexpr uint32_t kExfilActivationProgress = 0x4AE64998;
 bool reads_object_position(const TechniqueStage& stage) {
     return disassemble_tfx(stage.bytecode).find("push_object_channel A7 A7 FE 43") != std::string::npos;
 }
@@ -641,7 +642,14 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
         if (cc.overrides)
             if (auto it = cc.overrides->find(h); it != cc.overrides->end()) value = &it->second;
         static const float4 unset{1, 1, 1, 1};
+        static const float4 inactive{};
         if (!value && h == kInterpolatedWorldPosition && cc.world_position) value = cc.world_position;
+        if (!value && h == kExfilActivationProgress) {
+            value = &inactive;
+            if (cc.estimates && cc.estimates->first_note(uint64_t(1) << 62 | h))
+                cc.estimates->note_estimate("object channel exfil_activation_progress = 0",
+                                            "no exfil activation state was supplied; the preview starts inactive");
+        }
         if (!value) {
             // No component default and no override: the channel is set at run time by gameplay.
             if (!cc.estimates) throw std::runtime_error(std::format("Missing engine object channel {:08X}", h));
@@ -1520,7 +1528,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     if (placements.empty()) throw std::runtime_error("mesh has no placements");
     const uint32_t set_base = uint32_t(sets_.size());
     std::shared_ptr<const ChannelValues> model_channels;
-    if (assembled_) model_channels = std::make_shared<ChannelValues>(mesh.channel_defaults);
+    if (mesh.dynamic) model_channels = std::make_shared<ChannelValues>(mesh.channel_defaults);
     if (first_mesh) {
         center_ = mesh.center;
         radius_ = mesh.radius;
@@ -1634,9 +1642,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             set.model_center = mesh.center;
             set.placements.assign(placements.begin(), placements.end());
             set.sky_order.assign(sky_order.begin(), sky_order.end());
+            set.model_channels = model_channels;
             if (assembled_) {
                 std::copy_n(mesh.model_cb.begin(), set.model_parameters.size(), set.model_parameters.begin());
-                set.model_channels = model_channels;
             }
         }
         if (mesh.dynamic) {
@@ -2181,6 +2189,11 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     }
     auto base = ext.environment();
     const ChannelContext cc{&channel_overrides_, &channels_, &channel_defaults_, &ext};
+    auto channels_for = [&](const BufferSet& set) {
+        ChannelContext result = cc;
+        if (set.dynamic) result.defaults = set.model_channels.get();
+        return result;
+    };
     material_addresses_.clear();
     // Shared scope bindings are fixed per item: resolved once to slots of scope_defs_, whose
     // constants are produced at most once per frame.
@@ -2345,17 +2358,17 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         if (!item_instances(it)) return;  // culled this frame: not drawn, nothing to evaluate
       try {
         const auto& set = sets_[it.buffers];
-        ChannelContext model_cc = cc;
+        const ChannelContext model_cc = channels_for(set);
         if (assembled_) {
             for (uint32_t row = 0; row < set.model_parameters.size(); ++row)
                 ext.set(ext::RigidModel, row * 16, set.model_parameters[row]);
-            model_cc.defaults = set.model_channels.get();
         }
         it.scope_addresses.resize(it.scope_slots.size());
         for (size_t k = 0; k < it.scope_slots.size(); ++k)
             it.scope_addresses[k] = {it.scope_slots[k].first, shared_scope(it.scope_slots[k].second)};
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
-            const uint64_t object = assembled_ ? set.model.value - TagHash::kBase : 0;
+            const bool model_inputs = assembled_ || (set.model_channels && !set.model_channels->empty());
+            const uint64_t object = model_inputs ? uint64_t(set.model.value - TagHash::kBase) + 1 : 0;
             const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
@@ -2454,7 +2467,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         for (auto& [table, error] : chunk.table_errors) failed_tables.try_emplace(table, std::move(error));
         for (const auto& [index, vs, key, origin] : chunk.requests) {
             auto [job, added] = pending.try_emplace(key, jobs.size());
-            if (added) jobs.push_back(MaterialJob{index, vs, cc, {0, 0, 0, 1}, origin, key, {}});
+            if (added) jobs.push_back(MaterialJob{index, vs, channels_for(sets_[items_[index].buffers]), {0, 0, 0, 1}, origin, key, {}});
             job_users.emplace_back(index, vs, job->second);
         }
     }
@@ -2472,7 +2485,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             auto& it = items_[index];
             if (it.failed) continue;
             try {
-                placement_constants(index, cc);
+                placement_constants(index, channels_for(sets_[it.buffers]));
             } catch (const std::exception& ex) {
                 it.failed = true;
                 notes_.push_back(std::format("{}: not drawn: {}", it.technique.str(), ex.what()));
@@ -2816,7 +2829,7 @@ bool StaticMeshScene::has_visible_light_grid() const {
     });
 }
 
-void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow) {
+void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow) {
     // Test the bounds against the projection. Leave room for subpixel camera jitter.
     const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
     const float half_h = 0.5f * float(std::max(1u, height));
@@ -2908,6 +2921,17 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
     if (first_uncullable && !uncullable_opaque_.empty() &&
         visible_opaque_[first_uncullable - 1] > uncullable_opaque_.front())
         std::inplace_merge(visible_opaque_.begin(), visible_opaque_.begin() + first_uncullable, visible_opaque_.end());
+}
+
+void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow) {
+    const float far_z = vm.proj.c[2][2] < 0 ? -vm.proj.c[3][2] / vm.proj.c[2][2] : INFINITY;
+    const VisibilityKey key{{vm.eye.x, vm.eye.y, vm.eye.z, vm.fwd.x, vm.fwd.y, vm.fwd.z,
+                             vm.right.x, vm.right.y, vm.right.z, vm.up.x, vm.up.y, vm.up.z,
+                             vm.fx, vm.fy, vm.ortho, far_z}, shadow_generation_, height, shadow};
+    if (!visibility_key_ || *visibility_key_ != key) {
+        rebuild_visibility(vm, height, shadow);
+        visibility_key_ = key;
+    }
     if (!visible_static_indices_.empty()) {
         const size_t bytes = visible_static_indices_.size() * sizeof(uint32_t);
         const auto upload = gpu.dynamic(bytes);

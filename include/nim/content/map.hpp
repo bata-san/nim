@@ -250,6 +250,7 @@ struct ParticleSystem {
     TagHash tag, definition, init, update, instance, draw;
     float lifetime = 0;  // definition +0x128: the longest particle life (seconds), estimate
     float rate = 0;      // definition +0x134: particles per second, estimate
+    uint16_t state_float4s = 0, instance_float4s = 0;  // definition +0x48 / +0x4C
 };
 ParticleSystem load_particle_system(PackageManager& pm, TagHash tag);
 // The particle systems a map places: nodes -> entity (8080BAAD) -> components (8080BADB) that

@@ -402,6 +402,14 @@ private:
     size_t world_transparent_draws_ = 0;
     size_t sky_transparent_draws_ = 0;
     uint64_t shadow_generation_ = 0;
+    struct VisibilityKey {
+        std::array<float, 16> view;
+        uint64_t generation;
+        uint32_t height;
+        bool shadow;
+        bool operator==(const VisibilityKey&) const = default;
+    };
+    std::optional<VisibilityKey> visibility_key_;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
     std::vector<size_t> transparent_items_;
@@ -436,6 +444,7 @@ private:
         GpuBuffer object_cb;
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
+    void rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                         std::span<const std::array<float, 12>> placements, std::span<const float> sky_order);
     std::vector<BufferSet> sets_;

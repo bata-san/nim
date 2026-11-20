@@ -13,16 +13,16 @@ namespace nim {
 // Extern blocks of the particle techniques (TFX extern ids; mida's TfxExtern order).
 namespace {
 constexpr uint8_t kGeneric = 26, kParticle = 27, kParticleCompute = 83;
-// Per-particle record sizes differ by system (the state is 5 or 6 float4s, the draw instance as
-// many float4s as the draw VS has TEXCOORD inputs). The pools are laid out with a fixed slot
-// size at least as large; the shaders take the record bases in float4s, so only the vertex
-// stride has to be the system's own.
-constexpr uint32_t kStateFloat4s = 8;     // slot size: cs_gpu_stateful_* records
+// Definition record counts are also used by the original shaders to advance each record.
+constexpr uint32_t kMaxStateFloat4s = 32;
 constexpr uint32_t kHistoryFloat4s = 3;   // per particle: the previous frame, for the draw's motion
 constexpr uint32_t kMaxInstanceFloat4s = 32; // D3D12 input-assembler limit
 constexpr uint32_t kMaxCapacity = 256;  // per emitter (estimate: the spawn rate itself is an estimate)
 constexpr uint32_t kGroup = 64;           // [numthreads(64,1,1)] of every particle CS
 constexpr uint32_t kWarmSteps = 30;       // steps through one lifetime for an emitter coming into range
+constexpr uint32_t kWarmStepsPerFrame = 4;
+static_assert(kWarmSteps % 2 == 0 && kWarmStepsPerFrame % 2 == 0);
+using ParticleObjectConstants = std::array<float4, 32>;
 
 void uav_barrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r) {
     D3D12_RESOURCE_BARRIER b{};
@@ -36,6 +36,7 @@ struct ParticleScene::System {
     ParticleSystem def;
     GamePipeline init, update, instance, draw;
     uint32_t instance_float4s = 0;  // the draw VS's per-instance TEXCOORD inputs
+    bool screen_collision = false;
     bool failed = false;  // an original program could not be evaluated: left out from then on
 };
 
@@ -60,13 +61,22 @@ const std::map<std::string, std::string>& ParticleScene::estimates() const {
     return ext_ ? ext_->estimates() : none;
 }
 
+bool ParticleScene::has_emitters_near(V3 eye) const {
+    return std::ranges::any_of(emitters_, [&](const auto& e) {
+        const V3 d = e.position - eye;
+        return !systems_[e.system]->failed && dot(d, d) <= radius * radius;
+    });
+}
+
 void ParticleScene::release(Gpu&) {
     systems_.clear();
     emitters_.clear();
     for (auto& s : state_) s.Reset();
     history_.Reset();
     instances_.Reset();
+    object_constants_.Reset();
     total_ = 0;
+    state_total_ = 0;
     instance_total_ = 0;
     active_ = 0;
     notes_.clear();
@@ -88,6 +98,9 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
                 if (const char* skip = std::getenv("NIM_FX_SKIP"); skip && std::strstr(skip, p.system.str().c_str()))
                     throw std::runtime_error("skipped (NIM_FX_SKIP)");  // diagnostics: per-system cost
                 s->def = load_particle_system(pm, p.system);
+                if (!s->def.state_float4s || s->def.state_float4s > kMaxStateFloat4s ||
+                    !s->def.instance_float4s || s->def.instance_float4s > kMaxInstanceFloat4s)
+                    throw std::runtime_error("unsupported particle record widths");
                 if (!(s->def.rate > 0) || !(s->def.lifetime > 0))
                     throw std::runtime_error(std::format("rate {} / lifetime {}", s->def.rate, s->def.lifetime));
                 for (TagHash t : {s->def.init, s->def.update, s->def.instance})
@@ -95,6 +108,10 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
                 GamePipeline::Options cs;
                 s->init.load(pm, gpu, s->def.init, {}, cs);
                 s->update.load(pm, gpu, s->def.update, {}, cs);
+                const auto update = load_technique(pm, s->def.update);
+                const auto program = disassemble_tfx(update.stage(ShaderStage::Compute).bytecode);
+                s->screen_collision = program.contains("push_extern_texview 03 16") && program.contains("push_extern_texview 03 13") &&
+                                      s->update.binds_shared_cbuffer(ShaderStage::Compute, 12);
                 s->instance.load(pm, gpu, s->def.instance, {}, cs);
                 const Technique draw = load_technique(pm, s->def.draw);
                 GamePipeline::Options d;
@@ -109,10 +126,11 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
                         throw std::runtime_error(std::format("{}: mesh particles (draw VS reads per-vertex {}{}), model not decoded",
                                                              s->def.draw.str(), in.semantic, in.index));
                 }
-                if (!s->instance_float4s || s->instance_float4s > kMaxInstanceFloat4s)
-                    throw std::runtime_error(std::format("{}: draw VS has {} instance inputs", s->def.draw.str(), s->instance_float4s));
+                if (!s->instance_float4s || s->instance_float4s > s->def.instance_float4s)
+                    throw std::runtime_error(std::format("{}: draw VS inputs exceed the authored instance record", s->def.draw.str()));
                 d.instance_float4s = s->instance_float4s;
                 s->draw.load(pm, gpu, s->def.draw, {}, d);
+                s->instance_float4s = s->def.instance_float4s;
                 it->second = int(systems_.size());
                 systems_.push_back(std::move(s));
             } catch (const std::exception& ex) {
@@ -127,26 +145,39 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
         e.position = {p.rows[3], p.rows[7], p.rows[11]};
         e.capacity = std::clamp<uint32_t>(uint32_t(std::ceil(s.def.rate * s.def.lifetime)) + 1, 1, kMaxCapacity);
         e.offset = total_;
+        e.state_base = state_total_;
         e.instance_base = instance_total_;
+        state_total_ += e.capacity * s.def.state_float4s;
         instance_total_ += e.capacity * s.instance_float4s;
         e.seed = uint32_t(emitters_.size()) * 7919u + 17u;
         total_ += e.capacity;
         emitters_.push_back(e);
     }
     if (emitters_.empty()) return;
+    std::vector<ParticleObjectConstants> objects(emitters_.size());
+    for (size_t i = 0; i < emitters_.size(); ++i) {
+        const auto& p = emitters_[i].rows;
+        auto& object = objects[i];
+        object[0] = {p[0], p[4], p[8], 0};
+        object[1] = {p[1], p[5], p[9], 0};
+        object[2] = {p[2], p[6], p[10], 0};
+        object[3] = {p[3], p[7], p[11], 1};
+        std::copy_n(object.begin(), 4, object.begin() + 8);
+    }
+    object_constants_ = gpu.upload(objects.data(), objects.size() * sizeof(ParticleObjectConstants));
     const uint64_t n = total_;
     auto uav_buffer = [&](uint64_t float4s) {
         return gpu.buffer(float4s * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     };
-    state_[0] = uav_buffer(n * kStateFloat4s);
-    state_[1] = uav_buffer(n * kStateFloat4s);
+    state_[0] = uav_buffer(state_total_);
+    state_[1] = uav_buffer(state_total_);
     history_ = uav_buffer(n * kHistoryFloat4s);
     instances_ = uav_buffer(instance_total_);
     // Zero the pools: a slot spawned in the last step has no history record until the next update,
     // and the draw VS reads it (garbage there made screen-sized quads).
     {
-        const uint64_t bytes = std::max<uint64_t>(n * kStateFloat4s, instance_total_) * 16;
+        const uint64_t bytes = std::max({uint64_t(state_total_), uint64_t(instance_total_), n * kHistoryFloat4s}) * 16;
         auto zeros = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* p = nullptr;
         zeros->Map(0, nullptr, &p);
@@ -167,15 +198,16 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
 // One simulation step of the emitters in `list` (state_[parity_] -> state_[1 - parity_]): the
 // original update over every used slot, then the original init over the slots spawned into.
 void ParticleScene::step(Gpu& gpu, ID3D12GraphicsCommandList* cl, const std::vector<uint32_t>& list, const std::vector<float>& dts,
-                         const ScopeBufferFn& scopes) {
+                         const ScopeBufferFn& scopes, std::span<const D3D12_GPU_VIRTUAL_ADDRESS> collision_views) {
     ExternStore& ext = *ext_;
     ID3D12Resource* src = state_[parity_].Get();
     ID3D12Resource* dst = state_[1 - parity_].Get();
     Gpu::barrier(cl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    const uint32_t state_elements = total_ * kStateFloat4s;
+    const uint32_t state_elements = state_total_;
     ext.set_texture(kParticleCompute, 0x00, src, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, state_elements);
     ext.set_texture(kParticleCompute, 0xC8, dst, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, state_elements);
     ext.set_texture(kParticleCompute, 0xD8, history_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kHistoryFloat4s);
+    GamePipeline::VolumeBatch update_batch, init_batch;
     std::vector<uint32_t> spawns(list.size());
     for (size_t k = 0; k < list.size(); ++k) {
         Emitter& e = emitters_[list[k]];
@@ -189,9 +221,17 @@ void ParticleScene::step(Gpu& gpu, ID3D12GraphicsCommandList* cl, const std::vec
         ext.set(kParticle, 0x14C, dt);
         ext.set(kParticle, 0x154, 0.0f);  // history index base
         ext.set(kParticleCompute, 0x110, float(used));
-        ext.set(kParticleCompute, 0xF0, float4{float(e.offset * kStateFloat4s), 0, float(e.offset * kStateFloat4s), 0});
+        ext.set(kParticleCompute, 0xF0, float4{float(e.state_base), 0, float(e.state_base), 0});
         ext.set(kParticleCompute, 0x134, float(e.offset * kHistoryFloat4s));
-        guard(s, [&] { s.update.dispatch(gpu, cl, ext, scopes, (used + kGroup - 1) / kGroup, 1, 1); });
+        const auto local_view = collision_views[list[k]];
+        guard(s, [&] {
+            if (local_view) {
+                const ScopeBufferFn local_scopes = [&](ShaderStage stage, uint32_t reg) {
+                    return reg == 12 && stage == ShaderStage::Compute ? local_view : scopes(stage, reg);
+                };
+                s.update.dispatch_batch(gpu, cl, ext, local_scopes, (used + kGroup - 1) / kGroup, update_batch);
+            } else s.update.dispatch_batch(gpu, cl, ext, scopes, (used + kGroup - 1) / kGroup, update_batch);
+        });
     }
     uav_barrier(cl, dst);
     for (size_t k = 0; k < list.size(); ++k) {
@@ -205,8 +245,8 @@ void ParticleScene::step(Gpu& gpu, ID3D12GraphicsCommandList* cl, const std::vec
             ext.set(kParticle, 0x15C, float(e.seed));
             ext.set(kParticle, 0x160, 0.0f);  // transform index into particle_transforms
             ext.set(kParticleCompute, 0x110, float(run));
-            ext.set(kParticleCompute, 0xF0, float4{0, 0, float((e.offset + e.head) * kStateFloat4s), 0});
-            guard(s, [&] { s.init.dispatch(gpu, cl, ext, scopes, (run + kGroup - 1) / kGroup, 1, 1); });
+            ext.set(kParticleCompute, 0xF0, float4{0, 0, float(e.state_base + e.head * s.def.state_float4s), 0});
+            guard(s, [&] { s.init.dispatch_batch(gpu, cl, ext, scopes, (run + kGroup - 1) / kGroup, init_batch); });
             e.head = (e.head + run) % e.capacity;
             e.spawned += run;
             left -= run;
@@ -238,7 +278,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
                       "the FX expression program of the definition (808081EF) is not decoded");
     ext.note_estimate("particle_transforms / particle_location_metadata: identity emitter frame",
                       "engine-filled scopes; the emitter's placement goes through rigid_model instead");
-    ext.note_estimate(std::format("particles simulated within {:.0f} m of the eye, warmed up over one life", radius),
+    ext.note_estimate(std::format("particles within {:.0f} m of the eye warm over one life, at most {} steps per frame", radius, kWarmStepsPerFrame),
                       "viewer choice: the engine's FX culling is not decoded");
 
     // Shared cbuffers. Per-emitter: rigid_model (b1, the placement). Engine-filled scopes get
@@ -290,6 +330,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     std::vector<uint32_t> live, warm;
     for (uint32_t i = 0; i < emitters_.size(); ++i) {
         Emitter& e = emitters_[i];
+        if (systems_[e.system]->failed) continue;
         const V3 d{e.position.x - vm.eye.x, e.position.y - vm.eye.y, e.position.z - vm.eye.z};
         const bool in_range = d.x * d.x + d.y * d.y + d.z * d.z <= radius * radius;
         if (!in_range) {
@@ -301,40 +342,73 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
             e.head = 0;
             e.spawned = 0;
             e.carry = 0;
-            warm.push_back(i);
+            e.warm_steps = kWarmSteps;
         }
+        if (e.warm_steps) warm.push_back(i);
         live.push_back(i);
     }
     active_ = live.size();
     if (live.empty()) return;
-    // Every step moves the whole pool to the other buffer, so all live emitters take part; the
-    // ones not warming advance by zero.
-    if (!warm.empty()) {
-        std::vector<float> dts(live.size());
-        for (uint32_t s = 0; s < kWarmSteps; ++s) {
-            for (size_t k = 0; k < live.size(); ++k) {
-                const Emitter& e = emitters_[live[k]];
-                const bool warming = std::find(warm.begin(), warm.end(), live[k]) != warm.end();
-                dts[k] = warming ? systems_[e.system]->def.lifetime / float(kWarmSteps) : 0.0f;
-            }
-            step(gpu, cl, live, dts, scopes);
+    const auto system_of = [&](uint32_t i) { return emitters_[i].system; };
+    std::ranges::sort(live, {}, system_of);
+    std::ranges::sort(warm, {}, system_of);
+    // Collision CS projects its stored emitter-local positions directly with b12[0..3].
+    // Draw VS has a separate rigid_model stage and continues to receive the normal view.
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> collision_views(emitters_.size());
+    std::vector<float4> collision_constants;
+    for (uint32_t i : live) {
+        const auto& e = emitters_[i];
+        if (!systems_[e.system]->screen_collision) continue;
+        if (collision_constants.empty()) {
+            ext.note_estimate("particle collision View b12: emitter-local projection and camera position",
+                              "the update shader projects the stored local position directly against map depth");
+            collision_constants = evaluate_scope(*view_scope_, ScopeStage::Pixel, ext);
+            if (collision_constants.size() < 8) break;
         }
+        const auto& p = e.rows;
+        M4 world;
+        world.c[0] = {p[0], p[4], p[8], 0};
+        world.c[1] = {p[1], p[5], p[9], 0};
+        world.c[2] = {p[2], p[6], p[10], 0};
+        world.c[3] = {p[3], p[7], p[11], 1};
+        const auto local_to_clip = mul(vm.vp_abs, world);
+        std::copy(std::begin(local_to_clip.c), std::end(local_to_clip.c), collision_constants.begin());
+        const V3 eye_offset = vm.eye - e.position;
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const V3 x{world.c[axis][0], world.c[axis][1], world.c[axis][2]};
+            collision_constants[7][axis] = dot(eye_offset, x) / std::max(dot(x, x), 1e-8f);
+        }
+        collision_views[i] = upload(collision_constants);
     }
-    step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes);
+    // Warm only new emitters. Each pair returns to the original buffer parity.
+    std::vector<float> dts;
+    for (uint32_t pair = 0; pair < kWarmStepsPerFrame / 2 && !warm.empty(); ++pair) {
+        dts.clear();
+        for (uint32_t i : warm) {
+            Emitter& e = emitters_[i];
+            e.warm_steps -= 2;
+            dts.push_back(systems_[e.system]->def.lifetime / float(kWarmSteps));
+        }
+        step(gpu, cl, warm, dts, scopes, collision_views);
+        step(gpu, cl, warm, dts, scopes, collision_views);
+        std::erase_if(warm, [&](uint32_t i) { return emitters_[i].warm_steps == 0; });
+    }
+    step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes, collision_views);
 
     // Expand each emitter's particles into draw instances.
     ID3D12Resource* cur = state_[parity_].Get();
     Gpu::barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    ext.set_texture(kParticleCompute, 0x00, cur, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kStateFloat4s);
+    ext.set_texture(kParticleCompute, 0x00, cur, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, state_total_);
     ext.set_texture(kParticleCompute, 0xC8, instances_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, instance_total_);
+    GamePipeline::VolumeBatch instance_batch;
     for (uint32_t i : live) {
         const Emitter& e = emitters_[i];
         const uint32_t used = uint32_t(std::min<uint64_t>(e.spawned, e.capacity));
         if (!used) continue;
         ext.set(kParticleCompute, 0x110, float(used));
-        ext.set(kParticleCompute, 0xF0, float4{float(e.offset * kStateFloat4s), 0, float(e.instance_base), 0});
+        ext.set(kParticleCompute, 0xF0, float4{float(e.state_base), 0, float(e.instance_base), 0});
         System& s = *systems_[e.system];
-        guard(s, [&] { s.instance.dispatch(gpu, cl, ext, scopes, (used + kGroup - 1) / kGroup, 1, 1); });
+        guard(s, [&] { s.instance.dispatch_batch(gpu, cl, ext, scopes, (used + kGroup - 1) / kGroup, instance_batch); });
     }
     Gpu::barrier(cl, cur, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Gpu::barrier(cl, instances_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -355,25 +429,18 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     cl->OMSetRenderTargets(1, &hdr, FALSE, &gb.dsv_ro);
     ext.set_texture(kParticle, 0x08, history_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kHistoryFloat4s);
     ext.set_texture(kParticle, 0x10, history_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kHistoryFloat4s);
+    GamePipeline::VolumeBatch draw_batch;
     for (const auto& [depth, i] : order) {
         const Emitter& e = emitters_[i];
         const uint32_t used = uint32_t(std::min<uint64_t>(e.spawned, e.capacity));
         if (!used) continue;
-        // rigid_model: local_to_world (columns, absolute world), the previous one at rows 8-11.
-        std::array<float4, 32> object{};
-        const auto& p = e.rows;
-        object[0] = {p[0], p[4], p[8], 0};
-        object[1] = {p[1], p[5], p[9], 0};
-        object[2] = {p[2], p[6], p[10], 0};
-        object[3] = {p[3], p[7], p[11], 1};
-        for (size_t c = 0; c < 4; ++c) object[8 + c] = object[c];
-        object_cb = upload(object);
+        object_cb = object_constants_->GetGPUVirtualAddress() + uint64_t(i) * sizeof(ParticleObjectConstants);
         System& s = *systems_[e.system];
         ext.set(kParticle, 0x178, float(e.offset * kHistoryFloat4s));
         ext.set(kParticle, 0x17C, float(e.offset * kHistoryFloat4s));
         const D3D12_VERTEX_BUFFER_VIEW vbv{instances_->GetGPUVirtualAddress() + uint64_t(e.instance_base) * 16,
                                            used * s.instance_float4s * 16, s.instance_float4s * 16};
-        guard(s, [&] { s.draw.draw_instances(gpu, cl, ext, scopes, vbv, used); });
+        guard(s, [&] { s.draw.draw_instances(gpu, cl, ext, scopes, vbv, used, draw_batch); });
     }
     Gpu::barrier(cl, instances_.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Gpu::barrier(cl, history_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

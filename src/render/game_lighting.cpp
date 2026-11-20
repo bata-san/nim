@@ -687,11 +687,21 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
 }
 
 void GamePipeline::draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
-                                  const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances) {
+                                  const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances, VolumeBatch& batch) {
     if (compute_) throw std::runtime_error("Compute pipeline cannot draw instances");
     Geometry g{nullptr, &vbv, nullptr, 4};
     g.instances = instances;
+    g.batch = &batch;
+    g.stable_views = true;
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
+void GamePipeline::dispatch_batch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                                  uint32_t groups_x, VolumeBatch& batch) {
+    if (!compute_ || !groups_x || groups_x > 65535) throw std::invalid_argument("Invalid original compute dispatch");
+    Geometry g{nullptr, nullptr, nullptr, 0, {}, &batch};
+    g.stable_views = true;
+    execute(gpu, cl, ext, scopes, batch.pipeline == this, groups_x, 1, 1, &g);
 }
 
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -746,6 +756,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     // still change independently; different cubemap textures never alias a mutable table.
 
     auto* batch = geometry ? geometry->batch : nullptr;
+    const bool reuse_views = batch && batch->pipeline == this && geometry->stable_views;
+    auto* stable_tables = batch && geometry->stable_views && !reuse_views ? &batch->stable_tables[this] : nullptr;
     if (!batch || batch->pipeline != this) {
         if (compute_) cl->SetComputeRootSignature(root_sig_.Get());
         else cl->SetGraphicsRootSignature(root_sig_.Get());
@@ -811,7 +823,29 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             if (compute_) cl->SetComputeRootConstantBufferView(param, va);
             else cl->SetGraphicsRootConstantBufferView(param, va);
         }
-        if (!st.srv_count && !st.uav_count) continue;
+        if (reuse_views || (!st.srv_count && !st.uav_count)) continue;
+        const auto bind_tables = [&](uint32_t base) {
+            if (st.table_param >= 0) {
+                const auto handle = gpu.srv().gpu(base);
+                if (changed(uint32_t(st.table_param), handle.ptr)) {
+                    if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), handle);
+                    else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), handle);
+                }
+            }
+            if (st.uav_table_param >= 0) {
+                const auto handle = gpu.srv().gpu(base + st.srv_count);
+                if (changed(uint32_t(st.uav_table_param), handle.ptr)) {
+                    if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.uav_table_param), handle);
+                    else cl->SetGraphicsRootDescriptorTable(UINT(st.uav_table_param), handle);
+                }
+            }
+        };
+        // Draw order can interleave pipelines. Their tables stay valid for the whole phase.
+        auto* stable_base = stable_tables ? &stable_tables->at(stage_index) : nullptr;
+        if (stable_base && *stable_base) {
+            bind_tables(**stable_base);
+            continue;
+        }
         pending_views_.clear();
         view_resources_.clear();
         view_key_.assign({st.srv_count, st.uav_count});
@@ -872,18 +906,8 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
                 gpu.cache_transient_table(view_key_, base, view_resources_);
             }
         }
-        if (st.table_param >= 0) {
-            const auto handle = gpu.srv().gpu(base);
-            if (changed(uint32_t(st.table_param), handle.ptr)) {
-                if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.table_param), handle);
-                else cl->SetGraphicsRootDescriptorTable(UINT(st.table_param), handle);
-            }
-        }
-        if (st.uav_table_param >= 0) {
-            const auto handle = gpu.srv().gpu(base + st.srv_count);
-            if (compute_) cl->SetComputeRootDescriptorTable(UINT(st.uav_table_param), handle);
-            else cl->SetGraphicsRootDescriptorTable(UINT(st.uav_table_param), handle);
-        }
+        if (stable_base) *stable_base = base;
+        bind_tables(base);
     }
     if (compute_ && indirect_args_) cl->ExecuteIndirect(indirect_signature_, 1, indirect_args_, 0, nullptr, 0);
     else if (compute_) cl->Dispatch(x, y, z);

@@ -46,7 +46,7 @@ public:
     Voice(const Voice&) = delete;
     Voice& operator=(const Voice&) = delete;
     bool ok() const { return voice_ != nullptr; }
-    void submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream = false);
+    bool submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream = false);
     void start();
     void pause();
     void set_volume(float v);
@@ -89,9 +89,7 @@ struct MovieSubtitle {
 };
 uint32_t subtitle_string_hash(const std::string& key);
 
-// Plays one USM: a reader thread demuxes, decodes MPEG-1 video through the Media Foundation
-// decoder and the chosen ADX audio channel, and keeps a few RGBA frames queued. The clock is the
-// audio voice when there is audio, otherwise wall time.
+// Plays one USM: a reader thread demuxes MPEG-1 pictures and the selected ADX/HCA track.
 class MoviePlayer {
 public:
     MoviePlayer(PackageManager& pm, AudioEngine* engine, const MovieEntry& movie, int audio_channel, double start = 0);
@@ -118,11 +116,15 @@ public:
     const UsmInfo& info() const { return info_; }
     int audio_channel() const { return channel_; }
     bool audio_supported() const { return audio_ok_; }
+    uint64_t audio_frames_played() const { return voice_ ? voice_->frames_played() : 0; }
+    uint32_t audio_peak() const { return audio_peak_; }
+    void set_volume(float v) { if (voice_) voice_->set_volume(v); }
 
 private:
     void run();
     bool frames_empty() const;
     void push_frame(std::unique_ptr<Frame> f);
+    double position_locked() const;
 
     std::unique_ptr<PackageManager> pm_;
     AudioEngine* engine_ = nullptr;
@@ -137,8 +139,12 @@ private:
 
     std::unique_ptr<Voice> voice_;
     std::atomic<bool> stop_{false}, finished_{false}, paused_{false}, started_{false};
+    std::atomic<uint32_t> audio_peak_{0};
     std::chrono::steady_clock::time_point wall_start_{};
     double wall_paused_at_ = 0;
+    mutable uint64_t clock_samples_ = 0;
+    mutable double clock_position_ = 0;
+    mutable std::chrono::steady_clock::time_point last_audio_progress_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<std::unique_ptr<Frame>> frames_;

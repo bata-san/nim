@@ -75,8 +75,8 @@ void Voice::release_finished() const {
     while (buffers_.size() > st.BuffersQueued) buffers_.pop_front();
 }
 
-void Voice::submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream) {
-    if (!voice_ || !samples || samples->empty()) return;
+bool Voice::submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream) {
+    if (!voice_ || !samples || samples->empty()) return false;
     std::lock_guard lock(mutex_);
     release_finished();
     XAUDIO2_BUFFER b{};
@@ -84,7 +84,9 @@ void Voice::submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end
     b.pAudioData = reinterpret_cast<const BYTE*>(samples->data());
     b.Flags = end_of_stream ? XAUDIO2_END_OF_STREAM : 0;
     buffers_.push_back(std::move(samples));
-    if (FAILED(voice_->SubmitSourceBuffer(&b))) buffers_.pop_back();
+    if (SUCCEEDED(voice_->SubmitSourceBuffer(&b))) return true;
+    buffers_.pop_back();
+    return false;
 }
 
 void Voice::start() {
@@ -162,7 +164,7 @@ MoviePlayer::MoviePlayer(PackageManager& pm, AudioEngine* engine, const MovieEnt
             start_offset_ = s.offset, start_frame_ = s.frame, start_ = t;
         }
     for (const auto& a : info_.audio)
-        if (a.channel == channel_ && (a.codec == 2 || a.codec == 4) && engine_ && engine_->ok() && info_.audio_headers.contains(a.channel)) {
+        if (a.channel == channel_ && (a.codec == 2 || a.codec == 4) && engine_ && engine_->ok()) {
             voice_ = std::make_unique<Voice>(*engine_, a.sample_rate, uint16_t(a.channels));
             audio_ok_ = voice_->ok();
             if (!audio_ok_) voice_.reset();
@@ -185,7 +187,7 @@ bool MoviePlayer::frames_empty() const {
 void MoviePlayer::push_frame(std::unique_ptr<Frame> f) {
     std::unique_lock lock(mutex_);
     // Keep a few frames ahead; allow more when the audio clock is starving (audio muxed late).
-    cv_.wait_for(lock, std::chrono::seconds(5), [&] {
+    cv_.wait(lock, [&] {
         if (stop_) return true;
         if (frames_.size() < 8) return true;
         return voice_ && started_ && !paused_ && voice_->queued() == 0 && frames_.size() < 48;
@@ -194,25 +196,45 @@ void MoviePlayer::push_frame(std::unique_ptr<Frame> f) {
     frames_.push_back(std::move(f));
     cv_.notify_all();
     if (!started_) {
-        started_ = true;
         wall_start_ = std::chrono::steady_clock::now();
+        last_audio_progress_ = wall_start_;
+        wall_paused_at_ = clock_position_ = start_;
+        started_ = true;
         if (voice_ && !paused_) voice_->start();
     }
 }
 
 double MoviePlayer::position() const {
+    std::lock_guard lock(mutex_);
+    return position_locked();
+}
+
+double MoviePlayer::position_locked() const {
     if (!started_) return start_;
-    if (voice_) return start_ + double(voice_->frames_played()) / voice_->sample_rate();
     if (paused_) return wall_paused_at_;
-    return start_ + std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start_).count();
+    const auto now = std::chrono::steady_clock::now();
+    if (!voice_) return start_ + std::chrono::duration<double>(now - wall_start_).count();
+    const uint64_t played = voice_->frames_played();
+    const double audio = start_ + double(played) / voice_->sample_rate();
+    if (played != clock_samples_) {
+        clock_samples_ = played;
+        last_audio_progress_ = now;
+        clock_position_ = std::max(clock_position_, audio);
+    } else if (voice_->queued() == 0) {
+        // Late blocks or a shorter audio track must not block the video reader and clock.
+        const double idle = std::chrono::duration<double>(now - last_audio_progress_).count();
+        clock_position_ = std::max(clock_position_, audio + std::max(0.0, idle - 0.12));
+    }
+    return clock_position_;
 }
 
 void MoviePlayer::set_paused(bool p) {
+    std::lock_guard lock(mutex_);
     if (p == paused_) return;
-    if (!voice_ && started_) {
-        if (p) {
-            wall_paused_at_ = position();
-        } else {
+    if (started_) {
+        if (p) wall_paused_at_ = position_locked();
+        else {
+            last_audio_progress_ = std::chrono::steady_clock::now();
             wall_start_ = std::chrono::steady_clock::now() -
                           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                               std::chrono::duration<double>(wall_paused_at_ - start_));
@@ -275,8 +297,23 @@ void MoviePlayer::run() {
         HcaDecoder hca;
         bool is_hca = false;
         std::vector<int16_t> pcm;
-        if (voice_) {
-            const auto& head = info_.audio_headers.at(uint8_t(channel_));
+        if (voice_ && start_offset_) {
+            std::span<const uint8_t> head;
+            std::vector<uint8_t> fetched_header;
+            if (const auto header = info_.audio_headers.find(uint8_t(channel_)); header != info_.audio_headers.end()) head = header->second;
+            if (head.empty()) {
+                // Catalog metadata is read from a bounded prefix. Some muxes put audio after it.
+                for (uint64_t limit = 0x80000; limit <= 0x800000 && fetched_header.empty() && !stop_; limit *= 2) {
+                    const auto prefix = pm_->read_range(usm_, 0, std::min(limit, size_));
+                    for_each_usm_chunk(prefix, [&](const UsmChunk& c) {
+                        if (fetched_header.empty() && c.data_type == 0 && c.stream == UsmStream::Audio && c.channel == channel_)
+                            fetched_header.assign(c.payload.begin(), c.payload.end());
+                    });
+                    if (prefix.size() == size_) break;
+                }
+                head = fetched_header;
+            }
+            if (head.empty()) throw std::runtime_error("movie audio header not available for this seek");
             if (head.size() >= 8 && (head[0] & 0x7F) == 'H' && (head[1] & 0x7F) == 'C' && (head[2] & 0x7F) == 'A') {
                 hca.parse_header(head);
                 is_hca = true;
@@ -300,10 +337,13 @@ void MoviePlayer::run() {
         };
         Mpeg1Decoder dec(on_frame);
         auto flush_audio = [&](bool end) {
-            if (!voice_ || (pcm.empty() && !end)) return;
+            if (!voice_ || pcm.empty()) return;
+            uint32_t peak = audio_peak_;
+            for (int16_t value : pcm) peak = std::max(peak, uint32_t(std::abs(int(value))));
             auto buf = std::make_shared<const std::vector<int16_t>>(std::move(pcm));
             pcm.clear();
-            if (!buf->empty() || end) voice_->submit(buf, end);
+            if (!voice_->submit(buf, end)) throw std::runtime_error("XAudio2 rejected the decoded movie audio");
+            audio_peak_ = peak;
         };
 
         auto feed_video = [&](std::span<const uint8_t> es) { dec.feed(es); };
@@ -332,23 +372,26 @@ void MoviePlayer::run() {
                                                                    std::memcmp(buf.data(), "@SFA", 4) != 0)))
                 throw std::runtime_error("シーク位置がチャンク境界ではありません");
             first_read = false;
+            // Submit the segment's audio before picture decoding can block on the frame queue.
+            if (voice_) for_each_usm_chunk(buf, [&](const UsmChunk& c) {
+                    if (stop_ || c.data_type != 0 || c.stream != UsmStream::Audio ||
+                        c.channel != channel_ || c.seconds() + 0.02 < start_) return;
+                    auto payload = c.payload;
+                    if (payload.size() >= 8 && (payload[0] & 0x7F) == 'H' &&
+                        (payload[1] & 0x7F) == 'C' && (payload[2] & 0x7F) == 'A') {
+                        if (!hca.ready()) hca.parse_header(payload);
+                        is_hca = true;
+                        if (payload.size() < hca.header_size()) throw std::runtime_error("truncated USM HCA header");
+                        payload = payload.subspan(hca.header_size());
+                    }
+                    if (is_hca) hca.feed(payload, pcm);
+                    else adx.feed(payload, pcm);
+            });
+            flush_audio(pos >= size_);
             const size_t used = for_each_usm_chunk(buf, [&](const UsmChunk& c) {
                 if (stop_ || c.data_type != 0) return;
-                if (c.stream == UsmStream::Video && c.channel == 0) {
-                    feed_video(c.payload);
-                } else if (c.stream == UsmStream::Audio && voice_ && c.channel == channel_) {
-                    if (c.seconds() + 0.02 < start_) return;
-                    if (is_hca) {
-                        // the header chunk was parsed up front; frames start with the 0xFFFF sync
-                        if (c.payload.size() >= 4 && (c.payload[0] & 0x7F) == 'H' && (c.payload[1] & 0x7F) == 'C') return;
-                        hca.feed(c.payload, pcm);
-                    } else {
-                        // the header was fed up front; data frames never start with 0x8000
-                        if (c.payload.size() >= 2 && c.payload[0] == 0x80 && c.payload[1] == 0x00) return;
-                        adx.feed(c.payload, pcm);
-                    }
-                    if (pcm.size() >= size_t(voice_->sample_rate()) * voice_->channels() / 10) flush_audio(false);
-                } else if (c.stream == UsmStream::Subtitle) {
+                if (c.stream == UsmStream::Video && c.channel == 0) feed_video(c.payload);
+                else if (c.stream == UsmStream::Subtitle) {
                     auto s = parse_usm_subtitle(c.payload);
                     if (!s) return;
                     MovieSubtitle m;
@@ -379,8 +422,10 @@ void MoviePlayer::run() {
         }
         if (!started_ && !stop_) {  // no picture at all: still let the clock run for audio
             std::lock_guard lock(mutex_);
-            started_ = true;
             wall_start_ = std::chrono::steady_clock::now();
+            last_audio_progress_ = wall_start_;
+            wall_paused_at_ = clock_position_ = start_;
+            started_ = true;
             if (voice_ && !paused_) voice_->start();
         }
     } catch (const std::exception& ex) {

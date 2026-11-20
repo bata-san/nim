@@ -1839,6 +1839,31 @@ int cmd_movie_frames(PackageManager& pm, TagHash usm, const fs::path& dir, doubl
     return got > 0 && player.error().empty() ? 0 : 1;
 }
 
+int cmd_movie_playcheck(PackageManager& pm, TagHash usm, int channel, double start) {
+    struct ComApartment {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } apartment;
+    if (FAILED(apartment.result)) throw std::runtime_error("could not initialize COM for movie playback");
+    const auto movies = list_movies(pm);
+    const auto movie = std::ranges::find_if(movies, [&](const auto& m) { return m.usm == usm; });
+    if (movie == movies.end()) throw std::runtime_error("not a movie");
+    media::AudioEngine engine;
+    if (!engine.ok()) throw std::runtime_error(engine.error());
+    media::MoviePlayer player(pm, &engine, *movie, channel, start);
+    player.set_volume(0);
+    size_t frames = 0;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < end && player.error().empty() &&
+           (player.audio_frames_played() < 48000 || frames < 10)) {
+        if (player.take_due_frame()) ++frames;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::println("audio supported {} played {} sample frames, PCM peak {}, {} pictures, clock {:.3f}s; {}",
+                 player.audio_supported(), player.audio_frames_played(), player.audio_peak(), frames, player.position(), player.error());
+    return player.audio_frames_played() > 0 && frames > 0 && player.error().empty() ? 0 : 1;
+}
+
 int cmd_wem(PackageManager& pm, TagHash tag, const char* out) {
     const Entry* e = pm.entry(tag);
     if (!e) throw std::runtime_error("no such entry");
@@ -2736,6 +2761,9 @@ int main(int argc, char** argv) {
             return cmd_movie_video(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoull(args[3]) << 20 : ~0ull);
         if (cmd == "movie-audio" && args.size() >= 3)
             return cmd_movie_audio(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoi(args[3]) : 0);
+        if (cmd == "movie-playcheck" && args.size() >= 2)
+            return cmd_movie_playcheck(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0,
+                                       args.size() >= 4 ? std::stod(args[3]) : 0.0);
         if (cmd == "movie-frames" && args.size() >= 3)
             return cmd_movie_frames(pm, TagHash(parse_hex(args[1])), args[2], args.size() >= 4 ? std::stod(args[3]) : 0,
                                     args.size() >= 5 ? std::stoi(args[4]) : 60);
