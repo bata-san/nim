@@ -2,6 +2,7 @@
 #include "nim/core/profile.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <format>
@@ -62,7 +63,7 @@ void CALLBACK on_d3d_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev,
 }
 void debug_name(ID3D12Resource* r, const char* kind, uint64_t a, uint64_t b) {
     if (!g_debug_log || !r) return;
-    static uint64_t n = 0;
+    static std::atomic<uint64_t> n{0};
     r->SetName(std::format(L"{} #{} {}x{}", std::wstring(kind, kind + std::strlen(kind)), ++n, a, b).c_str());
 }
 }  // namespace
@@ -104,6 +105,21 @@ void Gpu::init(bool warp) {
         sm.HighestShaderModel < D3D_SHADER_MODEL_6_6)
         throw std::runtime_error("GPU/driver lacks Shader Model 6.6, which the game's shaders need (try --warp)");
 
+    init_queue(1000000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
+}
+
+Gpu::~Gpu() {
+    if (event_) CloseHandle(event_);
+}
+
+void Gpu::init_preview(ID3D12Device* device) {
+    device_ = device;
+    transient_per_frame_ = 8192;
+    dynamic_per_frame_ = 8 << 20;
+    init_queue(1 << 17);
+}
+
+void Gpu::init_queue(uint32_t descriptors) {
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check_hr(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
@@ -112,10 +128,11 @@ void Gpu::init(bool warp) {
              "CreateCommandList");
     check_hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    srv_.init(device_.Get(), 1000000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
-    transient_first_ = srv_.alloc(kTransientPerFrame * kFramesInFlight);
+    if (!event_) check_hr(HRESULT_FROM_WIN32(GetLastError()), "CreateEventW");
+    srv_.init(device_.Get(), descriptors);
+    transient_first_ = srv_.alloc(transient_per_frame_ * kFramesInFlight);
 
-    dynamic_ = buffer(kDynamicPerFrame * kFramesInFlight, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    dynamic_ = buffer(dynamic_per_frame_ * kFramesInFlight, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     check_hr(dynamic_->Map(0, nullptr, reinterpret_cast<void**>(&dynamic_cpu_)), "Map(dynamic)");
     begin_frame(0);
 }
@@ -194,10 +211,10 @@ void Gpu::begin_frame(uint32_t frame_index) {
     table_frame_ = frame_index % kFramesInFlight;
     table_cache_[table_frame_].clear();
     table_hits_ = 0;
-    dynamic_offset_ = size_t(frame_index % kFramesInFlight) * kDynamicPerFrame;
-    dynamic_end_ = dynamic_offset_ + kDynamicPerFrame;
-    transient_offset_ = transient_first_ + (frame_index % kFramesInFlight) * kTransientPerFrame;
-    transient_end_ = transient_offset_ + kTransientPerFrame;
+    dynamic_offset_ = size_t(frame_index % kFramesInFlight) * dynamic_per_frame_;
+    dynamic_end_ = dynamic_offset_ + dynamic_per_frame_;
+    transient_offset_ = transient_first_ + (frame_index % kFramesInFlight) * transient_per_frame_;
+    transient_end_ = transient_offset_ + transient_per_frame_;
 }
 
 std::optional<uint32_t> Gpu::find_transient_table(const std::vector<uint64_t>& key) {
@@ -226,7 +243,7 @@ void Gpu::transient_rewind(uint32_t mark) {
 uint32_t Gpu::transient_descriptors(uint32_t n) {
     if (n > transient_end_ - transient_offset_)
         throw std::runtime_error(std::format("per-frame descriptor space exhausted: {} used + {} requested / {}",
-                                            transient_used(), n, kTransientPerFrame));
+                                            transient_used(), n, transient_per_frame_));
     const uint32_t first = transient_offset_;
     transient_offset_ += n;
     return first;

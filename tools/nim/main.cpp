@@ -10,6 +10,7 @@
 #include "nim/content/audio.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/core/parallel.hpp"
 #include "nim/content/codex.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
@@ -50,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <string>
 #include <thread>
@@ -709,6 +711,8 @@ public:
     struct Result {
         TagHash tag;
         bool thumbnail = false;
+        bool no_drawable = false;
+        ComPtr<ID3D12Resource> thumbnail_texture;
         std::optional<PreparedMesh> mesh;
         std::string error;
         double ms = 0;
@@ -717,10 +721,10 @@ public:
         std::optional<PreviewAnimation> part_animation;
     };
 
-    void start(const fs::path& install) {
+    void start(const fs::path& install, ID3D12Device* device, const std::vector<std::vector<InputElement>>& layouts) {
         stop();
         quit_ = false;
-        thread_ = std::thread([this, install] { run(install); });
+        thread_ = std::thread([this, install, device = ComPtr<ID3D12Device>(device), layouts] { run(install, device.Get(), layouts); });
     }
     void stop() {
         {
@@ -730,6 +734,7 @@ public:
         cv_.notify_all();
         if (thread_.joinable()) thread_.join();
         live_.reset();
+        working_thumbnail_ = {};
         thumbs_.clear();
         results_.clear();
         thumbnail_cache_ = PrepareCache{512};
@@ -750,7 +755,11 @@ public:
     void request_thumbnails(std::vector<TagHash> tags) {
         {
             std::lock_guard lk(m_);
-            thumbs_.assign(tags.begin(), tags.end());
+            thumbs_.clear();
+            for (TagHash tag : tags) {
+                if (working_thumbnail_ == tag || std::ranges::any_of(results_, [tag](const Result& r) { return r.thumbnail && r.tag == tag; })) continue;
+                thumbs_.push_back(tag);
+            }
         }
         cv_.notify_all();
     }
@@ -760,6 +769,7 @@ public:
             if (it->thumbnail == thumbnail) {
                 Result r = std::move(*it);
                 results_.erase(it);
+                cv_.notify_one();
                 return r;
             }
         return std::nullopt;
@@ -771,7 +781,51 @@ public:
     ~MeshWorker() { stop(); }
 
 private:
-    void run(fs::path install) {
+    struct ThumbnailRenderer {
+        Gpu gpu;
+        StaticMeshScene scene;
+        GBuffer gb;
+        GameLighting lighting;
+        bool preview;
+
+        ThumbnailRenderer(ID3D12Device* device, PackageManager& pm) {
+            gpu.init_preview(device);
+            lighting.init(pm, gpu);
+            preview = false;
+            try { preview = lighting.set_entity_preview(pm, gpu); }
+            catch (const std::exception&) {}
+            gb.resize(gpu, kThumbSize, kThumbSize);
+        }
+
+        ComPtr<ID3D12Resource> render(PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts) {
+            gpu.begin_frame(0);
+            scene.upload(gpu, std::move(mesh), layouts);
+            const auto view = make_view(frame_sphere(scene.center(), scene.radius(), kThumbSize, kThumbSize));
+            auto* cl = gpu.immediate();
+            scene.render_gbuffer(gpu, cl, gb, view);
+            LightingParams params;
+            params.atmosphere = false;
+            params.entity_preview = preview;
+            params.auto_exposure = params.temporal_aa = false;
+            GameLighting::TransparentFn transparent;
+            if (scene.has_transparent()) transparent = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+                scene.render_transparent(gpu, c, gb, hdr, view, lighting.externs());
+            };
+            lighting.render(gpu, cl, gb, view, params, transparent, nullptr, scene.has_visible_light_grid());
+            auto texture = gpu.texture2d(kThumbSize, kThumbSize, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
+            Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cl->CopyResource(texture.Get(), gb.lit.Get());
+            Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Gpu::barrier(cl, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            gpu.flush();
+            return texture;
+        }
+    };
+
+    void run(fs::path install, ID3D12Device* device, const std::vector<std::vector<InputElement>>& layouts) {
+        WorkerPool::use_current_thread_only();
+        std::optional<ThumbnailRenderer> thumbnail_renderer;
         std::unique_ptr<PackageManager> pm;
         try {
             pm = std::make_unique<PackageManager>(install);
@@ -786,7 +840,7 @@ private:
             ChannelValues channels;
             {
                 std::unique_lock lk(m_);
-                cv_.wait(lk, [&] { return quit_ || live_ || !thumbs_.empty(); });
+                cv_.wait(lk, [&] { return quit_ || live_ || (!thumbs_.empty() && std::ranges::none_of(results_, &Result::thumbnail)); });
                 if (quit_) return;
                 if (live_) {
                     tag = *live_;
@@ -798,23 +852,14 @@ private:
                 } else {
                     tag = thumbs_.front();
                     thumbs_.pop_front();
+                    working_thumbnail_ = tag;
                     thumb = true;
-                }
-                // Keep the hand-off small: the UI uploads one result per frame.
-                if (thumb) {
-                    size_t pending = 0;
-                    for (auto& r : results_) pending += r.thumbnail;
-                    if (pending >= 2) {
-                        thumbs_.push_front(tag);
-                        lk.unlock();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(8));
-                        continue;
-                    }
                 }
             }
             Result r;
             r.tag = tag;
             r.thumbnail = thumb;
+            const bool background = thumb && SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
             auto t0 = std::chrono::steady_clock::now();
             try {
                 const Entry* e = pm->entry(tag);
@@ -847,10 +892,28 @@ private:
             } catch (const std::exception& ex) {
                 r.error = ex.what();
             }
-            if (thumb) thumbnail_cache_.textures.clear();
+            if (thumb) {
+                thumbnail_cache_.textures.clear();
+                if (r.mesh) {
+                    r.no_drawable = r.mesh->no_drawable;
+                    try {
+                        if (r.no_drawable) r.error = r.mesh->notes.empty() ? "no drawable geometry" : r.mesh->notes.front();
+                        else {
+                            if (!thumbnail_renderer) thumbnail_renderer.emplace(device, *pm);
+                            r.thumbnail_texture = thumbnail_renderer->render(std::move(*r.mesh), layouts);
+                        }
+                    } catch (const std::exception& ex) {
+                        r.error = ex.what();
+                        thumbnail_renderer.reset();
+                    }
+                    r.mesh.reset();
+                }
+            }
+            if (background) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
             r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             std::lock_guard lk(m_);
             if (!thumb) working_live_ = false;
+            else working_thumbnail_ = {};
             results_.push_back(std::move(r));
         }
     }
@@ -859,6 +922,7 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     bool quit_ = false, working_live_ = false;
+    TagHash working_thumbnail_;
     std::optional<TagHash> live_;
     int live_permutation_ = -1;
     ChannelValues live_channels_;
@@ -1468,6 +1532,7 @@ public:
         std::optional<PreviewAnimation> alternate;
         bool part_only = false;
         int clip = -1;  // index into clips
+        TagHash equipment_model;
         AnimationClip loaded;
         std::string error;
         bool playing = true, dirty = false;
@@ -1477,10 +1542,7 @@ public:
     static constexpr float kClipFps = 30;
 
     // thumbnails
-    StaticMeshScene thumb_scene;
-    GBuffer thumb_gb;
-    GameLighting thumb_lighting;
-    bool thumb_game_ready = false;
+    std::deque<std::pair<uint64_t, Thumb>> retired_thumbnails;
     bool thumbnails_enabled = true;
     std::unordered_map<uint32_t, Thumb> thumbs;
     uint64_t frame_no = 0;
@@ -1611,14 +1673,14 @@ public:
             if (loader.joinable()) loader.join();
             catalog = std::make_unique<Catalog>();
             loader = std::thread(load_catalog, dir, catalog.get());
-            worker.start(dir);
+            worker.start(dir, gpu.device(), layouts);
             map_worker.start(dir);
             map = MapView{};
             map_scene = false;
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
-            entity_preview_active = thumb_preview_active = false;
+            entity_preview_active = false;
             init_game_lighting();
             return true;
         } catch (const std::exception& ex) {
@@ -1640,13 +1702,7 @@ public:
             game_ready = false;
             error(ui::trf(ui::S::ErrLighting, ex.what()));
         }
-        try {
-            thumb_lighting.release(gpu);
-            thumb_lighting.init(*pm, gpu);
-            thumb_game_ready = true;
-        } catch (...) {
-            thumb_game_ready = false;
-        }
+
     }
 
     bool set_entity_preview(GameLighting& renderer, bool& active) {
@@ -1807,10 +1863,7 @@ public:
                 error(ui::trf(ui::S::ErrRead, r->tag.str(), r->error));
             }
         }
-        // Preparing a card submits its uploads synchronously. Never put that work on each
-        // viewport frame or interrupt mouse-driven camera movement.
-        if (!map.streaming && frame_no % 6 == 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
-            make_thumbnail(g);
+        publish_thumbnail(g);
         try {
             stream_map(g);
         } catch (const std::exception& ex) {
@@ -1942,7 +1995,7 @@ public:
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
-    bool entity_preview_active = false, thumb_preview_active = false;
+    bool entity_preview_active = false;
     // Weather: the map's world channel controllers and the state chosen for each (-1 = none,
     // the render-globals defaults).
     std::shared_ptr<const MapWeather> map_weather;
@@ -2182,77 +2235,30 @@ public:
         estimates_panel();
     }
 
-    void make_thumbnail(Gpu& g) {
-        auto r = worker.take(true);
-        if (!r) return;
-        Thumb& t = thumbs[r->tag.value];
-        t.last_used = frame_no;
-        t.failed = false;
-        t.no_drawable = false;
-        if (r->mesh && r->mesh->no_drawable) {
-            t.no_drawable = true;
-            t.error = r->mesh->notes.empty() ? "no drawable geometry" : r->mesh->notes.front();
-            return;
+    void publish_thumbnail(Gpu& g) {
+        while (!retired_thumbnails.empty() && retired_thumbnails.front().first <= g.completed()) {
+            const auto descriptor = retired_thumbnails.front().second.srv;
+            g.srv().free(descriptor, 1);
+            retired_thumbnails.pop_front();
         }
-        if (!r->mesh) {
-            t.failed = true;
-            t.error = r->error;
-            return;
+        auto result = worker.take(true);
+        if (!result || thumbs.contains(result->tag.value)) return;
+        Thumb card;
+        card.last_used = frame_no;
+        card.tex = std::move(result->thumbnail_texture);
+        card.failed = !card.tex && !result->no_drawable;
+        card.no_drawable = result->no_drawable;
+        card.error = std::move(result->error);
+        if (card.tex) {
+            card.srv = g.srv().alloc(1);
+            g.device()->CreateShaderResourceView(card.tex.Get(), nullptr, g.srv().cpu(card.srv));
         }
-        try {
-            g.wait_idle();
-            thumb_scene.upload(g, std::move(*r->mesh), layouts);
-            const bool preview = thumb_game_ready && set_entity_preview(thumb_lighting, thumb_preview_active);
-            thumb_gb.resize(g, kThumbSize, kThumbSize);
-            ViewMatrices vm = make_view(frame_sphere(thumb_scene.center(), thumb_scene.radius(), kThumbSize, kThumbSize));
-            auto* cl = g.immediate();
-            thumb_scene.render_gbuffer(g, cl, thumb_gb, vm);
-            LightingParams lp = light;
-            lp.mode = ViewMode::Lit;
-            lp.time = lp.delta_time = 0;
-            lp.atmosphere = false;
-            lp.entity_preview = preview;
-            lp.auto_exposure = lp.temporal_aa = false;
-            if (thumb_game_ready) {
-                GameLighting::TransparentFn transparents;
-                if (thumb_scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                    thumb_scene.render_transparent(g, c, thumb_gb, hdr, vm, thumb_lighting.externs());
-                };
-                thumb_lighting.render(g, cl, thumb_gb, vm, lp, transparents, nullptr, thumb_scene.has_visible_light_grid());
-            } else throw std::runtime_error("Original game lighting is unavailable; thumbnail rendering stopped");
-            if (!t.tex) {
-                t.tex = g.texture2d(kThumbSize, kThumbSize, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
-                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
-                t.srv = g.srv().alloc(1);
-                g.device()->CreateShaderResourceView(t.tex.Get(), nullptr, g.srv().cpu(t.srv));
-            } else {
-                Gpu::barrier(cl, t.tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            }
-            Gpu::barrier(cl, thumb_gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            cl->CopyResource(t.tex.Get(), thumb_gb.lit.Get());
-            Gpu::barrier(cl, thumb_gb.lit.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            Gpu::barrier(cl, t.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            g.flush();
-            thumb_scene.release(g);
-        } catch (const std::exception& ex) {
-            t.failed = true;
-            t.error = ex.what();
-            thumb_scene.release(g);
-        }
-        evict_thumbnails(g);
-    }
-
-    void evict_thumbnails(Gpu& g) {
-        constexpr size_t kMax = 600;
-        if (thumbs.size() <= kMax) return;
-        std::vector<std::pair<uint64_t, uint32_t>> order;
-        for (auto& [k, t] : thumbs) order.push_back({t.last_used, k});
-        std::sort(order.begin(), order.end());
-        g.wait_idle();
-        for (size_t i = 0; i < order.size() - kMax; ++i) {
-            auto it = thumbs.find(order[i].second);
-            if (it->second.srv != UINT32_MAX) g.srv().free(it->second.srv, 1);
-            thumbs.erase(it);
+        thumbs.emplace(result->tag.value, std::move(card));
+        constexpr size_t max_cards = 600;
+        if (thumbs.size() > max_cards) {
+            const auto oldest = std::ranges::min_element(thumbs, {}, [](const auto& entry) { return entry.second.last_used; });
+            if (oldest->second.srv != UINT32_MAX) retired_thumbnails.emplace_back(g.pending_fence(), std::move(oldest->second));
+            thumbs.erase(oldest);
         }
     }
 
@@ -2272,10 +2278,12 @@ public:
     void select_clip(int i) {
         if (!anim || i < 0 || i >= int(anim->binding.clips.size())) return;
         anim->clip = i;
+        anim->equipment_model = {};
         anim->frame = 0;
         anim->error.clear();
         try {
             anim->loaded = load_animation_clip(*pm, anim->binding.clips[size_t(i)].tag);
+            restrict_preview_clip(anim->loaded, anim->binding.clips[size_t(i)]);
         } catch (const std::exception& ex) {
             anim->loaded = AnimationClip{};
             anim->error = ex.what();
@@ -2300,7 +2308,13 @@ public:
         }
         if (!a.dirty) return;
         a.dirty = false;
-        scene.set_skin_poses(a.binding.poses(a.loaded, a.frame));
+        auto poses = a.binding.poses(a.loaded, a.frame, a.equipment_model);
+        try {
+            scene.load_animation_equipment(gpu, layouts, poses);
+        } catch (const std::exception& ex) {
+            a.error = ex.what();
+        }
+        scene.set_skin_poses(std::move(poses));
     }
 
     void animation_panel() {
@@ -2350,6 +2364,20 @@ public:
         }
         if (!a.error.empty()) ImGui::TextColored({1, 0.45f, 0.4f, 1}, "%s", a.error.c_str());
         if (a.clip < 0) return;
+        if (clips[size_t(a.clip)].shared_bones) ImGui::TextDisabled(ui::tr(ui::S::SharedBodyClip));
+        auto equipment = binding.equipment | std::views::filter([&](const auto& e) { return e.source_clip == a.loaded.tag; });
+        if (!equipment.empty()) {
+            const TagHash active = a.equipment_model.is_none() ? equipment.front().model : a.equipment_model;
+            ImGui::SetNextItemWidth(-1);
+            if (begin_combo(ui::tr(ui::S::EquipmentCandidate), active.str().c_str())) {
+                for (const auto& option : equipment)
+                    if (ImGui::Selectable(option.model.str().c_str(), active == option.model)) {
+                        a.equipment_model = option.model;
+                        a.dirty = true;
+                    }
+                ImGui::EndCombo();
+            }
+        }
         if (ImGui::Button(a.playing ? ui::tr(ui::S::Pause) : ui::tr(ui::S::Play), {em * 5, 0})) a.playing = !a.playing;
         ImGui::SameLine();
         if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(clips.size()) - 1);
@@ -2452,6 +2480,7 @@ public:
     // status line along the bottom. Every page is one rail entry; the page shown is `tab`.
     void open_tab(int t) {
         if (tab != t && (tab == TabDialogue || tab == TabCodex)) stop_line_audio();
+        if (tab != t && (tab == TabStatics || tab == TabEntities)) worker.request_thumbnails({});
         tab = Tab(t);
     }
     void set_ui_language(ui::Lang l) {
@@ -4792,18 +4821,17 @@ public:
         for (auto& [k, t] : thumbs)
             if (t.srv != UINT32_MAX) gpu.srv().free(t.srv, 1);
         thumbs.clear();
+        for (const auto& entry : retired_thumbnails) gpu.srv().free(entry.second.srv, 1);
+        retired_thumbnails.clear();
         if (movie.srv != UINT32_MAX) gpu.srv().free(movie.srv, 1);
         movie.srv = UINT32_MAX;
         movie.tex.Reset();
         for (auto& u : movie.upload) u.Reset();
         game_lighting.release(gpu);
-        thumb_lighting.release(gpu);
         rain.release(gpu);
         particles.release(gpu);
         scene.release(gpu);
-        thumb_scene.release(gpu);
         gb.release(gpu);
-        thumb_gb.release(gpu);
     }
 };
 

@@ -114,7 +114,7 @@ public:
     uint32_t width() const { return w_; }
     uint32_t height() const { return h_; }
 
-    ComPtr<ID3D12Resource> rt[4], depth, lit;
+    ComPtr<ID3D12Resource> rt[4], depth, lit, decal_normals;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, null_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
     uint32_t srv_first = UINT32_MAX;  // 6 SRVs: rt0..3, depth, lit
     static constexpr DXGI_FORMAT kFormats[4] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -182,7 +182,8 @@ struct PreparedMesh {
     TagHash tag;
     TagHash assembly_root;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
-    bool no_drawable = false;  // dynamic model has no GenerateGbuffer parts
+    bool no_drawable = false;  // dynamic model has no parts supported by the connected passes
+    bool inferred_dynamic_lod = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
@@ -229,7 +230,7 @@ struct PreviewAnimation {
     std::vector<Equipment> equipment;
     std::optional<uint16_t> equipment_socket;
     std::optional<uint16_t> equipment_wrist;
-    std::vector<ModelSkinPose> poses(const AnimationClip& clip, float frame) const;
+    std::vector<ModelSkinPose> poses(const AnimationClip& clip, float frame, TagHash equipment_model = {}) const;
 };
 // Shared across many prepare_static_mesh calls (maps): render globals / scopes read once,
 // textures shared by tag and capped at max_texture_dim (0 = full size), G-buffer parts only.
@@ -267,7 +268,8 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
-                                                          TagHash preferred = {});
+                                                          TagHash preferred = {}, std::span<const ClipInfo> related = {});
+void restrict_preview_clip(AnimationClip& clip, const ClipInfo& info);
 void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAnimation& animation,
                                const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
                                const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
@@ -318,6 +320,7 @@ public:
     // Models without a supplied pose use the bind pose.
     bool skinned() const { return skinned_; }
     void set_skin_poses(std::vector<ModelSkinPose> poses);
+    void load_animation_equipment(Gpu& gpu, const std::vector<std::vector<InputElement>>& layouts, std::span<const ModelSkinPose> poses);
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }
@@ -427,6 +430,8 @@ private:
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
     std::vector<size_t> transparent_items_;
+    std::vector<size_t> decal_items_;
+    bool standalone_decal_ = false;
     std::vector<SceneGroupInfo> info_;
     struct PlacementConstants { std::array<float4, 32> values; };
     struct BufferSet {
@@ -520,6 +525,7 @@ private:
     bool dynamic_parts_ = false;    // dynamic models placed among static meshes (map entities)
     bool skinned_ = false, skin_dirty_ = false;
     std::vector<ModelSkinPose> skin_poses_;
+    std::vector<PreparedMesh> pending_equipment_;
     uint32_t skin_frame_ = 0;
     uint32_t srv_count_ = 0;
     V3 center_;

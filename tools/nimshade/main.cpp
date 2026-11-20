@@ -8,7 +8,7 @@
 // (composite_game.png).
 //
 //   nimshade [--install DIR] STATIC_TAG [OUT_DIR] [--size WxH] [--warp] [--game]
-//            [--clip CLIP_TAG [--frame F]]   (skinned dynamic models: posed with an animation clip)
+//            [--clip CLIP_TAG [--frame F] [--equipment MODEL]]  (skinned dynamic models)
 //            [--probe-index N --dump-probe-mask] (original CSG/GPU membership verification)
 //            [--probe-distance-fade] (opt in to the unverified camera-distance fade)
 //            [--activity TAG --activity-map N] (DEIMOS ActivityTab selection)
@@ -83,6 +83,7 @@ int run(int argc, char** argv) {
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
     std::optional<TagHash> clip_tag;
+    TagHash equipment_model;
     bool list_clips = false;
     bool single_model = false;
     float clip_frame = 0;
@@ -189,6 +190,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
+        else if (args[i] == "--equipment" && i + 1 < args.size()) equipment_model = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--single-model") single_model = true;
         else if (args[i] == "--list-clips") list_clips = true;
         else if (args[i] == "--frame" && i + 1 < args.size()) clip_frame = std::stof(args[++i]);
@@ -464,11 +466,17 @@ int run(int argc, char** argv) {
         if (clip_tag) {
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
             const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups, clip.name_hash};
-            auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1));
+            const auto all = index_animation_clips(pm);
+            auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1), {}, all);
             if (!anim || anim->clips.empty())
                 throw std::runtime_error(std::format("clip {} is incompatible with the preview's skinned models", clip.tag.str()));
-            prepare_preview_equipment(pm, mesh, *anim, rigs, index_animation_clips(pm), mats);
-            poses = anim->poses(clip, clip_frame);
+            restrict_preview_clip(clip, anim->clips.front());
+            if (anim->clips.front().shared_bones) std::println("retargeted {} shared body bones", anim->clips.front().shared_bones);
+            prepare_preview_equipment(pm, mesh, *anim, rigs, all, mats);
+            for (const auto& option : anim->equipment) std::println("equipment candidate {}", option.model.str());
+            poses = anim->poses(clip, clip_frame, equipment_model);
+            if (!equipment_model.is_none() && std::ranges::none_of(poses, [](const auto& pose) { return bool(pose.placement); }))
+                throw std::runtime_error(std::format("equipment {} is incompatible with this preview clip", equipment_model.str()));
             for (const auto& pose : poses)
                 if (pose.placement) std::println("animation equipment {}", pose.model.str());
             std::println("posed model {} and {} linked parts with clip {} ({}, {} frames{}) at frame {}{}",
@@ -477,6 +485,7 @@ int run(int argc, char** argv) {
                          anim->inferred_binding ? " (estimated rig binding)" : "");
         }
         scene.upload(gpu, std::move(mesh), layouts);
+        scene.load_animation_equipment(gpu, layouts, poses);
         if (!poses.empty()) scene.set_skin_poses(std::move(poses));
         for (const auto& n : scene.notes()) std::println("  note: {}", n);
     } else {

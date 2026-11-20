@@ -67,7 +67,13 @@ class Gpu {
 public:
     static constexpr uint32_t kFramesInFlight = 2;
 
+    Gpu() = default;
+    Gpu(const Gpu&) = delete;
+    Gpu& operator=(const Gpu&) = delete;
+    ~Gpu();
     void init(bool warp = false);
+    // Independent command queue and descriptors on the viewport's device.
+    void init_preview(ID3D12Device* device);
     ID3D12Device* device() const { return device_.Get(); }
     ID3D12CommandQueue* queue() const { return queue_.Get(); }
     IDXGIFactory6* factory() const { return factory_.Get(); }
@@ -102,8 +108,8 @@ public:
     size_t transient_table_hits() const { return table_hits_; }
     size_t transient_table_count() const { return table_cache_[table_frame_].size(); }
     // This frame's use of the per-frame regions (descriptors, upload bytes).
-    uint32_t transient_used() const { return transient_offset_ - (transient_end_ - kTransientPerFrame); }
-    size_t dynamic_used() const { return dynamic_offset_ - (dynamic_end_ - kDynamicPerFrame); }
+    uint32_t transient_used() const { return transient_offset_ - (transient_end_ - transient_per_frame_); }
+    size_t dynamic_used() const { return dynamic_offset_ - (dynamic_end_ - dynamic_per_frame_); }
     // Work recorded on the immediate list only and flushed can hand its descriptors back.
     uint32_t transient_mark() const { return transient_offset_; }
     void transient_rewind(uint32_t mark);
@@ -125,6 +131,7 @@ public:
                         D3D12_RESOURCE_STATES to);
 
 private:
+    void init_queue(uint32_t descriptors);
     ComPtr<IDXGIFactory6> factory_;
     ComPtr<IDXGIAdapter3> adapter3_;
     ComPtr<ID3D12Device> device_;
@@ -149,9 +156,9 @@ private:
     std::array<std::map<std::vector<uint64_t>, CachedTable>, kFramesInFlight> table_cache_;
     uint32_t table_frame_ = 0;
     size_t table_hits_ = 0;
-    static constexpr uint32_t kTransientPerFrame = 1 << 17;  // a map frame with ~1300 lights uses ~16k
+    uint32_t transient_per_frame_ = 1 << 17;  // a map frame with ~1300 lights uses ~16k
     std::string adapter_;
-    static constexpr size_t kDynamicPerFrame = 128 << 20;  // ~12 MB for the same frame
+    size_t dynamic_per_frame_ = 128 << 20;  // ~12 MB for the same frame
 };
 
 } // namespace nim

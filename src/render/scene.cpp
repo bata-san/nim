@@ -25,8 +25,9 @@ namespace nim {
 namespace {
 constexpr uint8_t kStageShadow = 4;
 constexpr uint8_t kStageTransparent = 8;
+constexpr uint8_t kStageDecal = 2;
 size_t stage_slot(uint8_t stage) {
-    return stage == kStageShadow ? 2 : stage == kStageTransparent ? 1 : 0;
+    return stage == kStageDecal ? 3 : stage == kStageShadow ? 2 : stage == kStageTransparent ? 1 : 0;
 }
 }
 
@@ -258,6 +259,7 @@ void GBuffer::release(Gpu& gpu) {
     for (auto& r : rt) r.Reset();
     depth.Reset();
     lit.Reset();
+    decal_normals.Reset();
     w_ = h_ = 0;
 }
 
@@ -582,6 +584,8 @@ void StaticMeshScene::release(Gpu& gpu) {
         if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
     items_.clear();
     transparent_items_.clear();
+    decal_items_.clear();
+    standalone_decal_ = false;
     table_cache_.clear();
     scopes_resolved_ = false;
     scope_defs_.clear();
@@ -611,6 +615,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     dynamic_ = dynamic_parts_ = assembled_ = false;
     skinned_ = skin_dirty_ = false;
     skin_poses_.clear();
+    pending_equipment_.clear();
     tag_ = TagHash();
 }
 
@@ -898,8 +903,8 @@ bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vect
     return true;
 }
 
-// Render stages nim draws: 0 GenerateGbuffer, 8 Transparents.
-constexpr uint8_t kDrawnStages[] = {0, 8};
+// Dynamic model stages with a connected draw pass.
+constexpr uint8_t kDrawnStages[] = {0, kStageDecal, kStageTransparent};
 class UnsupportedMeshPart : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -945,6 +950,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         out.permutation = perm;
         out.permutation_count = materials->permutation_count;
     }
+    if (tag.value == 0x80B0CD84) out.channel_defaults[0x3969B148] = {0, 0, 0, 0};
     DynamicModel model = load_dynamic_model(pm, tag);
     out.bone_count = model.bone_count;
     const V3 scale{model.model_scale[0], model.model_scale[1], model.model_scale[2]};
@@ -985,44 +991,63 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         }
         const uint32_t set = uint32_t(out.buffers.size());
         bool used = false;
+        // Some meshes also contain a complete auxiliary representation tagged (role 3, mask 0xF).
+        // Its mask overlaps the regular detail levels, but drawing both overlays two models.
+        auto auxiliary = [](const DynamicMeshPart& part) { return part.lod_role == 3 && part.lod_category == 0xF; };
+        const size_t opaque_begin = std::min<size_t>(mesh.part_range[0], mesh.parts.size());
+        const size_t opaque_end = std::max(opaque_begin, std::min<size_t>(mesh.part_range[1], mesh.parts.size()));
+        const auto opaque = std::span(mesh.parts).subspan(opaque_begin, opaque_end - opaque_begin);
+        const bool has_regular = std::ranges::any_of(opaque, [](const auto& part) {
+            return part.lod_role == 1 && (part.lod_category & 1);
+        });
         for (uint8_t stage : kDrawnStages) {
-        const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
-        uint8_t authored_lods = 0;
-        for (size_t k = first; k < last; ++k) authored_lods |= mesh.parts[k].lod_category;
-        const uint8_t highest = uint8_t(authored_lods & -int(authored_lods));
-        for (size_t k = first; k < last; ++k) {
-            const DynamicMeshPart& dp = mesh.parts[k];
-            if (highest && !(dp.lod_category & highest)) continue;
-            // The entity's material variant wins over the part's own technique (goriath binds both,
-            // the variant last).
-            TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
-            if (tech.is_none()) tech = dp.technique;
-            if (tech.is_none()) {
-                if (dp.variant_shader_index != 0xFFFF)
-                    out.notes.push_back(std::format("mesh {} part {}: material variant {} needs the entity component", mi, k,
-                                                    dp.variant_shader_index));
-                continue;
-            }
-            if (dp.primitive_type != 3 && dp.primitive_type != 5) continue;
-            StaticMeshPart part{dp.index_start, dp.index_count, uint8_t(mi), dp.lod_category, dp.primitive_type};
-            try {
-                Technique t = load_technique(pm, tech);
-                if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
-                PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes, true);
-                g.stage = stage;
-                if (vs_reads_typed_buffers(g.vs) && !packed) {
-                    out.notes.push_back(std::format("mesh {} part {}: skinning shader, but no 24-byte vertex stream to pack", mi, k));
-                    continue;
+            const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
+            const bool has_auxiliary = first < last && std::ranges::any_of(
+                std::span(mesh.parts).subspan(first, last - first), auxiliary);
+            const bool choose_representation = has_regular && has_auxiliary;
+            out.inferred_dynamic_lod |= choose_representation;
+            const auto before = out.groups.size();
+            // A second pass is only needed when no regular part can be loaded.
+            for (unsigned attempt = 0; attempt < (choose_representation ? 2u : 1u) && out.groups.size() == before; ++attempt) {
+                uint8_t authored_lods = 0;
+                for (size_t k = first; k < last; ++k)
+                    if (!choose_representation || auxiliary(mesh.parts[k]) == (attempt == 1)) authored_lods |= mesh.parts[k].lod_category;
+                const uint8_t highest = uint8_t(authored_lods & -int(authored_lods));
+                for (size_t k = first; k < last; ++k) {
+                    const DynamicMeshPart& dp = mesh.parts[k];
+                    if (choose_representation && auxiliary(dp) != (attempt == 1)) continue;
+                    if (highest && !(dp.lod_category & highest)) continue;
+                    // The entity's material variant wins over the part's own technique (goriath binds both,
+                    // the variant last).
+                    TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
+                    if (tech.is_none()) tech = dp.technique;
+                    if (tech.is_none()) {
+                        if (dp.variant_shader_index != 0xFFFF)
+                            out.notes.push_back(std::format("mesh {} part {}: material variant {} needs the entity component", mi, k,
+                                                            dp.variant_shader_index));
+                        continue;
+                    }
+                    if (dp.primitive_type != 3 && dp.primitive_type != 5) continue;
+                    StaticMeshPart part{dp.index_start, dp.index_count, uint8_t(mi), dp.lod_category, dp.primitive_type};
+                    try {
+                        Technique t = load_technique(pm, tech);
+                        if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
+                        PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes, true);
+                        g.stage = stage;
+                        if (vs_reads_typed_buffers(g.vs) && !packed) {
+                            out.notes.push_back(std::format("mesh {} part {}: skinning shader, but no 24-byte vertex stream to pack", mi, k));
+                            continue;
+                        }
+                        g.buffers = set;
+                        grow_bounds(bufs.ib, bufs.vb0, part, scale, offset, lo, hi);
+                        lod = std::min(lod, dp.lod_category);
+                        out.groups.push_back(std::move(g));
+                        used = true;
+                    } catch (const std::exception& ex) {
+                        out.notes.push_back(std::format("mesh {} part {}: {}", mi, k, ex.what()));
+                    }
                 }
-                g.buffers = set;
-                grow_bounds(bufs.ib, bufs.vb0, part, scale, offset, lo, hi);
-                lod = std::min(lod, dp.lod_category);
-                out.groups.push_back(std::move(g));
-                used = true;
-            } catch (const std::exception& ex) {
-                out.notes.push_back(std::format("mesh {} part {}: {}", mi, k, ex.what()));
             }
-        }
         }
         if (used) out.buffers.push_back(std::move(bufs));
     }
@@ -1090,14 +1115,16 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
     return result;
 }
 
-std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, float frame) const {
+std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, float frame, TagHash equipment_model) const {
     std::vector<ModelSkinPose> result;
     result.reserve(followers.size() + 2);
     result.push_back({model, {}, {}});
     auto& source = result.front().bones;
     pose_skeleton(skeleton, rig, clip, frame, source);
     std::optional<ModelSkinPose> held;
-    if (auto e = std::ranges::find(equipment, clip.tag, &Equipment::source_clip); e != equipment.end()) {
+    if (auto e = std::ranges::find_if(equipment, [&](const Equipment& item) {
+            return item.source_clip == clip.tag && (equipment_model.is_none() || equipment_model == item.model);
+        }); e != equipment.end()) {
         const auto socket = *equipment_socket;
         const auto wrist = *equipment_wrist;
         std::vector<BoneTransform> sampled = rig.default_pose;
@@ -1121,9 +1148,63 @@ std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, fl
     return result;
 }
 
+namespace {
+bool paired_equipment_clip(const ClipInfo& source, const ClipInfo& candidate) {
+    return source.name_hash && source.name_hash != 0x811C9DC5 && source.frames > 1 &&
+           candidate.name_hash == source.name_hash && candidate.frames == source.frames &&
+           candidate.tag.pkg_id() == source.tag.pkg_id() && candidate.bones && candidate.bones < source.bones &&
+           !candidate.bone_groups.empty();
+}
+
+void add_shared_body_clips(PackageManager& pm, const ModelRigIndex& rigs, const AnimationRig& target,
+                           std::span<const ClipInfo> clips, std::span<const ClipInfo> related, std::vector<ClipInfo>& result) {
+    // The first humanoid group includes the upper body, weapon socket and fingers. Later groups
+    // belong to the specific rig and must not be interpreted using the other skeleton's indices.
+    if (target.bone_groups.empty() || target.bone_groups.front().hash != 0xC2D413D4) return;
+    const auto group = target.bone_groups.front();
+    if (!group.bones || group.bones > target.size()) return;
+    if (related.empty()) related = clips;
+    std::vector<ClipInfo> candidates;
+    for (const auto& clip : clips) {
+        if (clip.bone_groups.empty() || clip.bone_groups.front() != group || clip.bones < group.bones ||
+            std::ranges::find(result, clip.tag, &ClipInfo::tag) != result.end()) continue;
+        if (std::ranges::any_of(related, [&](const ClipInfo& other) { return paired_equipment_clip(clip, other); }))
+            candidates.push_back(clip);
+    }
+    if (candidates.empty()) return;
+    std::set<TagHash> tried;
+    for (const auto& [tag, binding] : rigs) {
+        if (binding.rig.is_none() || !tried.insert(binding.rig).second) continue;
+        AnimationRig source;
+        try { source = load_animation_rig(pm, binding.rig); }
+        catch (const std::exception&) { continue; }
+        if (source.size() < group.bones || source.bone_groups.empty() || source.bone_groups.front() != group) continue;
+        bool same_nodes = true;
+        for (size_t i = 0; i < group.bones; ++i) {
+            if (std::memcmp(target.node_layout.data() + i * 72, source.node_layout.data() + i * 72, 4) != 0 ||
+                target.object_space[i] != source.object_space[i]) { same_nodes = false; break; }
+        }
+        if (!same_nodes) continue;
+        for (auto& candidate : candidates) {
+            if (candidate.shared_bones || candidate.bones != source.size() || candidate.bone_groups != source.bone_groups) continue;
+            candidate.shared_bones = uint16_t(group.bones);
+            result.push_back(candidate);
+        }
+    }
+}
+} // namespace
+
+void restrict_preview_clip(AnimationClip& clip, const ClipInfo& info) {
+    if (!info.shared_bones) return;
+    const auto outside = [&](const auto& track) { return track.bone >= info.shared_bones; };
+    std::erase_if(clip.rotations, outside);
+    std::erase_if(clip.translations, outside);
+    std::erase_if(clip.scales, outside);
+}
+
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
-                                                          TagHash preferred) {
+                                                          TagHash preferred, std::span<const ClipInfo> related) {
     struct Part {
         const PreparedMesh* mesh;
         std::optional<Skeleton> skeleton;
@@ -1203,6 +1284,7 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
         if (!valid_skin(part) || part.rig.is_none()) continue;
         auto rig = load_animation_rig(pm, part.rig);
         auto matches = compatible_animation_clips(pm, rigs, rig, clips);
+        if (preferred.is_none()) add_shared_body_clips(pm, rigs, rig, clips, related, matches);
         if (result && matches.empty()) continue;
         result = PreviewAnimation{part.mesh->tag, *part.skeleton, std::move(rig), std::move(matches), {}, part.inferred};
         if (!result->clips.empty()) break;
@@ -1244,9 +1326,7 @@ void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAn
         if (!source.name_hash || source.name_hash == 0x811C9DC5 || source.frames <= 1) continue;
         const ClipInfo* paired = nullptr;
         for (const auto& candidate : clips) {
-            if (candidate.name_hash != source.name_hash || candidate.frames != source.frames ||
-                candidate.tag.pkg_id() != source.tag.pkg_id() || !candidate.bones || candidate.bones >= source.bones ||
-                candidate.bone_groups.empty()) continue;
+            if (!paired_equipment_clip(source, candidate)) continue;
             if (paired) { paired = nullptr; break; }
             paired = &candidate;
         }
@@ -1256,7 +1336,20 @@ void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAn
 
     std::map<TagHash, AnimationRig> loaded_rigs;
     std::set<TagHash> tried, uploaded;
+    PrepareCache equipment_cache;
     for (const auto& [source, paired] : matches) {
+        try {
+            auto source_clip = load_animation_clip(pm, source);
+            const auto source_info = std::ranges::find(animation.clips, source, &ClipInfo::tag);
+            if (source_info != animation.clips.end()) restrict_preview_clip(source_clip, *source_info);
+            auto has_position = [&](uint16_t b) {
+                return std::ranges::any_of(source_clip.translations, [b](const auto& t) { return t.bone == b && !t.frames.empty(); });
+            };
+            if (is_additive(rig, source_clip) || !has_position(*animation.equipment_socket) || !has_position(*animation.equipment_wrist)) continue;
+        } catch (const std::exception& ex) {
+            mesh.notes.push_back(std::format("animation equipment source {}: {}", source.str(), ex.what()));
+            continue;
+        }
         std::vector<TagHash> candidates;
         for (const auto& [tag, binding] : rigs) {
             if (binding.rig.is_none() || !materials.contains(tag)) continue;
@@ -1268,30 +1361,27 @@ void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAn
             if (r != loaded_rigs.end() && r->second.size() == paired->bones && r->second.bone_groups == paired->bone_groups)
                 candidates.emplace_back(tag);
         }
-        if (candidates.size() != 1) continue;
-        const TagHash tag = candidates.front();
-        if (tag == mesh.tag || (std::ranges::any_of(mesh.attachments, [&](const auto& part) { return part.tag == tag; }) && !uploaded.contains(tag))) continue;
-        try {
-            const auto source_clip = load_animation_clip(pm, source);
-            auto has_position = [&](uint16_t b) {
-                return std::ranges::any_of(source_clip.translations, [b](const auto& t) { return t.bone == b && !t.frames.empty(); });
-            };
-            if (is_additive(rig, source_clip) || !has_position(*animation.equipment_socket) || !has_position(*animation.equipment_wrist)) continue;
-            const auto& binding = rigs.at(tag.value);
-            auto skeleton = load_skeleton(pm, binding.skeleton);
-            auto clip = load_animation_clip(pm, paired->tag);
-            if (!uploaded.contains(tag)) {
-                auto part = prepare_dynamic_model(pm, tag, &materials.at(tag.value));
-                if (part.no_drawable || std::ranges::any_of(part.buffers, [&](const auto& b) {
-                    return !b.skin.bones.empty() && b.skin.max_bone >= skeleton.size();
-                })) continue;
-                part.animation_equipment = true;
-                mesh.attachments.push_back(std::move(part));
-                uploaded.insert(tag);
+        std::ranges::sort(candidates);
+        for (TagHash tag : candidates) {
+            if (tag == mesh.tag || (!uploaded.contains(tag) &&
+                std::ranges::find(mesh.attachments, tag, &PreparedMesh::tag) != mesh.attachments.end())) continue;
+            try {
+                const auto& binding = rigs.at(tag.value);
+                auto skeleton = load_skeleton(pm, binding.skeleton);
+                auto clip = load_animation_clip(pm, paired->tag);
+                if (!uploaded.contains(tag)) {
+                    auto part = prepare_dynamic_model(pm, tag, &materials.at(tag.value), -1, nullptr, &equipment_cache);
+                    if (part.no_drawable || std::ranges::any_of(part.buffers, [&](const auto& b) {
+                        return !b.skin.bones.empty() && b.skin.max_bone >= skeleton.size();
+                    })) continue;
+                    part.animation_equipment = true;
+                    mesh.attachments.push_back(std::move(part));
+                    uploaded.insert(tag);
+                }
+                animation.equipment.push_back({source, tag, std::move(skeleton), loaded_rigs.at(binding.rig), std::move(clip)});
+            } catch (const std::exception& ex) {
+                mesh.notes.push_back(std::format("animation equipment {}: {}", tag.str(), ex.what()));
             }
-            animation.equipment.push_back({source, tag, std::move(skeleton), loaded_rigs.at(binding.rig), std::move(clip)});
-        } catch (const std::exception& ex) {
-            mesh.notes.push_back(std::format("animation equipment {}: {}", tag.str(), ex.what()));
         }
     }
 }
@@ -1331,7 +1421,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
     auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageShadow; };
     std::vector<Pending> pending;
-    std::array<uint8_t, 3> stage_lods{};
+    std::array<uint8_t, 4> stage_lods{};
     for (const auto& g : mesh.groups)
         if (drawn(g.render_stage))
             stage_lods[stage_slot(g.render_stage)] |= std::max<uint8_t>(1, mesh.parts.at(g.part_index).lod_category);
@@ -1528,6 +1618,9 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     const TagHash tag = mesh.tag;
     auto parts = std::move(mesh.attachments);
     assembled_ = !parts.empty();
+    standalone_decal_ = mesh.dynamic && !assembled_ && std::ranges::all_of(mesh.groups, [](const auto& group) {
+        return group.stage == kStageDecal;
+    });
     if (assembled_) {
         auto packed = mesh.model_cb[13];
         for (const auto& part : parts)
@@ -1546,15 +1639,17 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     V3 hi = mesh.center + V3{mesh.radius, mesh.radius, mesh.radius};
     add_mesh(gpu, std::move(mesh), layouts, std::span(&identity, 1));
     for (auto& part : parts) {
+        if (part.animation_equipment) {
+            pending_equipment_.push_back(std::move(part));
+            continue;
+        }
         const TagHash part_tag = part.tag;
         const V3 r{part.radius, part.radius, part.radius};
         const V3 a = part.center - r, b = part.center + r;
         try {
             const float radius = part.radius;
             const V3 center = part.center;
-            const bool equipment = part.animation_equipment;
             add_mesh(gpu, std::move(part), layouts, std::span(&identity, 1));
-            if (equipment) continue;
             bounds.emplace_back(center, radius);
             lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
             hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
@@ -1591,6 +1686,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
     const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count();
     const size_t instances = instance_total_, culls = cull_groups_.size();
     const size_t uncullable = uncullable_opaque_.size();
+    const size_t decals = decal_items_.size();
     try {
         add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
         retire_prepared(std::move(mesh));
@@ -1604,6 +1700,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         }
         items_.resize(items);
         transparent_items_.resize(transparent);
+        decal_items_.resize(decals);
         sets_.resize(sets);
         info_.resize(infos);
         instance_total_ = instances;
@@ -1643,6 +1740,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         for (auto& [h, v] : mesh.channel_defaults) channel_defaults_.emplace(h, v);
         for (auto& [h, u] : mesh.channels) channels_.emplace(h, u);
     }
+
+    if (mesh.inferred_dynamic_lod)
+        material_externs_->note_estimate("dynamic LOD: regular parts take precedence over the auxiliary representation",
+                                         "role 3 with mask 0x0F overlaps the regular LODs");
 
     // Instance index stream (0..n-1) and t2: n 80-byte records (3x4 rows, translation in w;
     // +60 = byte offset of the mesh block), then the mesh block from the prepared single record.
@@ -1977,8 +2078,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         const auto vs_inputs = shader_inputs(g.vs);
         for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
-            if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0)
-                throw UnsupportedMeshPart(std::format("{}: missing original vertex stream {}", item.technique.str(), e.buffer));
+            if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0) {
+                if (std::ranges::any_of(vs_inputs, [&](const auto& input) {
+                    return !input.never_read && input.index == e.semantic_index && _stricmp(e.semantic, input.semantic.c_str()) == 0;
+                })) throw UnsupportedMeshPart(std::format("{}: missing original vertex stream {}", item.technique.str(), e.buffer));
+                continue;
+            }
             d.SemanticName = e.semantic;
             d.SemanticIndex = e.semantic_index;
             d.Format = DXGI_FORMAT(e.dxgi_format);
@@ -2019,6 +2124,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
+        const bool decal = g.stage == kStageDecal;
         const bool authored_shadow = g.stage == kStageShadow;
         const auto outputs = g.ps.empty() ? std::vector<ShaderInput>{} : shader_outputs(g.ps);
         const bool motion = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -2051,8 +2157,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = TRUE;
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = transparent || blended ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
-        pd.DepthStencilState.DepthFunc = transparent || blended ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
+        pd.DepthStencilState.DepthWriteMask = (decal ? !standalone_decal_ : transparent || blended)
+            ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc = transparent || blended || decal ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
         pd.InputLayout = {ied.data(), UINT(ied.size())};
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         // Strips restart at the all-ones index.
@@ -2102,7 +2209,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
 
         if (authored_shadow) {
             item.shadow_pso = item.pso;
-        } else if (!transparent && sky_order.empty()) {
+        } else if (!transparent && !decal && sky_order.empty()) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
             const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
@@ -2125,6 +2232,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         items_.push_back(std::move(item));
         upload_guard.committed = true;
         if (transparent) transparent_items_.push_back(items_.size() - 1);
+        else if (decal) decal_items_.push_back(items_.size() - 1);
         else if (cull == UINT32_MAX && !authored_shadow) uncullable_opaque_.push_back(items_.size() - 1);
         if (!authored_shadow) info_.push_back(std::move(g.info));
       } catch (const UnsupportedMeshPart& ex) {
@@ -2141,10 +2249,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (!group.dynamic) {
             // A translucent layer may only have one authored LOD while the opaque mesh has four.
             // Keep that layer at the nearest level actually supplied for its own stage.
-            std::array<uint8_t, 3> stage_levels{};
+            std::array<uint8_t, 4> stage_levels{};
             for (size_t i = group.first_item; i < group.end_item; ++i)
                 stage_levels[stage_slot(items_[i].stage)] |= items_[i].lod_mask;
-            group.levels = stage_levels[0] | stage_levels[1];
+            group.levels = stage_levels[0] | stage_levels[1] | stage_levels[3];
             group.authored_shadow = stage_levels[2] != 0;
             for (size_t i = group.first_item; i < group.end_item; ++i) {
                 auto& item = items_[i];
@@ -2388,7 +2496,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         return scope_frame_[slot] = upload.gpu;
     };
     const bool transparent = render_stage == kStageTransparent;
-    const auto& candidates = transparent ? transparent_items_ : visible_opaque_;
+    const auto& candidates = transparent ? transparent_items_ : render_stage == kStageDecal ? decal_items_ : visible_opaque_;
     if (!material_scratch_) material_scratch_ = std::make_unique<MaterialScratch>();
     // Material constants are evaluated after the walk, on the worker pool when the scene is a map
     // (no per-item extern writes): each live (object, technique, stage) once, into its first
@@ -2793,7 +2901,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             }
         }
     };
-    const std::span<const size_t> opaque(visible_opaque_);
+    const std::span<const size_t> opaque(stage == kStageDecal ? decal_items_ : visible_opaque_);
     std::array<DrawBundle*, kDrawBundles> bundles{};
     size_t available = 0;
     if (opaque.size() >= 1800) {
@@ -2835,6 +2943,21 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     }
     // Blended G-buffer items (decals) go over opaque surfaces.
     if (!shadow) record(cl, opaque, true);
+}
+
+void StaticMeshScene::load_animation_equipment(Gpu& gpu, const std::vector<std::vector<InputElement>>& layouts,
+                                               std::span<const ModelSkinPose> poses) {
+    if (pending_equipment_.empty()) return;
+    for (const auto& pose : poses) {
+        if (!pose.placement) continue;
+        const auto part = std::ranges::find(pending_equipment_, pose.model, &PreparedMesh::tag);
+        if (part == pending_equipment_.end()) continue;
+        const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        auto prepared = std::move(*part);
+        pending_equipment_.erase(part);
+        add_mesh(gpu, std::move(prepared), layouts, std::span(&identity, 1));
+        gpu.flush();
+    }
 }
 
 void StaticMeshScene::set_skin_poses(std::vector<ModelSkinPose> poses) {
@@ -3092,6 +3215,26 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     if (items_.size() == transparent_count()) return;
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
     draw_items(gpu, cl, 0, gb.width(), gb.height(), vm);
+    if (!std::ranges::any_of(decal_items_, [&](size_t i) { return item_instances(items_[i]) != 0; })) return;
+
+    // The game's decals sample the underlying packed normals while updating the same G-buffer.
+    if (!gb.decal_normals)
+        gb.decal_normals = gpu.texture2d(gb.width(), gb.height(), GBuffer::kFormats[1], D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+    cl->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+    Gpu::barrier(cl, gb.rt[1].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Gpu::barrier(cl, gb.decal_normals.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->CopyResource(gb.decal_normals.Get(), gb.rt[1].Get());
+    Gpu::barrier(cl, gb.decal_normals.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Gpu::barrier(cl, gb.rt[1].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto& ext = *material_externs_;
+    ext.set_texture(0x2D, 0x08, gb.decal_normals.Get(), GBuffer::kFormats[1]);
+    ext.set(0x2D, 0x30, float4{1, 1, 0, 0});
+    ext.note_estimate("decal: normal-buffer pixel scale and offset (1, 1, 0, 0)", "preview uses the full-resolution G-buffer without a subrect");
+    if (standalone_decal_) ext.note_estimate("standalone decal: depth from the authored decal triangles", "preview has no receiving surface");
+    cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
+    update_materials(gpu, gb.width(), gb.height(), vm, kStageDecal);
+    draw_items(gpu, cl, kStageDecal, gb.width(), gb.height(), vm);
 }
 
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {

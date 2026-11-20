@@ -189,6 +189,7 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
             p.index_start = r.u32_at(q + 8);
             p.index_count = r.u32_at(q + 0x0C);
             p.external_identifier = r.u16_at(q + 0x14);
+            p.lod_role = r.u16_at(q + 0x1C);
             p.lod_category = r.u8_at(q + 0x21);
             dm.parts.push_back(p);
         }
@@ -269,11 +270,17 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                 std::memcpy(&v, bytes.data() + o, 4);
                 if (!models.count(v) || out.count(v)) continue;
                 const size_t base = o - 0x234;
-                if (base < 4 || base + 0x428 > bytes.size() || r.u32_at(base - 4) != 0x80808678) continue;
+                if (base < 4 || base + 0x428 > bytes.size()) continue;
+                const uint32_t component_class = r.u32_at(base - 4);
+                // The wrapped component carries its subtype after the owner tag.
+                const bool wrapped = component_class == 0x80808655 && r.tag_at(base) == tag &&
+                                     r.u32_at(base + 4) == 0x80808644;
+                if (component_class != 0x80808678 && !wrapped) continue;
                 try {
                     auto map = r.vec_at(base + 0x3D8);
                     auto techs = r.vec_at(base + 0x418);
                     if ((map.count && map.element_class != 0x80808681) ||
+                        (wrapped && techs.count && techs.element_class != 0x80800014) ||
                         map.data > bytes.size() || map.count > (bytes.size() - map.data) / 12 ||
                         techs.data > bytes.size() || techs.count > (bytes.size() - techs.data) / 4) continue;
                     DynamicModelMaterials m;

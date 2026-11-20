@@ -106,6 +106,7 @@ struct DynamicMeshPart {
     uint8_t primitive_type = 3;              // 3 triangles, 5 strip
     uint32_t index_start = 0, index_count = 0;
     uint16_t external_identifier = 0;
+    uint16_t lod_role = 0;  // low half of the authored flags at +0x1C
     uint8_t lod_category = 0;                // bit 0 = highest detail
 };
 struct DynamicMesh {

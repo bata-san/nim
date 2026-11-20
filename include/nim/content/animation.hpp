@@ -129,6 +129,7 @@ struct ClipInfo {
     uint16_t frames = 0, bones = 0;
     std::vector<AnimationBoneGroup> bone_groups;
     uint32_t name_hash = 0;
+    uint16_t shared_bones = 0;  // preview transfer only: keep this many leading rig nodes
 };
 // Every clip in the install with its frame and bone counts and ordered bone groups.
 std::vector<ClipInfo> index_animation_clips(PackageManager& pm);

@@ -22,12 +22,14 @@ public:
         return pool;
     }
     size_t threads() const { return workers_.size() + 1; }
+    // Background rendering must not borrow the viewport's workers or block their caller.
+    static void use_current_thread_only() { serial_caller_ = true; }
 
     template <class Fn>
     void parallel_for(size_t n, Fn&& fn, size_t min_per_thread = 1) {
         if (n == 0) return;
         const size_t lanes = std::min(threads(), (n + min_per_thread - 1) / std::max<size_t>(min_per_thread, 1));
-        if (lanes <= 1) {
+        if (serial_caller_ || lanes <= 1) {
             for (size_t i = 0; i < n; ++i) fn(i);
             return;
         }
@@ -96,6 +98,7 @@ private:
     size_t count_ = 0, wanted_ = 0, claimed_ = 0, finished_ = 0;
     uint64_t generation_ = 0;
     bool stop_ = false;
+    inline static thread_local bool serial_caller_ = false;
 };
 
 } // namespace nim
