@@ -22,31 +22,35 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
 // X(key, japanese, english, korean)
 #define NIM_UI_STRINGS(X)                                                                                              \
     X(AppSubtitle, "Marathon アセットビューア", "Marathon asset viewer", "Marathon 에셋 뷰어")                              \
-    X(NavHome, "ホーム", "Home", "홈")                                                                                   \
-    X(NavStatics, "静的メッシュ", "Static meshes", "정적 메시")                                                           \
-    X(NavEntities, "エンティティ", "Entities", "엔티티")                                                                  \
-    X(NavMaps, "マップ", "Maps", "맵")                                                                                    \
-    X(NavText, "テキスト", "Text", "텍스트")                                                                              \
-    X(NavDialogue, "台詞", "Dialogue", "대사")                                                                            \
-    X(NavMovies, "ムービー", "Movies", "영상")                                                                            \
-    X(NavCodex, "コデックス", "Codex", "코덱스") \
-    X(NavPackages, "パッケージ", "Packages", "패키지")                                                                    \
-    X(NavLog, "ログ", "Log", "로그")                                                                                      \
-    X(NavSettings, "設定", "Settings", "설정")                                                                            \
+    X(NavFind, "検索", "find", "검색") \
+    X(DescFind, "場所・声・コデックス・映像・文字列をまとめて検索", "Search places, voices, codex, films and text at once", "장소·음성·코덱스·영상·문자열을 한 번에 검색") \
+    X(PromptHint, "ページ名かキーワード (Enter)", "page name or keyword (Enter)", "페이지 이름 또는 키워드 (Enter)") \
+    X(FindEmpty, "上の nim › にキーワードを入れて Enter", "Type a keyword after nim › above and press Enter", "위의 nim › 에 키워드를 넣고 Enter") \
+    X(FindHits, "{} 件", "{} hits", "{}건") \
+    X(FindOpen, "このページで絞り込む", "filter this page", "이 페이지에서 걸러 보기") \
+    X(FindNone, "見つかりません: {}", "Nothing found: {}", "찾지 못했습니다: {}") \
+    X(MapKindMap, "マップ", "map", "맵") \
+    X(MapKindMode, "モード", "mode", "모드") \
+    X(NavHome, "はじめに", "start", "시작") \
+    X(NavStatics, "背景物", "scenery", "배경물") \
+    X(NavEntities, "モデル", "models", "모델") \
+    X(NavMaps, "場所", "places", "장소") \
+    X(NavText, "文字列", "text", "문자열") \
+    X(NavDialogue, "声", "voices", "음성") \
+    X(NavMovies, "映像", "films", "영상") \
+    X(NavCodex, "コデックス", "codex", "코덱스") \
+    X(NavPackages, "ファイル", "files", "파일") \
+    X(NavLog, "ログ", "log", "로그") \
+    X(NavSettings, "設定", "config", "설정") \
     X(GroupModels3D, "3D", "3D", "3D")                                                                                    \
     X(Group2D, "2D", "2D", "2D")                                                                                          \
     X(GroupData, "データ", "Data", "데이터")                                                                              \
     X(DescHome, "Marathon のアセットを 3D と 2D から閲覧します", "Browse Marathon's assets in 3D and 2D",                  \
       "Marathon 에셋을 3D와 2D로 살펴봅니다")                                                                              \
-    X(DescStatics, "静的メッシュをライブ 3D サムネイルで一覧し、ゲームのシェーダで表示",                                   \
-      "Static meshes with live 3D thumbnails, drawn with the game's shaders",                                              \
-      "정적 메시를 실시간 3D 썸네일로 보여주고 게임 셰이더로 표시합니다")                                                    \
-    X(DescEntities, "エンティティのダイナミックモデル (剛体・スキン) をエンティティのマテリアルで表示",                    \
-      "Dynamic entity models (rigid and skinned) with their entity materials",                                             \
-      "엔티티의 동적 모델(강체·스킨)을 엔티티 머티리얼로 표시합니다")                                                        \
-    X(DescMaps, "マップの配置済み静的ジオメトリを読み込んで歩き回る", "Load a map's placed static geometry and walk through it", \
-      "맵에 배치된 정적 지오메트리를 불러와 둘러봅니다")                                                                    \
-    X(DescText, "ローカライズ文字列 (全言語)", "Localized strings in every language", "모든 언어의 현지화 문자열")              \
+    X(DescStatics, "建物・地形・小物などの背景物を 3D サムネイルで一覧し、ゲームのシェーダで表示", "Buildings, terrain and props, listed as live 3D thumbnails and drawn with the game shaders", "건물·지형·소품을 3D 썸네일로 보고 게임 셰이더로 표시") \
+    X(DescEntities, "キャラクター・装備・機械を、材質とアニメーション付きで表示", "Characters, gear and machines with their materials and animations", "캐릭터·장비·기계를 재질과 애니메이션으로 표시") \
+    X(DescMaps, "マップを丸ごと読み込んで歩き回る (時刻・天候つき)", "Load a whole map and walk through it, with its time of day and weather", "맵 전체를 불러와 돌아다닙니다 (시간·날씨 포함)") \
+    X(DescText, "ゲーム内の文字列を 13 言語で検索", "Search the game text in 13 languages", "게임 문자열을 13개 언어로 검색") \
     X(DescDialogue, "台詞を全言語で表示し、音声を再生・話者ごとに書き出す",                                              \
       "Lines in every language, with voice playback and per-speaker WAV export",                                           \
       "모든 언어의 대사를 보여주고, 음성 재생과 화자별 WAV 내보내기를 합니다")                                              \
@@ -54,7 +58,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
       "Play USM movies with a chosen audio track and subtitle language",                                                   \
       "USM 영상을 음성 트랙과 자막 언어를 골라 재생합니다")                                                                 \
     X(DescCodex, "ゲーム内コデックスの記録を全言語で読み、音声ログを再生", "Read the in-game codex records in every language and play their audio logs", "게임 내 코덱스 기록을 모든 언어로 읽고 음성 로그를 재생합니다") \
-    X(DescPackages, "パッケージとエントリの生データ", "Raw package entries and bytes", "패키지 항목과 원시 데이터")              \
+    X(DescPackages, "インストールのファイルとタグの生データ (開発向け)", "The install files and raw tag bytes (for development)", "설치 파일과 태그 원시 데이터 (개발용)") \
     X(DescLog, "読込とエラーの記録", "Load and error messages", "로드 및 오류 기록")                                       \
     X(DescSettings, "インストール・表示・言語", "Install, display and language", "설치·표시·언어")                          \
     X(PickInstallFolder, "Marathon のインストールフォルダを選択", "Choose the Marathon install folder",                  \
@@ -180,12 +184,10 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(TexCapTip, "テクスチャの最大辺 (VRAM と読込時間の節約。原寸 = ゲームのデータそのまま)",                              \
       "Longest texture edge (saves VRAM and load time; full size = the game's data as is)",                              \
       "텍스처 최대 변 (VRAM과 로드 시간 절약. 원본 = 게임 데이터 그대로)")                                                  \
-    X(MapKindTip, "DEIMOS と同じ選択元: map_view = SBubbleParent / activity_view = SActivity のマップ参照 + ambient + phase", \
-      "Same source as DEIMOS: map_view = SBubbleParent / activity_view = SActivity map references + ambient + phase",      \
-      "DEIMOS와 같은 원본: map_view = SBubbleParent / activity_view = SActivity 맵 참조 + ambient + phase")                \
+    X(MapKindTip, "マップ = マップ単体 / モード = 遊ぶモードが使うマップ (モード固有の配置と状態を含む)", "map = the map alone / mode = the map as a game mode uses it (with the mode's own placements and state)", "맵 = 맵 단독 / 모드 = 게임 모드가 쓰는 맵 (모드 고유 배치와 상태 포함)") \
     X(MapFilterHint, "  マップ / タグ", "  Map / tag", "  맵 / 태그")                                                  \
     X(MapRowStats, "{}   {} メッシュ · {} 配置", "{}   {} meshes · {} placements", "{}   메시 {}개 · 배치 {}개")          \
-    X(MapActivityRow, "activity {} / map[{}] → {}", "activity {} / map[{}] → {}", "activity {} / map[{}] → {}")          \
+    X(MapActivityRow, "モード {} / 区画 {} → {}", "mode {} / part {} → {}", "모드 {} / 구역 {} → {}") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \
@@ -197,9 +199,8 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(FlyHint, "右ドラッグ + WASD / QE で移動 (Shift 速く · Ctrl 遅く · ホイールで速度)",                                 \
       "Right-drag + WASD / QE to move (Shift faster · Ctrl slower · wheel for speed)",                                    \
       "오른쪽 드래그 + WASD / QE로 이동 (Shift 빠르게 · Ctrl 느리게 · 휠로 속도)")                                          \
-    X(MapViewLine, "map_view · SBubbleParent %s", "map_view · SBubbleParent %s", "map_view · SBubbleParent %s")          \
-    X(ActivityViewLine, "activity_view · SActivity %s / map[%u] → %s", "activity_view · SActivity %s / map[%u] → %s",   \
-      "activity_view · SActivity %s / map[%u] → %s")                                                                     \
+    X(MapViewLine, "マップ  %s", "map  %s", "맵  %s") \
+    X(ActivityViewLine, "モード %s / 区画 %u → %s", "mode %s / part %u → %s", "모드 %s / 구역 %u → %s") \
     X(SkippedHeader, "スキップしたメッシュ ({})", "Skipped meshes ({})", "건너뛴 메시 ({})")                              \
     X(MapUnsupported, "未対応: マップの大気 / 空・雨や VFX のパーティクル・ギミックの動き (推定値は下に記載)",               \
       "Not yet supported: map atmosphere and sky, rain and VFX particles, gimmick motion (estimates listed below)",       \

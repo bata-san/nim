@@ -33,12 +33,16 @@ build/Release/nim.exe                 # opens the Steam install automatically
 build/Release/nim.exe 80A878C8        # ...and shows this static mesh (or dynamic model)
 ```
 
-A minimal, terminal-style window: one line of pages at the top (`nim> [home] statics entities …`),
-the page, and a status line. Pages: **STATICS** (57k static meshes) and **ENTITIES** (2.3k dynamic
-models, rigid and skinned) with live 3D thumbnails and a live view, **MAPS**, **TEXT** (every
-localized string beside a second language), **DIALOGUE** (lines in 13 languages with voice playback),
-**MOVIES** (USM with HCA/ADX audio), **CODEX** (the in-game codex: collections, records in 13
-languages and their audio logs), **PACKAGES** (entry table + hex) and **LOG**.
+A minimal, terminal-style window built around one prompt line at the top: `nim ›` takes a page
+word (`places`, `models`, `scenery`, `voices`, `codex`, `films`, `text`, `files`, `log`, `config`) or any
+keyword, which **find** looks up across places, voices, codex, films and text at once (each group
+opens its page filtered to the keyword). The page words also sit on the right of the line; Ctrl+L
+focuses the prompt. Pages: **places** (whole maps, with their time of day and weather), **models**
+(2.3k characters, gear and machines with materials and animation) and **scenery** (57k static meshes)
+with live 3D thumbnails, **voices** (lines in 13 languages with voice playback), **codex** (the
+in-game codex: collections, records in 13 languages and their audio logs), **films** (USM with
+HCA/ADX audio), **text** (every localized string beside a second language), **files** (package
+entries + hex) and **log**.
 
 Everything is drawn with the game's own shaders: the G-buffer pass with each material's DXIL,
 then the game's deferred `global_lighting_and_shading` and its `final_combine` film curve

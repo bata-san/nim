@@ -61,7 +61,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kVersion = "0.3.1";
-constexpr ImU32 kGreen = IM_COL32(201, 254, 0, 255);  // Marathon green
+constexpr ImU32 kGreen = IM_COL32(255, 179, 64, 255);  // nim amber (the accent; the name predates it)
 constexpr uint32_t kThumbSize = 256;
 
 // ---- small utilities ------------------------------------------------------------------------------
@@ -332,7 +332,7 @@ constexpr ImU32 kBorder = IM_COL32(48, 48, 48, 255);
 constexpr ImU32 kText = IM_COL32(214, 214, 214, 255);
 constexpr ImU32 kMuted = IM_COL32(118, 118, 118, 255);
 constexpr ImU32 kError = IM_COL32(255, 110, 110, 255);
-constexpr ImU32 kAccentHi = IM_COL32(222, 255, 96, 255);
+constexpr ImU32 kAccentHi = IM_COL32(255, 206, 128, 255);
 } // namespace theme
 
 void apply_style(float scale) {
@@ -1206,10 +1206,11 @@ struct Camera {
 enum class Engine : int { Game };
 
 // The pages of the navigation rail. Every page is always reachable from the rail.
-enum Tab : int { TabHome, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages, TabLog, TabCount };
+enum Tab : int { TabHome, TabFind, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; ui::S name; ui::S desc; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, ui::S::NavHome, ui::S::DescHome},
+    {ico::Search, ui::S::NavFind, ui::S::DescFind},
     {ico::Settings, ui::S::NavSettings, ui::S::DescSettings},
     {ico::Statics, ui::S::NavStatics, ui::S::DescStatics},
     {ico::Entities, ui::S::NavEntities, ui::S::DescEntities},
@@ -1244,7 +1245,7 @@ public:
 
     // The loaded map region (the live scene holds its meshes).
     struct MapView {
-        int selection_mode = 0;  // DEIMOS MapTab / ActivityTab
+        int selection_mode = 0;  // 0: the map alone, 1: the map as a game mode (activity) uses it
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
@@ -1398,6 +1399,16 @@ public:
     int selected_package = -1;
     std::vector<EntryRow> package_rows;
     char entry_filter[32] = "";
+    // The prompt line and the find page.
+    char prompt[256] = "";
+    bool focus_prompt = false;
+    std::string find_query;
+    struct FindGroup {
+        Tab tab;
+        size_t count = 0;
+        std::vector<std::string> samples;
+    };
+    std::vector<FindGroup> find_results;
     int selected_entry = -1;
     std::vector<uint8_t> entry_preview;
     std::string entry_preview_error;
@@ -1838,7 +1849,10 @@ public:
         ImGui::BeginChild("maps", {left_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         ImGui::SetCursorPos({pad, pad});
         ImGui::SetNextItemWidth(left_w - 2 * pad);
-        if (ImGui::Combo("##map_view_kind", &map.selection_mode, "map_view\0activity_view\0")) map.selected = -1;
+        {
+            const char* kinds[] = {ui::tr(ui::S::MapKindMap), ui::tr(ui::S::MapKindMode)};
+            if (ImGui::Combo("##map_view_kind", &map.selection_mode, kinds, 2)) map.selected = -1;
+        }
         ImGui::SetItemTooltip(ui::tr(ui::S::MapKindTip));
         ImGui::SetNextItemWidth(left_w - 2 * pad);
         ImGui::InputTextWithHint("##mfilter", (icon(ico::Search) + ui::tr(ui::S::MapFilterHint)).c_str(), map.filter, sizeof(map.filter));
@@ -2286,6 +2300,7 @@ public:
         ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         switch (tab) {
         case TabHome: home_tab(); break;
+        case TabFind: find_tab(); break;
         case TabSettings: settings_tab(); break;
         case TabStatics: statics_tab(false); break;
         case TabEntities: statics_tab(true); break;
@@ -2302,27 +2317,184 @@ public:
         ImGui::PopStyleVar();
     }
 
-    // One line of page names, like a shell prompt: "nim> [home] statics entities ...".
+    // The page words a prompt line accepts (the English word or the UI-language name).
+    static constexpr Tab kPageOrder[] = {TabHome, TabMaps, TabEntities, TabStatics, TabDialogue, TabCodex,
+                                         TabMovies, TabText, TabFind, TabPackages, TabLog, TabSettings};
+    static const char* page_word(Tab t) {
+        switch (t) {
+        case TabHome: return "start";
+        case TabFind: return "find";
+        case TabMaps: return "places";
+        case TabEntities: return "models";
+        case TabStatics: return "scenery";
+        case TabDialogue: return "voices";
+        case TabCodex: return "codex";
+        case TabMovies: return "films";
+        case TabText: return "text";
+        case TabPackages: return "files";
+        case TabLog: return "log";
+        case TabSettings: return "config";
+        default: return "";
+        }
+    }
+
+    // The top line is a prompt: "nim >" then a page word (open it) or anything else (find it
+    // everywhere). The page words follow on the right; the current page is bracketed. Ctrl+L
+    // focuses the prompt.
     void tab_bar() {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "nim>");
-        static const Tab order[] = {TabHome, TabStatics, TabEntities, TabMaps, TabText, TabDialogue,
-                                    TabMovies, TabCodex, TabPackages, TabLog, TabSettings};
-        for (Tab t : order) {
-            ImGui::SameLine(0, 10);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "nim \xE2\x80\xBA");
+        ImGui::SameLine(0, 6 * sc);
+        float words_w = 0;
+        for (Tab t : kPageOrder) words_w += ImGui::CalcTextSize(page_word(t)).x + 18 * sc;
+        ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x - words_w - 24 * sc));
+        if (focus_prompt) {
+            ImGui::SetKeyboardFocusHere();
+            focus_prompt = false;
+        }
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4{0, 0, 0, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+        const bool enter = ImGui::InputTextWithHint("##prompt", ui::tr(ui::S::PromptHint), prompt, sizeof(prompt),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_L)) focus_prompt = true;
+        if (enter) run_prompt();
+        for (Tab t : kPageOrder) {
+            ImGui::SameLine(0, 14 * sc);
             const bool sel = tab == t;
-            const std::string label = sel ? std::format("[{}]", ui::tr(kTabs[t].name)) : std::string(ui::tr(kTabs[t].name));
+            const std::string label = sel ? std::format("[{}]", page_word(t)) : std::string(page_word(t));
             ImGui::PushID(int(t));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(sel ? kGreen : theme::kText));
+            ImGui::PushStyleColor(ImGuiCol_Text, sel ? ImGui::ColorConvertU32ToFloat4(kGreen) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0, 0, 0, 0});
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {2, ImGui::GetStyle().FramePadding.y});
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {1, ImGui::GetStyle().FramePadding.y});
             if (ImGui::Button(label.c_str())) open_tab(t);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", ui::tr(kTabs[t].desc));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  %s", ui::tr(kTabs[t].name), ui::tr(kTabs[t].desc));
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor(2);
             ImGui::PopID();
         }
+    }
+
+    void run_prompt() {
+        std::string q = prompt;
+        while (!q.empty() && q.back() == ' ') q.pop_back();
+        while (!q.empty() && q.front() == ' ') q.erase(q.begin());
+        prompt[0] = 0;
+        focus_prompt = true;
+        if (q.empty()) return;
+        const std::string ql = lower_ascii(q);
+        for (Tab t : kPageOrder)
+            if (ql == page_word(t) || q == ui::tr(kTabs[t].name)) {
+                open_tab(t);
+                return;
+            }
+        find(q);
+        open_tab(TabFind);
+    }
+
+    // Finds `q` in every page that has a list: places, voices, codex, films and text.
+    void find(const std::string& q) {
+        find_query = q;
+        find_results.clear();
+        const std::string ql = lower_ascii(q);
+        auto group = [&](Tab t) -> FindGroup& { return find_results.emplace_back(FindGroup{t}); };
+        auto hit = [](FindGroup& g, std::string sample) {
+            if (g.samples.size() < 6) g.samples.push_back(std::move(sample));
+            ++g.count;
+        };
+        {
+            auto& g = group(TabMaps);
+            for (const auto& m : map_worker.maps())
+                if (contains_ci(m.name, ql) || contains_ci(m.package, ql) || contains_ci(m.bubble.str(), ql))
+                    hit(g, m.name.empty() ? m.package : m.name);
+        }
+        if (!catalog || !catalog->strings_ready) return;
+        const auto& strings = catalog->strings;
+        const size_t lang = size_t(language);
+        auto text_of = [&](uint32_t h) -> std::string {
+            const auto* s = strings.find(h);
+            if (!s) return {};
+            return s->text[lang].empty() ? s->text[0] : s->text[lang];
+        };
+        auto matches = [&](uint32_t h) {
+            const auto* s = strings.find(h);
+            return s && (contains_ci(s->text[0], ql) || s->text[lang].find(q) != std::string::npos);
+        };
+        if (catalog->dialogue_ready) {
+            auto& g = group(TabDialogue);
+            for (const auto& d : catalog->dialogue)
+                if (matches(d.subtitle_hash) || matches(d.speaker_hash))
+                    hit(g, text_of(d.speaker_hash) + ": " + text_of(d.subtitle_hash));
+        }
+        if (catalog->codex_ready) {
+            auto& g = group(TabCodex);
+            for (const auto& c : catalog->codex.collections)
+                for (const auto& e : c.entries)
+                    if (matches(e.title) || matches(e.body)) hit(g, text_of(c.title) + " / " + text_of(e.title));
+        }
+        if (catalog->movies_ready) {
+            auto& g = group(TabMovies);
+            for (const auto& m : catalog->movies)
+                if (contains_ci(m.usm.str(), ql)) hit(g, m.usm.str());
+        }
+        {
+            auto& g = group(TabText);
+            for (const auto& s : strings.strings())
+                if (contains_ci(s.text[0], ql) || s.text[lang].find(q) != std::string::npos)
+                    hit(g, s.text[lang].empty() ? s.text[0] : s.text[lang]);
+        }
+    }
+
+    // Opens a page with its own filter set to the query.
+    void open_filtered(Tab t, const std::string& q) {
+        auto put = [&](char* dst, size_t n) {
+            const size_t k = std::min(n - 1, q.size());
+            std::memcpy(dst, q.data(), k);
+            dst[k] = 0;
+        };
+        switch (t) {
+        case TabMaps: put(map.filter, sizeof(map.filter)); break;
+        case TabDialogue: put(dialogue_filter, sizeof(dialogue_filter)); break;
+        case TabCodex: put(codex.filter, sizeof(codex.filter)); break;
+        case TabMovies: put(movie.filter, sizeof(movie.filter)); break;
+        case TabText: put(string_filter, sizeof(string_filter)); break;
+        default: break;
+        }
+        open_tab(t);
+    }
+
+    // -- FIND --
+    void find_tab() {
+        if (find_query.empty()) {
+            ImGui::TextDisabled("%s", ui::tr(ui::S::FindEmpty));
+            return;
+        }
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "find \"%s\"", find_query.c_str());
+        ImGui::Spacing();
+        bool any = false;
+        for (const auto& g : find_results) {
+            if (!g.count) continue;
+            any = true;
+            ImGui::PushID(int(g.tab));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s/", page_word(g.tab));
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", ui::trf(ui::S::FindHits, g.count).c_str());
+            ImGui::SameLine();
+            if (dbutton(ui::tr(ui::S::FindOpen), 0, true)) open_filtered(g.tab, find_query);
+            for (const auto& line : g.samples) {
+                ImGui::TextDisabled("  ");
+                ImGui::SameLine(0, 0);
+                ImGui::TextUnformatted(line.c_str());
+            }
+            if (g.count > g.samples.size()) ImGui::TextDisabled("  ...");
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        if (!any) ImGui::TextDisabled("%s", ui::trf(ui::S::FindNone, find_query).c_str());
     }
 
     // The bottom line: the current status (the catalogue or the last message), the version and GPU.
@@ -2388,17 +2560,17 @@ public:
         if (dbutton(ui::tr(pm ? ui::S::HomeChange : ui::S::SelectFolder), 0, pm != nullptr))
             if (auto p = pick_folder(g_win.hwnd)) open_install(*p);
         ImGui::Spacing();
-        static const Tab order[] = {TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages};
+        static const Tab order[] = {TabMaps, TabEntities, TabStatics, TabDialogue, TabCodex, TabMovies, TabText, TabFind, TabPackages};
         float name_w = 0;
-        for (Tab t : order) name_w = std::max(name_w, ImGui::CalcTextSize(ui::tr(kTabs[t].name)).x);
-        const float desc_x = ImGui::GetCursorPosX() + ImGui::CalcTextSize("> ").x + name_w + 24;
+        for (Tab t : order) name_w = std::max(name_w, ImGui::CalcTextSize(std::format("{:<8} {}", page_word(t), ui::tr(kTabs[t].name)).c_str()).x);
+        const float desc_x = ImGui::GetCursorPosX() + name_w + 24;
         for (Tab t : order) {
             ImGui::PushID(int(t));
             const ImVec2 p = ImGui::GetCursorPos();
             if (ImGui::Selectable("##go", false)) open_tab(t);
             const bool hovered = ImGui::IsItemHovered();
             ImGui::SetCursorPos(p);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hovered ? theme::kAccentHi : kGreen), "> %s", ui::tr(kTabs[t].name));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hovered ? theme::kAccentHi : kGreen), "%s", std::format("{:<8} {}", page_word(t), ui::tr(kTabs[t].name)).c_str());
             ImGui::SameLine(desc_x);
             ImGui::TextDisabled("%s", ui::tr(kTabs[t].desc));
             ImGui::PopID();
