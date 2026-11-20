@@ -42,7 +42,8 @@ void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const
         for (auto [pipeline, name] : {std::pair{&grid_sky_, "light_sample_sky_hemisphere_grid"},
                                       std::pair{&grid_probe_, "light_sample_local_cubemaps_grid"},
                                       std::pair{&grid_blend_, "light_sample_blend_grid_cascades"},
-                                      std::pair{&grid_encode_, "light_sample_encode_from_rgba_to_rgb"}}) {
+                                      std::pair{&grid_encode_, "light_sample_encode_from_rgba_to_rgb"},
+                                      std::pair{&grid_points_, "light_sample_points_instance_grid"}}) {
             const auto tag = globals_.pipeline(name);
             if (tag.is_none()) throw std::runtime_error(std::format("Missing {}", name));
             pipeline->load(pm, gpu, tag, scopes, {});
@@ -58,7 +59,7 @@ void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const
 }
 
 void GameLighting::release_light_grid(Gpu& gpu) {
-    for (auto* pipeline : {&grid_sky_, &grid_probe_, &grid_blend_, &grid_encode_}) pipeline->release(gpu);
+    for (auto* pipeline : {&grid_sky_, &grid_probe_, &grid_blend_, &grid_encode_, &grid_points_}) pipeline->release(gpu);
     for (auto& resource : grid_basis_) resource.Reset();
     for (auto& resource : grid_sh_) resource.Reset();
     grid_clear_heap_.Reset();
@@ -87,13 +88,18 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
             }
             if (d2 <= kProbeRadius * kProbeRadius && cv.specular) probes.push_back(&cv);
         }
-    if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && probes.empty())) return;
+    // Local lights: each adds its SH into the cells (atomics) after the volumes have blended them.
+    // Lights whose volume comes within this radius of the grid centre are run (estimate).
+    constexpr float kLightRadius = 64;
+    const bool rebuild_lights = !preview && grid_points_.loaded() && !lights_.empty();
+    if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && probes.empty() && !rebuild_lights)) return;
     const float4 cover_scale = overhead ? overhead_scale_ : float4{};
     const float4 cover_offset = overhead ? overhead_offset_ : float4{};
     const auto& channels = ext_.channels;
     const std::array key{center, cover_scale, cover_offset,
                          float4{float(overhead_items_), float(overhead), channels.at(0x85)[0], channels.at(0x86)[0]},
-                         float4{float(probes.size()), float(cubemaps_.size()), 0, 0},
+                         float4{float(probes.size()), float(cubemaps_.size()), float(lights_.size()), rebuild_lights ? 1.0f : 0.0f},
+                         float4{},
                          channels.at(0x54), channels.at(0xB7), channels.at(0x8C), channels.at(0x83)};
 
     // The grid scope's constants are laid out by 80A740DC. The shaders used here never read
@@ -216,6 +222,27 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
                     if (resource) Gpu::barrier(cl, resource, kRead, kPixel);
                 synchronize_uavs(cl);
             }
+            if (rebuild_lights) {
+                const auto lights = grid_lights(vm, center, kLightRadius);
+                e.copy_block_from(1, ext_);
+                for (const auto& g : lights) {
+                    // +0x00: light to world; the CS takes the position (w column) and the +X axis
+                    // (the capsule and cone axis).
+                    M4 m;
+                    m.c[0] = {g.axis[0], g.axis[1], g.axis[2], 0};
+                    m.c[1] = {0, 1, 0, 0};
+                    m.c[2] = {0, 0, 1, 0};
+                    m.c[3] = {g.position[0], g.position[1], g.position[2], 1};
+                    e.set(kSampling, 0x00, m);
+                    for (uint32_t off : {0x40u, 0x50u, 0x60u, 0x70u}) e.set(kSampling, off, float4{});  // lobes 2 and 3
+                    e.set(kSampling, 0x80, float4{0, 0, 0, g.intensity});
+                    e.set(kSampling, 0x90, float4{g.colour[0], g.colour[1], g.colour[2], 0});  // .w: capsule half length
+                    e.set(kSampling, 0xA0, float4{g.start, g.end, g.inner, g.outer});
+                    grid_points_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices - 1);
+                }
+                if (!lights.empty()) synchronize_uavs(cl);
+                grid_light_count_ = lights.size();
+            }
             for (uint32_t cascade = kCascades - 1; cascade-- > 0;) {
                 cb[11][0] = float(cascade);
                 cb3 = upload(cb);
@@ -289,7 +316,12 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
                            "the fixed preview uses the room probe for all materials; variable per-object reflection selection is unresolved");
     } else {
         ext_.note_estimate("transparent lighting: sky SH, then the map cubemap volumes within 64 m (largest first), on six 16x16x8 cascades, base cell 2 m",
-                           "grid size, probe radius and update cadence are estimates; local lights and object samples are not in the grid");
+                           "grid size, probe radius and update cadence are estimates; object samples are not in the grid");
+        if (grid_light_count_ || grid_light_misses_)
+            ext_.note_estimate(std::format("transparent local lights: {} lights within 64 m into light_sample_points_instance_grid ({} without readable registers)",
+                                           grid_light_count_, grid_light_misses_),
+                               "light PS registers by pattern: falloff = the (-a, b, 0, 0) init, colour = falloff - 1, cone = falloff - 3, weight = the +0x150 product; "
+                               "point / spot from the node +X axis, cone exponent and clip planes dropped, no capsule length, one SH lobe; values taken when the grid is rebuilt");
         ext_.note_estimate(reflect ? "transparent_advanced: reflection cube of the smallest map volume holding the eye, object occlusion one"
                                    : "transparent_advanced: sky reflection (no map volume holds the eye), object occlusion one",
                            "the engine selects the cube per object; nim uses one per frame");

@@ -1,6 +1,7 @@
 #include "nim/render/game_lighting.hpp"
 #include "nim/core/profile.hpp"
 #include "nim/core/parallel.hpp"
+#include "nim/content/tfx_vm.hpp"
 #include "nim/content/weather.hpp"
 
 #include <d3dcompiler.h>
@@ -2424,6 +2425,20 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                 it = keys.emplace(key, index).first;
             }
             LocalLight local{it->second, tech, *l};
+            {  // the grid registers (grid_lights)
+                const auto& ps = tech->stage(ShaderStage::Pixel);
+                for (size_t r = 0; r < ps.cbuffer_init.size(); ++r) {
+                    const auto& v = ps.cbuffer_init[r];
+                    if (v[0] < 0 && v[1] > 0 && v[2] == 0 && v[3] == 0) {
+                        local.grid_falloff = local.grid_falloff < 0 ? int(r) : -2;  // -2: ambiguous
+                    }
+                }
+                if (local.grid_falloff == -2) local.grid_falloff = -1;
+                const auto program = disassemble_tfx(ps.bytecode);
+                if (auto at = program.find("push_extern_float 04 54"); at != std::string::npos)
+                    if (auto pop = program.find("pop_output ", at); pop != std::string::npos)
+                        local.grid_weight = std::stoi(program.substr(pop + 11, 2), nullptr, 16);
+            }
             const M4 node = m4(l->node), light_space = m4(l->light_space);
             local.world_volume = mul(node, light_space);
             local.world_to_box = inverse(light_box_to_world(node, light_space));
@@ -2651,6 +2666,41 @@ void GameLighting::bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& 
     ext_.set(kShadow, 0x180, 2.0f);                   // > 1: the 21-tap filter of the PS
 }
 
+// The extern writes of one light, to the store (when drawing) or to the overlay (ahead).
+template <class Sink>
+void GameLighting::write_light(Sink& sink, const LocalLight& ll, const ViewMatrices& vm, bool shadowed) const {
+    M4 to_rel;  // world -> camera-relative world
+    to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
+    to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
+    M4 from_rel;  // camera-relative world -> world (bind_light_shadow's +0xC0)
+    from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
+    from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
+    const MapLight& l = ll.light;
+    const M4 node_rel = mul(to_rel, m4(l.node));
+    const M4 volume = mul(to_rel, ll.world_volume);  // unit cube -> camera-relative world
+    sink.set(15, 0x00, mul(vm.vp_rel, volume));
+    sink.set(ext::DeferredLight, 0x00, 0.0f);
+    M4 relative_to_box = ll.world_to_box;
+    for (size_t i = 0; i < 4; ++i)
+        relative_to_box.c[3][i] += vm.eye.x * relative_to_box.c[0][i] + vm.eye.y * relative_to_box.c[1][i] +
+            vm.eye.z * relative_to_box.c[2][i];
+    sink.set(ext::DeferredLight, 0x40, relative_to_box);
+    sink.set(ext::DeferredLight, 0xC0, node_rel);
+    for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
+    sink.set(ext::DeferredLight, 0x150, 1.0f);
+    // +0x154: weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
+    sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+    if (shadowed) {  // bind_light_shadow's values
+        sink.set(6, 0x18, float(ll.shadow->size));
+        sink.set(6, 0x1C, float(ll.shadow->size));
+        sink.set(6, 0x30, float4{-7000, 0, 1, 0});
+        sink.set(6, 0xB0, float4{0, 0, 1, 1});
+        sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
+        sink.set(6, 0x180, 2.0f);
+    }
+    sink.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
+}
+
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -2658,43 +2708,10 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
     cl->OMSetRenderTargets(2, rtvs, FALSE, &gb.dsv_ro);
     if (!ext_.zero_policy(ext::DeferredLight)) ext_.zero_when_missing(ext::DeferredLight, "deferred light value with no known meaning: zero");
     if (!ext_.zero_policy(15)) ext_.zero_when_missing(15, "simple geometry value with no known meaning: zero");
-    M4 to_rel;  // world -> camera-relative world
-    to_rel.c[0] = {1, 0, 0, 0}; to_rel.c[1] = {0, 1, 0, 0}; to_rel.c[2] = {0, 0, 1, 0};
-    to_rel.c[3] = {-vm.eye.x, -vm.eye.y, -vm.eye.z, 1};
     const LightFrustum frustum(vm);
     GamePipeline::VolumeBatch batch;
     const bool light_debug = std::getenv("NIM_LIGHT_DEBUG") != nullptr;
     light_shadows_used_ = 0;
-    M4 from_rel;  // camera-relative world -> world (bind_light_shadow's +0xC0)
-    from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
-    from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
-    // The extern writes of one light, to the store (when drawing) or to the overlay (ahead).
-    auto write_light = [&](auto& sink, const LocalLight& ll, bool shadowed) {
-        const MapLight& l = ll.light;
-        const M4 node_rel = mul(to_rel, m4(l.node));
-        const M4 volume = mul(to_rel, ll.world_volume);  // unit cube -> camera-relative world
-        sink.set(15, 0x00, mul(vm.vp_rel, volume));
-        sink.set(ext::DeferredLight, 0x00, 0.0f);
-        M4 relative_to_box = ll.world_to_box;
-        for (size_t i = 0; i < 4; ++i)
-            relative_to_box.c[3][i] += vm.eye.x * relative_to_box.c[0][i] + vm.eye.y * relative_to_box.c[1][i] +
-                vm.eye.z * relative_to_box.c[2][i];
-        sink.set(ext::DeferredLight, 0x40, relative_to_box);
-        sink.set(ext::DeferredLight, 0xC0, node_rel);
-        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
-        sink.set(ext::DeferredLight, 0x150, 1.0f);
-        // +0x154: weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
-        sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
-        if (shadowed) {  // bind_light_shadow's values
-            sink.set(6, 0x18, float(ll.shadow->size));
-            sink.set(6, 0x1C, float(ll.shadow->size));
-            sink.set(6, 0x30, float4{-7000, 0, 1, 0});
-            sink.set(6, 0xB0, float4{0, 0, 1, 1});
-            sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
-            sink.set(6, 0x180, 2.0f);
-        }
-        sink.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
-    };
     size_t draws = 0;
     volume_overlay_.clear();  // this pass's writes only, over the store as it is now
     for (size_t index = 0; index < lights_.size(); ++index) {
@@ -2710,7 +2727,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
         // winding on screen flips with the handedness of its transform.
         d.pipeline = light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (ll.mirrored ? 1 : 0)].get();
         d.technique = shadowed ? ll.shadow_technique.get() : ll.technique.get();
-        write_light(volume_overlay_, ll, shadowed);
+        write_light(volume_overlay_, ll, vm, shadowed);
         volume_overlay_.snapshot(d.overlay);
     }
     evaluate_volume_draws(draws);
@@ -2718,7 +2735,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
         const auto& d = volume_draws_[k];
         auto& ll = lights_[d.light];
         const bool shadowed = d.shadowed;
-        write_light(ext_, ll, shadowed);
+        write_light(ext_, ll, vm, shadowed);
         if (shadowed) {
             bind_light_shadow(cl, ll, vm);
             ++light_shadows_used_;
@@ -2740,6 +2757,77 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
             if (light_notes_.size() < 32) light_notes_.push_back(std::format("{}: {}", ll.technique->tag.str(), ex.what()));
         }
     }
+}
+
+// The map's local lights near `center` as the transparent light grid reads them. Each light's PS
+// constants are evaluated with the deferred pass's writes (unshadowed); the registers are found
+// at load (set_lights): falloff F from its init, colour F - 1, cone F - 3, diffuse weight from
+// the +0x150 product. The grid CS takes a capsule light with an SH lobe per colour; nim fills the
+// main lobe only.
+std::vector<GameLighting::GridLight> GameLighting::grid_lights(const ViewMatrices& vm, const float4& center, float radius) {
+    std::vector<GridLight> out;
+    size_t draws = 0;
+    grid_light_misses_ = 0;
+    volume_overlay_.clear();
+    for (size_t index = 0; index < lights_.size(); ++index) {
+        auto& ll = lights_[index];
+        if (ll.grid_falloff < 3 || ll.grid_weight < 0) {
+            ++grid_light_misses_;
+            continue;
+        }
+        float d2 = 0;
+        for (size_t a = 0; a < 3; ++a) {
+            const float d = center[a] - std::clamp(center[a], ll.light.lo[a], ll.light.hi[a]);
+            d2 += d * d;
+        }
+        if (d2 > radius * radius) continue;
+        if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
+        auto& d = volume_draws_[draws++];
+        d.light = index;
+        d.shadowed = false;
+        d.pipeline = light_pipelines_[ll.pipeline].get();
+        d.technique = ll.technique.get();
+        write_light(volume_overlay_, ll, vm, false);
+        volume_overlay_.snapshot(d.overlay);
+    }
+    evaluate_volume_draws(draws);
+    for (size_t k = 0; k < draws; ++k) {
+        const auto& d = volume_draws_[k];
+        const auto& ll = lights_[d.light];
+        const auto& ps = d.constants[1];
+        const size_t f = size_t(ll.grid_falloff), w = size_t(ll.grid_weight);
+        if (!d.error.empty() || ps.size() <= std::max(f, w)) {
+            ++grid_light_misses_;
+            continue;
+        }
+        const float a = ps[f][0], b = ps[f][1];
+        if (!(a < 0) || !(b > 0)) {
+            ++grid_light_misses_;
+            continue;
+        }
+        GridLight g;
+        const auto& n = ll.light.node;
+        g.position = {n[12], n[13], n[14]};
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        g.axis = len > 0 ? std::array{n[0] / len, n[1] / len, n[2] / len} : std::array{1.0f, 0.0f, 0.0f};
+        g.colour = {ps[f - 1][0], ps[f - 1][1], ps[f - 1][2]};
+        // saturate(a d + b) as the CS's saturate((end - d) / (end - start)).
+        g.end = -b / a;
+        g.start = (1 - b) / a;
+        g.intensity = ps[w][0];
+        // Cone (scale, bias, exponent): saturate(bias + scale cos)^exponent, cos from the +X axis.
+        // The CS's cone is linear between cos(inner) and cos(outer); the exponent is dropped.
+        const auto& cone = ps[f - 3];
+        if (cone[0] > 0 && cone[2] > 0) {
+            const float outer = -cone[1] / cone[0], inner = (1 - cone[1]) / cone[0];
+            if (outer > -1 && inner <= 1) {
+                g.outer = std::acos(std::clamp(outer, -1.0f, 1.0f));
+                g.inner = std::acos(std::clamp(inner, -1.0f, 1.0f));
+            }
+        }
+        if (g.intensity > 0 && g.end > 0 && (g.colour[0] > 0 || g.colour[1] > 0 || g.colour[2] > 0)) out.push_back(g);
+    }
+    return out;
 }
 
 // Evaluates the TFX of the first `count` volume draws on the worker pool. Each sees the store as it

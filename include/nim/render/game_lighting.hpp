@@ -538,7 +538,21 @@ private:
         bool shadow_readable = false;  // depth map in PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
         M4 world_volume, world_to_box;
         bool mirrored = false;
+        // Registers of the light PS read for the transparent light grid (-1: not found):
+        // falloff (a, b) of saturate(a * d + b)^2, the colour at falloff - 1, the spot cone
+        // (scale, bias, exponent) at falloff - 3, and the diffuse weight (+0x150 product).
+        int grid_falloff = -1, grid_weight = -1;
     };
+    // One local light as light_sample_points_instance_grid reads it (extern 68).
+    struct GridLight {
+        std::array<float, 3> position{}, axis{}, colour{};
+        float start = 0, end = 0;               // +0xA0.xy: full light up to start, none past end
+        float inner = -1, outer = -1;           // +0xA0.zw: cone angles in radians, -1 for a point light
+        float intensity = 0;                    // +0x80.w
+    };
+    template <class Sink> void write_light(Sink& sink, const LocalLight& ll, const ViewMatrices& vm, bool shadowed) const;
+    std::vector<GridLight> grid_lights(const ViewMatrices& vm, const float4& center, float radius);
+    size_t grid_light_misses_ = 0, grid_light_count_ = 0;
     size_t light_shadow_items_ = 0, light_shadows_used_ = 0;
     // Hands a light's depth map to the deferred_shadow extern (6) for its +0xD8 / +0xE0 technique.
     void bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& ll, const ViewMatrices& vm);
@@ -644,11 +658,11 @@ private:
     void release_light_grid(Gpu& gpu);
     void render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
                            const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview);
-    GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_;
+    GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_;
     ExternStore grid_ext_;
     std::array<ComPtr<ID3D12Resource>, 3> grid_basis_, grid_sh_;
     ComPtr<ID3D12DescriptorHeap> grid_clear_heap_;
-    std::optional<std::array<float4, 9>> grid_key_;
+    std::optional<std::array<float4, 10>> grid_key_;
     bool grid_ready_ = false;
     // Screen-space reflections (game_ssr.cpp, docs/PROGRESS.md 3.12).
     void load_ssr(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
