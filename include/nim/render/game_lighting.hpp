@@ -648,7 +648,7 @@ private:
     ExternStore grid_ext_;
     std::array<ComPtr<ID3D12Resource>, 3> grid_basis_, grid_sh_;
     ComPtr<ID3D12DescriptorHeap> grid_clear_heap_;
-    std::optional<std::array<float4, 8>> grid_key_;
+    std::optional<std::array<float4, 9>> grid_key_;
     bool grid_ready_ = false;
     // Screen-space reflections (game_ssr.cpp, docs/PROGRESS.md 3.12).
     void load_ssr(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);

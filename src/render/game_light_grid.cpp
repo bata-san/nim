@@ -1,5 +1,6 @@
 #include "nim/render/game_lighting.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -67,15 +68,32 @@ void GameLighting::release_light_grid(Gpu& gpu) {
 
 void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
                                      const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview) {
-    if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && !preview)) return;
     const float cell = preview ? 0.5f : kCell;
     const float4 center = preview ? float4{} : float4{std::floor(vm.eye.x / kCell) * kCell, std::floor(vm.eye.y / kCell) * kCell,
                         std::floor(vm.eye.z / kCell) * kCell, 0};
+    // The map's cubemap volumes are applied to the grid as the deferred pass applies them to the
+    // screen: largest first, each blending the cells inside its box toward its own probe by its face
+    // weights (the CS reads the cell, lerps, writes it back). Only volumes near the grid centre are
+    // run; the outer cascades are 32-64 m cells where the sky term dominates (radius: estimate).
+    constexpr float kProbeRadius = 64;
+    std::vector<const CubemapVolume*> probes;
+    if (preview) probes.push_back(preview);
+    else
+        for (const auto& cv : cubemaps_) {
+            float d2 = 0;
+            for (size_t a = 0; a < 3; ++a) {
+                const float d = center[a] - std::clamp(center[a], cv.volume.lo[a], cv.volume.hi[a]);
+                d2 += d * d;
+            }
+            if (d2 <= kProbeRadius * kProbeRadius && cv.specular) probes.push_back(&cv);
+        }
+    if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && probes.empty())) return;
     const float4 cover_scale = overhead ? overhead_scale_ : float4{};
     const float4 cover_offset = overhead ? overhead_offset_ : float4{};
     const auto& channels = ext_.channels;
     const std::array key{center, cover_scale, cover_offset,
                          float4{float(overhead_items_), float(overhead), channels.at(0x85)[0], channels.at(0x86)[0]},
+                         float4{float(probes.size()), float(cubemaps_.size()), 0, 0},
                          channels.at(0x54), channels.at(0xB7), channels.at(0x8C), channels.at(0x83)};
 
     // The grid scope's constants are laid out by 80A740DC. The shaders used here never read
@@ -152,23 +170,31 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
                 grid_sky_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices - 1);
                 synchronize_uavs(cl);
             }
-            if (preview) {
-                const auto& probe = preview->volume;
+            for (const CubemapVolume* cv : probes) {
+                const auto& probe = cv->volume;
                 std::array<float4, 32> constants{};
+                constexpr float kHardEdge = 1e-3f;  // as the deferred volumes: an unblended face still cuts off
                 for (size_t axis = 0; axis < 3; ++axis) {
-                    constants[0][axis] = 1 / std::max(probe.blend_neg[axis], 0.001f);
-                    constants[1][axis] = 1 / std::max(probe.blend_pos[axis], 0.001f);
+                    constants[0][axis] = 1 / std::max(probe.blend_neg[axis], preview ? 0.001f : kHardEdge);
+                    constants[1][axis] = 1 / std::max(probe.blend_pos[axis], preview ? 0.001f : kHardEdge);
                     std::copy_n(probe.axes.begin() + 4 * axis, 4, constants[9 + axis].begin());
                     constants[14][axis] = 1 / float(probe.probes[axis]);
                 }
-                constants[0][3] = 1;  // baked diffuse samples
+                constants[0][3] = preview || cv->diffuse ? 1.0f : 0.0f;  // baked diffuse samples
                 constants[2][3] = probe.unk30;
-                constants[3][3] = preview->max_mip;
+                constants[3][3] = cv->max_mip;
                 constants[13] = {1, 1, 1, 1};
                 constants[14][3] = 1;
-                constants[15] = {probe.probe_params[0], probe.probe_params[1], 1, probe.probe_params[3]};
-                constants[18] = {0, 0, preview->alpha ? 1.0f : 0.0f, preview->squared ? 0.0f : 1.0f};
-                constants[20] = {1, 1, 1, 0};  // this authored probe has no relighting
+                constants[15] = {probe.probe_params[0], probe.probe_params[1],
+                                 preview ? 1.0f : cubemap_alpha_exponent(probe.probe_params[2]), probe.probe_params[3]};
+                constants[18] = {0, 0, cv->alpha ? 1.0f : 0.0f, cv->squared ? 0.0f : 1.0f};
+                constants[20] = {1, 1, 1, 0};  // no relighting
+                if (!preview && probe.use_relighting() && channels.size() > 0x8B) {
+                    const auto relit = cubemap_relighting(probe, {channels[0x8B][0], channels[0x8A][0], channels[0x89][0],
+                                                                  channels[0x08][0], channels[0x09], channels[0x64]});
+                    constants[19] = relit[0];
+                    constants[20] = relit[1];
+                }
                 M4 local;
                 for (size_t c = 0; c < 4; ++c) std::copy_n(probe.local_to_world.begin() + c * 4, 4, local.c[c].begin());
                 const auto inverse_box = inverse_matrix(local);
@@ -176,7 +202,7 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
                 cb11 = upload(constants);
                 for (uint32_t off = 0xD0; off <= 0x160; off += 16) e.set(kSampling, off, float4{});
                 const std::pair<uint32_t, ID3D12Resource*> textures[] = {
-                    {0, preview->specular.Get()}, {1, preview->alpha.Get()}, {2, preview->diffuse.Get()}};
+                    {0, cv->specular.Get()}, {1, cv->alpha.Get()}, {2, cv->diffuse.Get()}};
                 for (const auto& [slot, resource] : textures)
                     if (resource) Gpu::barrier(cl, resource, kPixel, kRead);
                 try {
@@ -231,20 +257,42 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     ext_.set_scope_constants(ShaderStage::Vertex, 3, cb);
     std::array<float4, 37> advanced{};
     advanced[6][3] = 1;
-    if (preview) {
+    const CubemapVolume* reflect = preview;
+    if (!preview) {  // the smallest map volume whose box holds the eye
+        float best = 0;
+        for (const auto& cv : cubemaps_) {
+            if (!cv.specular) continue;
+            M4 local;
+            for (size_t c = 0; c < 4; ++c) std::copy_n(cv.volume.local_to_world.begin() + c * 4, 4, local.c[c].begin());
+            const M4 inv = inverse_matrix(local);
+            const float q[3] = {vm.eye.x, vm.eye.y, vm.eye.z};
+            bool inside = true;
+            for (size_t r = 0; r < 3 && inside; ++r) {
+                const float x = inv.c[0][r] * q[0] + inv.c[1][r] * q[1] + inv.c[2][r] * q[2] + inv.c[3][r];
+                inside = std::abs(x) <= 1;
+            }
+            const float size = cv.volume.extents[0] * cv.volume.extents[1] * cv.volume.extents[2];
+            if (inside && (!reflect || size < best)) reflect = &cv, best = size;
+        }
+    }
+    if (reflect) {
+        const CubemapVolume* preview = reflect;
         advanced[10][3] = preview->volume.unk30;
         advanced[11][3] = preview->max_mip;
         advanced[14][3] = 1;
         advanced[15][3] = preview->squared ? 0.0f : 1.0f;
         advanced[16] = {1, 1, 1, 0};
         ext_.set_texture(ext::Transparent, 0xE0, preview->specular.Get());
+    }
+    if (preview) {
         ext_.note_estimate("transparent preview: orbit_goliath_013b probe SH and reflection cube",
                            "the fixed preview uses the room probe for all materials; variable per-object reflection selection is unresolved");
     } else {
-        ext_.note_estimate("transparent lighting: sky SH on six 16x16x8 cascades, base cell 2 m, current overhead occlusion when available",
-                           "grid size and update cadence are estimates; map local lighting and object probes are pending");
-        ext_.note_estimate("transparent_advanced: sky reflection, t26 volume weight zero, object occlusion one",
-                           "object-level specular cubemap selection is unavailable on maps");
+        ext_.note_estimate("transparent lighting: sky SH, then the map cubemap volumes within 64 m (largest first), on six 16x16x8 cascades, base cell 2 m",
+                           "grid size, probe radius and update cadence are estimates; local lights and object samples are not in the grid");
+        ext_.note_estimate(reflect ? "transparent_advanced: reflection cube of the smallest map volume holding the eye, object occlusion one"
+                                   : "transparent_advanced: sky reflection (no map volume holds the eye), object occlusion one",
+                           "the engine selects the cube per object; nim uses one per frame");
     }
     ext_.set_scope_constants(ShaderStage::Pixel, 8, advanced);
     grid_ready_ = true;
