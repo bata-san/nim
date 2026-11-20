@@ -240,6 +240,10 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
       "Skeleton-to-rig matching is estimated (shared bones and skin)", "스켈레톤과 리그의 대응은 추정 (공통 본·스킨 일치)")    \
     X(FollowerParts, "連動パーツ %zu", "Linked parts %zu", "연동 파츠 %zu")                                              \
     X(EquipmentCandidate, "装備候補（推定）", "Equipment candidate (estimated)", "장비 후보 (추정)")                      \
+    X(AuthoredMotionBank, "このエンティティのアニメーション参照表", "Animations referenced by this entity", "이 엔티티가 참조하는 애니메이션") \
+    X(RigCompatibleClips, "リグで再生可能な候補（所属は未確認）", "Rig-compatible clips (ownership unverified)", "리그 호환 후보 (소속 미확인)") \
+    X(ShellClipLabel, "[シェル専用]", "[Shell-specific]", "[셸 전용]") \
+    X(SharedClipLabel, "[共通]", "[Shared]", "[공통]") \
     X(SharedBodyClip, "共通の人体ボーンで再生（推定）", "Playing shared body bones (estimated)", "공통 신체 본 재생 (추정)") \
     X(SourcePart, "再生元パーツ %s", "Playing from part %s", "재생 원본 파츠 %s")                                         \
     X(NoClips, "対応するクリップが見つかりません", "No matching clips found", "맞는 클립을 찾지 못했습니다")                  \

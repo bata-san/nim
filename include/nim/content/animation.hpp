@@ -75,8 +75,14 @@ struct ModelRig {
 };
 using ModelRigIndex = std::unordered_map<uint32_t, ModelRig>;
 using ModelAssemblyIndex = std::unordered_map<uint32_t, std::vector<TagHash>>;
+// Animation banks explicitly referenced by the entities that own a model. Sorted by tag.
+struct ModelMotionBank {
+    std::vector<TagHash> clips;
+    std::vector<TagHash> shell_clips;
+};
+using ModelMotionIndex = std::unordered_map<uint32_t, ModelMotionBank>;
 ModelRigIndex index_model_skeletons(PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
-                                   ModelAssemblyIndex* assemblies = nullptr);
+                                   ModelAssemblyIndex* assemblies = nullptr, ModelMotionIndex* motions = nullptr);
 // For an assembled part missing a direct binding, require a unique skeleton and rig layout
 // of the declared size which shares several authored bind joints with another part.
 std::optional<ModelRig> find_assembly_rig(PackageManager& pm, const ModelRigIndex& models, uint32_t bones,
@@ -130,6 +136,7 @@ struct ClipInfo {
     std::vector<AnimationBoneGroup> bone_groups;
     uint32_t name_hash = 0;
     uint16_t shared_bones = 0;  // preview transfer only: keep this many leading rig nodes
+    bool shell_specific = false;  // selected by this shell's branch of the authored animation graph
 };
 // Every clip in the install with its frame and bone counts and ordered bone groups.
 std::vector<ClipInfo> index_animation_clips(PackageManager& pm);

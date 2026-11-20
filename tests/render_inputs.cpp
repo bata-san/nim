@@ -154,6 +154,34 @@ int main() {
     check(center_ray[2] == -1 && center_ray[3] == 0, "screen ray Z does not match the engine camera basis");
     const auto projection_z = scene.get_v(ext::View, 0xC0);
     check(projection_z[3] == -1, "engine projection does not project negative view Z in front of the camera");
+    {
+        // A co-authored mechanism starts its own clip at the same frame, independent
+        // of a humanoid hand or any common joints, and returns to rest on other clips.
+        PreviewAnimation preview;
+        preview.model = TagHash(0x80A40001);
+        AnimationClip camera_event;
+        camera_event.tag = TagHash(0x80A40002);
+        camera_event.frame_count = 2;
+        auto& part = preview.animated_parts.emplace_back();
+        part.model = TagHash(0x80A40003);
+        part.skeleton.parents = {-1, 0};
+        part.skeleton.bind.resize(2);
+        part.skeleton.local_bind.resize(2);
+        part.skeleton.inverse_bind.resize(2);
+        part.rig.skeleton_bone = {0, 1};
+        part.rig.object_space = {0, 0};
+        part.rig.default_pose.resize(2);
+        auto& local = part.clips[camera_event.tag];
+        local.frame_count = 2;
+        local.translations.push_back({1, {{0, 0, 0}, {2, 0, 0}}});
+        auto poses = preview.poses(camera_event, 0.5f);
+        check(poses.size() == 2 && poses[1].model == part.model && poses[1].bones.size() == 2 &&
+              std::abs(poses[1].bones[1].translation[0] - 1) < 1e-6f,
+              "the co-authored part did not play its own animation at the selected frame");
+        camera_event.tag = TagHash(0x80A40004);
+        check(preview.poses(camera_event, 0.5f).size() == 1,
+              "the co-authored part's pose survived switching to an unrelated clip");
+    }
     std::printf("render input tests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

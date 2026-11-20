@@ -448,8 +448,9 @@ int run(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
         ModelAssemblyIndex assemblies;
+        ModelMotionIndex motions;
         ModelRigIndex rigs;
-        if (!single_model || clip_tag || list_clips) rigs = index_model_skeletons(pm, mats, single_model ? nullptr : &assemblies);
+        if (!single_model || clip_tag || list_clips) rigs = index_model_skeletons(pm, mats, single_model ? nullptr : &assemblies, list_clips || clip_tag ? &motions : nullptr);
         auto it = mats.find(mesh_tag.value);
         std::println("dynamic model: {} components indexed in {:.1f}s, materials {}", mats.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
@@ -459,15 +460,17 @@ int run(int argc, char** argv) {
         std::vector<ModelSkinPose> poses;
         if (list_clips) {
             const auto all = index_animation_clips(pm);
-            if (const auto anim = prepare_preview_animation(pm, mesh, rigs, all))
-                for (const auto& c : anim->clips) std::println("clip {} ({} frames)", c.tag.str(), c.frames);
-            else std::println("no compatible clips");
+            if (const auto anim = prepare_preview_animation(pm, mesh, rigs, all, {}, {}, &motions)) {
+                std::println("clip source: {}", anim->authored_clips ? "entity animation bank" : "compatible rig");
+                for (const auto& c : anim->clips)
+                    std::println("clip {} ({} frames){}{}", c.tag.str(), c.frames, c.shell_specific ? " [shell]" : "", c.shared_bones ? " [shared]" : "");
+            } else std::println("no compatible clips");
         }
         if (clip_tag) {
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
             const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups, clip.name_hash};
             const auto all = index_animation_clips(pm);
-            auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1), {}, all);
+            auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1), {}, all, &motions);
             if (!anim || anim->clips.empty())
                 throw std::runtime_error(std::format("clip {} is incompatible with the preview's skinned models", clip.tag.str()));
             restrict_preview_clip(clip, anim->clips.front());

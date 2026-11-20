@@ -218,6 +218,12 @@ struct PreviewAnimation {
         TagHash model;
         std::vector<int32_t> bone_map;
     };
+    struct AnimatedPart {
+        TagHash model;
+        Skeleton skeleton;
+        AnimationRig rig;
+        std::map<TagHash, AnimationClip> clips;
+    };
     struct Equipment {
         TagHash source_clip, model;
         Skeleton skeleton;
@@ -230,6 +236,8 @@ struct PreviewAnimation {
     std::vector<ClipInfo> clips;
     std::vector<Follower> followers;
     bool inferred_binding = false;
+    bool authored_clips = false;
+    std::vector<AnimatedPart> animated_parts;
     std::vector<Equipment> equipment;
     std::optional<uint16_t> equipment_socket;
     std::optional<uint16_t> equipment_wrist;
@@ -271,7 +279,8 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
-                                                          TagHash preferred = {}, std::span<const ClipInfo> related = {});
+                                                          TagHash preferred = {}, std::span<const ClipInfo> related = {},
+                                                          const ModelMotionIndex* motions = nullptr);
 void restrict_preview_clip(AnimationClip& clip, const ClipInfo& info);
 void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAnimation& animation,
                                const ModelRigIndex& rigs, std::span<const ClipInfo> clips,

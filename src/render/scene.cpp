@@ -1159,7 +1159,7 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
 
 std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, float frame, TagHash equipment_model) const {
     std::vector<ModelSkinPose> result;
-    result.reserve(followers.size() + 2);
+    result.reserve(followers.size() + animated_parts.size() + 2);
     result.push_back({model, {}, {}});
     auto& source = result.front().bones;
     pose_skeleton(skeleton, rig, clip, frame, source);
@@ -1186,6 +1186,15 @@ std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, fl
             part.bones.push_back(b < 0 ? BoneTransform{} : result.front().bones[size_t(b)]);
         result.push_back(std::move(part));
     }
+    for (const auto& part : animated_parts) {
+        const auto found = part.clips.find(clip.tag);
+        if (found == part.clips.end()) continue;
+        ModelSkinPose pose{part.model, {}, {}};
+        pose_skeleton(part.skeleton, part.rig, found->second, frame, pose.bones, true);
+        for (size_t b = 0; b < pose.bones.size(); ++b)
+            pose.bones[b] = pose.bones[b] * part.skeleton.inverse_bind[b];
+        result.push_back(std::move(pose));
+    }
     if (held) result.push_back(std::move(*held));
     return result;
 }
@@ -1199,7 +1208,8 @@ bool paired_equipment_clip(const ClipInfo& source, const ClipInfo& candidate) {
 }
 
 void add_shared_body_clips(PackageManager& pm, const ModelRigIndex& rigs, const AnimationRig& target,
-                           std::span<const ClipInfo> clips, std::span<const ClipInfo> related, std::vector<ClipInfo>& result) {
+                           std::span<const ClipInfo> clips, std::span<const ClipInfo> related, std::vector<ClipInfo>& result,
+                           bool authored_shell = false) {
     // The first humanoid group includes the upper body, weapon socket and fingers. Later groups
     // belong to the specific rig and must not be interpreted using the other skeleton's indices.
     if (target.bone_groups.empty() || target.bone_groups.front().hash != 0xC2D413D4) return;
@@ -1210,7 +1220,7 @@ void add_shared_body_clips(PackageManager& pm, const ModelRigIndex& rigs, const 
     for (const auto& clip : clips) {
         if (clip.bone_groups.empty() || clip.bone_groups.front() != group || clip.bones < group.bones ||
             std::ranges::find(result, clip.tag, &ClipInfo::tag) != result.end()) continue;
-        if (std::ranges::any_of(related, [&](const ClipInfo& other) { return paired_equipment_clip(clip, other); }))
+        if (authored_shell || std::ranges::any_of(related, [&](const ClipInfo& other) { return paired_equipment_clip(clip, other); }))
             candidates.push_back(clip);
     }
     if (candidates.empty()) return;
@@ -1246,7 +1256,8 @@ void restrict_preview_clip(AnimationClip& clip, const ClipInfo& info) {
 
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
-                                                          TagHash preferred, std::span<const ClipInfo> related) {
+                                                          TagHash preferred, std::span<const ClipInfo> related,
+                                                          const ModelMotionIndex* motions) {
     struct Part {
         const PreparedMesh* mesh;
         std::optional<Skeleton> skeleton;
@@ -1326,17 +1337,64 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
         if (!valid_skin(part) || part.rig.is_none()) continue;
         auto rig = load_animation_rig(pm, part.rig);
         auto matches = compatible_animation_clips(pm, rigs, rig, clips);
-        if (preferred.is_none()) add_shared_body_clips(pm, rigs, rig, clips, related, matches);
-        if (result && matches.empty()) continue;
-        result = PreviewAnimation{part.mesh->tag, *part.skeleton, std::move(rig), std::move(matches), {}, part.inferred};
-        if (!result->clips.empty()) break;
+        bool authored_clips = false;
+        if (motions) {
+            const auto owned = motions->find(part.mesh->tag.value);
+            if (owned != motions->end()) {
+                auto in_bank = [&](const ClipInfo& clip) { return std::ranges::binary_search(owned->second.clips, clip.tag); };
+                auto is_own_rig = [&](const ClipInfo& clip) {
+                    return clip.bones == rig.size() && !clip.bone_groups.empty() && clip.bone_groups == rig.bone_groups;
+                };
+                authored_clips = std::ranges::any_of(matches, in_bank) ||
+                    std::ranges::any_of(related, [&](const ClipInfo& clip) { return is_own_rig(clip) && in_bank(clip); });
+                if (authored_clips) std::erase_if(matches, [&](const ClipInfo& clip) { return !in_bank(clip); });
+                if (preferred.is_none() && !owned->second.shell_clips.empty()) {
+                    std::vector<ClipInfo> shell_clips;
+                    for (const auto& clip : clips)
+                        if (std::ranges::binary_search(owned->second.shell_clips, clip.tag)) shell_clips.push_back(clip);
+                    const auto before = matches.size();
+                    add_shared_body_clips(pm, rigs, rig, shell_clips, related, matches, true);
+                    authored_clips |= matches.size() != before;
+                    for (auto& clip : matches)
+                        clip.shell_specific = std::ranges::binary_search(owned->second.shell_clips, clip.tag);
+                    std::stable_partition(matches.begin(), matches.end(), [](const ClipInfo& clip) { return clip.shell_specific; });
+                }
+            }
+        }
+        if (!authored_clips && preferred.is_none()) add_shared_body_clips(pm, rigs, rig, clips, related, matches);
+        if (result && matches.empty() && !authored_clips) continue;
+        result = PreviewAnimation{part.mesh->tag, *part.skeleton, std::move(rig), std::move(matches), {}, part.inferred, authored_clips};
+        if (authored_clips || !result->clips.empty()) break;
     }
     if (result && preferred.is_none() && parts.size() > 1) {
         for (const auto& part : parts) {
             if (part.mesh->tag == result->model || !valid_skin(part)) continue;
             auto map = assembly_pose_map(result->skeleton, *part.skeleton);
-            if (std::ranges::any_of(map, [](int32_t index) { return index > 0; }))
+            if (std::ranges::any_of(map, [](int32_t index) { return index > 0; })) {
                 result->followers.push_back({part.mesh->tag, std::move(map)});
+                continue;
+            }
+            // A co-authored part with its own rig can carry a separate track for the same event.
+            // Require its own bank so that aliases such as "open" do not match unrelated meshes.
+            if (!motions || part.rig.is_none()) continue;
+            const auto owned = motions->find(part.mesh->tag.value);
+            if (owned == motions->end()) continue;
+            try {
+                auto rig = load_animation_rig(pm, part.rig);
+                auto compatible = compatible_animation_clips(pm, rigs, rig, related.empty() ? clips : related);
+                std::erase_if(compatible, [&](const ClipInfo& clip) { return !std::ranges::binary_search(owned->second.clips, clip.tag); });
+                PreviewAnimation::AnimatedPart synced{part.mesh->tag, *part.skeleton, std::move(rig), {}};
+                for (const auto& source : result->clips) {
+                    if (!source.name_hash || source.name_hash == 0x811C9DC5 || source.frames < 2) continue;
+                    auto matches = [&](const ClipInfo& clip) {
+                        return clip.tag != source.tag && clip.name_hash == source.name_hash && clip.frames == source.frames;
+                    };
+                    const auto first = std::ranges::find_if(compatible, matches);
+                    if (first != compatible.end() && std::find_if(first + 1, compatible.end(), matches) == compatible.end())
+                        synced.clips.emplace(source.tag, load_animation_clip(pm, first->tag));
+                }
+                if (!synced.clips.empty()) result->animated_parts.push_back(std::move(synced));
+            } catch (const std::exception&) {}
         }
     }
     return result;

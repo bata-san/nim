@@ -742,6 +742,7 @@ public:
         rigs_.reset();
         clips_.reset();
         assemblies_.clear();
+        motions_.clear();
     }
     void request_live(TagHash t, int permutation = -1, ChannelValues channels = {}) {
         {
@@ -866,7 +867,7 @@ private:
                 if (e && e->reference == kClassDynamicModel) {
                     // The entity components hold the materials; index them once.
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
-                    if (!rigs_) rigs_ = index_model_skeletons(*pm, *materials_, &assemblies_);
+                    if (!rigs_) rigs_ = index_model_skeletons(*pm, *materials_, &assemblies_, &motions_);
                     r.mesh = prepare_entity_preview(*pm, tag, *materials_, assemblies_, permutation,
                                                     channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
                     const auto skinned = [](const PreparedMesh& m) {
@@ -876,9 +877,9 @@ private:
                         (rigs_->contains(tag.value) || !r.mesh->attachments.empty() || skinned(*r.mesh))) {
                         try {
                             if (!clips_) clips_ = index_animation_clips(*pm);
-                            r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_);
+                            r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, {}, {}, &motions_);
                             if (r.animation && r.animation->model != tag) {
-                                auto local = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, tag);
+                                auto local = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, tag, {}, &motions_);
                                 if (local && !local->clips.empty()) r.part_animation = std::move(local);
                             }
                             if (r.animation) prepare_preview_equipment(*pm, *r.mesh, *r.animation, *rigs_, *clips_, *materials_);
@@ -929,6 +930,7 @@ private:
     std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> materials_;
     std::optional<ModelRigIndex> rigs_;
     ModelAssemblyIndex assemblies_;
+    ModelMotionIndex motions_;
     std::optional<std::vector<ClipInfo>> clips_;
     PrepareCache thumbnail_cache_{512};
     std::deque<TagHash> thumbs_;
@@ -2343,6 +2345,7 @@ public:
         }
         if (clips.front().bone_groups != binding.rig.bone_groups)
             ImGui::TextDisabled(ui::tr(ui::S::ClipsSameRig));
+        ImGui::TextDisabled(ui::tr(binding.authored_clips ? ui::S::AuthoredMotionBank : ui::S::RigCompatibleClips));
         const float em = ImGui::GetFontSize();
         ImGui::SetNextItemWidth(-1);
         const std::string preview = a.clip < 0 ? std::string(ui::tr(ui::S::BindPose))
@@ -2358,7 +2361,10 @@ public:
             while (clip.Step())
                 for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
                     const auto& c = clips[size_t(i)];
-                    if (ImGui::Selectable(ui::trf(ui::S::ClipFramesItem, c.tag.str(), c.frames, i).c_str(), a.clip == i)) select_clip(i);
+                    std::string tag = c.tag.str();
+                    if (c.shell_specific) tag += std::string(" ") + ui::tr(ui::S::ShellClipLabel);
+                    if (c.shared_bones) tag += std::string(" ") + ui::tr(ui::S::SharedClipLabel);
+                    if (ImGui::Selectable(ui::trf(ui::S::ClipFramesItem, tag, c.frames, i).c_str(), a.clip == i)) select_clip(i);
                 }
             ImGui::EndCombo();
         }

@@ -85,7 +85,8 @@ std::vector<AnimationBoneGroup> read_bone_groups(const TagReader& r, size_t offs
 }
 
 // S808032B3 holds named child entities (S808032BA, 0x40-byte rows).
-std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r, size_t resource) {
+std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r, size_t resource,
+                                        std::vector<TagHash>* colocated) {
     const auto children = r.vec_at(resource + 0x118);
     std::vector<TagHash> result;
     if (children.element_class != 0x808032BA) return result;
@@ -94,7 +95,13 @@ std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r,
         const auto child = resolve_wide_hash(pm, r.u32_at(row + 0x10), r.u64_at(row + 0x18));
         if (!child) continue;
         const Entry* entry = pm.entry(*child);
-        if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+        if (!entry || entry->type != 8 || entry->reference != kClassEntity) continue;
+        result.push_back(*child);
+        // Child rows with no attachment or placement payload are already in the owning
+        // model's space. Leave children whose placement depends on a link out of this preview.
+        if (colocated && r.u32_at(row + 4) == 0 && r.u64_at(row + 8) == 0 &&
+            r.u32_at(row + 0x14) == 0 && r.u64_at(row + 0x28) == 0 &&
+            r.u64_at(row + 0x30) == 0 && r.u64_at(row + 0x38) == 0) colocated->push_back(*child);
     }
     return result;
 }
@@ -114,6 +121,100 @@ std::vector<TagHash> read_equipment_entities(PackageManager& pm, const TagReader
             if (!child) continue;
             const Entry* entry = pm.entry(*child);
             if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+        }
+    }
+    return result;
+}
+
+std::vector<TagHash> read_motion_bank(PackageManager& pm, TagHash tag) {
+    const Entry* entry = pm.entry(tag);
+    if (!entry || entry->type != 8 || entry->reference != 0x80803BE9) return {};
+    const auto bytes = pm.read(tag);
+    TagReader r(bytes);
+    const auto clips = r.vec_at(8);
+    if (clips.element_class != 0x8080AE00 || clips.data > bytes.size() ||
+        clips.count > (bytes.size() - clips.data) / 16) return {};
+    std::vector<TagHash> result(size_t(clips.count));
+    for (size_t i = 0; i < clips.count; ++i) {
+        const size_t row = clips.data + 16 * i;
+        const auto clip_tag = resolve_wide_hash(pm, r.u32_at(row), r.u64_at(row + 8));
+        if (!clip_tag) continue;
+        const auto* clip = pm.entry(*clip_tag);
+        if (clip && clip->type == 8 && clip->reference == kClassAnimationClip) result[i] = *clip_tag;
+    }
+    return result;
+}
+
+struct ShellMotionBranch {
+    std::set<uint32_t> shells;
+    bool shared = false;
+};
+
+// S8080391D selects animation sequences (80803922, vectors of 80803924 clip index / weight).
+// Its 80803968 decision rows encode the shell selector and the next row on a failed test.
+// A negative signed result encodes the sequence index via one's complement.
+std::map<size_t, ShellMotionBranch> read_shell_motion_branches(PackageManager& pm, TagHash graph,
+                                                               const std::unordered_set<uint32_t>& shells) {
+    const auto* entry = pm.entry(graph);
+    if (!entry || entry->reference != 0x80803950) return {};
+    const auto bytes = pm.read(graph);
+    const TagReader r(bytes);
+    std::map<size_t, std::set<uint32_t>> classified_leaves;
+    for (size_t at = 4; at + 0x38 <= bytes.size(); at += 4) {
+        if (r.u32_at(at - 4) != 0x8080391D) continue;
+        try {
+            const auto sequences = r.vec_at(at);
+            const auto decisions = r.vec_at(at + 0x20);
+            if (sequences.element_class != 0x80803922 || decisions.element_class != 0x80803968 ||
+                sequences.data > bytes.size() || decisions.data > bytes.size() ||
+                sequences.count > (bytes.size() - sequences.data) / 16 ||
+                decisions.count > (bytes.size() - decisions.data) / 36) continue;
+            std::map<size_t, uint32_t> selectors;
+            for (size_t i = 0; i < decisions.count; ++i) {
+                const size_t row = decisions.data + i * 36;
+                const uint32_t hash = r.u32_at(row + 0x18);
+                if (shells.contains(hash) && r.u32_at(row + 0x14) == 0x80000000 &&
+                    r.u16_at(row + 0x20) < 0x8000) selectors.emplace(i, hash);
+            }
+            if (selectors.size() < 2) continue;
+            for (const auto& [selector, shell] : selectors) {
+                std::vector<size_t> pending{selector + 1};
+                std::set<size_t> seen;
+                while (!pending.empty()) {
+                    const size_t i = pending.back();
+                    pending.pop_back();
+                    if (i >= decisions.count || selectors.contains(i) || !seen.insert(i).second) continue;
+                    const size_t row = decisions.data + i * 36;
+                    const auto next = r.u16_at(row + 0x1E);
+                    if (next > i && next < decisions.count) pending.push_back(next);
+                    const int result = int16_t(r.u16_at(row + 0x20));
+                    if (result >= 0) {
+                        pending.push_back(i + 1);
+                        continue;
+                    }
+                    const size_t sequence = size_t(-result - 1);
+                    if (sequence >= sequences.count) continue;
+                    const auto leaves = r.vec_at(sequences.data + sequence * 16);
+                    if (leaves.element_class != 0x80803924 || leaves.data > bytes.size() || leaves.count > (bytes.size() - leaves.data) / 8) continue;
+                    for (size_t k = 0; k < leaves.count; ++k)
+                        classified_leaves[leaves.data + 8 * k].insert(shell);
+                }
+            }
+        } catch (const std::exception&) {}
+    }
+    std::map<size_t, ShellMotionBranch> result;
+    if (classified_leaves.empty()) return result;
+    for (size_t at = 8; at + 16 <= bytes.size(); at += 4) {
+        // A leaf vector header is headed by the Tiger sentinel and followed by the typed rows.
+        if (r.u32_at(at - 4) != 0x8080BFCD || r.u32_at(at + 8) != 0x80803924 || r.u32_at(at + 12)) continue;
+        const auto count = r.u64_at(at);
+        if (count > (bytes.size() - at - 16) / 8) continue;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t leaf = at + 16 + i * 8;
+            auto& entry = result[r.u32_at(leaf)];
+            if (const auto found = classified_leaves.find(leaf); found != classified_leaves.end())
+                entry.shells.insert(found->second.begin(), found->second.end());
+            else entry.shared = true;
         }
     }
     return result;
@@ -205,12 +306,19 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
 }
 
 ModelRigIndex index_model_skeletons(
-    PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials, ModelAssemblyIndex* assemblies) {
+    PackageManager& pm, const std::unordered_map<uint32_t, DynamicModelMaterials>& materials, ModelAssemblyIndex* assemblies, ModelMotionIndex* motions) {
     std::unordered_map<uint32_t, std::vector<uint32_t>> models_of;  // component -> models it places
     for (const auto& [model, m] : materials) models_of[m.component.value].push_back(model);
     std::unordered_set<uint32_t> skeletons, rigs;
     std::unordered_map<uint32_t, std::vector<TagHash>> children_of_component;
+    std::unordered_map<uint32_t, std::vector<TagHash>> colocated_of_component;
     std::unordered_map<uint32_t, std::vector<TagHash>> equipment_of_component;
+    std::unordered_map<uint32_t, std::pair<TagHash, TagHash>> bank_of_component;
+    std::unordered_map<uint32_t, uint32_t> shell_of_component;
+    std::unordered_set<uint32_t> shell_values;
+    std::unordered_map<TagHash, std::vector<TagHash>> banks;
+    std::unordered_map<TagHash, std::map<size_t, ShellMotionBranch>> shell_branches;
+    if (motions) motions->clear();
     std::vector<TagHash> entities;
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
@@ -226,10 +334,21 @@ ModelRigIndex index_model_skeletons(
                 const auto [resource, cls] = resource_at(r, 0x18);
                 if (cls == kClassSkeleton) skeletons.insert(tag.value);
                 else if (cls == kClassAnimationRig) rigs.insert(tag.value);
-                else if (cls == 0x808032B3)
-                    children_of_component.emplace(tag.value, read_child_entities(pm, r, resource));
-                else if (cls == 0x8080A313 && assemblies)
+                else if (cls == 0x808032B3) {
+                    std::vector<TagHash> colocated;
+                    children_of_component.emplace(tag.value, read_child_entities(pm, r, resource, assemblies ? &colocated : nullptr));
+                    if (!colocated.empty()) colocated_of_component.emplace(tag.value, std::move(colocated));
+                } else if (cls == 0x8080A313 && assemblies)
                     equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource, true));
+                else if (motions && cls == 0x80803936)
+                    bank_of_component.emplace(tag.value, std::pair{r.tag_at(resource + 0xE8), r.tag_at(resource + 0xF4)});
+                else if (motions && cls == 0x808041DA && r.u32_at(resource + 0x140) == 0x808041DE) {
+                    const uint32_t value = r.u32_at(resource + 0x148), shell = r.u32_at(resource + 0x14C);
+                    if (value == 9 && shell && shell != 0x811C9DC5) {
+                        shell_values.insert(shell);
+                        shell_of_component.emplace(tag.value, shell);
+                    }
+                }
             } catch (...) {
             }
         }
@@ -238,8 +357,16 @@ ModelRigIndex index_model_skeletons(
         ModelRig binding;
         std::vector<uint32_t> models;
         std::vector<TagHash> children;
+        std::vector<TagHash> colocated;
         std::vector<TagHash> equipment;
+        std::vector<TagHash> clips;
     };
+    struct MotionOwners {
+        uint32_t shell = 0;
+        bool conflicting = false;
+        std::vector<TagHash> shell_clips;
+    };
+    std::unordered_map<uint32_t, MotionOwners> motion_owners;
     std::unordered_map<uint32_t, EntityBinding> bindings;
     std::unordered_map<uint32_t, ModelRig> out;
     std::unordered_map<TagHash, TagHash> rig_for_skeleton;
@@ -250,6 +377,9 @@ ModelRigIndex index_model_skeletons(
             TagReader r(bytes);
             auto comps = r.vec_at(0x08);
             EntityBinding node;
+            uint32_t shell = 0;
+            std::vector<TagHash> shell_clips;
+            std::vector<std::pair<TagHash, TagHash>> motion_banks;
             for (uint64_t k = 0; k < comps.count; ++k) {
                 const uint32_t c = r.u32_at(comps.data + size_t(k) * 12);
                 if (skeletons.count(c)) node.binding.skeleton = TagHash(c);
@@ -258,8 +388,58 @@ ModelRigIndex index_model_skeletons(
                     node.models.insert(node.models.end(), f->second.begin(), f->second.end());
                 if (auto f = children_of_component.find(c); f != children_of_component.end())
                     node.children.insert(node.children.end(), f->second.begin(), f->second.end());
+                if (auto f = colocated_of_component.find(c); f != colocated_of_component.end())
+                    node.colocated.insert(node.colocated.end(), f->second.begin(), f->second.end());
                 if (auto f = equipment_of_component.find(c); f != equipment_of_component.end())
                     node.equipment.insert(node.equipment.end(), f->second.begin(), f->second.end());
+                if (auto f = bank_of_component.find(c); f != bank_of_component.end() && !f->second.first.is_none())
+                    motion_banks.push_back(f->second);
+                if (auto f = shell_of_component.find(c); f != shell_of_component.end()) shell = f->second;
+            }
+            for (const auto& [bank_tag, graph_tag] : motion_banks) {
+                const auto [bank, fresh] = banks.try_emplace(bank_tag);
+                if (fresh) {
+                    try { bank->second = read_motion_bank(pm, bank_tag); } catch (const std::exception&) {}
+                }
+                auto branch_index = shell_branches.end();
+                if (shell && !graph_tag.is_none()) {
+                    const auto [graph, fresh] = shell_branches.try_emplace(graph_tag);
+                    if (fresh) {
+                        try { graph->second = read_shell_motion_branches(pm, graph_tag, shell_values); }
+                        catch (const std::exception&) {}
+                    }
+                    branch_index = graph;
+                }
+                for (size_t i = 0; i < bank->second.size(); ++i) {
+                    if (bank->second[i].is_none()) continue;
+                    if (branch_index != shell_branches.end()) {
+                        const auto found = branch_index->second.find(i);
+                        if (found != branch_index->second.end() && !found->second.shared && !found->second.shells.empty()) {
+                            if (!found->second.shells.contains(shell)) continue;
+                            shell_clips.push_back(bank->second[i]);
+                        }
+                    }
+                    node.clips.push_back(bank->second[i]);
+                }
+            }
+            if (motions && !node.clips.empty()) {
+                std::ranges::sort(node.clips);
+                node.clips.erase(std::unique(node.clips.begin(), node.clips.end()), node.clips.end());
+                for (auto model : node.models) {
+                    if (shell) {
+                        auto& owner = motion_owners[model];
+                        if (owner.shell && owner.shell != shell) owner.conflicting = true;
+                        else owner.shell = shell;
+                        owner.shell_clips.insert(owner.shell_clips.end(), shell_clips.begin(), shell_clips.end());
+                    }
+                    auto [owned, fresh] = motions->try_emplace(model, ModelMotionBank{node.clips, {}});
+                    if (fresh || owned->second.clips == node.clips) continue;
+                    // A mesh reused by several entities can show their common clips in its own
+                    // preview. The individual owners' state machines may select different extras.
+                    std::vector<TagHash> common;
+                    std::ranges::set_intersection(owned->second.clips, node.clips, std::back_inserter(common));
+                    owned->second.clips = std::move(common);
+                }
             }
             if (!node.binding.skeleton.is_none()) {
                 if (!node.binding.rig.is_none()) {
@@ -275,6 +455,17 @@ ModelRigIndex index_model_skeletons(
                 bindings.emplace(ent.value, std::move(node));
         } catch (...) {
         }
+    }
+    for (auto& [model, owner] : motion_owners) {
+        if (owner.conflicting || owner.shell_clips.empty()) continue;
+        auto& bank = motions->at(model);
+        auto& own = owner.shell_clips;
+        std::ranges::sort(own);
+        own.erase(std::unique(own.begin(), own.end()), own.end());
+        std::vector<TagHash> merged;
+        std::ranges::set_union(bank.clips, own, std::back_inserter(merged));
+        bank.clips = std::move(merged);
+        bank.shell_clips = std::move(own);
     }
     std::unordered_map<uint32_t, ModelRig> inherited;
     std::unordered_set<uint32_t> ambiguous;
@@ -342,9 +533,10 @@ ModelRigIndex index_model_skeletons(
         std::unordered_map<uint32_t, std::unordered_set<uint32_t>> roots_of;
         std::unordered_set<uint32_t> ambiguous_roots;
         for (const auto& [entity, node] : bindings) {
-            if (node.models.size() != 1 || node.equipment.empty()) continue;
+            if (node.models.size() != 1 || (node.equipment.empty() && node.colocated.empty())) continue;
             const uint32_t root = node.models.front();
             std::vector<TagHash> pending = node.equipment;
+            pending.insert(pending.end(), node.colocated.begin(), node.colocated.end());
             std::unordered_set<uint32_t> seen{entity};
             std::vector<TagHash> parts;
             while (!pending.empty()) {
@@ -358,6 +550,7 @@ ModelRigIndex index_model_skeletons(
                     parts.emplace_back(model);
                 }
                 pending.insert(pending.end(), it->second.equipment.begin(), it->second.equipment.end());
+                pending.insert(pending.end(), it->second.colocated.begin(), it->second.colocated.end());
             }
             std::ranges::sort(parts);
             parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
@@ -373,9 +566,8 @@ ModelRigIndex index_model_skeletons(
         for (const auto& [model, roots] : roots_of) {
             if (roots.size() == 1) assemblies->try_emplace(model, assemblies->at(*roots.begin()));
         }
-        // Bodies built from several skinned models placed by one entity (torso, limbs, head)
-        // share one skeleton and object space: preview them together. The root is a part bound to
-        // a skeleton with a rig, else the one declaring the most bones.
+        // Models directly owned by the same entity share its object space. Keep rigid parts
+        // too: machines and props can be split across several model components.
         std::unordered_map<uint32_t, uint32_t> bones_of;
         auto skinned_bones = [&](uint32_t model) -> uint32_t {
             if (const auto it = bones_of.find(model); it != bones_of.end()) return it->second;
@@ -392,8 +584,7 @@ ModelRigIndex index_model_skeletons(
         for (const auto& [entity, node] : bindings) {
             if (node.models.size() < 2) continue;
             std::vector<TagHash> parts;
-            for (uint32_t model : node.models)
-                if (skinned_bones(model)) parts.emplace_back(model);
+            for (uint32_t model : node.models) parts.emplace_back(model);
             std::ranges::sort(parts);
             parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
             if (parts.size() < 2) continue;
