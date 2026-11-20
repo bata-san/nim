@@ -213,6 +213,8 @@ public:
         // Instanced quads: a per-instance stream of this many float4s (TEXCOORD0..n-1), each
         // instance drawn as a 4-vertex strip (draw_instances). 0 = none.
         uint32_t instance_float4s = 0;
+        // A graphics technique that also carries a compute stage: load that stage instead.
+        bool compute_stage = false;
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -657,8 +659,14 @@ private:
     void load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
     void release_light_grid(Gpu& gpu);
     void render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
-                           const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview);
-    GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_;
+                           const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview,
+                           const SunShadow* shadow);
+    // light_sample_points_shadow_compute: the sun visibility of each grid cell from the sun shadow
+    // map (extern 6), read by the transparent shaders as extern 40 +0x40.
+    void render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow);
+    GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_, grid_sun_;
+    std::array<ComPtr<ID3D12Resource>, 2> grid_sun_vis_;  // [0] result, [1] the "previous" input, all 1
+    bool grid_sun_cleared_ = false;
     ExternStore grid_ext_;
     std::array<ComPtr<ID3D12Resource>, 3> grid_basis_, grid_sh_;
     ComPtr<ID3D12DescriptorHeap> grid_clear_heap_;

@@ -489,7 +489,7 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     release(gpu);
     tag_ = technique;
     Technique t = load_technique(pm, technique);
-    compute_ = t.bind_mode == 6 || (t.bind_mode == 2 &&
+    compute_ = t.bind_mode == 6 || (opt.compute_stage && !t.stage(ShaderStage::Compute).shader.is_none()) || (t.bind_mode == 2 &&
         !t.stage(ShaderStage::Compute).shader.is_none() && t.stage(ShaderStage::Pixel).shader.is_none());
     if (!compute_ && t.bind_mode != 1) throw std::runtime_error("Unsupported original pipeline bind mode");
     auto authored_scopes = load_technique_scopes(pm, load_render_globals(pm), t);
@@ -1927,7 +1927,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (transparents && (sky_ambient || preview_probe) && needs_light_grid) {
         try {
             ProfileScope ps_("frame.light.grid");
-            render_light_grid(gpu, cl, vm, scopes, sky_ambient, overhead_occlusion_on(p), preview_probe);
+            render_light_grid(gpu, cl, vm, scopes, sky_ambient, overhead_occlusion_on(p), preview_probe, shadow);
         } catch (const std::exception& ex) {
             ext_.note_estimate("transparent light grid is unavailable", ex.what());
         }

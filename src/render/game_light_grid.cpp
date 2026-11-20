@@ -50,7 +50,14 @@ void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const
         }
         for (auto& basis : grid_basis_) basis = volume(gpu, kX * 6, DXGI_FORMAT_R32_TYPELESS);
         for (auto& sh : grid_sh_) sh = volume(gpu, kX, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3};
+        if (const auto tag = globals_.pipeline("light_sample_points_shadow_compute"); !tag.is_none()) {
+            GamePipeline::Options opt;
+            opt.compute_stage = true;
+            grid_sun_.load(pm, gpu, tag, scopes, opt);
+            for (auto& v : grid_sun_vis_) v = volume(gpu, kX, DXGI_FORMAT_R16_FLOAT);
+            grid_sun_cleared_ = false;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5};
         check_hr(gpu.device()->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&grid_clear_heap_)), "light grid UAV descriptors");
     } catch (const std::exception& ex) {
         release_light_grid(gpu);
@@ -59,7 +66,8 @@ void GameLighting::load_light_grid(PackageManager& pm, Gpu& gpu, std::span<const
 }
 
 void GameLighting::release_light_grid(Gpu& gpu) {
-    for (auto* pipeline : {&grid_sky_, &grid_probe_, &grid_blend_, &grid_encode_, &grid_points_}) pipeline->release(gpu);
+    for (auto* pipeline : {&grid_sky_, &grid_probe_, &grid_blend_, &grid_encode_, &grid_points_, &grid_sun_}) pipeline->release(gpu);
+    for (auto& resource : grid_sun_vis_) resource.Reset();
     for (auto& resource : grid_basis_) resource.Reset();
     for (auto& resource : grid_sh_) resource.Reset();
     grid_clear_heap_.Reset();
@@ -68,7 +76,8 @@ void GameLighting::release_light_grid(Gpu& gpu) {
 }
 
 void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm,
-                                     const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview) {
+                                     const ScopeBufferFn& scopes, bool sky, bool overhead, const CubemapVolume* preview,
+                                     const SunShadow* shadow) {
     const float cell = preview ? 0.5f : kCell;
     const float4 center = preview ? float4{} : float4{std::floor(vm.eye.x / kCell) * kCell, std::floor(vm.eye.y / kCell) * kCell,
                         std::floor(vm.eye.z / kCell) * kCell, 0};
@@ -91,7 +100,13 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     // Local lights: each adds its SH into the cells (atomics) after the volumes have blended them.
     // Lights whose volume comes within this radius of the grid centre are run (estimate).
     constexpr float kLightRadius = 64;
-    const bool rebuild_lights = !preview && grid_points_.loaded() && !lights_.empty();
+    // Diagnostic: NIM_GRID_PARTS = bit mask of the grid inputs to run (1 sky, 2 volumes, 4 lights).
+    const unsigned parts = [] {
+        const char* v = std::getenv("NIM_GRID_PARTS");
+        return v ? unsigned(std::strtoul(v, nullptr, 0)) : 7u;
+    }();
+    if (!(parts & 2)) probes.clear();
+    const bool rebuild_lights = (parts & 4) && !preview && grid_points_.loaded() && !lights_.empty();
     if (!grid_clear_heap_ || (sky && !hemi_inputs_) || (!sky && probes.empty() && !rebuild_lights)) return;
     const float4 cover_scale = overhead ? overhead_scale_ : float4{};
     const float4 cover_offset = overhead ? overhead_offset_ : float4{};
@@ -172,7 +187,7 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
             Gpu::barrier(cl, cover, kPixel, kRead);
         }
         try {
-            if (sky) {
+            if (sky && (parts & 1)) {
                 grid_sky_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices - 1);
                 synchronize_uavs(cl);
             }
@@ -279,7 +294,28 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
         grid_key_ = key;
     }
     for (uint32_t i = 0; i < 3; ++i) ext_.set_texture(ext::Transparent, 0x28 + 8 * i, grid_sh_[i].Get());
-    ext_.estimate_texture(ext::Transparent, 0x40, no_atmosphere_.Get(), "sun visibility on transparent grid = 1");
+    bool sun_grid = false;
+    if (!preview && shadow && shadow->valid && shadow->depth && grid_sun_.loaded() && grid_sun_vis_[0]) {
+        const auto cb3 = [&] {
+            const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+            std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+            return a.gpu;
+        }();
+        const ScopeBufferFn grid_scopes = [&](ShaderStage stage, uint32_t reg) { return reg == 3 ? cb3 : scopes(stage, reg); };
+        try {
+            render_grid_sun(gpu, cl, grid_scopes, *shadow);
+            sun_grid = true;
+        } catch (const std::exception& ex) {
+            ext_.note_estimate("transparent grid sun visibility unavailable", ex.what());
+        }
+    }
+    if (sun_grid) {
+        ext_.set_texture(ext::Transparent, 0x40, grid_sun_vis_[0].Get());
+        ext_.note_estimate("transparent grid sun visibility: light_sample_points_shadow_compute on nim's sun shadow map, every cell replaced each frame, 1 outside the map",
+                           "extern 6 +0x30 compare slope = -map size (as the froxels); extern 0x43 +0x50 = (1, 0, 1, 1) with a constant in-range matrix at +0x60 (camera range test and temporal blend off)");
+    } else {
+        ext_.estimate_texture(ext::Transparent, 0x40, no_atmosphere_.Get(), "sun visibility on transparent grid = 1");
+    }
     ext_.set_scope_constants(ShaderStage::Pixel, 3, cb);
     ext_.set_scope_constants(ShaderStage::Vertex, 3, cb);
     std::array<float4, 37> advanced{};
@@ -328,5 +364,56 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     }
     ext_.set_scope_constants(ShaderStage::Pixel, 8, advanced);
     grid_ready_ = true;
+}
+
+void GameLighting::render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow) {
+    constexpr uint8_t kSun = 6, kMask = 0x43;  // extern 0x43 (67): the grid sample shadow block
+    auto* out = grid_sun_vis_[0].Get();
+    auto* one = grid_sun_vis_[1].Get();
+    if (!grid_sun_cleared_) {  // the "previous" input stays 1: cells outside the shadow map are lit
+        const auto inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const auto first = gpu.transient_descriptors(2);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        desc.Format = DXGI_FORMAT_R16_FLOAT;
+        desc.Texture3D.WSize = kSlices;
+        ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+        cl->SetDescriptorHeaps(1, heaps);
+        constexpr float ones[4]{1, 1, 1, 1};
+        for (uint32_t i = 0; i < 2; ++i) {
+            auto* v = grid_sun_vis_[i].Get();
+            const D3D12_CPU_DESCRIPTOR_HANDLE clear{grid_clear_heap_->GetCPUDescriptorHandleForHeapStart().ptr + (3 + i) * size_t(inc)};
+            gpu.device()->CreateUnorderedAccessView(v, nullptr, &desc, clear);
+            gpu.device()->CreateUnorderedAccessView(v, nullptr, &desc, gpu.srv().cpu(first + i));
+            Gpu::barrier(cl, v, kRead, kWrite);
+            cl->ClearUnorderedAccessViewFloat(gpu.srv().gpu(first + i), clear, v, ones, 0, nullptr);
+            Gpu::barrier(cl, v, kWrite, kRead);
+        }
+        grid_sun_cleared_ = true;
+    }
+    auto& e = grid_ext_;
+    const float size = float(shadow.size);
+    e.set(kSun, 0x100, shadow.vm.vp_abs);  // absolute world -> sun clip (cb0[9..12])
+    e.set(kSun, 0x18, size);
+    e.set(kSun, 0x1C, size);
+    e.set(kSun, 0x30, float4{-size, 0, 0, 0});  // reversed depth: a negative slope on (receiver - map)
+    e.set_texture(kSun, 0x00, shadow.depth.Get(), DXGI_FORMAT_R32_FLOAT);
+    M4 in_range{};
+    in_range.c[3] = {0, 0, 0.5f, 1};
+    e.set(kMask, 0x60, in_range);
+    e.set(kMask, 0x50, float4{1, 0, 1, 1});
+    e.set_texture(kMask, 0x10, one);
+    e.set_texture(kMask, 0xA0, out, DXGI_FORMAT_R16_FLOAT);
+    Gpu::barrier(cl, shadow.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
+    Gpu::barrier(cl, out, kRead, kWrite);
+    try {
+        grid_sun_.dispatch(gpu, cl, e, grid_scopes, kX / 8, kY / 8, kSlices);
+    } catch (...) {
+        Gpu::barrier(cl, out, kWrite, kRead);
+        Gpu::barrier(cl, shadow.depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        throw;
+    }
+    Gpu::barrier(cl, out, kWrite, kRead);
+    Gpu::barrier(cl, shadow.depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 }
 }
