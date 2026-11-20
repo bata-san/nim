@@ -143,6 +143,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(Rewind, "先頭に戻す", "Rewind", "처음으로")                                                                       \
     X(Audio, "音声", "Audio", "음성")                                                                                    \
     X(Voice, "音声", "Voice", "음성")                                                                                    \
+    X(VoiceFollowText, "本文の言語に合わせる", "Match text language", "텍스트 언어에 맞춤")                                  \
     X(None, "なし", "None", "없음")                                                                                      \
     X(Off, "オフ", "Off", "끔")                                                                                          \
     X(Unsupported, "未対応", "unsupported", "미지원")                                                                    \

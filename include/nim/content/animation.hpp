@@ -60,7 +60,7 @@ struct AnimationRig {
     TagHash component;
     std::vector<uint16_t> skeleton_bone;      // rig bone -> skeleton bone
     std::vector<uint8_t> object_space;        // rig bone: rotation is object space, not parent-relative
-    std::vector<uint8_t> bind_relative;      // local mode with identity rig rest transform
+    std::vector<uint8_t> bind_relative;      // mode 1 with identity rig rest, a bind-relative candidate
     std::vector<BoneTransform> default_pose;  // rig order
     std::vector<AnimationBoneGroup> bone_groups;
     std::vector<uint8_t> node_layout;         // full authored node records for layout comparisons
@@ -128,6 +128,7 @@ struct ClipInfo {
     TagHash tag;
     uint16_t frames = 0, bones = 0;
     std::vector<AnimationBoneGroup> bone_groups;
+    uint32_t name_hash = 0;
 };
 // Every clip in the install with its frame and bone counts and ordered bone groups.
 std::vector<ClipInfo> index_animation_clips(PackageManager& pm);
@@ -147,7 +148,7 @@ bool is_additive(const AnimationRig& rig, const AnimationClip& clip);
 // space; bone offsets stay those of the bind pose, except that bones directly under the root move
 // by the clip translation (object space, relative to bind). Root motion is dropped.
 void pose_skeleton(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip, float frame,
-                   std::vector<BoneTransform>& object);
+                   std::vector<BoneTransform>& object, bool authored_local_offsets = false);
 
 // ---- Skin weights ---------------------------------------------------------------------------------
 // The game's compute_skinning reads the bone binding from vb0's position w (s16): |w| < 0x800 is

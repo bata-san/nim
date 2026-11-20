@@ -201,10 +201,6 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
         rig.bind_relative.push_back(space == 1 && identity);
         rig.default_pose.push_back(rest);
     }
-    // Only weapon / mechanism rigs, which pose (nearly) everything parent-relative, store bind
-    // offsets. Body rigs (many object-space nodes) keep their identity-rest local nodes (hand,
-    // foot and prop sockets) on the regular path. A threshold estimate.
-    if (std::ranges::count(rig.object_space, uint8_t(1)) > 3) std::ranges::fill(rig.bind_relative, uint8_t(0));
     return rig;
 }
 
@@ -734,7 +730,7 @@ std::vector<ClipInfo> index_animation_clips(PackageManager& pm) {
             try {
                 auto bytes = pm.read(tag);
                 TagReader r(bytes);
-                out.push_back({tag, r.u16_at(0x140), r.u16_at(0x142), read_bone_groups(r, 0x170)});
+                out.push_back({tag, r.u16_at(0x140), r.u16_at(0x142), read_bone_groups(r, 0x170), r.u32_at(0x120)});
             } catch (...) {
             }
         }
@@ -926,25 +922,25 @@ bool is_additive(const AnimationRig& rig, const AnimationClip& clip) {
 }
 
 void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationClip& clip, float frame,
-                   std::vector<BoneTransform>& object) {
+                   std::vector<BoneTransform>& object, bool authored_local_offsets) {
     std::vector<BoneTransform> pose = rig.default_pose;
     // Clips shared by rigs of other proportions carry their own limb offsets. A parent-relative
     // translation track that never comes near this rig's rest offset was authored for another
     // body: keep the bind offset so limbs keep their length. Tracks that start from the rest
     // offset (sliding parts, jaws) play as authored.
     std::vector<uint8_t> foreign_offset(rig.size(), 0);
-    // Rig nodes with an identity rest (bind_relative) may hold either offsets from the bind pose
-    // (weapon rigs) or the full parent-relative transform: a track that reaches the bone's bind
-    // offset / rotation is a full transform, one that reaches zero / identity is an offset.
+    // Weapon and mechanism rigs can mix full local transforms and bind-relative offsets.
+    // Their largely parent-relative layouts keep the existing track-based interpretation.
+    const bool mechanism_offsets = std::ranges::count(rig.object_space, uint8_t(1)) <= 3;
+    const auto identity_local = [&](size_t bone) { return bone < rig.bind_relative.size() && rig.bind_relative[bone]; };
     std::vector<int32_t> rig_to_skeleton_parent_child(rig.size(), -1);
     for (size_t i = 0; i < rig.size(); ++i)
         if (rig.skeleton_bone[i] < sk.size()) rig_to_skeleton_parent_child[i] = rig.skeleton_bone[i];
     std::vector<uint8_t> offset_translation(rig.size(), 0), offset_rotation(rig.size(), 1);
     const bool additive = is_additive(rig, clip);
     if (!additive) {
-        auto bind_relative = [&](size_t bone) { return bone < rig.bind_relative.size() && rig.bind_relative[bone]; };
         for (const auto& t : clip.rotations) {
-            if (t.bone >= rig.size() || !bind_relative(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
+            if (!mechanism_offsets || t.bone >= rig.size() || !identity_local(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
             const Q& bind = sk.local_bind[size_t(rig_to_skeleton_parent_child[t.bone])].rotation;
             float to_bind = 1e30f, to_identity = 1e30f;
             for (const auto& q : t.frames) {
@@ -954,7 +950,7 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
             offset_rotation[t.bone] = to_identity <= to_bind;
         }
         for (const auto& t : clip.translations) {
-            if (t.bone >= rig.size() || !bind_relative(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
+            if (!mechanism_offsets || t.bone >= rig.size() || !identity_local(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
             const auto& bind = sk.local_bind[size_t(rig_to_skeleton_parent_child[t.bone])].translation;
             const float length = std::sqrt(bind[0] * bind[0] + bind[1] * bind[1] + bind[2] * bind[2]);
             const float tolerance = std::max(0.005f, 0.1f * length);
@@ -979,7 +975,7 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 const float x = v[0] - rest[0], y = v[1] - rest[1], z = v[2] - rest[2];
                 nearest = std::min(nearest, std::sqrt(x * x + y * y + z * z));
             }
-            if (nearest > tolerance) foreign_offset[t.bone] = 1;
+            if (!authored_local_offsets && nearest > tolerance) foreign_offset[t.bone] = 1;
         }
     }
     if (additive) {
@@ -999,6 +995,9 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         if (rig.skeleton_bone[i] < n) rig_of[rig.skeleton_bone[i]] = int32_t(i);
     object.assign(n, BoneTransform{});
     std::vector<uint8_t> done(n, 0);
+    std::vector<uint8_t> below_wrist(n, 0);
+    // Authored skeleton bone hashes shared by the humanoid wrists.
+    constexpr uint32_t wrist_a = 0x67CB838C, wrist_b = 0xEA6B9DDE;
     // Parents precede children in Tiger skeletons; a few extra passes cover any that do not.
     for (size_t pass = 0; pass < 8; ++pass) {
         bool all = true;
@@ -1011,21 +1010,19 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
             }
             const int32_t ri = rig_of[b];
             BoneTransform& o = object[b];
-            // The clip rotation is the bone's rotation (local or object space by the node). An
-            // earlier version re-based nodes whose rig default pose differs from the skeleton bind
-            // (clip x rest^-1 x bind); on the 81 / 103 bone humans that bent the wrists backwards
-            // and turned the fingers up, while the feet were unchanged (user report, 2026-11-20).
-            auto attached = [&](const Q& clip, const Q&) { return qnormalize(clip); };
             if (p < 0) {
                 o = sk.bind[b];
-                if (ri >= 0) o.rotation = attached(pose[size_t(ri)].rotation, sk.bind[b].rotation);
+                if (ri >= 0) o.rotation = qnormalize(pose[size_t(ri)].rotation);
             } else {
+                const uint32_t parent_hash = size_t(p) < sk.hashes.size() ? sk.hashes[size_t(p)] : 0;
+                below_wrist[b] = below_wrist[size_t(p)] || parent_hash == wrist_a || parent_hash == wrist_b;
                 const BoneTransform& po = object[size_t(p)];
                 auto local = sk.local_bind[b];
                 if (ri >= 0 && !rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
                     const auto& rest = rig.default_pose[size_t(ri)];
-                    if (size_t(ri) < rig.bind_relative.size() && rig.bind_relative[size_t(ri)] && !additive) {
+                    const bool bind_digit = below_wrist[b] && identity_local(size_t(ri));
+                    if (mechanism_offsets && identity_local(size_t(ri)) && !bind_digit && !additive) {
                         // Local-mode weapon rigs can store offsets from the model bind pose.
                         local.rotation = offset_rotation[size_t(ri)] ? qnormalize(qmul(c.rotation, local.rotation)) : c.rotation;
                         if (offset_translation[size_t(ri)] == 1)
@@ -1034,7 +1031,9 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                             local.translation = c.translation;
                         if (c.scale > 0 && std::isfinite(c.scale)) local.scale *= c.scale;
                     } else {
-                        local.rotation = attached(c.rotation, sk.local_bind[b].rotation);
+                        // The identity-rest digit channels bend about the finger's own bind axes.
+                        // An identity key preserves the joint's bind orientation, including thumb opposition.
+                        local.rotation = bind_digit ? qnormalize(qmul(local.rotation, c.rotation)) : qnormalize(c.rotation);
                         // A matching rest offset establishes that this track uses the local
                         // skeleton space and units. Variant rigs can have different proportions.
                         float rest_error = 0;
@@ -1048,7 +1047,7 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 o = po * local;
                 if (ri >= 0 && rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
-                    o.rotation = attached(c.rotation, sk.bind[b].rotation);
+                    o.rotation = qnormalize(c.rotation);
                     if (sk.parents[size_t(p)] < 0)
                         for (int k = 0; k < 3; ++k) o.translation[k] = sk.bind[b].translation[k] + c.translation[k];
                 }

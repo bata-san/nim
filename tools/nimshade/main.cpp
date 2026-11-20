@@ -463,11 +463,14 @@ int run(int argc, char** argv) {
         }
         if (clip_tag) {
             AnimationClip clip = load_animation_clip(pm, *clip_tag);
-            const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups};
-            const auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1));
+            const ClipInfo info{clip.tag, uint16_t(clip.frame_count), uint16_t(clip.bone_count), clip.bone_groups, clip.name_hash};
+            auto anim = prepare_preview_animation(pm, mesh, rigs, std::span(&info, 1));
             if (!anim || anim->clips.empty())
                 throw std::runtime_error(std::format("clip {} is incompatible with the preview's skinned models", clip.tag.str()));
+            prepare_preview_equipment(pm, mesh, *anim, rigs, index_animation_clips(pm), mats);
             poses = anim->poses(clip, clip_frame);
+            for (const auto& pose : poses)
+                if (pose.placement) std::println("animation equipment {}", pose.model.str());
             std::println("posed model {} and {} linked parts with clip {} ({}, {} frames{}) at frame {}{}",
                          anim->model.str(), poses.size() - 1, clip.tag.str(), clip_codec_name(clip.codec), clip.frame_count,
                          is_additive(anim->rig, clip) ? ", additive" : "", clip_frame,

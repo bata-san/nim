@@ -725,13 +725,13 @@ int cmd_dialogue(PackageManager& pm, const char* out_path) {
     DialogueStats st;
     auto lines = load_all_dialogue(pm, &st);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    auto text = [&](uint32_t h, size_t lang) -> std::string {
-        const LocalizedString* s = table.find(h);
+    auto text = [&](uint32_t h, size_t lang, TagHash container = {}) -> std::string {
+        const LocalizedString* s = table.find(h, container);
         return s ? s->text[lang] : std::string();
     };
     size_t with_text = 0, with_speaker = 0, with_wem = 0;
     for (const auto& l : lines) {
-        with_text += !text(l.subtitle_hash, 0).empty();
+        with_text += !text(l.subtitle_hash, 0, l.subtitle_container).empty();
         with_speaker += !text(l.speaker_hash, 0).empty();
         with_wem += !l.wem.empty();
     }
@@ -741,8 +741,8 @@ int cmd_dialogue(PackageManager& pm, const char* out_path) {
                  with_speaker, st.audio_resolved, with_wem);
     for (size_t i = 0; i < std::min<size_t>(lines.size(), 8); ++i) {
         const auto& l = lines[i * (lines.size() / 8)];
-        std::println("  [{}] {}: {}\n      {}: {}", l.table.str(), text(l.speaker_hash, 0), text(l.subtitle_hash, 0),
-                     text(l.speaker_hash, 1), text(l.subtitle_hash, 1));
+        std::println("  [{}] {}: {}\n      {}: {}", l.table.str(), text(l.speaker_hash, 0), text(l.subtitle_hash, 0, l.subtitle_container),
+                     text(l.speaker_hash, 1), text(l.subtitle_hash, 1, l.subtitle_container));
     }
     if (out_path) {
         std::ofstream f(out_path, std::ios::binary);
@@ -752,9 +752,9 @@ int cmd_dialogue(PackageManager& pm, const char* out_path) {
         for (const auto& l : lines) {
             f << std::format("{},{:08X},{},{},{:08X}", l.table.str(), l.line_id, csv_field(text(l.speaker_hash, 0)),
                              csv_field(text(l.speaker_hash, 1)), l.subtitle_hash);
-            for (size_t lg = 0; lg < kTextLanguageCount; ++lg) f << ',' << csv_field(text(l.subtitle_hash, lg));
-            std::string caption = text(l.caption_hash, 0);
-            f << ',' << csv_field(caption == text(l.subtitle_hash, 0) ? "" : caption);
+            for (size_t lg = 0; lg < kTextLanguageCount; ++lg) f << ',' << csv_field(text(l.subtitle_hash, lg, l.subtitle_container));
+            std::string caption = text(l.caption_hash, 0, l.caption_container);
+            f << ',' << csv_field(caption == text(l.subtitle_hash, 0, l.subtitle_container) ? "" : caption);
             f << ',' << (l.audio_event.is_none() ? "" : l.audio_event.str()) << ",\"";
             for (size_t w = 0; w < l.wem.size(); ++w) f << (w ? " " : "") << l.wem[w].str();
             f << "\"\n";

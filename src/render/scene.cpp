@@ -1092,17 +1092,32 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
 
 std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, float frame) const {
     std::vector<ModelSkinPose> result;
-    result.reserve(followers.size() + 1);
-    result.push_back({model, {}});
+    result.reserve(followers.size() + 2);
+    result.push_back({model, {}, {}});
     auto& source = result.front().bones;
     pose_skeleton(skeleton, rig, clip, frame, source);
+    std::optional<ModelSkinPose> held;
+    if (auto e = std::ranges::find(equipment, clip.tag, &Equipment::source_clip); e != equipment.end()) {
+        const auto socket = *equipment_socket;
+        const auto wrist = *equipment_wrist;
+        std::vector<BoneTransform> sampled = rig.default_pose;
+        sample_clip(clip, frame, sampled);
+        // Use the recorded socket rotation and its offset from the recorded wrist. Anchor that
+        // offset to the posed wrist so different body proportions still hold the prop.
+        auto placement = sampled[socket];
+        for (size_t i = 0; i < 3; ++i) placement.translation[i] += source[rig.skeleton_bone[wrist]].translation[i] - sampled[wrist].translation[i];
+        held.emplace(ModelSkinPose{e->model, {}, placement});
+        pose_skeleton(e->skeleton, e->rig, e->clip, frame, held->bones, true);
+        for (size_t b = 0; b < held->bones.size(); ++b) held->bones[b] = held->bones[b] * e->skeleton.inverse_bind[b];
+    }
     for (size_t b = 0; b < source.size(); ++b) source[b] = source[b] * skeleton.inverse_bind[b];
     for (const auto& follower : followers) {
-        ModelSkinPose part{follower.model, {}};
+        ModelSkinPose part{follower.model, {}, {}};
         for (int32_t b : follower.bone_map)
             part.bones.push_back(b < 0 ? BoneTransform{} : result.front().bones[size_t(b)]);
         result.push_back(std::move(part));
     }
+    if (held) result.push_back(std::move(*held));
     return result;
 }
 
@@ -1201,6 +1216,84 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
         }
     }
     return result;
+}
+
+void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAnimation& animation,
+                               const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
+                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {
+    // Authored humanoid rig node on the weapon side. The skeleton calls this node EF4BAB19.
+    constexpr uint32_t weapon_socket = 0x88BBAC70;
+    const auto& rig = animation.rig;
+    for (uint16_t i = 0; i < rig.size(); ++i) {
+        uint32_t hash = 0;
+        std::memcpy(&hash, rig.node_layout.data() + size_t(i) * 72, sizeof(hash));
+        if (hash != weapon_socket || !rig.object_space[i] || rig.skeleton_bone[i] >= animation.skeleton.size()) continue;
+        const int32_t parent = animation.skeleton.parents[rig.skeleton_bone[i]];
+        if (parent < 0) continue;
+        const auto end = rig.skeleton_bone.end();
+        const auto wrist = std::find(rig.skeleton_bone.begin(), end, uint16_t(parent));
+        if (wrist == end || !rig.object_space[size_t(wrist - rig.skeleton_bone.begin())]) continue;
+        animation.equipment_socket = i;
+        animation.equipment_wrist = uint16_t(wrist - rig.skeleton_bone.begin());
+        break;
+    }
+    if (!animation.equipment_socket) return;
+
+    std::vector<std::pair<TagHash, const ClipInfo*>> matches;
+    for (const auto& source : animation.clips) {
+        if (!source.name_hash || source.name_hash == 0x811C9DC5 || source.frames <= 1) continue;
+        const ClipInfo* paired = nullptr;
+        for (const auto& candidate : clips) {
+            if (candidate.name_hash != source.name_hash || candidate.frames != source.frames ||
+                candidate.tag.pkg_id() != source.tag.pkg_id() || !candidate.bones || candidate.bones >= source.bones ||
+                candidate.bone_groups.empty()) continue;
+            if (paired) { paired = nullptr; break; }
+            paired = &candidate;
+        }
+        if (paired) matches.emplace_back(source.tag, paired);
+    }
+    if (matches.empty()) return;
+
+    std::map<TagHash, AnimationRig> loaded_rigs;
+    std::set<TagHash> tried, uploaded;
+    for (const auto& [source, paired] : matches) {
+        std::vector<TagHash> candidates;
+        for (const auto& [tag, binding] : rigs) {
+            if (binding.rig.is_none() || !materials.contains(tag)) continue;
+            if (tried.insert(binding.rig).second) {
+                try { loaded_rigs.emplace(binding.rig, load_animation_rig(pm, binding.rig)); }
+                catch (const std::exception&) {}
+            }
+            const auto r = loaded_rigs.find(binding.rig);
+            if (r != loaded_rigs.end() && r->second.size() == paired->bones && r->second.bone_groups == paired->bone_groups)
+                candidates.emplace_back(tag);
+        }
+        if (candidates.size() != 1) continue;
+        const TagHash tag = candidates.front();
+        if (tag == mesh.tag || (std::ranges::any_of(mesh.attachments, [&](const auto& part) { return part.tag == tag; }) && !uploaded.contains(tag))) continue;
+        try {
+            const auto source_clip = load_animation_clip(pm, source);
+            auto has_position = [&](uint16_t b) {
+                return std::ranges::any_of(source_clip.translations, [b](const auto& t) { return t.bone == b && !t.frames.empty(); });
+            };
+            if (is_additive(rig, source_clip) || !has_position(*animation.equipment_socket) || !has_position(*animation.equipment_wrist)) continue;
+            const auto& binding = rigs.at(tag.value);
+            auto skeleton = load_skeleton(pm, binding.skeleton);
+            auto clip = load_animation_clip(pm, paired->tag);
+            if (!uploaded.contains(tag)) {
+                auto part = prepare_dynamic_model(pm, tag, &materials.at(tag.value));
+                if (part.no_drawable || std::ranges::any_of(part.buffers, [&](const auto& b) {
+                    return !b.skin.bones.empty() && b.skin.max_bone >= skeleton.size();
+                })) continue;
+                part.animation_equipment = true;
+                mesh.attachments.push_back(std::move(part));
+                uploaded.insert(tag);
+            }
+            animation.equipment.push_back({source, tag, std::move(skeleton), loaded_rigs.at(binding.rig), std::move(clip)});
+        } catch (const std::exception& ex) {
+            mesh.notes.push_back(std::format("animation equipment {}: {}", tag.str(), ex.what()));
+        }
+    }
 }
 
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials,
@@ -1459,7 +1552,9 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
         try {
             const float radius = part.radius;
             const V3 center = part.center;
+            const bool equipment = part.animation_equipment;
             add_mesh(gpu, std::move(part), layouts, std::span(&identity, 1));
+            if (equipment) continue;
             bounds.emplace_back(center, radius);
             lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
             hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
@@ -1643,6 +1738,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             set.placements.assign(placements.begin(), placements.end());
             set.sky_order.assign(sky_order.begin(), sky_order.end());
             set.model_channels = model_channels;
+            if (mesh.animation_equipment) set.equipment = std::make_unique<BufferSet::EquipmentPlacement>(BufferSet::EquipmentPlacement{mesh.model_cb});
             if (assembled_) {
                 std::copy_n(mesh.model_cb.begin(), set.model_parameters.size(), set.model_parameters.begin());
             }
@@ -2149,6 +2245,33 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                                        const ExternStore* frame_inputs) {
     if (!material_externs_) return;
     auto& ext = *material_externs_;
+    if (assembled_) for (auto& set : sets_) {
+        if (!set.equipment || !set.equipment->current) continue;
+        if (ext.first_note(0x45515549504D454Eull))
+            ext.note_estimate("animation equipment: synchronized clip and wrist-relative weapon placement",
+                              "clip name, frame count and rig match; runtime equipment selection and IK are not decoded");
+        auto& prop = *set.equipment;
+        PlacementConstants cb{};
+        std::ranges::copy(prop.constants, cb.values.begin());
+        auto write_transform = [&](size_t row, const BoneTransform& transform) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                std::array<float, 3> basis{};
+                basis[axis] = transform.scale;
+                const auto v = rotate(transform.rotation, basis);
+                cb.values[row + axis] = {v[0], v[1], v[2], 0};
+            }
+            cb.values[row + 3] = {transform.translation[0], transform.translation[1], transform.translation[2], 1};
+        };
+        write_transform(0, *prop.current);
+        write_transform(8, prop.previous.value_or(*prop.current));
+        for (size_t row = 0; row < 3; ++row)
+            for (size_t column = 0; column < 4; ++column)
+                set.placements.front()[row * 4 + column] = cb.values[column][row];
+        std::copy_n(cb.values.begin(), set.model_parameters.size(), set.model_parameters.begin());
+        const auto upload = gpu.dynamic(sizeof(cb));
+        std::memcpy(upload.cpu, &cb, sizeof(cb));
+        prop.gpu = upload.gpu;
+    }
     fill_view_externs(ext, w, h, vm);
     ext.set(ext::Frame, 0x00, material_time_);
     ext.set(ext::Frame, 0x04, material_time_);
@@ -2589,7 +2712,8 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         if (state.topology != topology) commands->IASetPrimitiveTopology(state.topology = topology);
         if (it.dynamic) {
             for (size_t p = first_instance; p < size_t(first_instance) + instances; ++p) {
-                for (uint32_t param : it.object_params) set_cbv(param, set.object_cb.gpu + p * sizeof(PlacementConstants));
+                const auto object = set.equipment ? set.equipment->gpu : set.object_cb.gpu + p * sizeof(PlacementConstants);
+                for (uint32_t param : it.object_params) set_cbv(param, object);
                 if (p < it.ps_placement_addresses.size()) set_cbv(0, it.ps_placement_addresses[p]);
                 if (p < it.vs_placement_addresses.size()) set_cbv(6, it.vs_placement_addresses[p]);
                 commands->DrawIndexedInstanced(it.part.index_count, 1, it.part.index_start, 0, 0);
@@ -2714,6 +2838,13 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
 }
 
 void StaticMeshScene::set_skin_poses(std::vector<ModelSkinPose> poses) {
+    for (auto& set : sets_) {
+        if (!set.equipment) continue;
+        auto& prop = *set.equipment;
+        prop.previous = prop.current;
+        const auto pose = std::ranges::find(poses, set.model, &ModelSkinPose::model);
+        prop.current = pose == poses.end() ? std::nullopt : pose->placement;
+    }
     skin_poses_ = std::move(poses);
     skin_dirty_ = skinned_;
     ++shadow_generation_;
@@ -2795,6 +2926,7 @@ uint32_t StaticMeshScene::item_instances(const Item& it) const {
     if (it.failed) return 0;
     if (it.light_grid && !it.light_grid_ready) return 0;
     const auto& set = sets_[it.buffers];
+    if (set.equipment && !set.equipment->current) return 0;
     if (set.cull == UINT32_MAX) return set.instances;
     if (it.dynamic) return cull_groups_[set.cull].visible;
     uint32_t n = 0;

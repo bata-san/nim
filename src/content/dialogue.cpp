@@ -1,4 +1,5 @@
 #include "nim/content/dialogue.hpp"
+#include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <cstring>
@@ -47,7 +48,14 @@ std::vector<DialogueLine> load_all_dialogue(PackageManager& pm, DialogueStats* s
                     line.subtitle_hash = r.u32_at(target + 0x40);
                     line.caption_hash = r.u32_at(target + 0x78);
                     line.speaker_hash = r.u32_at(target + 0x94);
-                    if (auto ev = pm.resolve64(line.audio_event64)) {
+                    auto resolve = [&](size_t offset) {
+                        return resolve_wide_hash(pm, r.u32_at(target + offset), r.u64_at(target + offset + 8));
+                    };
+                    if (const auto subtitle = resolve(0x30)) line.subtitle_container = *subtitle;
+                    if (const auto caption = resolve(0x68)) line.caption_container = *caption;
+                    const auto ev = resolve(0x20);
+                    const auto* audio = ev ? pm.entry(*ev) : nullptr;
+                    if (audio && audio->reference == kClassAudioEvent) {
                         line.audio_event = *ev;
                         st.audio_resolved++;
                         try {

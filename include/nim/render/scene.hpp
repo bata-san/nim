@@ -183,6 +183,7 @@ struct PreparedMesh {
     TagHash assembly_root;
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no GenerateGbuffer parts
+    bool animation_equipment = false;  // visible when the active clip supplies a placement
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
     std::vector<PreparedMesh> attachments;  // authored equipment parts, in the same preview space
@@ -206,11 +207,18 @@ struct PreparedMesh {
 struct ModelSkinPose {
     TagHash model;
     std::vector<BoneTransform> bones;
+    std::optional<BoneTransform> placement;
 };
 struct PreviewAnimation {
     struct Follower {
         TagHash model;
         std::vector<int32_t> bone_map;
+    };
+    struct Equipment {
+        TagHash source_clip, model;
+        Skeleton skeleton;
+        AnimationRig rig;
+        AnimationClip clip;
     };
     TagHash model;
     Skeleton skeleton;
@@ -218,6 +226,9 @@ struct PreviewAnimation {
     std::vector<ClipInfo> clips;
     std::vector<Follower> followers;
     bool inferred_binding = false;
+    std::vector<Equipment> equipment;
+    std::optional<uint16_t> equipment_socket;
+    std::optional<uint16_t> equipment_wrist;
     std::vector<ModelSkinPose> poses(const AnimationClip& clip, float frame) const;
 };
 // Shared across many prepare_static_mesh calls (maps): render globals / scopes read once,
@@ -257,6 +268,9 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
                                                           TagHash preferred = {});
+void prepare_preview_equipment(PackageManager& pm, PreparedMesh& mesh, PreviewAnimation& animation,
+                               const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
+                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
 class StaticMeshScene {
 public:
@@ -442,6 +456,12 @@ private:
         std::vector<std::array<float, 12>> placements;
         std::vector<float> sky_order;
         GpuBuffer object_cb;
+        struct EquipmentPlacement {
+            std::array<float4, 20> constants;
+            std::optional<BoneTransform> current, previous;
+            D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+        };
+        std::unique_ptr<EquipmentPlacement> equipment;
     };
     void update_skin(ID3D12GraphicsCommandList* cl);
     void rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow);

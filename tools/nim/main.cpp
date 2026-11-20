@@ -836,6 +836,7 @@ private:
                                 auto local = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, tag);
                                 if (local && !local->clips.empty()) r.part_animation = std::move(local);
                             }
+                            if (r.animation) prepare_preview_equipment(*pm, *r.mesh, *r.animation, *rigs_, *clips_, *materials_);
                         } catch (const std::exception& ex) {
                             r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
                         }
@@ -1524,7 +1525,7 @@ public:
     int dialogue_selected = -1;   // index into catalog->dialogue
     std::vector<std::pair<uint16_t, std::string>> audio_langs;  // installed localized audio packages (id, name)
     std::vector<std::string> audio_suffixes;                    // their package suffixes (names follow the UI language)
-    int audio_lang = 0;           // index into audio_langs
+    int audio_lang = -1;          // -1 follows this screen's text language
 
     // audio playback (dialogue) and WAV export
     std::unique_ptr<media::AudioEngine> audio_engine_;
@@ -2449,7 +2450,10 @@ public:
     // ---- UI ----
     // Layout: a navigation rail on the left, a page header and the page body on the right, and a
     // status line along the bottom. Every page is one rail entry; the page shown is `tab`.
-    void open_tab(int t) { tab = Tab(t); }
+    void open_tab(int t) {
+        if (tab != t && (tab == TabDialogue || tab == TabCodex)) stop_line_audio();
+        tab = Tab(t);
+    }
     void set_ui_language(ui::Lang l) {
         ui::set_lang(l);
         g_prefs.lang = l;
@@ -2775,20 +2779,20 @@ public:
         if (!catalog || !catalog->strings_ready) return;
         const auto& strings = catalog->strings;
         const size_t lang = size_t(language);
-        auto text_of = [&](uint32_t h) -> std::string {
-            const auto* s = strings.find(h);
+        auto text_of = [&](uint32_t h, TagHash container = {}) -> std::string {
+            const auto* s = strings.find(h, container);
             if (!s) return {};
             return s->text[lang].empty() ? s->text[0] : s->text[lang];
         };
-        auto matches = [&](uint32_t h) {
-            const auto* s = strings.find(h);
+        auto matches = [&](uint32_t h, TagHash container = {}) {
+            const auto* s = strings.find(h, container);
             return s && (contains_ci(s->text[0], ql) || s->text[lang].find(q) != std::string::npos);
         };
         if (catalog->dialogue_ready) {
             auto& g = group(TabDialogue);
             for (const auto& d : catalog->dialogue)
-                if (matches(d.subtitle_hash) || matches(d.speaker_hash))
-                    hit(g, text_of(d.speaker_hash) + ": " + text_of(d.subtitle_hash));
+                if (matches(d.subtitle_hash, d.subtitle_container) || matches(d.speaker_hash))
+                    hit(g, text_of(d.speaker_hash) + ": " + text_of(d.subtitle_hash, d.subtitle_container));
         }
         if (catalog->codex_ready) {
             auto& g = group(TabCodex);
@@ -3528,10 +3532,10 @@ public:
         }
     }
 
-    const std::string& text(uint32_t hash, size_t lang) {
+    const std::string& text(uint32_t hash, size_t lang, TagHash container = {}) {
         static const std::string empty;
         if (!catalog || !catalog->strings_ready) return empty;
-        const LocalizedString* s = catalog->strings.find(hash);
+        const LocalizedString* s = catalog->strings.find(hash, container);
         return s ? s->text[lang] : empty;
     }
 
@@ -3560,9 +3564,44 @@ public:
             audio_langs.emplace_back(id, audio_language_name(suffix));
             audio_suffixes.push_back(suffix);
         }
-        // default to the voice that matches the second text language, else English
-        for (size_t i = 0; i < audio_suffixes.size(); ++i)
-            if (audio_language_slot(audio_suffixes[i]) == language) audio_lang = int(i);
+    }
+
+    size_t voice_index(size_t text_lang) const {
+        if (audio_lang >= 0) return size_t(audio_lang);
+        size_t english = 0;
+        for (size_t i = 0; i < audio_suffixes.size(); ++i) {
+            const int slot = audio_language_slot(audio_suffixes[i]);
+            if (slot == int(text_lang)) return i;
+            if (slot == 0) english = i;
+        }
+        return english;
+    }
+
+    void stop_line_audio() {
+        if (clip) clip->stop();
+        if (audio_request) audio_request->id = 0;  // discard the pending decode without blocking the UI
+        audio_error.clear();
+    }
+
+    void voice_selector(const char* label, size_t text_lang) {
+        if (audio_langs.empty() || !begin_combo(label, audio_langs[voice_index(text_lang)].second.c_str())) return;
+        if (ImGui::Selectable(ui::tr(ui::S::VoiceFollowText), audio_lang < 0) && audio_lang >= 0) {
+            stop_line_audio();
+            audio_lang = -1;
+        }
+        for (int i = 0; i < int(audio_langs.size()); ++i) {
+            if (!ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i) || audio_lang == i) continue;
+            stop_line_audio();
+            audio_lang = i;
+        }
+        ImGui::EndCombo();
+    }
+
+    static PcmAudio read_line_audio(PackageManager& source, TagHash tag) {
+        const auto* package = source.info(tag.pkg_id());
+        if (!package || (package->language && package->language != source.language()))
+            throw std::runtime_error("no recording in the selected audio language");
+        return decode_wem(source.read(tag));
     }
 
     media::AudioEngine* audio_engine() {
@@ -3582,6 +3621,7 @@ public:
         if (!catalog || line >= catalog->dialogue.size() || !pm) return;
         const auto& l = catalog->dialogue[line];
         if (wem_index >= l.wem.size()) return;
+        if (tab == TabDialogue) dialogue_selected = int(line);
         const uint64_t id = clip_id(line, wem_index, lang);
         audio_engine();
         if (clip && clip->id() == id && clip->playing()) {
@@ -3594,8 +3634,7 @@ public:
         audio_request.reset();
         audio_request = AudioRequest{id, std::async(std::launch::async, [fork, wem, lang] {
                                          fork->set_language(lang);
-                                         auto bytes = fork->read(wem);
-                                         return std::make_shared<const PcmAudio>(decode_wem(bytes));
+                                         return std::make_shared<const PcmAudio>(read_line_audio(*fork, wem));
                                      })};
     }
 
@@ -3657,7 +3696,7 @@ public:
         if (export_thread.joinable()) export_thread.join();
         const auto& lines = catalog->dialogue;
         const size_t lang = dialogue_lang();
-        const auto [lang_id, lang_name] = audio_langs[size_t(audio_lang)];
+        const auto [lang_id, lang_name] = audio_langs[voice_index(lang)];
         struct Job { TagHash wem; fs::path file; };
         auto jobs = std::make_shared<std::vector<Job>>();
         std::string csv = "\xEF\xBB\xBF" "folder,file,table,line_id,speaker_en,speaker";
@@ -3674,7 +3713,7 @@ public:
             const std::string folder = safe_file_name(speaker_name(l.speaker_hash, lang));
             for (size_t w = 0; w < l.wem.size(); ++w) {
                 std::string name = std::format("{}_{:08X}{}", l.table.str(), l.line_id, l.wem.size() > 1 ? std::format("_{}", w) : "");
-                std::string snippet = safe_file_name(text(l.subtitle_hash, lang));
+                std::string snippet = safe_file_name(text(l.subtitle_hash, lang, l.subtitle_container));
                 if (snippet.size() > 48) snippet = utf8_prefix(snippet, 48);
                 if (!snippet.empty()) name += "_" + snippet;
                 std::string file = name + ".wav";
@@ -3682,7 +3721,7 @@ public:
                 jobs->push_back({l.wem[w], dir / to_wide(folder) / to_wide(file)});
                 csv += quote(folder) + "," + quote(file) + "," + l.table.str() + std::format(",{:08X},", l.line_id) +
                        quote(speaker_name(l.speaker_hash, 0)) + "," + quote(speaker_name(l.speaker_hash, lang));
-                for (size_t t = 0; t < kTextLanguageCount; ++t) csv += "," + quote(text(l.subtitle_hash, t));
+                for (size_t t = 0; t < kTextLanguageCount; ++t) csv += "," + quote(text(l.subtitle_hash, t, l.subtitle_container));
                 csv += "\n";
             }
         }
@@ -3709,7 +3748,7 @@ public:
                 if (export_cancel) break;
                 try {
                     fs::create_directories(j.file.parent_path());
-                    const auto pcm = decode_wem(fork->read(j.wem));
+                    const auto pcm = read_line_audio(*fork, j.wem);
                     if (!write_wav_file(j.file, pcm)) throw std::runtime_error(ui::tr(ui::S::ErrWriteFailed));
                 } catch (const std::exception& ex) {
                     if (std::string_view(ex.what()).find("no recording") != std::string_view::npos) export_missing++;
@@ -3741,7 +3780,10 @@ public:
         ImGui::SetNextItemWidth(170 * sc);
         if (begin_combo(ui::tr(ui::S::Subtitles), text_language_name(lang))) {
             for (int l = 0; l < int(kTextLanguageCount); ++l)
-                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) dialogue_text_lang = l;
+                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang) && size_t(l) != lang) {
+                    stop_line_audio();
+                    dialogue_text_lang = l;
+                }
             ImGui::EndCombo();
         }
         ImGui::SameLine();
@@ -3750,11 +3792,7 @@ public:
         ImGui::SetNextItemWidth(130 * sc);
         if (audio_langs.empty()) {
             ImGui::TextDisabled(ui::tr(ui::S::NoVoicePackages));
-        } else if (begin_combo(ui::tr(ui::S::Voice), audio_langs[size_t(audio_lang)].second.c_str())) {
-            for (int i = 0; i < int(audio_langs.size()); ++i)
-                if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
-            ImGui::EndCombo();
-        }
+        } else voice_selector(ui::tr(ui::S::Voice), lang);
         ImGui::SetItemTooltip(ui::tr(ui::S::VoiceTip));
         ImGui::SameLine();
         ImGui::BeginDisabled(export_running || dialogue_view.empty() || audio_langs.empty());
@@ -3805,8 +3843,8 @@ public:
             dialogue_view.clear();
             auto match = [&](uint32_t i) {
                 const auto& l = lines[i];
-                return f.empty() || contains_ci(text(l.speaker_hash, 0), f) || contains_ci(text(l.subtitle_hash, 0), f) ||
-                       text(l.subtitle_hash, lang).find(dialogue_filter) != std::string::npos ||
+                return f.empty() || contains_ci(text(l.speaker_hash, 0), f) || contains_ci(text(l.subtitle_hash, 0, l.subtitle_container), f) ||
+                       text(l.subtitle_hash, lang, l.subtitle_container).find(dialogue_filter) != std::string::npos ||
                        text(l.speaker_hash, lang).find(dialogue_filter) != std::string::npos;
             };
             if (dialogue_group >= 0 && size_t(dialogue_group) < dialogue_groups.size()) {
@@ -3821,7 +3859,7 @@ public:
         ImGui::BeginGroup();
         const float details_h = dialogue_selected >= 0 ? std::min(330 * sc, ImGui::GetContentRegionAvail().y * 0.45f) : 0;
         ImGui::TextDisabled(ui::tr(ui::S::RowCount), dialogue_view.size(), lines.size());
-        const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
+        const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[voice_index(lang)].first;
         if (ImGui::BeginTable("dialogue", 4, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                                  ImGuiTableFlags_BordersOuter,
                               {0, ImGui::GetContentRegionAvail().y - details_h})) {
@@ -3844,11 +3882,13 @@ public:
                     ImGui::TableNextColumn();
                     ImGui::PushFont(g_fonts.bold, 0);
                     if (ImGui::Selectable(speaker_name(l.speaker_hash, lang).c_str(), dialogue_selected == int(li),
-                                          ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                                          ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                        if (dialogue_selected != int(li)) stop_line_audio();
                         dialogue_selected = int(li);
+                    }
                     ImGui::PopFont();
-                    const std::string& en = text(l.subtitle_hash, 0);
-                    const std::string& tr = text(l.subtitle_hash, lang);
+                    const std::string& en = text(l.subtitle_hash, 0, l.subtitle_container);
+                    const std::string& tr = text(l.subtitle_hash, lang, l.subtitle_container);
                     if (ImGui::BeginPopupContextItem("ctx")) {
                         if (ImGui::MenuItem(ui::tr(ui::S::CopyDisplayed))) ImGui::SetClipboardText(tr.c_str());
                         if (ImGui::MenuItem(ui::tr(ui::S::CopyEnglish))) ImGui::SetClipboardText(en.c_str());
@@ -3898,10 +3938,11 @@ public:
                     if (auto dir = pick_folder(g_win.hwnd)) {
                         try {
                             std::unique_ptr<PackageManager> fork(pm->fork());
-                            fork->set_language(audio_langs[size_t(audio_lang)].first);
-                            const auto pcm = decode_wem(fork->read(l.wem[w]));
+                            const auto& [voice, name] = audio_langs[voice_index(lang)];
+                            fork->set_language(voice);
+                            const auto pcm = read_line_audio(*fork, l.wem[w]);
                             const fs::path file = *dir / to_wide(safe_file_name(std::format(
-                                "{}_{:08X}_{}.wav", speaker_name(l.speaker_hash, lang), l.line_id, audio_langs[size_t(audio_lang)].second)));
+                                "{}_{:08X}_{}.wav", speaker_name(l.speaker_hash, lang), l.line_id, name)));
                             if (!write_wav_file(file, pcm)) throw std::runtime_error(ui::tr(ui::S::ErrWriteWav));
                             info(ui::trf(ui::S::LogSaved, to_utf8(file.wstring())));
                         } catch (const std::exception& ex) {
@@ -3925,7 +3966,7 @@ public:
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(speaker_name(l.speaker_hash, t).c_str());
                 ImGui::TableNextColumn();
-                const std::string& s = text(l.subtitle_hash, t);
+                const std::string& s = text(l.subtitle_hash, t, l.subtitle_container);
                 ImGui::PushID(int(t));
                 ImGui::TextWrapped("%s", s.c_str());
                 if (ImGui::BeginPopupContextItem("c")) {
@@ -3934,13 +3975,13 @@ public:
                 }
                 ImGui::PopID();
             }
-            if (l.caption_hash && l.caption_hash != 0x811C9DC5 && !text(l.caption_hash, 0).empty()) {
+            if (l.caption_hash && l.caption_hash != 0x811C9DC5 && !text(l.caption_hash, 0, l.caption_container).empty()) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextDisabled(ui::tr(ui::S::Caption));
                 ImGui::TableNextColumn();
                 ImGui::TableNextColumn();
-                ImGui::TextWrapped("%s", text(l.caption_hash, lang).c_str());
+                ImGui::TextWrapped("%s", text(l.caption_hash, lang, l.caption_container).c_str());
             }
             ImGui::EndTable();
         }
@@ -3991,13 +4032,17 @@ public:
         if (audio_request && audio_request->result.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             try {
                 auto pcm = audio_request->result.get();
-                audio_engine();
-                if (clip) clip->play(pcm, audio_request->id);
-                audio_error.clear();
+                if (audio_request->id) {
+                    audio_engine();
+                    if (clip) clip->play(pcm, audio_request->id);
+                    audio_error.clear();
+                }
             } catch (const std::exception& ex) {
-                audio_error = ex.what();
-                if (audio_error.find("no recording") != std::string::npos) audio_error = ui::tr(ui::S::NoRecording);
-                error(ui::trf(ui::S::ErrPlayAudio, audio_error));
+                if (audio_request->id) {
+                    audio_error = ex.what();
+                    if (audio_error.find("no recording") != std::string::npos) audio_error = ui::tr(ui::S::NoRecording);
+                    error(ui::trf(ui::S::ErrPlayAudio, audio_error));
+                }
             }
             audio_request.reset();
         }
@@ -4107,7 +4152,10 @@ public:
         ImGui::SetNextItemWidth(170 * sc);
         if (begin_combo("##cxlang", text_language_name(lang))) {
             for (int l = 0; l < int(kTextLanguageCount); ++l)
-                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) codex.lang = l;
+                if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang) && size_t(l) != lang) {
+                    stop_line_audio();
+                    codex.lang = l;
+                }
             ImGui::EndCombo();
         }
         ImGui::SetItemTooltip("%s", ui::tr(ui::S::Subtitles));
@@ -4221,6 +4269,7 @@ public:
 
         // The reader, as a popup over the grid. Esc or x closes; left / right step through the grid.
         if (codex.open_reader) {
+            stop_line_audio();
             ImGui::OpenPopup("##cxreader");
             codex.open_reader = false;
         }
@@ -4241,12 +4290,19 @@ public:
                     int at = 0;
                     for (int v = 0; v < int(codex.view.size()); ++v)
                         if (codex.view[size_t(v)].first == codex.collection && codex.view[size_t(v)].second == codex.entry) at = v;
-                    at = std::clamp(at + step, 0, int(codex.view.size()) - 1);
-                    codex.collection = codex.view[size_t(at)].first, codex.entry = codex.view[size_t(at)].second;
+                    const int next = std::clamp(at + step, 0, int(codex.view.size()) - 1);
+                    if (at != next) {
+                        stop_line_audio();
+                        codex.collection = codex.view[size_t(next)].first;
+                        codex.entry = codex.view[size_t(next)].second;
+                    }
                 }
             }
             codex_reader(cx, lang, close);
-            if (close) ImGui::CloseCurrentPopup();
+            if (close) {
+                stop_line_audio();
+                ImGui::CloseCurrentPopup();
+            }
             ImGui::EndPopup();
         }
         ImGui::PopStyleColor(2);
@@ -4359,18 +4415,14 @@ public:
 
         // audio log
         if (!e.lines.empty()) {
-            const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
+            const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[voice_index(lang)].first;
             ImGui::PushFont(g_fonts.mono, 0);
             ImGui::TextColored(col4(kCxDim), "%s", upper_ascii(ui::tr(ui::S::CodexPlayLog)).c_str());
             ImGui::PopFont();
             if (!audio_langs.empty()) {
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(140 * sc);
-                if (begin_combo("##cxvoice", audio_langs[size_t(audio_lang)].second.c_str())) {
-                    for (int i = 0; i < int(audio_langs.size()); ++i)
-                        if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
-                    ImGui::EndCombo();
-                }
+                voice_selector("##cxvoice", lang);
             }
             for (size_t li : e.lines) {
                 const auto& l = catalog->dialogue[li];
@@ -4388,9 +4440,9 @@ public:
                 ImGui::SameLine();
                 ImGui::AlignTextToFramePadding();
                 ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
-                // The line's own subtitle is a production label ("[Codex Audio Log for ...]"), not
-                // the transcript; the record body above is what is spoken, so only the time is shown.
                 text_line_fit(clip && clip->id() == id ? (clock_text(clip->position()) + " / " + clock_text(clip->length())).c_str() : l.wem[0].str().c_str(), kCxDim);
+                const auto& audio_label = text(l.subtitle_hash, lang, l.subtitle_container);
+                if (!audio_label.empty()) ImGui::SetItemTooltip("%s", audio_label.c_str());
                 ImGui::PopFont();
             }
             rule(rw);

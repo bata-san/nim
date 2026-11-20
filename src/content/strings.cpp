@@ -63,6 +63,7 @@ std::vector<std::string> decode_string_data(std::span<const uint8_t> tag, String
 void StringTable::load_all(PackageManager& pm) {
     strings_.clear();
     by_hash_.clear();
+    by_container_.clear();
     stats_ = {};
     std::unordered_set<TagHash> referenced;
     for (const auto& info : pm.packages()) {
@@ -84,6 +85,7 @@ void StringTable::load_all(PackageManager& pm) {
                     ls.hash = r.u32_at(hashes.data + size_t(h) * 4);
                     ls.container = container;
                 }
+                by_container_.emplace(container, std::pair(base, size_t(hashes.count)));
                 for (size_t lang = 0; lang < kTextLanguageCount; ++lang) {
                     TagHash data_tag = r.tag_at(0x18 + lang * 4);
                     if (data_tag.is_none() || !pm.entry(data_tag)) continue;
@@ -119,7 +121,15 @@ void StringTable::load_all(PackageManager& pm) {
     stats_.unique_hashes = by_hash_.size();
 }
 
-const LocalizedString* StringTable::find(uint32_t hash) const {
+const LocalizedString* StringTable::find(uint32_t hash, TagHash container) const {
+    if (!container.is_none()) {
+        const auto group = by_container_.find(container);
+        if (group == by_container_.end()) return nullptr;
+        const auto [start, count] = group->second;
+        for (size_t i = start; i < start + count; ++i)
+            if (strings_[i].hash == hash) return &strings_[i];
+        return nullptr;
+    }
     auto it = by_hash_.find(hash);
     return it == by_hash_.end() ? nullptr : &strings_[it->second];
 }

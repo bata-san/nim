@@ -74,12 +74,13 @@ public:
     void load_all(PackageManager& pm);
 
     const std::vector<LocalizedString>& strings() const { return strings_; }
-    const LocalizedString* find(uint32_t hash) const;
+    const LocalizedString* find(uint32_t hash, TagHash container = {}) const;
     const Stats& stats() const { return stats_; }
 
 private:
     std::vector<LocalizedString> strings_;
     std::unordered_map<uint32_t, size_t> by_hash_;
+    std::unordered_map<TagHash, std::pair<size_t, size_t>> by_container_;
     Stats stats_;
 };
 

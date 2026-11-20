@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace nim {
 
@@ -144,10 +143,8 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
     }
     // (table, conversation) -> dialogue line indices.
     std::unordered_map<uint64_t, std::vector<size_t>> by_conversation;
-    std::unordered_set<uint32_t> tables;
     for (size_t i = 0; i < dialogue.size(); ++i) {
         by_conversation[(uint64_t(dialogue[i].table.value) << 32) | dialogue[i].conversation].push_back(i);
-        tables.insert(dialogue[i].table.value);
     }
 
     pm.build_hash64_index();
@@ -170,25 +167,18 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
         } catch (...) {
             return;
         }
-        // The component names its dialogue table by hash64; the conversation key is one of its
-        // u32 fields. Match both against the dialogue lines rather than trusting fixed offsets.
+        // The recording component stores the conversation key and its wide table reference.
+        // Both fields matched the authored recording on all 87 installed audio logs.
+        if (comp.size() < 0xAB0) return;
         TagReader cr(comp);
-        for (size_t o = 0; o + 8 <= comp.size() && e.dialogue_table.is_none(); o += 4) {
-            const uint64_t v = cr.u64_at(o);
-            if (!v || v == ~0ull) continue;
-            auto t = pm.resolve64(v);
-            if (t && tables.contains(t->value)) e.dialogue_table = *t;
-        }
-        if (e.dialogue_table.is_none()) return;
-        for (size_t o = 0; o + 4 <= comp.size(); o += 4) {
-            const uint32_t key = cr.u32_at(o);
-            if (!key || key == 0xFFFFFFFF) continue;
-            auto it = by_conversation.find((uint64_t(e.dialogue_table.value) << 32) | key);
-            if (it == by_conversation.end()) continue;
-            e.conversation = key;
-            e.lines = it->second;
-            break;
-        }
+        const auto table = pm.resolve64(cr.u64_at(0xAA8));
+        const uint32_t key = cr.u32_at(0xA98);
+        if (!table || !key || key == 0xFFFFFFFF) return;
+        const auto lines = by_conversation.find((uint64_t(table->value) << 32) | key);
+        if (lines == by_conversation.end()) return;
+        e.dialogue_table = *table;
+        e.conversation = key;
+        e.lines = lines->second;
     };
 
     codex.collections.emplace_back();  // entries that come before the first collection

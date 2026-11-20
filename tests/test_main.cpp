@@ -241,6 +241,37 @@ int main() {
     }
 
     {
+        // Identity-rest finger channels retain the bind axes, and curls use those local axes.
+        constexpr float q = 0.70710678f;
+        Skeleton hand;
+        hand.hashes = {1, 0x67CB838C, 3, 4, 5};
+        hand.parents = {-1, 0, 1, 2, 0};
+        hand.local_bind.resize(5);
+        hand.local_bind[2].rotation = {0, 0, q, q};
+        hand.local_bind[3].translation = {0, 1, 0};
+        hand.local_bind[4].rotation = hand.local_bind[2].rotation;
+        hand.bind = hand.local_bind;
+        hand.bind[3] = hand.bind[2] * hand.local_bind[3];
+
+        AnimationRig rig;
+        rig.skeleton_bone = {0, 1, 2, 4};
+        rig.object_space = {1, 1, 0, 0};
+        rig.bind_relative = {0, 0, 1, 0};
+        rig.default_pose.resize(rig.size());
+        AnimationClip clip;
+        clip.frame_count = 2;
+        clip.rotations = {{2, {{{0, 0, 0, 1}, {q, 0, 0, q}}}}};
+
+        std::vector<BoneTransform> posed;
+        pose_skeleton(hand, rig, clip, 0, posed);
+        CHECK(std::fabs(posed[3].translation[0] + 1) < 1e-5f);
+        pose_skeleton(hand, rig, clip, 1, posed);
+        CHECK(std::fabs(posed[3].translation[2] - 1) < 1e-5f);
+        CHECK(posed[1].rotation == BoneTransform{}.rotation);
+        CHECK(posed[4].rotation == BoneTransform{}.rotation);
+    }
+
+    {
         // The FFT inverse MDCT matches the direct Vorbis formula.
         for (size_t n : {size_t(256), size_t(2048)}) {
             std::vector<float> in(n / 2), fast(n), slow(n);
