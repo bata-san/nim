@@ -384,6 +384,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(CodexFilterHint, "タイトル・本文で検索", "Search titles and text", "제목·본문 검색") \
     X(CodexAudioOnly, "音声ログのみ", "Audio logs only", "음성 로그만") \
     X(CodexCount, "{} コレクション / {} 記録 / 音声 {}", "{} collections / {} records / {} with audio", "{} 컬렉션 / {} 기록 / 음성 {}") \
+    X(CodexNone, "該当する記録はありません。", "No records match.", "해당하는 기록이 없습니다.") \
     X(CodexPick, "左の一覧から記録を選んでください。", "Choose a record from the list on the left.", "왼쪽 목록에서 기록을 고르세요.") \
     X(CodexUnlock, "解除条件", "unlock", "해제 조건") \
     X(CodexPlayLog, "音声ログ", "audio log", "음성 로그") \
