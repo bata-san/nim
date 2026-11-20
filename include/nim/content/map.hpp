@@ -239,4 +239,26 @@ std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout&
 MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
+// ---- particle systems (FX) ----------------------------------------------------------------
+// A GPU particle system (808081E8, 64 bytes): +0x00 its definition (808081EF: header floats at
+// +0x128 / +0x134 and an FX expression program not decoded), then techniques: +0x04
+// cs_gpu_stateful_init (spawn), +0x08 cs_gpu_stateful_update, +0x10
+// cs_gpu_stateless_update_instance (11 float4 per particle), +0x14 the draw (vs_gpu_update_draw
+// + PS: a camera-facing 4-vertex quad per particle), +0x28 gpu_debug_cs (unused).
+constexpr uint32_t kClassParticleSystem = 0x808081E8;
+struct ParticleSystem {
+    TagHash tag, definition, init, update, instance, draw;
+    float lifetime = 0;  // definition +0x128: the longest particle life (seconds), estimate
+    float rate = 0;      // definition +0x134: particles per second, estimate
+};
+ParticleSystem load_particle_system(PackageManager& pm, TagHash tag);
+// The particle systems a map places: nodes -> entity (8080BAAD) -> components (8080BADB) that
+// name systems (the sequencer data 8080B66D of a pattern). One per (node, system), at the node's
+// transform. Needs the hash64 index (PackageManager::build_hash64_index).
+struct MapParticle {
+    TagHash system;
+    std::array<float, 12> rows;  // rotation * scale | translation
+};
+std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map);
+
 }  // namespace nim

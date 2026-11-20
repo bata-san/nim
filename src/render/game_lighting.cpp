@@ -586,7 +586,7 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     }
 
     D3D12_ROOT_SIGNATURE_DESC rsd{UINT(params.size()), params.data(), UINT(samplers.size()), samplers.data(),
-                                  opt.volume ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT : D3D12_ROOT_SIGNATURE_FLAG_NONE};
+                                  opt.volume || opt.instance_float4s ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT : D3D12_ROOT_SIGNATURE_FLAG_NONE};
     root_sig_ = serialize(dev, rsd, "game pipeline root signature");
 
     if (compute_) {
@@ -625,6 +625,13 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
         pd.InputLayout = {&position, 1};
         pd.RasterizerState.CullMode = opt.cull_front ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
         if (std::getenv("NIM_LIGHT_NOCULL")) pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
+    std::vector<D3D12_INPUT_ELEMENT_DESC> instance_layout;
+    for (uint32_t i = 0; i < opt.instance_float4s; ++i)
+        instance_layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16 * i, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1});
+    if (!instance_layout.empty()) {
+        pd.InputLayout = {instance_layout.data(), UINT(instance_layout.size())};
+        pd.RasterizerState.DepthClipEnable = TRUE;
     }
     cbuffer_floor_ = opt.cbuffer_floor;
     pd.NumRenderTargets = UINT(1 + opt.additional_rtv_formats.size());
@@ -676,6 +683,14 @@ void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternSto
                         std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures) {
     if (compute_) throw std::runtime_error("Compute pipeline requires original dispatch dimensions");
     const Geometry g{nullptr, nullptr, nullptr, 0, ps_textures};
+    execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
+void GamePipeline::draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                                  const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances) {
+    if (compute_) throw std::runtime_error("Compute pipeline cannot draw instances");
+    Geometry g{nullptr, &vbv, nullptr, 4};
+    g.instances = instances;
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
 }
 
@@ -744,7 +759,10 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             batch->root_bindings.fill(UINT64_MAX);
         }
     }
-    if (geometry && geometry->vbv) {
+    if (geometry && geometry->instances) {
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        cl->IASetVertexBuffers(0, 1, geometry->vbv);
+    } else if (geometry && geometry->vbv) {
         if (!batch || batch->vertices != geometry->vbv || batch->indices != geometry->ibv) {
             cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cl->IASetVertexBuffers(0, 1, geometry->vbv);
@@ -869,6 +887,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     }
     if (compute_ && indirect_args_) cl->ExecuteIndirect(indirect_signature_, 1, indirect_args_, 0, nullptr, 0);
     else if (compute_) cl->Dispatch(x, y, z);
+    else if (geometry && geometry->instances) cl->DrawInstanced(4, geometry->instances, 0, 0);
     else if (geometry && geometry->vbv && geometry->ibv && geometry->ibv->BufferLocation) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
     else if (geometry && geometry->vbv) cl->DrawInstanced(geometry->indices, 1, 0, 0);
     else cl->DrawInstanced(4, 1, 0, 0);

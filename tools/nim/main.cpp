@@ -19,6 +19,7 @@
 #include "nim/render/game_lighting.hpp"
 #include "nim/content/object_channels.hpp"
 #include "nim/render/scene.hpp"
+#include "nim/render/particles.hpp"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -783,6 +784,7 @@ public:
         std::optional<MapStart> start;  // the first player start (estimate), the initial camera
         std::shared_ptr<const std::vector<MapLight>> lights;  // the region's local lights, once read
         std::shared_ptr<const std::vector<MapCubemap>> cubemaps;  // the region's reflection / ambient volumes
+        std::shared_ptr<const std::vector<MapParticle>> particles;  // the region's particle systems (FX)
         std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
         std::shared_ptr<const MapAtmosphere> atmosphere;  // the map's sky lookups and sun path
         std::map<std::string, size_t> failures;  // reason -> count
@@ -1001,6 +1003,15 @@ private:
                 // Surface probe failures through the worker's existing error path; silently
                 // continuing with zero probes makes a data failure look like missing lighting.
                 *cubemaps = load_map_cubemaps(*pm, *layout);
+                auto particles = std::make_shared<std::vector<MapParticle>>();
+                try {
+                    pm->build_hash64_index();
+                    for (auto& p : load_map_particles(*pm, *layout))
+                        if (std::hypot(p.rows[3] - center[0], p.rows[7] - center[1], p.rows[11] - center[2]) <= req.radius)
+                            particles->push_back(p);
+                } catch (const std::exception&) {
+                    // drawn without FX
+                }
                 if (selection_changed || !weather || weather_bubble_ != req.bubble) {
                     try {
                         weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
@@ -1026,6 +1037,7 @@ private:
                     progress_.start = starts.empty() || req.center ? std::nullopt : std::optional<MapStart>(starts.front());
                     progress_.lights = std::move(lights);
                     progress_.cubemaps = std::move(cubemaps);
+                    progress_.particles = std::move(particles);
                 }
                 // Prepare sky, terrain and then nearby world assets in parallel.
                 // Every core but the UI thread's.
@@ -1252,7 +1264,7 @@ public:
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
         float radius = kUnlimited;  // default to the user's whole-world workflow
-        bool lights_set = false;
+        bool lights_set = false, particles_set = false;
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
         bool streaming = false, framed = false;
@@ -1274,6 +1286,7 @@ public:
     GBuffer gb;
     LightingPass lighting;
     GameLighting game_lighting;
+    ParticleScene particles;  // the map's FX
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
@@ -1675,6 +1688,8 @@ public:
         rain.valid = false;
         apply_weather();
         map.lights_set = false;
+        map.particles_set = false;
+        particles.release(gpu);
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
         info(whole ? ui::trf(ui::S::LogMapLoadAll, m.package, m.bubble.str())
@@ -1733,6 +1748,15 @@ public:
                 }
                 for (const auto& n : game_lighting.cubemap_notes()) ++map_add_failures[n.substr(0, 120)];
             }
+        }
+        if (pr.particles && !map.particles_set) {
+            map.particles_set = true;
+            try {
+                particles.load(*pm, g, *pr.particles);
+            } catch (const std::exception& ex) {
+                ++map_add_failures[std::string("fx: ") + std::string(ex.what()).substr(0, 100)];
+            }
+            for (const auto& n : particles.notes()) ++map_add_failures[n.substr(0, 120)];
         }
         if (added) {
             scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
@@ -2218,10 +2242,12 @@ public:
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
                 GameLighting::TransparentFn transparents;
-                if (scene.has_transparent()) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                    scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
+                const bool fx = map_scene && particles.loaded();
+                if (scene.has_transparent() || fx) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
+                    if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
+                    if (fx) particles.render(gpu, c, gb, hdr, vm, game_lighting.externs(), light.delta_time);
                 };
-                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow, scene.has_visible_light_grid());
+                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow, scene.has_visible_light_grid() || fx);
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {
@@ -4140,6 +4166,7 @@ public:
         game_lighting.release(gpu);
         thumb_lighting.release(gpu);
         rain.release(gpu);
+        particles.release(gpu);
         scene.release(gpu);
         thumb_scene.release(gpu);
         gb.release(gpu);

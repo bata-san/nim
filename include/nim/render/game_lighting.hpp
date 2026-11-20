@@ -210,6 +210,9 @@ public:
         // Original volume VS only, with winding counts behind the scene depth; or apply where
         // that count is nonzero. No replacement pixel shader is used for the geometry mask.
         bool stencil_volume = false, stencil_test = false;
+        // Instanced quads: a per-instance stream of this many float4s (TEXCOORD0..n-1), each
+        // instance drawn as a 4-vertex strip (draw_instances). 0 = none.
+        uint32_t instance_float4s = 0;
     };
     // `scopes` supply samplers the technique does not (the frame scope's s0, ...).
     void load(PackageManager& pm, Gpu& gpu, TagHash technique, std::span<const Scope* const> scopes, Options opt);
@@ -226,6 +229,9 @@ public:
     void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
               std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
+    // Options::instance_float4s pipelines: `instances` 4-vertex strips over the stream `vbv`.
+    void draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                        const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances);
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
     // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
     // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
@@ -287,6 +293,7 @@ private:
         std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures;
         VolumeBatch* batch = nullptr;
         const StageConstants* constants = nullptr;
+        uint32_t instances = 0;  // instanced 4-vertex strips over vbv
     };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                  bool validated, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, const Geometry* geometry = nullptr);
