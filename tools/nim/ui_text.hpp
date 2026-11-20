@@ -95,6 +95,8 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(PickMovie, "左の一覧からムービーを選ぶと再生します。", "Choose a movie from the list on the left to play it.",      \
       "왼쪽 목록에서 영상을 고르면 재생합니다.")                                                                             \
     X(LoadingItem, "{} を読込中…", "Loading {}…", "{} 불러오는 중…")                                                      \
+    X(SidebarHide, "サイドバーを畳む (Ctrl+B)", "Collapse the sidebar (Ctrl+B)", "사이드바 접기 (Ctrl+B)") \
+    X(SidebarShow, "サイドバーを開く (Ctrl+B)", "Expand the sidebar (Ctrl+B)", "사이드바 펼치기 (Ctrl+B)") \
     X(HomeInstall, "インストール", "Install", "설치")                                                                    \
     X(HomeChange, "変更…", "Change…", "변경…")                                                                           \
     X(HomeFooter, "nim {}  —  Marathon アセットビューア", "nim {}  —  Marathon asset viewer",                          \

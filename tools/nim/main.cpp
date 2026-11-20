@@ -86,6 +86,11 @@ fs::path exe_dir() {
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     return fs::path(buf).parent_path();
 }
+std::string upper_ascii(std::string s) {
+    for (char& c : s)
+        if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+    return s;
+}
 std::string lower_ascii(std::string s) {
     for (auto& c : s)
         if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
@@ -168,23 +173,26 @@ std::string format_bytes(uint64_t b) {
     return std::format("{:.1f} {}", v, units[u]);
 }
 
-// The interface language is kept in nim_settings.ini next to the exe ("language=ja"). Missing or
-// unknown values fall back to Japanese.
-ui::Lang load_ui_language() {
-    ui::Lang l = ui::Lang::Ja;
+// Preferences kept in nim_settings.ini next to the exe: "language=ja" and "sidebar=1". Missing or
+// unknown values fall back to Japanese and an open sidebar.
+struct Prefs {
+    ui::Lang lang = ui::Lang::Ja;
+    bool sidebar_open = true;
+};
+Prefs g_prefs;
+
+void load_prefs() {
     std::ifstream f(exe_dir() / "nim_settings.ini");
     std::string line;
     while (std::getline(f, line)) {
-        if (line.rfind("language=", 0) != 0) continue;
-        std::string v = line.substr(9);
-        while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
-        ui::parse_lang(v, l);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.rfind("language=", 0) == 0) ui::parse_lang(line.substr(9), g_prefs.lang);
+        else if (line.rfind("sidebar=", 0) == 0) g_prefs.sidebar_open = line.substr(8) != "0";
     }
-    return l;
 }
-void save_ui_language(ui::Lang l) {
+void save_prefs() {
     std::ofstream f(exe_dir() / "nim_settings.ini", std::ios::trunc);
-    if (f) f << "language=" << ui::code(l) << "\n";
+    if (f) f << "language=" << ui::code(g_prefs.lang) << "\nsidebar=" << (g_prefs.sidebar_open ? 1 : 0) << "\n";
 }
 
 std::optional<fs::path> pick_folder(HWND owner) {
@@ -2382,7 +2390,8 @@ public:
     void open_tab(int t) { tab = Tab(t); }
     void set_ui_language(ui::Lang l) {
         ui::set_lang(l);
-        save_ui_language(l);
+        g_prefs.lang = l;
+        save_prefs();
         for (size_t i = 0; i < audio_langs.size() && i < audio_suffixes.size(); ++i)
             audio_langs[i].second = audio_language_name(audio_suffixes[i]);
     }
@@ -2392,7 +2401,7 @@ public:
         viewport_visible = false;
         ImGuiViewport* vp = ImGui::GetMainViewport();
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float side_w = 240 * sc, title_h = 44 * sc, status_h = 28 * sc;
+        const float side_w = (g_prefs.sidebar_open ? 220 : 52) * sc, title_h = 44 * sc, status_h = 28 * sc;
         const ImVec2 work = vp->WorkPos, wsize = vp->WorkSize;
         const ImGuiWindowFlags chrome = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
@@ -2433,8 +2442,64 @@ public:
         if (!pm) install_picker();
         if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && (ImGui::IsKeyPressed(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_L)))
             focus_prompt = true;
+        if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_B) && !ImGui::GetIO().WantTextInput) toggle_sidebar();
         if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S) && gb.lit && scene.loaded())
             capture_requested = true;
+    }
+
+    void toggle_sidebar() {
+        g_prefs.sidebar_open = !g_prefs.sidebar_open;
+        save_prefs();
+    }
+
+    // A square icon button in the title bar. Returns true on click.
+    bool title_icon(const char* id, uint32_t glyph, float x, float h, const char* tip) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        const float s = 30 * sc;
+        ImGui::SetCursorPos({x, (h - s) * 0.5f});
+        const bool clicked = ImGui::InvisibleButton(id, {s, s});
+        caption_hot();
+        const bool hov = ImGui::IsItemHovered();
+        const ImVec2 a = ImGui::GetItemRectMin();
+        auto* dl = ImGui::GetWindowDrawList();
+        if (hov) dl->AddRectFilled(a, {a.x + s, a.y + s}, theme::kHover, 4 * sc);
+        const std::string g = icon(glyph);
+        const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
+        dl->AddText({a.x + (s - gs.x) * 0.5f, a.y + (s - gs.y) * 0.5f}, hov ? theme::kText : theme::kMuted, g.c_str());
+        if (hov && tip) ImGui::SetTooltip("%s", tip);
+        return clicked;
+    }
+
+    // JA / EN / KO: the interface language, one click away. Returns the control's left edge.
+    float lang_switch(float right_x, float h) {
+        const float sc = ImGui::GetStyle().FontScaleDpi;
+        auto* dl = ImGui::GetWindowDrawList();
+        const char* labels[3] = {"JA", "EN", "KO"};
+        const ui::Lang langs[3] = {ui::Lang::Ja, ui::Lang::En, ui::Lang::Ko};
+        const float bw = 34 * sc, bh = 26 * sc, total = 3 * bw;
+        const float x0 = right_x - total;
+        const ImVec2 o = ImGui::GetWindowPos();
+        const float y = (h - bh) * 0.5f;
+        dl->AddRect({o.x + x0, o.y + y}, {o.x + x0 + total, o.y + y + bh}, theme::kBorder, 4 * sc);
+        ImGui::PushFont(g_fonts.button, ImGui::GetFontSize() * 0.8f / sc);
+        for (int i = 0; i < 3; ++i) {
+            ImGui::SetCursorPos({x0 + i * bw, y});
+            ImGui::PushID(i);
+            const bool clicked = ImGui::InvisibleButton("##lang", {bw, bh});
+            caption_hot();
+            const bool hov = ImGui::IsItemHovered();
+            const bool sel = ui::lang() == langs[i];
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            if (sel) dl->AddRectFilled({a.x + 2 * sc, a.y + 2 * sc}, {b.x - 2 * sc, b.y - 2 * sc}, theme::kActive, 3 * sc);
+            else if (hov) dl->AddRectFilled({a.x + 2 * sc, a.y + 2 * sc}, {b.x - 2 * sc, b.y - 2 * sc}, theme::kHover, 3 * sc);
+            const ImVec2 ts = ImGui::CalcTextSize(labels[i]);
+            dl->AddText({a.x + (bw - ts.x) * 0.5f, a.y + (bh - ts.y) * 0.5f}, sel || hov ? theme::kText : theme::kMuted, labels[i]);
+            if (hov) ImGui::SetTooltip("%s", ui::native_name(langs[i]));
+            if (clicked && !sel) set_ui_language(langs[i]);
+            ImGui::PopID();
+        }
+        ImGui::PopFont();
+        return x0;
     }
 
     // Marks the last item as clickable inside the title bar (everything else there drags the window).
@@ -2476,16 +2541,19 @@ public:
             }
         }
 
-        // search
-        const float search_w = std::min(340 * sc, std::max(160 * sc, buttons_x * 0.42f));
-        const float search_x = buttons_x - search_w - 12 * sc;
+        // language, then search
+        const float lang_x = lang_switch(buttons_x - 12 * sc, h);
+        const float search_w = std::min(320 * sc, std::max(140 * sc, lang_x * 0.4f));
+        const float search_x = lang_x - search_w - 10 * sc;
         const float fh = ImGui::GetFrameHeight();
         ImGui::SetCursorPos({search_x, (h - fh) * 0.5f});
         search_box(search_w);
 
         // page name and its description
         const TabInfo& info = kTabs[tab];
-        const float x0 = 20 * sc, max_x = o.x + search_x - 16 * sc;
+        if (title_icon("##side", 0xE700, 8 * sc, h, ui::tr(g_prefs.sidebar_open ? ui::S::SidebarHide : ui::S::SidebarShow)))
+            toggle_sidebar();
+        const float x0 = 46 * sc, max_x = o.x + search_x - 16 * sc;
         ImGui::PushFont(g_fonts.button, 0);
         const float ty = o.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
         const char* name = ui::tr(info.name);
@@ -2530,7 +2598,9 @@ public:
         auto* dl = ImGui::GetWindowDrawList();
         dl->AddLine({o.x + w - 1, o.y}, {o.x + w - 1, o.y + h}, theme::kBorder);
         ImGui::PushFont(g_fonts.bold, 0);
-        dl->AddText({o.x + 20 * sc, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, "nim");
+        const char* brand = g_prefs.sidebar_open ? "nim" : "n";
+        const float bx = g_prefs.sidebar_open ? 20 * sc : (w - ImGui::CalcTextSize(brand).x) * 0.5f;
+        dl->AddText({o.x + bx, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, brand);
         ImGui::PopFont();
 
         const float item = 30 * sc + 2 * sc;
@@ -2591,7 +2661,15 @@ public:
         if (sel) dl->AddRectFilled(p, q, theme::kActive, 4 * sc);
         else if (hovered) dl->AddRectFilled(p, q, theme::kHover, 4 * sc);
         const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
-        text_fit(dl, {p.x + 12 * sc, ty}, sel || hovered ? theme::kText : theme::kMuted, ui::tr(info.name), q.x - 8 * sc);
+        const ImU32 col = sel || hovered ? theme::kText : theme::kMuted;
+        if (g_prefs.sidebar_open) {
+            text_fit(dl, {p.x + 12 * sc, ty}, col, ui::tr(info.name), q.x - 8 * sc);
+        } else {  // folded: the page's icon, its name as the tooltip
+            const std::string g = icon(info.icon);
+            const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
+            dl->AddText({p.x + (w - gs.x) * 0.5f, ty}, col, g.c_str());
+            if (hovered) ImGui::SetTooltip("%s", ui::tr(info.name));
+        }
         ImGui::PopID();
     }
 
@@ -3921,10 +3999,16 @@ public:
     // -- CODEX --
     // The in-game codex: collections in game order, each entry's title, unlock hint and body in any
     // of the 13 languages, and its audio log in any installed voice language.
+    // The codex terminal palette (the in-game intel reader): black, phosphor green, a dim rule.
+    static constexpr ImU32 kCxGreen = IM_COL32(64, 236, 104, 255);
+    static constexpr ImU32 kCxDim = IM_COL32(44, 132, 66, 255);
+    static constexpr ImU32 kCxRule = IM_COL32(26, 74, 40, 255);
+    static constexpr ImU32 kCxPanel = IM_COL32(5, 9, 6, 255);
+
     void codex_tab() {
         if (!catalog || !catalog->codex_ready) {
             if (catalog && catalog->done && !catalog->codex_error.empty())
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kError), "! %s", catalog->codex_error.c_str());
+                ImGui::TextColored(col4(theme::kError), "%s", catalog->codex_error.c_str());
             else loading_state(ui::tr(ui::S::Loading));
             return;
         }
@@ -3933,106 +4017,262 @@ public:
         const float sc = ImGui::GetStyle().FontScaleDpi;
         const size_t lang = codex.lang < 0 ? language : size_t(codex.lang);
 
-        // toolbar
-        ImGui::SetNextItemWidth(std::max(160 * sc, ImGui::GetContentRegionAvail().x * 0.3f));
+        // left: search, options, then the collections and their records
+        const float list_w = 300 * sc;
+        if (codex.collection < 0)  // open on the first record rather than an empty reader
+            for (int ci = 0; ci < int(cx.collections.size()) && codex.collection < 0; ++ci)
+                if (!cx.collections[size_t(ci)].entries.empty()) codex.collection = ci, codex.entry = 0;
+        ImGui::BeginChild("cxside", {list_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        ImGui::SetNextItemWidth(-1);
         ImGui::InputTextWithHint("##cxfilter", ui::tr(ui::S::CodexFilterHint), codex.filter, sizeof(codex.filter));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(170 * sc);
-        if (ImGui::BeginCombo(ui::tr(ui::S::Subtitles), text_language_name(lang))) {
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##cxlang", text_language_name(lang))) {
             for (int l = 0; l < int(kTextLanguageCount); ++l)
                 if (ImGui::Selectable(text_language_name(size_t(l)), size_t(l) == lang)) codex.lang = l;
             ImGui::EndCombo();
         }
-        ImGui::SameLine();
+        ImGui::SetItemTooltip("%s", ui::tr(ui::S::Subtitles));
         ImGui::Checkbox(ui::tr(ui::S::CodexAudioOnly), &codex.audio_only);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(130 * sc);
-        if (audio_langs.empty()) {
-            ImGui::TextDisabled(ui::tr(ui::S::NoVoicePackages));
-        } else if (ImGui::BeginCombo(ui::tr(ui::S::Voice), audio_langs[size_t(audio_lang)].second.c_str())) {
-            for (int i = 0; i < int(audio_langs.size()); ++i)
-                if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
-            ImGui::EndCombo();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", ui::trf(ui::S::CodexCount, cx.collections.size(), cx.entries, cx.with_audio).c_str());
-
-        // left: collections and entries, like a directory listing
         const std::string f = lower_ascii(codex.filter);
-        auto match = [&](uint32_t h) {
-            return f.empty() || contains_ci(text(h, lang), f) || contains_ci(text(h, 0), f);
-        };
-        ImGui::BeginChild("cxlist", {360 * sc, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
-        for (int ci = 0; ci < int(cx.collections.size()); ++ci) {
-            const auto& c = cx.collections[size_t(ci)];
-            bool any = false;
-            for (const auto& e : c.entries)
-                if ((!codex.audio_only || !e.lines.empty()) && (match(c.title) || match(e.title) || match(e.body))) any = true;
-            if (!any) continue;
-            ImGui::PushID(ci);
-            const std::string& ct = text(c.title, lang);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s/", ct.empty() ? "?" : ct.c_str());
-            for (int ei = 0; ei < int(c.entries.size()); ++ei) {
-                const auto& e = c.entries[size_t(ei)];
-                if (codex.audio_only && e.lines.empty()) continue;
-                if (!match(c.title) && !match(e.title) && !match(e.body)) continue;
-                ImGui::PushID(ei);
-                const std::string& et = text(e.title, lang);
-                const std::string label = std::format("  {} {}", e.lines.empty() ? ' ' : '~', et.empty() ? "?" : et);
-                if (ImGui::Selectable(label.c_str(), codex.collection == ci && codex.entry == ei)) {
-                    codex.collection = ci;
-                    codex.entry = ei;
+        auto match = [&](uint32_t h) { return f.empty() || contains_ci(text(h, lang), f) || contains_ci(text(h, 0), f); };
+        const float foot = ImGui::GetTextLineHeightWithSpacing() + 4 * sc;
+        ImGui::BeginChild("cxlist", {0, -foot}, ImGuiChildFlags_Borders);
+        auto* dl = ImGui::GetWindowDrawList();
+        // The game splits one topic over many collections of the same name (one per faction or
+        // contract). Group them by name, in first-seen order, so each topic is one folder.
+        struct Item { int ci, ei; };
+        std::vector<std::pair<std::string, std::vector<Item>>> groups;
+        {
+            std::unordered_map<std::string, size_t> at;
+            for (int ci = 0; ci < int(cx.collections.size()); ++ci) {
+                const auto& c = cx.collections[size_t(ci)];
+                const std::string& ct = text(c.title, lang);
+                const std::string key = ct.empty() ? std::format("{:08X}", c.hash) : ct;
+                for (int ei = 0; ei < int(c.entries.size()); ++ei) {
+                    const auto& e = c.entries[size_t(ei)];
+                    if (codex.audio_only && e.lines.empty()) continue;
+                    if (!match(c.title) && !match(e.title) && !match(e.body)) continue;
+                    auto [it, fresh] = at.try_emplace(key, groups.size());
+                    if (fresh) groups.push_back({key, {}});
+                    groups[it->second].second.push_back({ci, ei});
                 }
-                ImGui::PopID();
+            }
+        }
+        const bool filtering = !f.empty() || codex.audio_only;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const auto& [name, items] = groups[gi];
+            ImGui::PushID(int(gi));
+            bool holds_sel = false;
+            for (const Item& it : items) holds_sel |= it.ci == codex.collection && it.ei == codex.entry;
+            // A folder with one record of the same name is shown as that record alone.
+            const bool single = items.size() == 1 && text(cx.collections[size_t(items[0].ci)].entries[size_t(items[0].ei)].title, lang) == name;
+            bool open = true;
+            if (!single) {
+                if (filtering || holds_sel) ImGui::SetNextItemOpen(true, filtering ? ImGuiCond_Always : ImGuiCond_Once);
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float w = ImGui::GetContentRegionAvail().x;
+                open = ImGui::TreeNodeEx("##g", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen, "%s", "");
+                const float ty = p.y + (ImGui::GetItemRectSize().y - ImGui::GetTextLineHeight()) * 0.5f;
+                const std::string count = std::to_string(items.size());
+                const float cw = ImGui::CalcTextSize(count.c_str()).x;
+                dl->AddText({p.x + w - cw - 6 * sc, ty}, theme::kMuted, count.c_str());
+                text_fit(dl, {p.x + ImGui::GetTreeNodeToLabelSpacing(), ty}, theme::kText, name.c_str(), p.x + w - cw - 14 * sc);
+            }
+            if (open) {
+                std::unordered_map<std::string, int> seen;  // repeated titles get a running number
+                for (const Item& it : items) {
+                    const auto& e = cx.collections[size_t(it.ci)].entries[size_t(it.ei)];
+                    ImGui::PushID(it.ci * 4096 + it.ei);
+                    const bool sel = codex.collection == it.ci && codex.entry == it.ei;
+                    const float indent = single ? 0 : ImGui::GetTreeNodeToLabelSpacing();
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+                    const ImVec2 p = ImGui::GetCursorScreenPos();
+                    const float w = ImGui::GetContentRegionAvail().x;
+                    if (ImGui::Selectable("##e", sel, 0, {w, 0})) {
+                        codex.collection = it.ci;
+                        codex.entry = it.ei;
+                    }
+                    std::string et = text(e.title, lang);
+                    if (et.empty()) et = std::format("{:08X}", e.hash);
+                    const int n = ++seen[et];
+                    if (n > 1) et += std::format("  ({})", n);
+                    const float ty = p.y + (ImGui::GetItemRectSize().y - ImGui::GetTextLineHeight()) * 0.5f;
+                    float right = p.x + w - 4 * sc;
+                    if (!e.lines.empty()) {
+                        const std::string g = icon(ico::Volume);
+                        right -= ImGui::CalcTextSize(g.c_str()).x;
+                        dl->AddText({right, ty}, sel ? kCxGreen : theme::kMuted, g.c_str());
+                        right -= 8 * sc;
+                    }
+                    text_fit(dl, {p.x + 6 * sc, ty}, sel ? theme::kText : (single ? theme::kText : IM_COL32(190, 190, 198, 255)), et.c_str(), right);
+                    ImGui::PopID();
+                }
             }
             ImGui::PopID();
         }
         ImGui::EndChild();
-        ImGui::SameLine();
+        text_line_fit(ui::trf(ui::S::CodexCount, cx.collections.size(), cx.entries, cx.with_audio).c_str(), theme::kMuted);
+        ImGui::EndChild();
+        ImGui::SameLine(0, 16 * sc);
 
-        // right: the record
-        ImGui::BeginChild("cxentry", {0, 0}, ImGuiChildFlags_None);
+        // right: the record as the game's intel reader shows it
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, col4(kCxPanel));
+        ImGui::PushStyleColor(ImGuiCol_Border, col4(kCxRule));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {28 * sc, 22 * sc});
+        ImGui::BeginChild("cxentry", {0, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PopStyleVar();
         if (codex.collection < 0 || size_t(codex.collection) >= cx.collections.size() || codex.entry < 0 ||
             size_t(codex.entry) >= cx.collections[size_t(codex.collection)].entries.size()) {
-            ImGui::TextDisabled("%s", ui::tr(ui::S::CodexPick));
+            ImGui::PushFont(g_fonts.mono, 0);
+            ImGui::TextColored(col4(kCxDim), "> %s", ui::tr(ui::S::CodexPick));
+            ImGui::PopFont();
             ImGui::EndChild();
+            ImGui::PopStyleColor(2);
             return;
         }
         const auto& c = cx.collections[size_t(codex.collection)];
         const auto& e = c.entries[size_t(codex.entry)];
-        ImGui::TextDisabled("%s / %08X", text(c.title, lang).c_str(), e.hash);
-        heading(text(e.title, lang).c_str(), 28);
-        if (e.unlock && !text(e.unlock, lang).empty())
-            ImGui::TextDisabled("[%s] %s", ui::tr(ui::S::CodexUnlock), text(e.unlock, lang).c_str());
+        dl = ImGui::GetWindowDrawList();
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const bool two_col = avail > 760 * sc;
+        const float meta_w = two_col ? std::min(300 * sc, avail * 0.32f) : avail;
+
+        // meta column: illustration frame (none found in the data) and the record's facts
+        auto rule = [&](float w) {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            dl->AddLine({p.x, p.y + 4 * sc}, {p.x + w, p.y + 4 * sc}, kCxRule);
+            ImGui::Dummy({w, 9 * sc});
+        };
+        ImGui::BeginGroup();
+        {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float box = two_col ? meta_w : std::min(meta_w, 220 * sc);
+            dl->AddRect(p, {p.x + box, p.y + box}, kCxRule, 0, 0, 1 * sc);
+            const float t = 10 * sc;  // corner ticks
+            for (int k = 0; k < 4; ++k) {
+                const float x = k & 1 ? p.x + box : p.x, y = k & 2 ? p.y + box : p.y;
+                const float sx = k & 1 ? -t : t, sy = k & 2 ? -t : t;
+                dl->AddLine({x, y}, {x + sx, y}, kCxGreen, 2 * sc);
+                dl->AddLine({x, y}, {x, y + sy}, kCxGreen, 2 * sc);
+            }
+            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
+            const char* none = ui::tr(ui::S::CodexNoIllustration);
+            const float wrap = box - 32 * sc;
+            const ImVec2 ts = ImGui::CalcTextSize(none, nullptr, false, wrap);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {p.x + 16 * sc, p.y + (box - ts.y) * 0.5f}, kCxDim, none, nullptr, wrap);
+            ImGui::PopFont();
+            ImGui::Dummy({box, box});
+            ImGui::Dummy({0, 6 * sc});
+            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + meta_w);
+            auto fact = [&](const char* k, const std::string& v) {
+                ImGui::TextColored(col4(kCxDim), "%s", k);
+                ImGui::TextColored(col4(kCxGreen), "%s", v.c_str());
+            };
+            fact("COLLECTION", upper_ascii(text(c.title, lang)));
+            fact("RECORD", std::format("{:08X}", e.hash));
+            if (e.unlock && !text(e.unlock, lang).empty()) fact(upper_ascii(ui::tr(ui::S::CodexUnlock)).c_str(), text(e.unlock, lang));
+            if (!e.asset.is_none()) fact("ASSET", e.asset.str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+        }
+        ImGui::EndGroup();
+        if (two_col) ImGui::SameLine(0, 32 * sc);
+        else ImGui::Dummy({0, 12 * sc});
+
+        // reader column
+        ImGui::BeginGroup();
+        const float rw = two_col ? std::min(avail - meta_w - 32 * sc, 820 * sc) : avail;
+        ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
+        ImGui::TextColored(col4(kCxDim), "/  %s  /  %s", upper_ascii(text(c.title, lang)).c_str(), upper_ascii(text(e.title, lang)).c_str());
+        ImGui::PopFont();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
+        heading(upper_ascii(text(e.title, lang)).c_str(), 30);
+        ImGui::PopTextWrapPos();
+        rule(rw);
+
+        // audio log
         if (!e.lines.empty()) {
             const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[size_t(audio_lang)].first;
+            ImGui::PushFont(g_fonts.mono, 0);
+            ImGui::TextColored(col4(kCxDim), "%s", upper_ascii(ui::tr(ui::S::CodexPlayLog)).c_str());
+            ImGui::PopFont();
+            if (!audio_langs.empty()) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(140 * sc);
+                if (ImGui::BeginCombo("##cxvoice", audio_langs[size_t(audio_lang)].second.c_str())) {
+                    for (int i = 0; i < int(audio_langs.size()); ++i)
+                        if (ImGui::Selectable(audio_langs[size_t(i)].second.c_str(), audio_lang == i)) audio_lang = i;
+                    ImGui::EndCombo();
+                }
+            }
             for (size_t li : e.lines) {
                 const auto& l = catalog->dialogue[li];
                 if (l.wem.empty()) continue;
-                play_button(uint32_t(li), 0, voice, ui::tr(ui::S::CodexPlayLog));
-                const uint64_t id = clip_id(uint32_t(li), 0, voice);
-                if (clip && clip->id() == id) {
-                    ImGui::SameLine();
-                    const double len = clip->length();
-                    ImGui::SetNextItemWidth(std::min(360 * sc, ImGui::GetContentRegionAvail().x));
-                    ImGui::ProgressBar(len > 0 ? float(clip->position() / len) : 0.f, {std::min(360 * sc, ImGui::GetContentRegionAvail().x), 0},
-                                       std::format("{} / {}", clock_text(clip->position()), clock_text(len)).c_str());
-                }
+                play_button(uint32_t(li), 0, voice);
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s %s", l.wem[0].str().c_str(), speaker_name(l.speaker_hash, lang).c_str());
+                const uint64_t id = clip_id(uint32_t(li), 0, voice);
+                const float bar_w = std::min(260 * sc, std::max(80 * sc, rw - 260 * sc));
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float bh = ImGui::GetFrameHeight();
+                const float t = clip && clip->id() == id && clip->length() > 0 ? float(clip->position() / clip->length()) : 0.0f;
+                dl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w, p.y + bh * 0.5f + 1 * sc}, kCxRule);
+                dl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w * t, p.y + bh * 0.5f + 1 * sc}, kCxGreen);
+                ImGui::Dummy({bar_w, bh});
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
+                // The line's own subtitle is a production label ("[Codex Audio Log for ...]"), not
+                // the transcript; the record body above is what is spoken, so only the time is shown.
+                text_line_fit(clip && clip->id() == id ? (clock_text(clip->position()) + " / " + clock_text(clip->length())).c_str() : l.wem[0].str().c_str(), kCxDim);
+                ImGui::PopFont();
             }
-        } else if (!e.asset.is_none()) {
-            ImGui::TextDisabled("%s", ui::trf(ui::S::CodexAssetNoAudio, e.asset.str()).c_str());
+            rule(rw);
         }
-        ImGui::Separator();
+
+        // body
         const std::string& body = text(e.body, lang);
-        ImGui::PushTextWrapPos(0);
-        if (body.empty()) ImGui::TextDisabled("%s", ui::tr(ui::S::CodexNoBody));
-        else ImGui::TextUnformatted(body.c_str());
+        ImGui::PushFont(g_fonts.mono, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 6 * sc});
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
+        if (body.empty()) ImGui::TextColored(col4(kCxDim), "%s", ui::tr(ui::S::CodexNoBody));
+        else {
+            // Line by line: the record's ===== / ----- rules are cut to the column instead of wrapping.
+            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxGreen));
+            const float cw = std::max(1.0f, ImGui::CalcTextSize("=").x);
+            size_t pos = 0;
+            while (pos <= body.size()) {
+                size_t end = body.find('\n', pos);
+                if (end == std::string::npos) end = body.size();
+                std::string line = body.substr(pos, end - pos);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const bool is_rule = line.size() > 8 && line.find_first_not_of("=-_~ ") == std::string::npos;
+                if (is_rule) {
+                    line.resize(std::min(line.size(), size_t(rw / cw)));
+                    ImGui::TextColored(col4(kCxDim), "%s", line.c_str());
+                } else if (line.empty()) {
+                    ImGui::Dummy({0, ImGui::GetTextLineHeight() * 0.5f});
+                } else {
+                    ImGui::TextUnformatted(line.c_str());
+                }
+                pos = end + 1;
+            }
+            ImGui::PopStyleColor();
+        }
         ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        ImGui::TextDisabled("%s", ui::tr(ui::S::CodexNoIllustration));
+        ImGui::PopStyleVar();
+        ImGui::PopFont();
+        if (e.lines.empty() && !e.asset.is_none()) {
+            rule(rw);
+            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
+            ImGui::TextColored(col4(kCxDim), "%s", ui::trf(ui::S::CodexAssetNoAudio, e.asset.str()).c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+        }
+        ImGui::EndGroup();
         ImGui::EndChild();
+        ImGui::PopStyleColor(2);
     }
 
     void movies_tab() {
@@ -4391,7 +4631,8 @@ int run(const std::wstring& cmdline) {
     }
 
     // The interface language is read before anything that shows text (fonts, the first messages).
-    ui::set_lang(load_ui_language());
+    load_prefs();
+    ui::set_lang(g_prefs.lang);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -4440,6 +4681,11 @@ int run(const std::wstring& cmdline) {
             app->request_load(*tag_arg);
             app->tab = e && e->reference == kClassDynamicModel ? TabEntities : TabStatics;
         }
+    }
+    // NIM_PAGE=<page number 0..11> opens that page first (for headless screenshots of the layout).
+    if (const char* page = std::getenv("NIM_PAGE"); page && *page) {
+        const int t = std::atoi(page);
+        if (t >= 0 && t < TabCount) app->tab = Tab(t);
     }
 
     uint64_t frame = 0;

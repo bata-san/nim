@@ -507,6 +507,140 @@ int cmd_h64(PackageManager& pm, const std::vector<std::string>& values) {
     return 0;
 }
 
+// Codex definition components: class census, then a dump of each component of the first N entries
+// with every u32 that names a tag and every u64 that resolves through the hash64 index.
+int cmd_codex_probe(PackageManager& pm, size_t n) {
+    std::optional<TagHash> defs_tag;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size() && !defs_tag; ++i)
+            if (p.entries()[i].type == 8 && p.entries()[i].reference == kClassCodexDefinitions) defs_tag = TagHash::make(info.pkg_id, uint16_t(i));
+    }
+    if (!defs_tag) return 1;
+    const auto bytes = pm.read(*defs_tag);
+    const auto defs = parse_codex_definitions(bytes);
+    TagReader r(bytes);
+    pm.build_hash64_index();
+    std::map<uint32_t, size_t> census;
+    std::map<uint32_t, std::map<uint32_t, size_t>> by_kind;
+    std::vector<size_t> offs;
+    for (const auto& d : defs)
+        for (const auto& c : d.components) { census[c.cls]++; by_kind[d.kind][c.cls]++; offs.push_back(c.offset); }
+    std::sort(offs.begin(), offs.end());
+    std::println("definitions {}  in {}", defs.size(), defs_tag->str());
+    for (auto& [k, m] : by_kind) {
+        std::print("kind {:08X}:", k);
+        for (auto& [c, cnt] : m) std::print("  {:08X} x{}", c, cnt);
+        std::println("");
+    }
+    {  // 80805322 icon definitions: does their key hash name codex definitions?
+        std::map<uint32_t, uint32_t> icon_of;  // hash -> tag
+        for (const auto& info : pm.packages()) {
+            Package& p = pm.open(info);
+            for (uint32_t i = 0; i < p.entries().size(); ++i)
+                if (p.entries()[i].type == 8 && p.entries()[i].reference == 0x80805322) {
+                    const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+                    const auto b = pm.read(t);
+                    if (b.size() >= 0x10) icon_of[TagReader(b).u32_at(8)] = t.value;
+                }
+        }
+        std::map<uint32_t, size_t> hit_kind, all_kind;
+        for (const auto& d : defs) {
+            all_kind[d.kind]++;
+            if (icon_of.contains(d.hash)) hit_kind[d.kind]++;
+        }
+        std::println("icon definitions (80805322): {}", icon_of.size());
+        // 80805335 (type 16): u32 hash at +0x10, icon tag at +0x18. Find those hashes in the table.
+        std::map<uint32_t, uint32_t> icon35;
+        for (const auto& info : pm.packages()) {
+            Package& p = pm.open(info);
+            for (uint32_t i = 0; i < p.entries().size(); ++i)
+                if (p.entries()[i].reference == 0x80805335) {
+                    const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+                    try {
+                        const auto b = pm.read(t);
+                        if (b.size() >= 0x1C) icon35[TagReader(b).u32_at(0x10)] = TagReader(b).u32_at(0x18);
+                    } catch (...) {}
+                }
+        }
+        std::map<std::pair<uint32_t, size_t>, size_t> where;  // (component class, offset in it) -> hits
+        size_t hits = 0;
+        for (size_t o = 0; o + 4 <= bytes.size(); o += 4)
+            if (icon35.contains(r.u32_at(o))) {
+                ++hits;
+                auto it = std::upper_bound(offs.begin(), offs.end(), o);
+                const size_t base = it == offs.begin() ? 0 : *(it - 1);
+                where[{r.u32_at(base - 4), o - base}]++;
+            }
+        std::println("icon hashes (80805335): {}  found in codex table: {}", icon35.size(), hits);
+        for (auto& [k, c] : where) std::println("  component {:08X} +{:X}: {}", k.first, k.second, c);
+        // Any tag at all whose u32s include an icon hash next to a codex definition hash.
+        std::set<uint32_t> def_hashes;
+        for (const auto& d : defs) def_hashes.insert(d.hash);
+        std::map<uint32_t, size_t> classes;
+        size_t shown_t = 0;
+        for (const auto& info : pm.packages()) {
+            Package& p = pm.open(info);
+            for (uint32_t i = 0; i < p.entries().size(); ++i) {
+                const Entry& e = p.entries()[i];
+                if (e.type != 8 && e.type != 16) continue;
+                const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+                std::vector<uint8_t> b;
+                try { b = pm.read(t); } catch (...) { continue; }
+                TagReader tr(b);
+                size_t ni = 0, nd = 0;
+                for (size_t o = 0; o + 4 <= b.size(); o += 4) {
+                    const uint32_t v = tr.u32_at(o);
+                    ni += icon35.contains(v);
+                    nd += def_hashes.contains(v);
+                }
+                if (ni && nd && e.reference == 0x80806CAC) {
+                    size_t k = 0;
+                    for (size_t o = 0; o + 4 <= b.size() && k < 12; o += 4)
+                        if (icon35.contains(tr.u32_at(o))) {
+                            std::print("    icon @{:X}:", o);
+                            for (int q = -8; q < 8; ++q) std::print(" {:08X}", tr.u32_at(o + q * 4));
+                            std::println("");
+                            ++k;
+                        }
+                }
+                if (ni && nd) {
+                    classes[e.reference]++;
+                    if (shown_t++ < 12) std::println("  both: {} class {:08X} size {} icons {} defs {}", t.str(), e.reference, b.size(), ni, nd);
+                }
+            }
+        }
+        for (auto& [c, k] : classes) std::println("  class {:08X}: {} tags", c, k);
+        for (auto& [k, c] : all_kind) std::println("  kind {:08X}: {} of {} have an icon definition", k, hit_kind[k], c);
+    }
+    size_t shown = 0;
+    for (const auto& d : defs) {
+        if (d.kind != kCodexKindEntry || shown++ >= n) continue;
+        std::println("entry {:08X}", d.hash);
+        for (const auto& c : d.components) {
+            auto it = std::upper_bound(offs.begin(), offs.end(), c.offset);
+            const size_t end = std::min({bytes.size(), it == offs.end() ? bytes.size() : *it - 4, c.offset + 0x140});
+            std::println("  comp {:08X} @{:X} size {:X}", c.cls, c.offset, end - c.offset);
+            for (size_t o = c.offset; o + 4 <= end; o += 4) {
+                const uint32_t v = r.u32_at(o);
+                std::string note;
+                if (const Entry* e = pm.entry(TagHash(v)); e && v != 0 && v != 0xFFFFFFFF && (v & 0x80000000))
+                    note = std::format(" tag type {} sub {} ref {:08X}", e->type, e->subtype, e->reference);
+                if (o + 8 <= end && (o & 7) == 0) {
+                    const uint64_t q = r.u64_at(o);
+                    if (q && q != ~0ull)
+                        if (auto t = pm.resolve64(q)) {
+                            const Entry* e = pm.entry(*t);
+                            note += std::format(" h64->{} type {} sub {} ref {:08X}", t->str(), e ? e->type : 0, e ? e->subtype : 0, e ? e->reference : 0);
+                        }
+                }
+                if (v || !note.empty()) std::println("    +{:03X} {:08X}{}", o - c.offset, v, note);
+            }
+        }
+    }
+    return 0;
+}
+
 // The in-game codex: collections and their intel entries, with the recording lines of each entry.
 // With OUT, writes a Markdown dump (titles and bodies in LANG, default en).
 int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
@@ -2390,6 +2524,7 @@ int main(int argc, char** argv) {
         if (cmd == "strings")
             return cmd_strings(pm, args.size() >= 2 && args[1] != "-" ? args[1].c_str() : nullptr,
                                args.size() >= 3 ? args[2].c_str() : nullptr);
+        if (cmd == "codex-probe") return cmd_codex_probe(pm, args.size() >= 2 ? size_t(std::stoul(args[1])) : 3);
         if (cmd == "codex") return cmd_codex(pm, args.size() >= 2 ? args[1].c_str() : nullptr, args.size() >= 3 ? args[2].c_str() : nullptr);
         if (cmd == "dialogue") return cmd_dialogue(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "wem-audit") return cmd_wem_audit(pm, args.size() >= 2 ? std::stoul(args[1]) : 0);
