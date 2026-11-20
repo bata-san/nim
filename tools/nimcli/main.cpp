@@ -1179,6 +1179,12 @@ int cmd_stage_survey(PackageManager& pm, size_t stage) {
                     ++statics;
                     const StaticMesh m = load_static_mesh(pm, tag);
                     bool hit = false;
+                    for (const auto& sp : m.special_parts)
+                        if (sp.render_stage == stage) {
+                            hit = true;
+                            auto& u = techs[sp.technique.value];
+                            if (!u.first++) u.second = tag.value;
+                        }
                     for (size_t g = 0; g < m.groups.size(); ++g)
                         if (m.groups[g].render_stage == stage) {
                             hit = true;
@@ -1209,6 +1215,111 @@ int cmd_stage_survey(PackageManager& pm, size_t stage) {
     return 0;
 }
 
+// Every record of a map's sky collections (80808378 components -> 8080837C): kind (+0x70),
+// authored distance (+0x64), model, position and the largest axis scale, and the model's
+// render stages.
+int cmd_map_sky(PackageManager& pm, TagHash bubble) {
+    const MapLayout map = load_map_layout(pm, bubble);
+    std::set<uint32_t> collections;
+    for (TagHash t : map.node_tables) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(t); } catch (...) { continue; }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t e = nodes.data + size_t(i) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                if (r.u32_at(p - 4) == 0x80808378) collections.insert(r.u32_at(p + 0x10));
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+        }
+    }
+    for (uint32_t c : collections) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(TagHash(c)); } catch (...) { continue; }
+        TagReader r(data);
+        const auto objects = r.vec_at(0x08);
+        std::println("collection {:08X}: {} records", c, objects.count);
+        for (uint64_t i = 0; i < objects.count; ++i) {
+            const size_t o = objects.data + size_t(i) * 0x90;
+            if (o + 0x90 > data.size()) break;
+            const TagHash ref = r.tag_at(o + 0x60);
+            TagHash model;
+            try { model = TagReader(pm.read(ref)).tag_at(0x08); } catch (...) {}
+            float sc = 0;
+            for (int k = 0; k < 3; ++k) {
+                const float x = r.f32_at(o + k * 16), y = r.f32_at(o + k * 16 + 4), z = r.f32_at(o + k * 16 + 8);
+                sc = std::max(sc, std::sqrt(x * x + y * y + z * z));
+            }
+            std::string stages;
+            try {
+                const StaticMesh m = load_static_mesh(pm, model);
+                std::set<int> st;
+                for (const auto& g : m.groups) st.insert(g.render_stage);
+                for (int s : st) stages += std::format(" {}", s);
+            } catch (const std::exception& ex) { stages = std::string(" (") + ex.what() + ")"; }
+            std::println("  [{:3}] kind {} dist {:9.1f} model {} pos ({:.0f} {:.0f} {:.0f}) scale {:.1f} words +0x68 {:08X} +0x6C {:08X} +0x74 {:08X} stages{}", i,
+                         r.u32_at(o + 0x70), r.f32_at(o + 0x64), model.str(), r.f32_at(o + 0x30), r.f32_at(o + 0x34), r.f32_at(o + 0x38), sc,
+                         r.u32_at(o + 0x68), r.u32_at(o + 0x6C), r.u32_at(o + 0x74), stages);
+        }
+    }
+    return 0;
+}
+
+// The statics and entity models placed within R of (X, Y) (horizontal), largest first:
+// position, scale, the render stages and the techniques of their groups.
+int cmd_map_near(PackageManager& pm, TagHash bubble, float x, float y, float radius) {
+    pm.build_hash64_index();
+    const MapLayout map = load_map_layout(pm, bubble);
+    struct Hit { std::string line; float size; };
+    std::vector<Hit> hits;
+    auto scale_of = [](const std::array<float, 12>& r) {
+        float s = 0;
+        for (int a = 0; a < 3; ++a) s = std::max(s, std::sqrt(r[a] * r[a] + r[4 + a] * r[4 + a] + r[8 + a] * r[8 + a]));
+        return s;
+    };
+    for (const auto& st : map.statics) {
+        StaticMesh m;
+        try { m = load_static_mesh(pm, st.mesh); } catch (...) { continue; }
+        for (const auto& row : st.rows) {
+            // The mesh's centre (its offset) through the placement, and its half extent.
+            const auto& o = m.mesh_offset;
+            const float cx = row[0] * o[0] + row[1] * o[1] + row[2] * o[2] + row[3];
+            const float cy = row[4] * o[0] + row[5] * o[1] + row[6] * o[2] + row[7];
+            const float cz = row[8] * o[0] + row[9] * o[1] + row[10] * o[2] + row[11];
+            const float half = m.mesh_scale * scale_of(row);
+            const float dx = cx - x, dy = cy - y;
+            if (std::sqrt(dx * dx + dy * dy) > radius + half * 0.5f || half > radius * 8) continue;
+            std::map<uint32_t, std::set<int>> tech;
+            for (size_t g = 0; g < m.groups.size(); ++g)
+                if (g < m.techniques.size()) tech[m.techniques[g].value].insert(m.groups[g].render_stage);
+            std::string info;
+            for (const auto& [t, ss] : tech) {
+                info += std::format(" {:08X}:", t);
+                for (int s2 : ss) info += std::format("{},", s2);
+            }
+            hits.push_back({std::format("static {} centre ({:.0f} {:.0f} {:.0f}) half {:.1f} x{} techs{}", st.mesh.str(), cx, cy, cz, half, st.rows.size(), info), half});
+            break;
+        }
+    }
+    const auto materials = index_dynamic_model_materials(pm);
+    const MapEntities me = load_map_entities(pm, map, materials);
+    for (const auto& m : me.models)
+        for (const auto& row : m.rows) {
+            const float dx = row[3] - x, dy = row[7] - y;
+            if (dx * dx + dy * dy > radius * radius) continue;
+            hits.push_back({std::format("entity {} at ({:.0f} {:.0f} {:.0f}) scale {:.1f} x{}", m.mesh.str(), row[3], row[7], row[11], scale_of(row), m.rows.size()), scale_of(row) * 10});
+            break;
+        }
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.size > b.size; });
+    for (size_t i = 0; i < hits.size() && i < 60; ++i) std::println("{}", hits[i].line);
+    return 0;
+}
+
 int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
     pm.build_hash64_index();
     const auto materials = index_dynamic_model_materials(pm);
@@ -1217,18 +1328,21 @@ int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
                  me.placements, me.models.size());
     std::map<size_t, std::pair<size_t, std::string>> stage_models;  // render stage -> (models, samples)
     for (const auto& m : me.models) {
-        std::println("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
+        std::print("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
         try {
             const DynamicModel dm = load_dynamic_model(pm, m.mesh);
             std::set<size_t> stages;
             for (const auto& mesh : dm.meshes)
                 for (size_t s = 0; s < kRenderStageCount; ++s)
                     if (mesh.part_range[s] < std::min<size_t>(mesh.part_range[s + 1], mesh.parts.size())) stages.insert(s);
+            std::print("  stages");
+            for (size_t s : stages) std::print(" {}", s);
             for (size_t s : stages) {
                 auto& e = stage_models[s];
                 if (e.first++ < 6) e.second += std::format(" {}x{}", m.mesh.str(), m.rows.size());
             }
         } catch (...) {}
+        std::println("");
     }
     for (const auto& [s, e] : stage_models) std::println("stage {:2} models {:4}{}", s, e.first, e.second);
     return 0;
@@ -2310,6 +2424,9 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "map-near" && args.size() >= 5)
+            return cmd_map_near(pm, TagHash(parse_hex(args[1])), std::stof(args[2]), std::stof(args[3]), std::stof(args[4]));
+        if (cmd == "map-sky" && args.size() >= 2) return cmd_map_sky(pm, TagHash(parse_hex(args[1])));
         if (cmd == "stage-survey" && args.size() >= 2) return cmd_stage_survey(pm, std::stoul(args[1]));
         if (cmd == "activities") {
             for (const auto& m : list_activity_maps(pm)) {

@@ -72,8 +72,19 @@ struct StaticMeshGroup {
 struct StaticMeshBuffers {
     TagHash index, vertex0, vertex1, color;
 };
+// A static mesh part outside the main groups (SStaticMesh +0x20, Vec<8080861F>, 0x20 bytes):
+// the transparent (8) and light shaft occlusion (10) parts, each with its own buffers.
+struct StaticMeshSpecialPart {
+    uint8_t render_stage = 0;  // +0x00
+    uint8_t input_layout = 0;  // +0x01
+    uint8_t primitive_type = 3;  // +0x02 (3 triangles, 5 strip)
+    TagHash index, vertex0, vertex1, color;  // +0x04, +0x08, +0x0C, +0x10
+    uint32_t index_start = 0, index_count = 0;  // +0x14, +0x18
+    TagHash technique;  // +0x1C
+};
 struct StaticMesh {
     TagHash tag, data_tag;
+    std::vector<StaticMeshSpecialPart> special_parts;
     std::vector<TagHash> techniques;  // one per group
     std::vector<StaticMeshGroup> groups;
     std::vector<StaticMeshPart> parts;

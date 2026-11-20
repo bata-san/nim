@@ -1227,7 +1227,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     TextureCache texture_cache;
     texture_cache.shared = cache;
 
-    struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
+    struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; bool every_lod = false; };
     auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageShadow; };
     std::vector<Pending> pending;
     std::array<uint8_t, 3> stage_lods{};
@@ -1253,9 +1253,27 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             out.notes.push_back(std::format("{} part {}: {}", tag.str(), gr.part_index, ex.what()));
         }
     }
+    // The transparent parts outside the groups (SStaticMesh +0x20): their own buffers, no LOD.
+    for (const auto& sp : mesh.special_parts) {
+        if (sp.render_stage != kStageTransparent || sp.technique.is_none() || sp.index.is_none() || sp.vertex0.is_none()) continue;
+        if (sp.primitive_type != 3 && sp.primitive_type != 5) continue;
+        if (mesh.buffers.size() >= 255 || mesh.parts.size() >= 0xFFFF) break;
+        try {
+            Technique t = load_technique(pm, sp.technique);
+            if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
+            const uint8_t buffer = uint8_t(mesh.buffers.size());
+            mesh.buffers.push_back({sp.index, sp.vertex0, sp.vertex1, sp.color});
+            const StaticMeshPart part{sp.index_start, sp.index_count, buffer, 0, sp.primitive_type};
+            const uint16_t index = uint16_t(mesh.parts.size());
+            mesh.parts.push_back(part);
+            pending.push_back({StaticMeshGroup{index, sp.render_stage, sp.input_layout}, part, std::move(t), true});
+        } catch (const std::exception& ex) {
+            out.notes.push_back(std::format("{} transparent part: {}", tag.str(), ex.what()));
+        }
+    }
     if (std::none_of(pending.begin(), pending.end(), [](const Pending& p) { return p.group.render_stage != kStageShadow; }))
         throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
-    out.lod = uint8_t(std::countr_zero(all_levels));
+    out.lod = all_levels ? uint8_t(std::countr_zero(all_levels)) : 0;
     if (all_lods) out.lod_levels = 0;
 
     ProfileScope profile_buffers("prepare.static.buffers_bounds");
@@ -1289,6 +1307,15 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     const float mb[8] = {mesh.mesh_offset[0], mesh.mesh_offset[1], mesh.mesh_offset[2], mesh.mesh_scale,
                          mesh.texcoord_scale, mesh.texcoord_offset[0], mesh.texcoord_offset[1], 0};
     std::memcpy(out.instance.data() + 80, mb, sizeof(mb));
+    // Mesh block +28 (u32): the VS reads the vertex colour stream as t0[min(vertex id, +28)].
+    // The data tag leaves it 0 (the engine fills it), which gave every vertex the first colour.
+    // The last colour index (estimate: the stream's element count - 1).
+    size_t colours = 0;
+    for (const auto& set : out.buffers) colours = std::max(colours, set.color.size() / 4);
+    if (colours) {
+        const uint32_t last = uint32_t(colours - 1);
+        std::memcpy(out.instance.data() + 80 + 28, &last, 4);
+    }
 
     profile_buffers.stop();
     ProfileScope profile_groups("prepare.static.build_groups");
@@ -1298,7 +1325,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
                                              p.group.render_stage == kStageTransparent));
             out.groups.back().stage = p.group.render_stage;
             out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
-            out.groups.back().lod_mask = all_lods ? std::max<uint8_t>(1, p.part.lod_category) : 1;
+            out.groups.back().lod_mask = !all_lods ? 1 : p.every_lod ? uint8_t(all_levels ? all_levels : 1) : std::max<uint8_t>(1, p.part.lod_category);
             if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
         } catch (const std::exception& ex) {
             if (p.group.render_stage == 0) throw;

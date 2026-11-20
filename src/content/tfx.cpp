@@ -120,6 +120,22 @@ StaticMesh load_static_mesh(PackageManager& pm, TagHash tag) {
     m.data_tag = r.tag_at(0x08);
     auto techs = r.vec_at(0x10);
     for (uint64_t i = 0; i < techs.count; ++i) m.techniques.push_back(r.tag_at(techs.data + size_t(i) * 4));
+    auto special = r.vec_at(0x20);
+    for (uint64_t i = 0; i < special.count; ++i) {
+        const size_t o = special.data + size_t(i) * 0x20;
+        StaticMeshSpecialPart p;
+        p.render_stage = r.u8_at(o);
+        p.input_layout = r.u8_at(o + 1);
+        p.primitive_type = r.u8_at(o + 2);
+        p.index = r.tag_at(o + 4);
+        p.vertex0 = r.tag_at(o + 8);
+        p.vertex1 = r.tag_at(o + 0x0C);
+        p.color = r.tag_at(o + 0x10);
+        p.index_start = r.u32_at(o + 0x14);
+        p.index_count = r.u32_at(o + 0x18);
+        p.technique = r.tag_at(o + 0x1C);
+        m.special_parts.push_back(p);
+    }
 
     auto db = pm.read(m.data_tag);
     TagReader d(db);
