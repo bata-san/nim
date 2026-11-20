@@ -29,7 +29,8 @@ OpInfo op_info(uint8_t op) {
     case 0x20: return {"negate", 1};     case 0x21: return {"vec_rot_sin", 1};
     case 0x22: return {"vec_rot_cos", 1}; case 0x23: return {"vec_rot_sincos", 1};
     case 0x28: return {"splat", 1};      case 0x29: return {"permute", 2};
-    case 0x2A: return {"saturate", 1};   case 0x2E: return {"triangle", 1};
+    case 0x2A: return {"saturate", 1};   case 0x2D: return {"length", 1};
+    case 0x2E: return {"triangle", 1};
     case 0x2F: return {"jitter", 1};     case 0x30: return {"wander", 1};
     case 0x31: return {"rand", 1};       case 0x32: return {"rand_smooth", 1};
     case 0x35: return {"transform_vec4", 1};
@@ -53,7 +54,7 @@ OpInfo op_info(uint8_t op) {
     case 0x67: return {"push_tex_tiling", 3}; case 0x68: return {"push_tex_layer_count", 3};
     case 0x69: return {"push_extern_u32_", 3};
     case 0x6A: case 0x6B: case 0x6C: case 0x6D: return {"unk6x", 1};
-    case 0x10: case 0x11: case 0x12: case 0x17: case 0x1E: case 0x2B: case 0x2C: case 0x2D:
+    case 0x10: case 0x11: case 0x12: case 0x17: case 0x1E: case 0x2B: case 0x2C:
     case 0x33: case 0x34: return {"unk", 1};
     case 0x3B: return {"cmp_lt", 1};     case 0x3C: return {"cmp_le", 1};
     case 0x3D: return {"cmp_gt", 1};     case 0x3E: return {"cmp_ge", 1};
@@ -364,6 +365,13 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
             break;
         }
         case 0x2A: vm.top() = map(vm.top(), [](float x) { return std::min(std::max(x, 0.0f), 1.0f); }); break;
+        case 0x2D: {
+            // Material visibility programs pack (eye - object, 0), then apply
+            // linear near and far ramps to this scalar distance.
+            const auto x = vm.top();
+            vm.top() = splat(std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]));
+            break;
+        }
         case 0x2E: vm.top() = map(vm.top(), [](float x) { return std::fabs(x - std::round(x)) * 2.0f; }); break;
         case 0x35: {
             float4 v = vm.pop(), w = vm.pop(), z = vm.pop(), y = vm.pop(), x = vm.top();

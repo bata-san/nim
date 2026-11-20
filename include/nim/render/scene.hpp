@@ -174,6 +174,7 @@ struct PreparedMesh {
         std::shared_ptr<const std::vector<Scope>> scopes;
         StageResourceSources vs_sources, ps_sources;
         bool vs_live = false, ps_live = false;
+        std::array<uint8_t, 2> preview_sky_weights{};
         std::map<uint32_t, SamplerDesc> vs_samplers, ps_samplers;
         // Constant buffers the object supplies itself (terrain: VS b11 = position offset and
         // texcoord transform), by (stage, register).
@@ -184,6 +185,8 @@ struct PreparedMesh {
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no parts supported by the connected passes
     bool inferred_dynamic_lod = false;
+    bool intact_preview = false;
+    bool inferred_transparent_stage = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
@@ -380,6 +383,7 @@ private:
         std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vs_placement_addresses, ps_placement_addresses;  // this frame's, per placement
         TagHash technique;
         bool vs_live = false, ps_live = false;
+        std::array<uint8_t, 2> preview_sky_weights{};
         bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items
         bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
         bool light_grid = false;

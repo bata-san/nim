@@ -71,14 +71,15 @@ int main() {
 
     // TFX VM: operand order (a - b with b on top), outputs, temps, permute, cubic.
     {
-        const float4 k[3] = {{1, 2, 3, 4}, {10, 20, 30, 40}, {2, 0, 0, 1}};  // cubic coeffs: 2x^3 + 1
+        const float4 k[] = {{1, 2, 3, 4}, {10, 20, 30, 40}, {2, 0, 0, 1}, {3, -4, 0, 0}};
         std::vector<float4> out(8);
         const uint8_t bc[] = {
             0x42, 0x01, 0x42, 0x00, 0x02, 0x53, 0x00,  // out0 = k1 - k0
             0x42, 0x00, 0x29, 0xE4, 0x53, 0x01,        // out1 = k0.wzyx (selectors 11 10 01 00)
             0x42, 0x00, 0x58, 0x03, 0x57, 0x03, 0x42, 0x01, 0x03, 0x53, 0x02,  // temp3 = k0; out2 = temp3 * k1
             0x42, 0x02, 0x42, 0x00, 0x0F, 0x53, 0x03,  // out3 = cubic(k2, k0)
-            0x80, 0x42, 0x00, 0x53, 0x04,              // return stops execution
+            0x42, 0x03, 0x2D, 0x53, 0x04,              // out4 = broadcast length(k3)
+            0x80, 0x42, 0x00, 0x53, 0x05,              // return stops execution
         };
         auto res = run_tfx(bc, k, out);
         CHECK(res.unsupported.empty());
@@ -86,7 +87,8 @@ int main() {
         CHECK((out[1] == float4{4, 3, 2, 1}));
         CHECK((out[2] == float4{10, 40, 90, 160}));
         CHECK((out[3] == float4{3, 17, 55, 129}));
-        CHECK((out[4] == float4{0, 0, 0, 0}));
+        CHECK((out[4] == float4{5, 5, 5, 5}));
+        CHECK((out[5] == float4{0, 0, 0, 0}));
     }
 
     // Sequencer (map environment channel expressions): 0x4A n pushes input n, 0x49 is the

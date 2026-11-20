@@ -26,6 +26,22 @@ namespace {
 constexpr uint8_t kStageShadow = 4;
 constexpr uint8_t kStageTransparent = 8;
 constexpr uint8_t kStageDecal = 2;
+
+// The sky layer's VS returns a zero clip position when cb0[1].x is zero.
+// Recognize its authored visibility expression without changing unrelated global channels.
+std::array<uint8_t, 2> sky_visibility_weights(std::span<const uint8_t> code) {
+    auto is_weight = [](uint8_t index) { return index >= 0x34 && index <= 0x45; };
+    constexpr uint8_t saturate_to_visibility[] = {0x2A, 0x53, 1};
+    auto load_weight = [&](size_t offset) {
+        return code[offset] == 0x63 && is_weight(code[offset + 1]) && code[offset + 2] == 0x29 && code[offset + 3] == 0;
+    };
+    if (code.size() == 7 && load_weight(0) && std::ranges::equal(code.last(3), saturate_to_visibility))
+        return {code[1], 0};
+    if (code.size() == 12 && load_weight(0) && load_weight(4) && code[8] == 0x03 &&
+        std::ranges::equal(code.last(3), saturate_to_visibility)) return {code[1], code[5]};
+    return {};
+}
+
 size_t stage_slot(uint8_t stage) {
     return stage == kStageDecal ? 3 : stage == kStageShadow ? 2 : stage == kStageTransparent ? 1 : 0;
 }
@@ -1000,6 +1016,15 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         const bool has_regular = std::ranges::any_of(opaque, [](const auto& part) {
             return part.lod_role == 1 && (part.lod_category & 1);
         });
+        // These two techniques draw the fragmented shell of the same body. In an
+        // intact preview their flagged sections overlap the unflagged intact shell.
+        auto fractured_shell = [](const DynamicMeshPart& part) {
+            return (part.flags & 8) && (part.technique.value == 0x80A4B903 || part.technique.value == 0x80A4B912);
+        };
+        const bool has_intact_shell = materials && std::ranges::any_of(opaque, [&](const DynamicMeshPart& part) {
+            return part.lod_role == 1 && (part.lod_category & 1) && part.flags == 0 &&
+                   !materials->technique(part.variant_shader_index, perm).is_none();
+        });
         for (uint8_t stage : kDrawnStages) {
             const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
             const bool has_auxiliary = first < last && std::ranges::any_of(
@@ -1017,6 +1042,10 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                     const DynamicMeshPart& dp = mesh.parts[k];
                     if (choose_representation && auxiliary(dp) != (attempt == 1)) continue;
                     if (highest && !(dp.lod_category & highest)) continue;
+                    if (stage == 0 && has_intact_shell && fractured_shell(dp)) {
+                        out.intact_preview = true;
+                        continue;
+                    }
                     // The entity's material variant wins over the part's own technique (goriath binds both,
                     // the variant last).
                     TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
@@ -1034,6 +1063,18 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                         if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
                         PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes, true);
                         g.stage = stage;
+                        if (stage == 0 && g.blend > 1) {
+                            const auto outputs = shader_outputs(g.ps);
+                            uint32_t targets = 0;
+                            for (const auto& output : outputs)
+                                if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && !output.never_written && output.index < 8)
+                                    targets |= 1u << output.index;
+                            // HDR colour and motion layout. The G-buffer has no slot 4.
+                            if (targets == 0x11) {
+                                g.stage = kStageTransparent;
+                                out.inferred_transparent_stage = true;
+                            }
+                        }
                         if (vs_reads_typed_buffers(g.vs) && !packed) {
                             out.notes.push_back(std::format("mesh {} part {}: skinning shader, but no 24-byte vertex stream to pack", mi, k));
                             continue;
@@ -1745,6 +1786,13 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         material_externs_->note_estimate("dynamic LOD: regular parts take precedence over the auxiliary representation",
                                          "role 3 with mask 0x0F overlaps the regular LODs");
 
+    if (mesh.intact_preview)
+        material_externs_->note_estimate("intact entity: fragmented shell groups disabled",
+                                         "the flagged shell techniques overlap the intact skinned mesh");
+    if (mesh.inferred_transparent_stage)
+        material_externs_->note_estimate("HDR colour and motion material drawn in the transparent pass",
+                                         "the shader writes colour at target 0 and motion at target 4");
+
     // Instance index stream (0..n-1) and t2: n 80-byte records (3x4 rows, translation in w;
     // +60 = byte offset of the mesh block), then the mesh block from the prepared single record.
     const uint32_t n = uint32_t(placements.size());
@@ -2124,6 +2172,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
+        if (transparent && dynamic_ && g.blend == 8 && mesh.radius >= 10) {
+            item.preview_sky_weights = sky_visibility_weights(item.vs_material.bytecode);
+            if (item.preview_sky_weights[0])
+                material_externs_->note_estimate("standalone sky layer: visibility weights set to 1",
+                                                 "the original vertex shader suppresses the layer until map channels activate it");
+        }
         const bool decal = g.stage == kStageDecal;
         const bool authored_shadow = g.stage == kStageShadow;
         const auto outputs = g.ps.empty() ? std::vector<ShaderInput>{} : shader_outputs(g.ps);
@@ -2137,11 +2191,16 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         // G-buffer decals blend into some targets and leave the others alone (their state masks them).
         bool blended = false;
         if (transparent) {
-            if (g.blend < 0 || g.blend >= int(std::size(kBlendStates)))
-                throw UnsupportedMeshPart(std::format("Missing original transparent blend state {}", g.blend));
+            constexpr int pass_blend = 8;
+            const int blend = g.blend < 0 ? pass_blend : g.blend;
+            if (blend >= int(std::size(kBlendStates)))
+                throw UnsupportedMeshPart(std::format("Missing original transparent blend state {}", blend));
+            if (g.blend < 0)
+                material_externs_->note_estimate("transparent pass blend state 8 for techniques which inherit it",
+                                                 "same-engine transparent pass default; using the installed blend table");
             pd.BlendState.IndependentBlendEnable = TRUE;
-            pd.BlendState.RenderTarget[0] = blend_desc(g.blend);
-            pd.BlendState.RenderTarget[4] = blend_desc(g.blend, 4);  // original motion blend / coverage
+            pd.BlendState.RenderTarget[0] = blend_desc(blend);
+            pd.BlendState.RenderTarget[4] = blend_desc(blend, 4);  // original motion blend / coverage
             if (!motion) pd.BlendState.RenderTarget[4].RenderTargetWriteMask = 0;
         }
         else if (g.blend >= 0) {
@@ -2540,6 +2599,13 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     };
     auto material_env = [&](const Item& it, const ChannelContext& channels, bool vs) {
         auto env = with_channels(base, channels, vs);
+        if (it.preview_sky_weights[0]) {
+            env.global_channel = [source = std::move(env.global_channel), weights = it.preview_sky_weights](uint8_t index) {
+                auto value = source(index);
+                if (index && (index == weights[0] || index == weights[1])) value[0] = 1;
+                return value;
+            };
+        }
         if (!vs && it.ps_atlas) {
             const auto& atlas = *it.ps_atlas;
             env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };

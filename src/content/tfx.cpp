@@ -189,6 +189,7 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
             p.index_start = r.u32_at(q + 8);
             p.index_count = r.u32_at(q + 0x0C);
             p.external_identifier = r.u16_at(q + 0x14);
+            p.flags = r.u32_at(q + 0x18);
             p.lod_role = r.u16_at(q + 0x1C);
             p.lod_category = r.u8_at(q + 0x21);
             dm.parts.push_back(p);
