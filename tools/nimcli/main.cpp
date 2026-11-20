@@ -1194,6 +1194,82 @@ int cmd_map_shaders(PackageManager& pm, TagHash bubble) {
 
 // Script instances (8080BADB) of a map's package family: the classes they reference, and the
 // ones that place a dynamic model (survey for entities / gimmicks).
+// The placed entities (map nodes -> 8080BAAD) whose components name particle systems (808081E8),
+// with the resource class that holds each reference.
+int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
+    pm.build_hash64_index();
+    MapLayout map;
+    if (!activity.is_none()) {
+        for (const auto& m : list_activity_maps(pm))
+            if (m.activity == activity && m.bubble == bubble) {
+                map = load_map_layout(pm, bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+                break;
+            }
+    } else {
+        map = load_map_layout(pm, bubble);
+    }
+    std::map<uint32_t, size_t> systems;          // particle system -> placements
+    std::map<uint32_t, std::set<uint32_t>> holder;  // system -> resource classes holding it
+    std::unordered_map<uint32_t, std::vector<uint32_t>> entity_systems;
+    size_t nodes = 0, placements = 0;
+    for (const auto table : map.node_tables) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(table); } catch (...) { continue; }
+        TagReader r(data);
+        const auto list = r.vec_at(0x08);
+        for (uint64_t k = 0; k < list.count; ++k) {
+            const size_t e = list.data + size_t(k) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            ++nodes;
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            if (!h64 || h64 == ~0ull) continue;
+            const auto ent = pm.resolve64(h64);
+            if (!ent) continue;
+            auto it = entity_systems.find(ent->value);
+            if (it == entity_systems.end()) {
+                std::vector<uint32_t> found;
+                try {
+                    const auto ed = pm.read(*ent);
+                    std::set<uint32_t> seen;
+                    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                        uint32_t c; std::memcpy(&c, ed.data() + o, 4);
+                        if (c < 0x80800000u || c == ~0u || !seen.insert(c).second) continue;
+                        const Entry* ce = pm.entry(TagHash(c));
+                        if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                        const auto cd = pm.read(TagHash(c));
+                        uint32_t resource = 0;
+                        for (size_t q = 0; q + 8 <= cd.size(); q += 4) {
+                            uint32_t v, w; std::memcpy(&v, cd.data() + q, 4); std::memcpy(&w, cd.data() + q + 4, 4);
+                            if (v == c) resource = w;
+                            if (v < 0x80800000u || v == ~0u) continue;
+                            const Entry* pe = pm.entry(TagHash(v));
+                            if (pe && pe->type == 8 && pe->reference == 0x808081E8) {
+                                found.push_back(v);
+                                holder[v].insert(resource);
+                            }
+                        }
+                    }
+                } catch (...) {}
+                it = entity_systems.emplace(ent->value, std::move(found)).first;
+            }
+            if (it->second.empty()) continue;
+            ++placements;
+            for (uint32_t s : it->second) ++systems[s];
+            if (placements <= 20)
+                std::println("  node {} ent {} pos ({:.1f} {:.1f} {:.1f}) systems {}", table.str(), ent->str(), r.f32_at(e + 0x10),
+                             r.f32_at(e + 0x14), r.f32_at(e + 0x18), it->second.size());
+        }
+    }
+    std::println("{} node tables, {} nodes, {} placements with particle systems, {} systems", map.node_tables.size(), nodes,
+                 placements, systems.size());
+    for (const auto& [s, n] : systems) {
+        std::print("  system {:08X} x{} in", s, n);
+        for (uint32_t c : holder[s]) std::print(" {:08X}", c);
+        std::println("");
+    }
+    return 0;
+}
+
 int cmd_map_entities(PackageManager& pm, TagHash bubble) {
     const PackageInfo* home = pm.info(bubble.pkg_id());
     if (!home) return 1;
@@ -2465,6 +2541,111 @@ int cmd_scope(PackageManager& pm, TagHash tag) {
     return 0;
 }
 
+// Techniques whose used_scopes has bit `bit` set (22 = particle_transforms), then one pass over
+// every tag counting which classes reference them (the asset classes that own those techniques).
+int cmd_scope_survey(PackageManager& pm, unsigned bit) {
+    pm.build_hash64_index();
+    std::set<uint32_t> hits;
+    size_t total = 0;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassTechnique) continue;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            ++total;
+            try {
+                const Technique t = load_technique(pm, tag);
+                if (t.used_scopes >> bit & 1) hits.insert(tag.value);
+            } catch (...) {}
+        }
+    }
+    std::println("scope bit {}: {} of {} techniques", bit, hits.size(), total);
+    size_t shown = 0;
+    for (uint32_t t : hits)
+        if (shown++ < 12) std::println("  technique {:08X}", t);
+    std::map<uint32_t, std::pair<size_t, std::vector<uint32_t>>> classes;  // class -> (tags, examples)
+    std::map<uint32_t, std::set<size_t>> offsets;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference == kClassTechnique) continue;
+            const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+            std::vector<uint8_t> d;
+            try { d = pm.read(t); } catch (...) { continue; }
+            bool hit = false;
+            for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, d.data() + o, 4);
+                if (hits.count(v)) {
+                    hit = true;
+                    if (offsets[e.reference].size() < 8) offsets[e.reference].insert(o);
+                }
+            }
+            if (hit) {
+                auto& c = classes[e.reference];
+                if (c.first++ < 4) c.second.push_back(t.value);
+            }
+        }
+    }
+    for (const auto& [cls, c] : classes) {
+        std::print("  class {:08X} tags {:6} e.g.", cls, c.first);
+        for (uint32_t t : c.second) std::print(" {:08X}", t);
+        std::print("  offsets");
+        for (size_t o : offsets[cls]) std::print(" +0x{:X}", o);
+        std::println("");
+    }
+    return 0;
+}
+
+// Which classes reference tags of class `cls` (by tag32, or by hash64 when `wide`), with offsets.
+int cmd_class_refs(PackageManager& pm, uint32_t cls) {
+    std::set<uint32_t> tags;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i)
+            if (p.entries()[i].type == 8 && p.entries()[i].reference == cls) tags.insert(TagHash::make(info.pkg_id, uint16_t(i)).value);
+    }
+    std::set<uint64_t> wide;
+    for (const auto& info : pm.packages())
+        for (const auto& h : pm.open(info).hash64s())
+            if (tags.count(h.hash32.value)) wide.insert(h.hash64);
+    std::println("class {:08X}: {} tags, {} with hash64", cls, tags.size(), wide.size());
+    struct Use { size_t tags = 0, wide = 0; std::vector<uint32_t> examples; std::set<size_t> offsets; };
+    std::map<uint32_t, Use> classes;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if ((e.type != 8 && e.type != 16) || e.reference == cls) continue;
+            std::vector<uint8_t> d;
+            try { d = p.read_entry(i); } catch (...) { continue; }
+            bool hit = false, hit_wide = false;
+            Use& u = classes[e.type == 8 ? e.reference : 0x10000000u | e.reference];
+            for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+                uint32_t v; std::memcpy(&v, d.data() + o, 4);
+                bool h = (v & 0x80000000u) && tags.count(v);
+                if (!h && o + 8 <= d.size() && !wide.empty()) {
+                    uint64_t w; std::memcpy(&w, d.data() + o, 8);
+                    if (wide.count(w)) h = hit_wide = true;
+                }
+                if (h) { hit = true; if (u.offsets.size() < 6) u.offsets.insert(o); }
+            }
+            if (hit) { ++u.tags; u.wide += hit_wide; if (u.examples.size() < 4) u.examples.push_back(TagHash::make(info.pkg_id, uint16_t(i)).value); }
+        }
+    }
+    for (const auto& [c, u] : classes) {
+        if (!u.tags) continue;
+        std::print("  class {:08X} tags {:6} (hash64 {:5}) e.g.", c, u.tags, u.wide);
+        for (uint32_t t : u.examples) std::print(" {:08X}", t);
+        std::print("  offsets");
+        for (size_t o : u.offsets) std::print(" +0x{:X}", o);
+        std::println("");
+    }
+    return 0;
+}
+
 int cmd_technique(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     Technique t = load_technique(pm, tag);
@@ -2590,6 +2771,10 @@ int main(int argc, char** argv) {
             return cmd_map_near(pm, TagHash(parse_hex(args[1])), std::stof(args[2]), std::stof(args[3]), std::stof(args[4]));
         if (cmd == "map-sky" && args.size() >= 2) return cmd_map_sky(pm, TagHash(parse_hex(args[1])));
         if (cmd == "stage-survey" && args.size() >= 2) return cmd_stage_survey(pm, std::stoul(args[1]));
+        if (cmd == "scope-survey" && args.size() >= 2) return cmd_scope_survey(pm, unsigned(std::stoul(args[1])));
+        if (cmd == "map-fx" && args.size() >= 2)
+            return cmd_map_fx(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? TagHash(parse_hex(args[2])) : TagHash{});
+        if (cmd == "class-refs" && args.size() >= 2) return cmd_class_refs(pm, parse_hex(args[1]));
         if (cmd == "activities") {
             for (const auto& m : list_activity_maps(pm)) {
                 std::println("{} map[{}] bubble {} name {:08X} {}", m.activity.str(), m.activity_map, m.bubble.str(), m.bubble_name, m.name);

@@ -24,6 +24,7 @@
 #include "nim/content/map.hpp"
 #include "nim/content/weather.hpp"
 #include "nim/render/scene.hpp"
+#include "nim/render/particles.hpp"
 
 #include <wincodec.h>
 
@@ -92,7 +93,8 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
-    bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false;
+    bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false, no_fx = false;
+    float fx_radius = -1;
     std::optional<size_t> probe_index;
     bool dump_probe_mask = false;
     bool dump_lighting = false;
@@ -149,6 +151,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-entities") no_entities = true;
+        else if (args[i] == "--no-fx") no_fx = true;
+        else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
@@ -209,7 +213,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--fx-radius M]");
         return 2;
     }
     if (install.empty()) {
@@ -240,6 +244,7 @@ int run(int argc, char** argv) {
     std::vector<const MapCubemap*> region_cubemaps;
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
+    std::vector<MapParticle> particle_placements;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -314,6 +319,14 @@ int run(int argc, char** argv) {
                 if (entity_range) std::println("entity model [{}]: {} ({} placements)", i, er[i].mesh.str(), er[i].rows.size());
                 region.push_back(std::move(er[i]));
             }
+        }
+        // The particle systems (FX) the map's entities place.
+        if (!no_fx) {
+            const auto tf = std::chrono::steady_clock::now();
+            pm.build_hash64_index();
+            particle_placements = load_map_particles(pm, map);
+            std::println("fx: {} particle system placements ({:.1f}s)", particle_placements.size(),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
         }
         // The sky objects (distant scenery kilometres out): all of them, whatever the radius.
         float geometry_extent = 1;
@@ -547,6 +560,17 @@ int run(int argc, char** argv) {
         game = true;
     }
     GameLighting gl;
+    ParticleScene particles;
+    if (fx_radius >= 0) particles.radius = fx_radius;
+    float fx_delta = 1.0f / 60;
+    if (!particle_placements.empty()) {
+        const auto tp = std::chrono::steady_clock::now();
+        particles.load(pm, gpu, particle_placements);
+        gpu.flush();
+        for (const auto& n : particles.notes()) std::println("  {}", n);
+        std::println("fx pipelines ready ({:.1f}s)", std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+        if (particles.loaded()) game = true;
+    }
     auto transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
         const auto& inputs = gl.externs();
         if (verify_frame_inputs) {
@@ -556,7 +580,8 @@ int run(int argc, char** argv) {
                 inputs.get_v(ext::Deferred, 0x00) != float4{0, 1, 0, 0})
                 throw std::runtime_error("Transparent pass requires current linear depth with a matching decode");
         }
-        scene.render_transparent(gpu, c, gb, hdr, vm, inputs);
+        if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, inputs);
+        if (particles.loaded()) particles.render(gpu, c, gb, hdr, vm, inputs, fx_delta);
     };
     if (game) {
         gl.init(pm, gpu);
@@ -615,7 +640,7 @@ int run(int argc, char** argv) {
                 const auto maps = gl.light_shadows_to_render(gpu, gpu.immediate(), vm, scene.item_count(), frame_light_shadows);
                 for (SunShadow* s : maps) scene.render_shadow(gpu, gpu.immediate(), *s);
                 scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-                gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+                gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
                 gpu.flush();
                 drawn += maps.size();
                 if (maps.empty()) break;
@@ -648,13 +673,13 @@ int run(int argc, char** argv) {
                 scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             }
         }
-        gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+        gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
         gpu.flush();
         // Screen-space reflections trace the previous frame's image: one more frame gives them one.
         if (lp.ssr && !gl.ssr_drawn()) {
             gpu.begin_frame(1);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
             gpu.flush();
         }
         std::println("screen-space reflections: {}", gl.ssr_drawn() ? "traced" : "not drawn");
@@ -664,7 +689,7 @@ int run(int argc, char** argv) {
             gpu.begin_frame(uint32_t(k + 1));  // the previous frame was flushed: its transient space is free
             scene.set_exposure(gl.exposure());
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
             gpu.flush();
         }
         // TAA: a still camera converges over the jitter sequence (16 frames: two passes of 8).
@@ -673,7 +698,7 @@ int run(int argc, char** argv) {
             gpu.begin_frame(uint32_t(k));  // the previous frame was flushed: its transient space is free
             vm = gl.temporal_view(view, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
             gpu.flush();
             if (verify_static_motion) {
                 const auto motion = gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8);
@@ -741,6 +766,12 @@ int run(int argc, char** argv) {
         std::println("estimated engine inputs (no game data for these):");
         for (const auto& [what, why] : scene.estimates()) std::println("  material  {}  [{}]", what, why);
         for (const auto& [what, why] : gl.externs().estimates()) std::println("  lighting  {}  [{}]", what, why);
+        for (const auto& [what, why] : particles.estimates()) std::println("  fx  {}  [{}]", what, why);
+        if (particles.loaded()) {
+            std::println("fx: {} of {} emitters simulated", particles.active_count(), particles.emitter_count());
+            for (const auto& n : particles.notes()) std::println("  {}", n);
+            if (std::getenv("NIM_FX_DUMP")) std::print("{}", particles.debug_dump(gpu));
+        }
         write_png(out_dir / "composite_game.png", width, height,
                   gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
         if (shadow.valid) {
@@ -792,7 +823,7 @@ int run(int argc, char** argv) {
             const auto after_geometry = std::chrono::steady_clock::now();
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
             if (game) gl.render(gpu, list, gb, vm, lp,
-                                scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+                                (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
             else lighting.render(gpu, list, gb, vm, lp);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
             list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, readback.Get(), 0);
@@ -1060,7 +1091,7 @@ int run(int argc, char** argv) {
             moved.target = moved.eye + normalize(V3{1, 0, 1});  // mostly empty sky, rotated from the previous view
             vm = gl.temporal_view(moved, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-            gl.render(gpu, gpu.immediate(), gb, vm, lp, scene.has_transparent() ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid());
+            gl.render(gpu, gpu.immediate(), gb, vm, lp, (scene.has_transparent() || particles.loaded()) ? GameLighting::TransparentFn(transparents) : nullptr, &shadow, scene.has_visible_light_grid() || particles.loaded());
             gpu.flush();
             verify_lut(vm);
             const auto depth = gl.externs().texture(ext::Deferred, 0x98);

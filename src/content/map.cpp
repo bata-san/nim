@@ -1022,4 +1022,83 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
     return out;
 }
 
+ParticleSystem load_particle_system(PackageManager& pm, TagHash tag) {
+    const Entry* e = pm.entry(tag);
+    if (!e || e->type != 8 || e->reference != kClassParticleSystem)
+        throw std::runtime_error(std::format("{}: not a particle system", tag.str()));
+    const auto d = pm.read(tag);
+    TagReader r(d);
+    if (d.size() < 0x2C) throw std::runtime_error(std::format("{}: particle system too short", tag.str()));
+    ParticleSystem s;
+    s.tag = tag;
+    s.definition = r.tag_at(0x00);
+    s.init = r.tag_at(0x04);
+    s.update = r.tag_at(0x08);
+    s.instance = r.tag_at(0x10);
+    s.draw = r.tag_at(0x14);
+    const auto def = pm.read(s.definition);
+    TagReader dr(def);
+    if (def.size() < 0x138 || dr.u32_at(0x120) != 0x811C9DC5u)
+        throw std::runtime_error(std::format("{}: unknown particle definition layout", s.definition.str()));
+    s.lifetime = dr.f32_at(0x128);
+    s.rate = dr.f32_at(0x134);
+    return s;
+}
+
+std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map) {
+    std::vector<MapParticle> out;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> entity_systems;
+    for (const auto table : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(table);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t k = 0; k < nodes.count; ++k) {
+            const size_t e = nodes.data + size_t(k) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            if (!h64 || h64 == ~0ull) continue;
+            const auto ent = pm.resolve64(h64);
+            if (!ent) continue;
+            auto it = entity_systems.find(ent->value);
+            if (it == entity_systems.end()) {
+                std::vector<uint32_t> systems;
+                const Entry* ee = pm.entry(*ent);
+                if (ee && ee->type == 8 && ee->reference == 0x8080BAAD) {
+                    try {
+                        const auto ed = pm.read(*ent);
+                        std::set<uint32_t> listed, found;
+                        for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                            uint32_t c;
+                            std::memcpy(&c, ed.data() + o, 4);
+                            if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+                            const Entry* ce = pm.entry(TagHash(c));
+                            if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
+                            const auto cd = pm.read(TagHash(c));
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t v;
+                                std::memcpy(&v, cd.data() + q, 4);
+                                if (v < 0x80800000u || v == ~0u || found.count(v)) continue;
+                                const Entry* pe = pm.entry(TagHash(v));
+                                if (pe && pe->type == 8 && pe->reference == kClassParticleSystem) found.insert(v);
+                            }
+                        }
+                        systems.assign(found.begin(), found.end());
+                    } catch (...) {
+                    }
+                }
+                it = entity_systems.emplace(ent->value, std::move(systems)).first;
+            }
+            if (it->second.empty()) continue;
+            const auto rows = quat_rows(r, e);
+            for (uint32_t s : it->second) out.push_back({TagHash(s), rows});
+        }
+    }
+    return out;
+}
+
 }  // namespace nim

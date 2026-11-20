@@ -54,7 +54,11 @@ OpInfo op_info(uint8_t op) {
     case 0x69: return {"push_extern_u32_", 3};
     case 0x6A: case 0x6B: case 0x6C: case 0x6D: return {"unk6x", 1};
     case 0x10: case 0x11: case 0x12: case 0x17: case 0x1E: case 0x2B: case 0x2C: case 0x2D:
-    case 0x33: case 0x34: case 0x3B: case 0x3D: case 0x3F: case 0x40: case 0x41: return {"unk", 1};
+    case 0x33: case 0x34: return {"unk", 1};
+    case 0x3B: return {"cmp_lt", 1};     case 0x3C: return {"cmp_le", 1};
+    case 0x3D: return {"cmp_gt", 1};     case 0x3E: return {"cmp_ge", 1};
+    case 0x3F: return {"cmp_eq", 1};     case 0x40: return {"cmp_ne", 1};
+    case 0x41: return {"select", 1};
     case 0x80: return {"return", 1};
     default: return {nullptr, 0};
     }
@@ -499,7 +503,22 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         }
         case 0x66:
             throw std::runtime_error(std::format("TFX: unimplemented opcode {} {:02X} {:02X} at {:04X}", name, a1, a2, ip));
-        case 0x3D: note("unk3d"); break;
+        // Comparisons (1 / 0 per component) and the select after them: mida's opcode list names
+        // 0x3B-0x41 CompareLess .. CompareNotEqual, CompareNotZeroTernary without values. Order
+        // and operands read from the particle update's frame-time guard
+        // `dt, 0.001, cmp_gt, 1/60, dt, select` = dt > 0.001 ? dt : 1/60.
+        case 0x3B: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x < y ? 1.0f : 0.0f; }); }); break;
+        case 0x3C: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x <= y ? 1.0f : 0.0f; }); }); break;
+        case 0x3D: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x > y ? 1.0f : 0.0f; }); }); break;
+        case 0x3E: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x >= y ? 1.0f : 0.0f; }); }); break;
+        case 0x3F: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x == y ? 1.0f : 0.0f; }); }); break;
+        case 0x40: vm.binary([](float4 a, float4 b) { return zip(a, b, [](float x, float y) { return x != y ? 1.0f : 0.0f; }); }); break;
+        case 0x41: {
+            const float4 b = vm.pop(), a = vm.pop();
+            const float4 c = vm.top();
+            for (int i = 0; i < 4; ++i) vm.top()[i] = c[i] != 0 ? b[i] : a[i];
+            break;
+        }
         default:
             // Never continue with an invented result for an unknown instruction.
             note(name);
