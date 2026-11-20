@@ -349,7 +349,7 @@ int run(int argc, char** argv) {
         }
         PrepareCache cache;
         cache.max_texture_dim = map_texture_cap;
-        cache.all_lods = true;
+        cache.keep_static_lods_for_map = true;
         scene.begin(gpu);
         std::map<std::string, size_t> failures;
         double prep_s = 0, add_s = 0;

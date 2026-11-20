@@ -1081,7 +1081,8 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                         }
                         g.buffers = set;
                         grow_bounds(bufs.ib, bufs.vb0, part, scale, offset, lo, hi);
-                        lod = std::min(lod, dp.lod_category);
+                        const auto detail = dp.lod_category ? uint8_t(std::countr_zero(dp.lod_category)) : uint8_t(0);
+                        lod = std::min(lod, detail);
                         out.groups.push_back(std::move(g));
                         used = true;
                     } catch (const std::exception& ex) {
@@ -1466,8 +1467,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     for (const auto& g : mesh.groups)
         if (drawn(g.render_stage))
             stage_lods[stage_slot(g.render_stage)] |= std::max<uint8_t>(1, mesh.parts.at(g.part_index).lod_category);
-    const uint8_t all_levels = stage_lods[0] | stage_lods[1];
-    const bool all_lods = cache && cache->all_lods;
+    const bool all_lods = cache && cache->keep_static_lods_for_map;
     for (size_t g = 0; g < mesh.groups.size(); ++g) {
         const auto& gr = mesh.groups[g];
         if (!drawn(gr.render_stage) || g >= mesh.techniques.size() || mesh.techniques[g].is_none()) continue;
@@ -1516,7 +1516,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     }
     if (std::none_of(pending.begin(), pending.end(), [](const Pending& p) { return p.group.render_stage != kStageShadow; }))
         throw std::runtime_error("mesh has no G-buffer or transparent groups with a vertex + pixel shader");
-    out.lod = all_levels ? uint8_t(std::countr_zero(all_levels)) : 0;
+    out.lod = 0xFF;
     if (all_lods) out.lod_levels = 0;
 
     ProfileScope profile_buffers("prepare.static.buffers_bounds");
@@ -1570,12 +1570,17 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
             out.groups.back().lod_mask = all_lods ? std::max<uint8_t>(1, p.part.lod_category) : 1;
             if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
+            if (p.group.render_stage != kStageShadow) {
+                const uint8_t detail = uint8_t(std::countr_zero(std::max<uint8_t>(1, p.part.lod_category)));
+                out.lod = std::min(out.lod, detail);
+            }
         } catch (const std::exception& ex) {
             if (p.group.render_stage == 0) throw;
             out.notes.push_back(std::format("{} part {}: {}", tag.str(), p.group.part_index, ex.what()));
         }
     }
     if (out.groups.empty()) throw std::runtime_error(out.notes.front());
+    if (out.lod == 0xFF) out.lod = 0;
     return out;
 }
 
@@ -2035,8 +2040,16 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
         }
         const auto& source_buffers = sets_.at(item.buffers);
+        // Rigid models with no colour stream can clamp the authored vertex-colour lookup to
+        // element zero. Supply the same-engine default vertex colour only for that typed slot.
+        auto neutral_vertex_color = [&](uint32_t slot, BindingKind kind) {
+            if (kind != BindingKind::TypedBuffer) return false;
+            if (!mesh.dynamic) return slot == 0 || slot == 1;
+            return slot == 0 && mesh.model_cb[4][3] == 0;
+        };
         for (const auto& [slot, kind] : vs_kinds) {
-            const bool color = (slot == 0 || slot == 1) && (source_buffers.color || !mesh.dynamic);
+            const bool color = kind == BindingKind::TypedBuffer && (slot == 0 || slot == 1) &&
+                               (source_buffers.color || neutral_vertex_color(slot, kind));
             const bool skin = mesh.dynamic && slot >= 2 && slot <= 4 && source_buffers.skin_pos;
             const bool instance_data = !mesh.dynamic && slot == 2;  // the mesh's own t2, a root SRV
             if (!item.vs_textures.contains(slot) && !item.vs_sources.extern_textures.contains(slot) && !color && !skin &&
@@ -2094,11 +2107,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 const BindingKind k = kind_of(vs_kinds, s);
                 if (auto f = item.vs_textures.find(s); f != item.vs_textures.end()) {
                     create_texture_srv(dev, f->second.Get(), k, h);
-                } else if ((s == 0 || s == 1) && bs.color) {
+                } else if ((s == 0 || s == 1) && k == BindingKind::TypedBuffer && bs.color) {
                     create_buffer_srv(dev, bs.color, DXGI_FORMAT_R8G8B8A8_UNORM, h);
-                } else if ((s == 0 || s == 1) && !mesh.dynamic && vs_kinds.contains(s) && !item.vs_sources.extern_textures.contains(s)) {
-                    // The VS reads a colour stream this mesh does not have (its colour comes from
-                    // map-baked per-instance data not decoded yet): white.
+                } else if (vs_kinds.contains(s) && !item.vs_sources.extern_textures.contains(s) && neutral_vertex_color(s, k)) {
                     if (!white_color_) {
                         const uint32_t white = 0xFFFFFFFFu;
                         white_color_ = arena_.upload(gpu, &white, 4);
@@ -2106,7 +2117,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                     create_buffer_srv(dev, white_color_.resource.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1, h, white_color_.offset / 4);
                     if (material_externs_)
                         material_externs_->note_estimate(std::format("{} VS t{} vertex colour = white", item.technique.str(), s),
-                                                         "mesh has no colour stream (map-baked per-instance colour not decoded)");
+                            mesh.dynamic ? "no authored vertex-colour stream; shader indexes element 0; same-engine neutral colour"
+                                         : "mesh has no colour stream (map-baked per-instance colour not decoded)");
                 } else if (mesh.dynamic && s >= 2 && s <= 4 && bs.skin_pos) {
                     ID3D12Resource* r = s == 3 ? bs.skin_normal.Get() : bs.skin_pos.Get();
                     create_buffer_srv(dev, r, DXGI_FORMAT_R32_UINT, UINT(r->GetDesc().Width / 4), h);

@@ -239,7 +239,7 @@ struct PreviewAnimation {
 // textures shared by tag and capped at max_texture_dim (0 = full size), G-buffer parts only.
 struct PrepareCache {
     uint32_t max_texture_dim = 0;
-    bool all_lods = false;  // every LOD level (maps pick one per instance by screen size)
+    bool keep_static_lods_for_map = false;  // the model view keeps only the highest authored LOD
     bool ready = false;
     std::shared_ptr<const std::vector<float4>> global_channels;
     std::shared_ptr<const std::vector<Scope>> scopes;

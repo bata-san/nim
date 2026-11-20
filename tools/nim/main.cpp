@@ -1119,7 +1119,7 @@ private:
                 if (!cache || cache->max_texture_dim != req.texture_cap) {
                     cache.emplace();
                     cache->max_texture_dim = req.texture_cap;
-                    cache->all_lods = true;
+                    cache->keep_static_lods_for_map = true;
                 }
                 const auto center = req.center ? *req.center : !starts.empty() ? starts.front().position : map_focus(*layout);
                 auto region = map_region(*layout, center, req.radius);
