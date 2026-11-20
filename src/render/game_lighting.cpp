@@ -2782,6 +2782,16 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     const auto q12p = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
     const Scope* extra_scopes[] = {&rigid_scope_, &transparent_scope_, &transparent_adv_scope_};
     const VolumeDraw* current_draw = nullptr;  // its object scopes were evaluated ahead
+    // transparent_advanced (cb8) has no bytecode: the engine fills it per object. The light
+    // shaft PS reads only cb8[7].w, the weight of the froxel transmittance t25.x * t25.y in
+    // lerp(fog colour (global channel 0x16), 1, weight * transmittance), the shaft's
+    // attenuation by the atmosphere. Zero turned every shaft into the fog colour (about
+    // 0.002, i.e. invisible); one leaves the attenuation to the froxels.
+    std::array<float4, 37> shaft_advanced{};
+    shaft_advanced[7][3] = 1;
+    ext_.note_estimate("light shaft transparent_advanced cb8[7].w = 1 (froxel transmittance weight)",
+                       "engine-filled per-object value; read as the weight of the froxel transmittance in the shaft PS");
+    const auto shaft_advanced_cb = upload({shaft_advanced.begin(), shaft_advanced.end()});
     ScopeBufferFn qscopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
         if (reg == 12) return stage == ShaderStage::Vertex ? q12v : q12p;
         if (reg == 13) return full_scopes(stage, 13);
@@ -2790,6 +2800,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
             const Scope* s = extra_scopes[i];
             const auto& st = s->stages[size_t(ss)];
             if (st.cbuffer_slot != int32_t(reg) || st.cbuffer_init.empty()) continue;
+            if (s == &transparent_adv_scope_) return shaft_advanced_cb;
             if (current_draw && (ss == ScopeStage::Vertex || ss == ScopeStage::Pixel)) {
                 const size_t slot = i * 2 + (ss == ScopeStage::Pixel ? 1 : 0);
                 if (!current_draw->scope_errors[slot].empty()) throw std::runtime_error(current_draw->scope_errors[slot]);

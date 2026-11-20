@@ -989,11 +989,26 @@ int cmd_map_components(PackageManager& pm, TagHash bubble, uint32_t detail_type,
 int cmd_map_shaders(PackageManager& pm, TagHash bubble) {
     const MapLayout map = load_map_layout(pm, bubble);
     std::map<uint32_t, size_t> techniques;  // technique -> parts
+    struct Census { size_t groups = 0, instances = 0; std::map<uint32_t, uint32_t> samples; };
+    std::map<int, Census> stage_census;  // render stage -> static mesh groups
     for (const auto& st : map.statics) {
         try {
             const StaticMesh mesh = load_static_mesh(pm, st.mesh);
             for (TagHash t : mesh.techniques) if (!t.is_none()) techniques[t.value] += st.rows.size();
+            for (size_t g = 0; g < mesh.groups.size(); ++g) {
+                auto& c = stage_census[mesh.groups[g].render_stage];
+                c.groups += 1;
+                c.instances += st.rows.size();
+                if (g < mesh.techniques.size() && !mesh.techniques[g].is_none() && c.samples.size() < 8 &&
+                    !c.samples.contains(mesh.techniques[g].value))
+                    c.samples[mesh.techniques[g].value] = st.mesh.value;
+            }
         } catch (...) {}
+    }
+    for (const auto& [stage, c] : stage_census) {
+        std::print("stage {:2} groups {:6} instances {:7}  e.g.", stage, c.groups, c.instances);
+        for (const auto& [t, m] : c.samples) std::print(" {:08X}@{:08X}", t, m);
+        std::println("");
     }
     for (const auto& tr : map.terrains)
         for (const auto& p : tr.parts) if (!p.technique.is_none()) techniques[p.technique.value] += 1;
@@ -1148,13 +1163,74 @@ int cmd_map_placements(PackageManager& pm, TagHash bubble) {
     return 0;
 }
 
+// Every static mesh and dynamic model in the install with parts in one render stage
+// (e.g. 20 = Volumetrics): count, examples and their techniques.
+int cmd_stage_survey(PackageManager& pm, size_t stage) {
+    size_t statics = 0, dynamics = 0, hits_s = 0, hits_d = 0;
+    std::map<uint32_t, std::pair<size_t, uint32_t>> techs;  // technique -> (uses, first model)
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8) continue;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            try {
+                if (e.reference == kClassStaticMesh) {
+                    ++statics;
+                    const StaticMesh m = load_static_mesh(pm, tag);
+                    bool hit = false;
+                    for (size_t g = 0; g < m.groups.size(); ++g)
+                        if (m.groups[g].render_stage == stage) {
+                            hit = true;
+                            const uint32_t t = g < m.techniques.size() ? m.techniques[g].value : 0;
+                            auto& u = techs[t];
+                            if (!u.first++) u.second = tag.value;
+                        }
+                    hits_s += hit;
+                } else if (e.reference == kClassDynamicModel) {
+                    ++dynamics;
+                    const DynamicModel dm = load_dynamic_model(pm, tag);
+                    bool hit = false;
+                    for (const auto& mesh : dm.meshes)
+                        for (size_t k = mesh.part_range[stage]; k < std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size()); ++k) {
+                            hit = true;
+                            auto& u = techs[mesh.parts[k].technique.value];
+                            if (!u.first++) u.second = tag.value;
+                        }
+                    hits_d += hit;
+                }
+            } catch (...) {}
+        }
+    }
+    std::println("stage {}: {} of {} statics, {} of {} dynamic models, {} techniques", stage, hits_s, statics, hits_d, dynamics, techs.size());
+    size_t shown = 0;
+    for (const auto& [t, u] : techs)
+        if (shown++ < 40) std::println("  technique {:08X} parts {:5} first in {:08X}", t, u.first, u.second);
+    return 0;
+}
+
 int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
     pm.build_hash64_index();
     const auto materials = index_dynamic_model_materials(pm);
     const MapEntities me = load_map_entities(pm, load_map_layout(pm, bubble), materials);
     std::println("{} node tables, {} nodes, {} entities, {} placements with a model, {} models", me.node_tables, me.nodes, me.entities,
                  me.placements, me.models.size());
-    for (const auto& m : me.models) std::println("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
+    std::map<size_t, std::pair<size_t, std::string>> stage_models;  // render stage -> (models, samples)
+    for (const auto& m : me.models) {
+        std::println("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
+        try {
+            const DynamicModel dm = load_dynamic_model(pm, m.mesh);
+            std::set<size_t> stages;
+            for (const auto& mesh : dm.meshes)
+                for (size_t s = 0; s < kRenderStageCount; ++s)
+                    if (mesh.part_range[s] < std::min<size_t>(mesh.part_range[s + 1], mesh.parts.size())) stages.insert(s);
+            for (size_t s : stages) {
+                auto& e = stage_models[s];
+                if (e.first++ < 6) e.second += std::format(" {}x{}", m.mesh.str(), m.rows.size());
+            }
+        } catch (...) {}
+    }
+    for (const auto& [s, e] : stage_models) std::println("stage {:2} models {:4}{}", s, e.first, e.second);
     return 0;
 }
 
@@ -2234,6 +2310,7 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "stage-survey" && args.size() >= 2) return cmd_stage_survey(pm, std::stoul(args[1]));
         if (cmd == "activities") {
             for (const auto& m : list_activity_maps(pm)) {
                 std::println("{} map[{}] bubble {} name {:08X} {}", m.activity.str(), m.activity_map, m.bubble.str(), m.bubble_name, m.name);
