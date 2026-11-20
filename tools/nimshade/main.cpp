@@ -81,7 +81,7 @@ int run(int argc, char** argv) {
     bool no_light_shadows = false;
     size_t frame_light_shadows = 0;  // > 0: draw the light maps as the GUI does, this many per whole frame
     bool verify_frame_inputs = false;
-    bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, print_channels = false;
+    bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, no_interior_fog = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     TagHash equipment_model;
     bool list_clips = false;
@@ -188,6 +188,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-environment") no_environment = true;
         else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
         else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
+        else if (args[i] == "--no-interior-fog") no_interior_fog = true;
         else if (args[i] == "--print-channels") print_channels = true;
         else if (args[i] == "--clip" && i + 1 < args.size()) clip_tag = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--equipment" && i + 1 < args.size()) equipment_model = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
@@ -215,7 +216,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--fx-radius M]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--fx-radius M]");
         return 2;
     }
     if (install.empty()) {
@@ -421,6 +422,12 @@ int run(int argc, char** argv) {
             const bool is_terrain = j < terrain.size();
             const std::string what = is_terrain ? terrain[j]->tag.str() : region[j - terrain.size()].mesh.str();
             try {
+                // Diagnostics: NIM_MESH_SKIP=TAG,... leaves those models out; NIM_MESH_LIST prints the entity models.
+                if (const char* skip = std::getenv("NIM_MESH_SKIP"); skip && !is_terrain && std::strstr(skip, what.c_str())) continue;
+                if (const char* list = std::getenv("NIM_MESH_LIST"); list && !is_terrain && (list[0] == 'a' || j - terrain.size() >= static_count))
+                    std::println("mesh {} at ({:.1f} {:.1f} {:.1f})", what, region[j - terrain.size()].rows.empty() ? 0.0f : region[j - terrain.size()].rows[0][3],
+                                 region[j - terrain.size()].rows.empty() ? 0.0f : region[j - terrain.size()].rows[0][7],
+                                 region[j - terrain.size()].rows.empty() ? 0.0f : region[j - terrain.size()].rows[0][11]);
                 if (!prepared[j]) throw std::runtime_error(errors[j]);
                 if (is_terrain) scene.add_mesh(gpu, std::move(*prepared[j]), layouts, std::span(&identity, 1));
                 else {
@@ -542,6 +549,7 @@ int run(int argc, char** argv) {
     lp.environment = !no_environment;
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
+    lp.interior_fog = !no_interior_fog;
     lp.froxel_fog = !no_froxels;
     lp.froxel_noise = !no_froxel_noise;
     lp.probe_distance_fade = probe_distance_fade;

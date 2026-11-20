@@ -1255,7 +1255,9 @@ int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
             if (it->second.empty()) continue;
             ++placements;
             for (uint32_t s : it->second) ++systems[s];
-            if (placements <= 20)
+            const char* want = std::getenv("NIM_FX_SYSTEM");  // list every placement holding this system
+            const bool listed = want && std::ranges::any_of(it->second, [&](uint32_t s) { return TagHash(s).str() == want; });
+            if (placements <= 20 || listed)
                 std::println("  node {} ent {} pos ({:.1f} {:.1f} {:.1f}) systems {}", table.str(), ent->str(), r.f32_at(e + 0x10),
                              r.f32_at(e + 0x14), r.f32_at(e + 0x18), it->second.size());
         }

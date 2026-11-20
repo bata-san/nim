@@ -1049,7 +1049,7 @@ ParticleSystem load_particle_system(PackageManager& pm, TagHash tag) {
 
 std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map) {
     std::vector<MapParticle> out;
-    std::unordered_map<uint32_t, std::vector<uint32_t>> entity_systems;
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> entity_systems;  // (system, gate)
     for (const auto table : map.node_tables) {
         std::vector<uint8_t> data;
         try {
@@ -1068,12 +1068,13 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             if (!ent) continue;
             auto it = entity_systems.find(ent->value);
             if (it == entity_systems.end()) {
-                std::vector<uint32_t> systems;
+                std::vector<std::pair<uint32_t, uint32_t>> systems;
                 const Entry* ee = pm.entry(*ent);
                 if (ee && ee->type == 8 && ee->reference == 0x8080BAAD) {
                     try {
                         const auto ed = pm.read(*ent);
-                        std::set<uint32_t> listed, found;
+                        std::set<uint32_t> listed;
+                        std::map<uint32_t, uint32_t> found;  // system -> gate
                         for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
                             uint32_t c;
                             std::memcpy(&c, ed.data() + o, 4);
@@ -1081,12 +1082,21 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
                             const Entry* ce = pm.entry(TagHash(c));
                             if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
                             const auto cd = pm.read(TagHash(c));
+                            uint32_t gate = 0;
                             for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
                                 uint32_t v;
                                 std::memcpy(&v, cd.data() + q, 4);
-                                if (v < 0x80800000u || v == ~0u || found.count(v)) continue;
+                                if (v == kChannelExfilActivationProgress) gate = v;
+                            }
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t v;
+                                std::memcpy(&v, cd.data() + q, 4);
+                                if (v < 0x80800000u || v == ~0u) continue;
                                 const Entry* pe = pm.entry(TagHash(v));
-                                if (pe && pe->type == 8 && pe->reference == kClassParticleSystem) found.insert(v);
+                                if (pe && pe->type == 8 && pe->reference == kClassParticleSystem) {
+                                    auto [at, fresh] = found.try_emplace(v, gate);
+                                    if (!fresh && !gate) at->second = 0;  // also held ungated
+                                }
                             }
                         }
                         systems.assign(found.begin(), found.end());
@@ -1097,7 +1107,7 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             }
             if (it->second.empty()) continue;
             const auto rows = quat_rows(r, e);
-            for (uint32_t s : it->second) out.push_back({TagHash(s), rows});
+            for (const auto& [s, gate] : it->second) out.push_back({TagHash(s), rows, gate});
         }
     }
     return out;

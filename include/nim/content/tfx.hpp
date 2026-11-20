@@ -137,6 +137,9 @@ struct DynamicModelMaterials {
     uint32_t permutation_count = 1;
     uint32_t default_permutation = 0;  // goriath: the last permutation when there are more than two
     std::map<uint32_t, std::array<float, 4>> object_defaults;  // entity channel expressions' initial constants
+    // Placed by an exfil device: a component of its entity reads exfil_activation_progress. Its
+    // run-time object state (shader_int, ...) is then the device's inactive state.
+    bool exfil_device = false;
     TagHash technique(uint16_t variant, uint32_t permutation) const;
 };
 // Model tag -> materials, from one pass over every component tag (a few seconds).

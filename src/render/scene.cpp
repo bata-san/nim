@@ -646,6 +646,9 @@ struct ChannelContext {
     const ExternStore* estimates = nullptr;  // where an unauthored channel's estimate is reported
     // The object's world position (its placement's translation), for interpolated_world_position.
     const float4* world_position = nullptr;
+    // A model of an exfil device (DynamicModelMaterials::exfil_device): with no activation state
+    // supplied the device is inactive, so its unset run-time state reads 0, not the generic 1.
+    bool exfil_device = false;
 };
 // fnv1("interpolated_world_position"): where the object is. Materials rotate / scale their
 // vertices about it; unset, the pivot is somewhere else and the object swings around it.
@@ -665,6 +668,12 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
         static const float4 unset{1, 1, 1, 1};
         static const float4 inactive{};
         if (!value && h == kInterpolatedWorldPosition && cc.world_position) value = cc.world_position;
+        if (!value && cc.exfil_device) {
+            value = &inactive;
+            if (cc.estimates && cc.estimates->first_note(uint64_t(1) << 61 | h))
+                cc.estimates->note_estimate(std::format("exfil device object channel {:08X} ({}) = 0", h, object_channel_name(h) ? object_channel_name(h) : "unnamed"),
+                                            "the model's entity reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
+        }
         if (!value && h == kExfilActivationProgress) {
             value = &inactive;
             if (cc.estimates && cc.estimates->first_note(uint64_t(1) << 62 | h))
@@ -961,6 +970,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     uint32_t perm = 0;
     if (materials) {
         out.channel_defaults = materials->object_defaults;
+        out.exfil_device = materials->exfil_device;
         perm = permutation < 0 ? materials->default_permutation : uint32_t(permutation);
         out.component = materials->component;
         out.permutation = perm;
@@ -1950,6 +1960,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             set.placements.assign(placements.begin(), placements.end());
             set.sky_order.assign(sky_order.begin(), sky_order.end());
             set.model_channels = model_channels;
+            set.exfil_device = mesh.exfil_device;
             if (mesh.animation_equipment) set.equipment = std::make_unique<BufferSet::EquipmentPlacement>(BufferSet::EquipmentPlacement{mesh.model_cb});
             if (assembled_) {
                 std::copy_n(mesh.model_cb.begin(), set.model_parameters.size(), set.model_parameters.begin());
@@ -2551,7 +2562,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     const ChannelContext cc{&channel_overrides_, &channels_, &channel_defaults_, &ext};
     auto channels_for = [&](const BufferSet& set) {
         ChannelContext result = cc;
-        if (set.dynamic) result.defaults = set.model_channels.get();
+        if (set.dynamic) result.defaults = set.model_channels.get(), result.exfil_device = set.exfil_device;
         return result;
     };
     material_addresses_.clear();

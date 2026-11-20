@@ -202,6 +202,7 @@ struct PreparedMesh {
     std::map<uint32_t, ChannelUse> channels;  // object channels the materials read
     ChannelValues channel_overrides;
     ChannelValues channel_defaults;
+    bool exfil_device = false;  // placed by an exfil device: unset object state is its inactive state (0)
     std::shared_ptr<const std::vector<float4>> global_channels;
     std::shared_ptr<const std::vector<Scope>> scopes;
     TagHash component;               // dynamic models: the component the materials came from
@@ -471,6 +472,7 @@ private:
         V3 model_center{};
         std::array<float4, 7> model_parameters{};
         std::shared_ptr<const ChannelValues> model_channels;
+        bool exfil_device = false;
         std::vector<std::array<float, 12>> placements;
         std::vector<float> sky_order;
         GpuBuffer object_cb;
@@ -576,6 +578,9 @@ struct LightingParams {
     // With the sky ambient: cubemap_apply_sky_copy_ao_with_overhead_occlusion, the sky's light
     // faded under cover (GameLighting::set_overhead_occlusion supplies the top-down map).
     bool overhead_occlusion = true;
+    // Froxel interior classification (extern 81) from the same top-down depth: froxels under geometry
+    // take fog_density_interior. The engine's interior visibility map producer is unknown (estimate).
+    bool interior_fog = true;
     // With the atmosphere: the engine's froxel volume (cascade_raymarch_atmosphere_volume and
     // its _inscatter pass) for the height fog's density, sun shadowing and in-scatter.
     bool froxel_fog = true;

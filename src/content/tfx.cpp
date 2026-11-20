@@ -5,6 +5,7 @@
 #include <cstring>
 #include <format>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace nim {
 namespace {
@@ -233,6 +234,8 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
     std::unordered_map<uint32_t, DynamicModelMaterials> out;
     using Defaults = std::map<uint32_t, std::array<float, 4>>;
     std::unordered_map<uint32_t, Defaults> channel_components;
+    std::unordered_set<uint32_t> exfil_components;  // components reading exfil_activation_progress
+    constexpr uint32_t kExfilActivationProgress = 0x4AE64998;  // fnv1("exfil_activation_progress")
     for (const auto& info : pm.packages()) {
         Package& p = pm.open(info);
         for (uint32_t i = 0; i < p.entries().size(); ++i) {
@@ -244,6 +247,14 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                 bytes = pm.read(tag);
             } catch (...) {
                 continue;
+            }
+            for (size_t o = 0; o + 4 <= bytes.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, bytes.data() + o, 4);
+                if (v == kExfilActivationProgress) {
+                    exfil_components.insert(tag.value);
+                    break;
+                }
             }
             TagReader r(bytes);
             try {
@@ -317,15 +328,19 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
             auto components = r.vec_at(0x08);
             Defaults defaults;
             std::vector<uint32_t> placed;
+            bool exfil = false;
             for (uint64_t c = 0; c < components.count; ++c) {
                 const uint32_t component = r.u32_at(components.data + size_t(c) * 12);
+                exfil = exfil || exfil_components.count(component);
                 if (auto f = channel_components.find(component); f != channel_components.end())
                     defaults.insert(f->second.begin(), f->second.end());
                 if (auto f = models_of.find(component); f != models_of.end())
                     placed.insert(placed.end(), f->second.begin(), f->second.end());
             }
-            for (uint32_t model : placed)
+            for (uint32_t model : placed) {
                 if (defaults.size() > out[model].object_defaults.size()) out[model].object_defaults = defaults;
+                if (exfil) out[model].exfil_device = true;
+            }
         } catch (...) {
         }
     }

@@ -73,6 +73,7 @@ private:
     size_t active_ = 0;
     std::unique_ptr<Scope> view_scope_, transparent_scope_, grid_scope_;
     std::vector<std::string> notes_;
+    size_t gated_ = 0;  // placements left out: their sequence waits on an unset exfil activation
 };
 
 }  // namespace nim

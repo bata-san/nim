@@ -259,7 +259,11 @@ ParticleSystem load_particle_system(PackageManager& pm, TagHash tag);
 struct MapParticle {
     TagHash system;
     std::array<float, 12> rows;  // rotation * scale | translation
+    // An object channel the holding component's sequence reads (the exfil device's
+    // exfil_activation_progress), 0 if none: the systems play on that run-time state.
+    uint32_t gate = 0;
 };
+inline constexpr uint32_t kChannelExfilActivationProgress = 0x4AE64998;  // fnv1("exfil_activation_progress")
 std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map);
 
 }  // namespace nim

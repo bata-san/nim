@@ -90,7 +90,14 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     transparent_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("transparent")));
     grid_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("player_centered_cascaded_grid")));
     std::unordered_map<uint32_t, int> index;  // system tag -> systems_ index, -1 = failed
+    gated_ = 0;
     for (const auto& p : placements) {
+        // The exfil device's FX component plays on exfil_activation_progress. With no activation
+        // state supplied the device is inactive (as its materials, scene.cpp), so they do not run.
+        if (p.gate == kChannelExfilActivationProgress) {
+            ++gated_;
+            continue;
+        }
         auto [it, fresh] = index.try_emplace(p.system.value, -1);
         if (fresh) {
             try {
@@ -274,6 +281,9 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
                      "per-instance effect parameters (tint / alpha) the pattern sequencer writes; not decoded: 1");
     ext.set(kParticle, 0x144, 1.0f);
     ext.note_estimate("extern 27 +0x144 = 1", "particle draw fade (cb0[186] of the draw VS), producer not found");
+    if (gated_)
+        ext.note_estimate(std::format("{} particle placements of exfil devices not run: exfil_activation_progress = 0", gated_),
+                          "their component's sequence reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
     ext.note_estimate("particle spawn rate = definition +0x134 per second, life = definition +0x128",
                       "the FX expression program of the definition (808081EF) is not decoded");
     ext.note_estimate("particle_transforms / particle_location_metadata: identity emitter frame",

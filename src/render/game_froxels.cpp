@@ -88,14 +88,20 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     ext_.set(S, 0x30, float4{shadowed ? -size : 0, 0, 0, 0});
     ext_.set_texture(S, 0x00, shadowed ? shadow->depth.Get() : unshadowed_.Get(),
                      shadowed ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UNORM);
-    // Interior (extern 81) and general overhead occlusion (extern 82) are
-    // distinct engine inputs: render_overhead_visibility_map_* has separate
-    // main/interior/occlusion variants. Rain depth is not an interior map.
-    // Feeding it here classifies every ray below any outdoor geometry as indoor
-    // and integrates the much denser indoor fog across the courtyard.
-    ext_.estimate_texture(I, 0x00, unshadowed_.Get(), "interior height map producer unknown: no authored interior classification");
-    ext_.estimate(I, 0x10, float4{}, "interior height map unavailable: world depth 0 compares in front of clear depth 1");
-    ext_.set(I, 0x20, float4{});
+    // Interior (extern 81): the density CS marks a froxel indoor when its depth in this top-down map
+    // lies behind the stored depth (w = 1: covered), and indoor froxels take fog_density_interior.
+    // The engine's render_overhead_visibility_map_interior producer is unknown; nim's straight-down
+    // depth (the rain / overhead occlusion map) stands in, so everything under geometry is indoor.
+    const bool covered = p.interior_fog && overhead_ && overhead_->valid && overhead_->mask;
+    if (covered) {
+        ext_.estimate_texture(I, 0x00, overhead_->mask.Get(), "interior height map = nim straight-down depth (everything under geometry is indoor)");
+        ext_.set(I, 0x10, overhead_->scale);
+        ext_.set(I, 0x20, overhead_->offset);
+    } else {
+        ext_.estimate_texture(I, 0x00, unshadowed_.Get(), "interior height map unavailable: no froxel is indoor");
+        ext_.set(I, 0x10, float4{});
+        ext_.set(I, 0x20, float4{});
+    }
     const V3 sun = sun_toward(p);
     ext_.set_channel("sun_light_direction", float4{sun.x, sun.y, sun.z, 0});
 
@@ -121,6 +127,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     Gpu::barrier(cl, no_atmosphere_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     if (p.froxel_noise) Gpu::barrier(cl, atmosphere_noise_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, kRead);
+    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kRead);
     Gpu::barrier(cl, froxel_density_vol_.Get(), kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto& density = p.froxel_noise ? (shadowed ? froxel_density_noise_ : froxel_density_noise_no_sun_)
                                   : (shadowed ? froxel_density_ : froxel_density_no_sun_);
@@ -133,6 +140,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     inscatter.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
     finite_constants(inscatter);
     Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
+    if (covered) Gpu::barrier(cl, overhead_->mask.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (shadowed) Gpu::barrier(cl, shadow->depth.Get(), kRead, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     Gpu::barrier(cl, no_atmosphere_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.froxel_noise) Gpu::barrier(cl, atmosphere_noise_.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
