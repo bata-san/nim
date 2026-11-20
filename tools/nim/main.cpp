@@ -1245,7 +1245,9 @@ public:
 
     // The loaded map region (the live scene holds its meshes).
     struct MapView {
-        int selection_mode = 0;  // 0: the map alone, 1: the map as a game mode (activity) uses it
+        // 0: the map alone, 1: the map as a game mode (activity) uses it. Default 1: the game always
+        // plays a map through an activity, whose placements carry most props (terminals, screens).
+        int selection_mode = 1;
         char filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
@@ -1837,8 +1839,16 @@ public:
         }
         const auto& maps = map_worker.maps();
         if (pending_map) {
-            for (size_t i = 0; i < maps.size(); ++i)
-                if (maps[i].bubble == *pending_map && maps[i].activity.is_none()) { load_map(int(i), std::nullopt); break; }
+            // The map as its first game mode uses it (the list's kind follows), else the map alone.
+            int pick = -1;
+            for (size_t i = 0; i < maps.size() && pick < 0; ++i)
+                if (maps[i].bubble == *pending_map && !maps[i].activity.is_none()) pick = int(i);
+            for (size_t i = 0; i < maps.size() && pick < 0; ++i)
+                if (maps[i].bubble == *pending_map) pick = int(i);
+            if (pick >= 0) {
+                map.selection_mode = maps[size_t(pick)].activity.is_none() ? 0 : 1;
+                load_map(pick, std::nullopt);
+            }
             pending_map.reset();
         }
         const ImVec2 avail = ImGui::GetContentRegionAvail();

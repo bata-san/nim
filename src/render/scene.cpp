@@ -1227,7 +1227,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     TextureCache texture_cache;
     texture_cache.shared = cache;
 
-    struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; bool every_lod = false; };
+    struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
     auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageShadow; };
     std::vector<Pending> pending;
     std::array<uint8_t, 3> stage_lods{};
@@ -1253,20 +1253,31 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             out.notes.push_back(std::format("{} part {}: {}", tag.str(), gr.part_index, ex.what()));
         }
     }
-    // The transparent parts outside the groups (SStaticMesh +0x20): their own buffers, no LOD.
+    // The transparent parts outside the groups (SStaticMesh +0x20): their own buffers and LOD
+    // categories, chosen like the groups' (the highest detail unless every LOD is kept).
+    uint8_t special_lods = 0;
+    for (const auto& sp : mesh.special_parts)
+        if (sp.render_stage == kStageTransparent) special_lods |= std::max<uint8_t>(1, sp.lod_category);
+    const uint8_t special_highest = uint8_t(special_lods & -int(special_lods));
     for (const auto& sp : mesh.special_parts) {
         if (sp.render_stage != kStageTransparent || sp.technique.is_none() || sp.index.is_none() || sp.vertex0.is_none()) continue;
         if (sp.primitive_type != 3 && sp.primitive_type != 5) continue;
+        if (!(std::max<uint8_t>(1, sp.lod_category) & (all_lods ? special_lods : special_highest))) continue;
         if (mesh.buffers.size() >= 255 || mesh.parts.size() >= 0xFFFF) break;
         try {
             Technique t = load_technique(pm, sp.technique);
             if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
-            const uint8_t buffer = uint8_t(mesh.buffers.size());
-            mesh.buffers.push_back({sp.index, sp.vertex0, sp.vertex1, sp.color});
-            const StaticMeshPart part{sp.index_start, sp.index_count, buffer, 0, sp.primitive_type};
+            // Parts sharing buffers share one set.
+            uint8_t buffer = uint8_t(mesh.buffers.size());
+            for (size_t b = 0; b < mesh.buffers.size(); ++b) {
+                const auto& mb = mesh.buffers[b];
+                if (mb.index == sp.index && mb.vertex0 == sp.vertex0 && mb.vertex1 == sp.vertex1 && mb.color == sp.color) buffer = uint8_t(b);
+            }
+            if (buffer == mesh.buffers.size()) mesh.buffers.push_back({sp.index, sp.vertex0, sp.vertex1, sp.color});
+            const StaticMeshPart part{sp.index_start, sp.index_count, buffer, sp.lod_category, sp.primitive_type};
             const uint16_t index = uint16_t(mesh.parts.size());
             mesh.parts.push_back(part);
-            pending.push_back({StaticMeshGroup{index, sp.render_stage, sp.input_layout}, part, std::move(t), true});
+            pending.push_back({StaticMeshGroup{index, sp.render_stage, sp.input_layout}, part, std::move(t)});
         } catch (const std::exception& ex) {
             out.notes.push_back(std::format("{} transparent part: {}", tag.str(), ex.what()));
         }
@@ -1325,7 +1336,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
                                              p.group.render_stage == kStageTransparent));
             out.groups.back().stage = p.group.render_stage;
             out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
-            out.groups.back().lod_mask = !all_lods ? 1 : p.every_lod ? uint8_t(all_levels ? all_levels : 1) : std::max<uint8_t>(1, p.part.lod_category);
+            out.groups.back().lod_mask = all_lods ? std::max<uint8_t>(1, p.part.lod_category) : 1;
             if (all_lods) out.lod_levels |= out.groups.back().lod_mask;
         } catch (const std::exception& ex) {
             if (p.group.render_stage == 0) throw;

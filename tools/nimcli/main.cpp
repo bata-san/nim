@@ -2119,6 +2119,10 @@ int cmd_static(PackageManager& pm, TagHash tag) {
     for (size_t b = 0; b < m.buffers.size(); ++b)
         std::println("  buffers[{}] ib {} vb0 {} vb1 {} color {}", b, m.buffers[b].index.str(), m.buffers[b].vertex0.str(),
                      m.buffers[b].vertex1.str(), m.buffers[b].color.str());
+    for (const auto& sp : m.special_parts)
+        std::println("  special stage {:>2} layout {:>3} lod {} prim {} ib {} vb0 {} vb1 {} color {} idx [{}, +{}) tech {}", sp.render_stage, sp.input_layout,
+                     sp.lod_category, sp.primitive_type, sp.index.str(), sp.vertex0.str(), sp.vertex1.str(), sp.color.str(), sp.index_start, sp.index_count,
+                     sp.technique.str());
     for (size_t g = 0; g < m.groups.size(); ++g) {
         const auto& gr = m.groups[g];
         const auto& part = m.parts.at(gr.part_index);

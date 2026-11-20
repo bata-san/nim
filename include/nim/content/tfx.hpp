@@ -77,7 +77,8 @@ struct StaticMeshBuffers {
 struct StaticMeshSpecialPart {
     uint8_t render_stage = 0;  // +0x00
     uint8_t input_layout = 0;  // +0x01
-    uint8_t primitive_type = 3;  // +0x02 (3 triangles, 5 strip)
+    uint8_t lod_category = 0;    // +0x02 (bit 0 = highest detail, as StaticMeshPart)
+    uint8_t primitive_type = 3;  // +0x03 (3 triangles, 5 strip)
     TagHash index, vertex0, vertex1, color;  // +0x04, +0x08, +0x0C, +0x10
     uint32_t index_start = 0, index_count = 0;  // +0x14, +0x18
     TagHash technique;  // +0x1C

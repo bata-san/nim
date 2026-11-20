@@ -416,7 +416,8 @@ int run(int argc, char** argv) {
                 prepared[j].reset();
                 terrain_ok += is_terrain;
             } catch (const std::exception& ex) {
-                if (++failures[std::string(ex.what()).substr(0, 100)] == 1) std::println("  {}{}: {}", is_terrain ? "terrain " : "", what, ex.what());
+                if (++failures[std::string(ex.what()).substr(0, 100)] == 1 || std::getenv("NIM_LIST_SKIPPED"))
+                    std::println("  {}{}: {}", is_terrain ? "terrain " : "", what, ex.what());
             }
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();

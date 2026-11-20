@@ -126,7 +126,8 @@ StaticMesh load_static_mesh(PackageManager& pm, TagHash tag) {
         StaticMeshSpecialPart p;
         p.render_stage = r.u8_at(o);
         p.input_layout = r.u8_at(o + 1);
-        p.primitive_type = r.u8_at(o + 2);
+        p.lod_category = r.u8_at(o + 2);
+        p.primitive_type = r.u8_at(o + 3);
         p.index = r.tag_at(o + 4);
         p.vertex0 = r.tag_at(o + 8);
         p.vertex1 = r.tag_at(o + 0x0C);
