@@ -55,6 +55,7 @@
 #include "nim/core/binary.hpp"
 #include "nim/core/package_manager.hpp"
 #include "nim/core/tag_reader.hpp"
+#include "nim/sim/ai.hpp"
 #include "nim/render/scene.hpp"
 
 #include <algorithm>
@@ -1321,6 +1322,115 @@ int cmd_h64_graph(PackageManager& pm, const std::string& prefix) {
                 }
             }
         }
+    }
+    return 0;
+}
+
+// An entity's motion-bank clips and the gait read from their feet (fps 30, 推定).
+int cmd_motion_probe(PackageManager& pm, TagHash entity) {
+    pm.build_hash64_index();
+    const auto bytes = pm.read(entity);
+    TagReader r(bytes);
+    const auto comps = r.vec_at(0x08);
+    TagHash sk, rg;
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        if (is_skeleton_component(pm, c)) sk = c;
+        else try { if (load_animation_rig(pm, c).size()) rg = c; } catch (...) {}
+    }
+    if (sk.is_none() || rg.is_none()) throw std::runtime_error("entity has no skeleton and rig");
+    const auto skeleton = load_skeleton(pm, sk);
+    const auto rig = load_animation_rig(pm, rg);
+    const auto feet = find_feet(skeleton);
+    if (!feet) throw std::runtime_error("no ankle pair");
+    std::println("skeleton {} rig {} feet {} {}", sk.str(), rg.str(), (*feet)[0], (*feet)[1]);
+    for (const auto clip : entity_motion_clips(pm, entity)) {
+        try {
+            const auto c = load_animation_clip(pm, clip);
+            if (c.bone_count != rig.size()) continue;
+            const auto g = measure_clip_gait(skeleton, rig, c, *feet, 30.0f);
+            std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f} dir ({:5.2f} {:5.2f})", clip.str(), c.frame_count, g.seconds,
+                         g.cyclic ? 1 : 0, g.lift, g.speed, g.direction[0], g.direction[1]);
+        } catch (const std::exception& e) {
+            std::println("{} {}", clip.str(), e.what());
+        }
+    }
+    return 0;
+}
+
+// Estimated AI simulation (3.69): squads patrol their objective's firing areas, drones fly their
+// splines, and every enemy keeps an awareness of the player (the camera). Rules are 推定.
+int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, std::array<float, 3> player, bool visible, uint64_t seed,
+               const char* json) {
+    pm.build_hash64_index();
+    const MapGameplay g = load_map_gameplay(pm, activity);
+    std::vector<MotionSet> motions;
+    std::map<uint32_t, size_t> by_entity;
+    for (const auto& ch : g.characters) {
+        if (const auto it = by_entity.find(ch.entity.value); it != by_entity.end()) {
+            const MotionSet copy = motions[it->second];
+            motions.push_back(copy);
+            continue;
+        }
+        by_entity[ch.entity.value] = motions.size();
+        motions.push_back(build_motion_set(pm, ch.entity, 30.0f));
+    }
+    for (size_t c = 0; c < g.characters.size(); ++c) {
+        const auto& m = motions[c];
+        std::println("  motion {} {:<28} {} locomotion clips, idle {}{}", g.characters[c].entity.str(), g.characters[c].name_estimate,
+                     m.locomotion.size(), m.idle ? m.idle->clip.str() : "-", m.error.empty() ? "" : "  (" + m.error + ")");
+    }
+    AiParams params;
+    params.player_invisible = !visible;
+    std::println("estimates (推定):");
+    for (const auto& e : ai_estimates(params)) std::println("  {:<16} {:>6.2f}  {}", e.name, e.value, e.note);
+    AiSimulation sim(g, params, seed, motions);
+    std::println("agents {} drones {} player ({:.1f} {:.1f} {:.1f}) {}", sim.agents().size(), sim.drones().size(), player[0], player[1], player[2],
+                 visible ? "visible" : "invisible to enemies");
+    std::string j = "{\"frames\":[";
+    const int steps = int(seconds / dt);
+    std::array<size_t, 3> peak{};
+    float walked = 0;
+    for (int i = 0; i <= steps; ++i) {
+        if (i) sim.step(dt, player);
+        std::array<size_t, 3> count{};
+        for (const auto& a : sim.agents()) ++count[size_t(a.alert)], walked += std::hypot(a.velocity[0], a.velocity[1]) * (i ? dt : 0);
+        for (const auto& d : sim.drones()) ++count[size_t(d.alert)];
+        for (size_t k = 0; k < 3; ++k) peak[k] = std::max(peak[k], count[k]);
+        if (json && i % std::max(1, int(0.5f / dt)) == 0) {
+            j += std::format("{}{{\"t\":{:.2f},\"agents\":[", j.back() == '[' ? "" : ",", sim.time());
+            for (size_t k = 0; k < sim.agents().size(); ++k) {
+                const auto& a = sim.agents()[k];
+                std::string clip = "idle";
+                if (a.character < motions.size() && a.motion.locomotion) clip = motions[a.character].locomotion[*a.motion.locomotion].clip.str();
+                j += std::format("{}[{:.2f},{:.2f},{:.2f},{:.3f},{:.3f},{},{},\"{}\",{:.2f}]", k ? "," : "", a.position[0], a.position[1], a.position[2],
+                                 a.yaw, a.awareness, int(a.alert), a.sees_player ? 1 : 0, clip, a.motion_time);
+            }
+            j += "],\"drones\":[";
+            for (size_t k = 0; k < sim.drones().size(); ++k) {
+                const auto& d = sim.drones()[k];
+                j += std::format("{}[{:.2f},{:.2f},{:.2f},{:.3f},{:.3f},{},{}]", k ? "," : "", d.position[0], d.position[1], d.position[2], d.yaw,
+                                 d.awareness, int(d.alert), d.sees_player ? 1 : 0);
+            }
+            j += "]}";
+        }
+    }
+    std::println("after {:.1f}s: walked {:.0f} m in total; peak unaware {} suspicious {} alerted {}", sim.time(), walked, peak[0], peak[1], peak[2]);
+    for (const auto& a : sim.agents())
+        if (a.alert != AiAlert::Unaware)
+            std::println("  {} at ({:.1f} {:.1f} {:.1f}) awareness {:.2f} {}", g.characters[a.character].name_estimate, a.position[0], a.position[1],
+                         a.position[2], a.awareness, ai_alert_name(a.alert));
+    if (json) {
+        j += std::format("],\"player\":[{:.2f},{:.2f},{:.2f}],\"squads\":[", player[0], player[1], player[2]);
+        for (size_t k = 0; k < sim.agents().size(); ++k) {
+            const auto& a = sim.agents()[k];
+            j += std::format("{}[{},{},{:.1f}]", k ? "," : "", a.squad, a.character, a.sight);
+        }
+        j += "],\"names\":[";
+        for (size_t c = 0; c < g.characters.size(); ++c) j += std::format("{}\"{}\"", c ? "," : "", g.characters[c].name_estimate);
+        j += "]}";
+        std::ofstream(json, std::ios::binary) << j;
+        std::println("wrote {}", json);
     }
     return 0;
 }
@@ -3139,7 +3249,26 @@ int main(int argc, char** argv) {
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "h64-graph" && args.size() >= 2) return cmd_h64_graph(pm, args[1]);
+        if (cmd == "motion-probe" && args.size() >= 2) return cmd_motion_probe(pm, TagHash(parse_hex(args[1])));
         if (cmd == "bs-modules") return cmd_bs_modules(pm, args.size() >= 2 ? args[1] : std::string());
+        if (cmd == "ai-sim" && args.size() >= 2) {
+            float seconds = 60, dt = 0.1f;
+            std::array<float, 3> player{};
+            bool visible = false;
+            uint64_t seed = 1;
+            const char* json = nullptr;
+            for (size_t i = 2; i < args.size(); ++i) {
+                if (args[i] == "--seconds" && i + 1 < args.size()) seconds = std::stof(args[++i]);
+                else if (args[i] == "--dt" && i + 1 < args.size()) dt = std::stof(args[++i]);
+                else if (args[i] == "--seed" && i + 1 < args.size()) seed = std::stoull(args[++i]);
+                else if (args[i] == "--visible") visible = true;
+                else if (args[i] == "--json" && i + 1 < args.size()) json = args[++i].c_str();
+                else if (args[i] == "--player" && i + 1 < args.size()) {
+                    if (std::sscanf(args[++i].c_str(), "%f,%f,%f", &player[0], &player[1], &player[2]) != 3) throw std::runtime_error("--player x,y,z");
+                }
+            }
+            return cmd_ai_sim(pm, TagHash(parse_hex(args[1])), seconds, dt, player, visible, seed, json);
+        }
         if (cmd == "map-gameplay" && args.size() >= 2) {
             bool verbose = false;
             const char* json = nullptr;

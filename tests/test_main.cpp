@@ -9,6 +9,7 @@
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
 #include "nim/core/tag_reader.hpp"
+#include "nim/sim/ai.hpp"
 #include "ui_text.hpp"
 
 #include <algorithm>
@@ -411,6 +412,60 @@ int main() {
         bool threw = false;
         try { nim::parse_codex_definitions(b); } catch (...) { threw = true; }
         CHECK(threw);
+    }
+
+    // AI simulation (3.69): motion choice, patrol inside the firing area, awareness, invisibility.
+    {
+        nim::MotionSet ms;
+        ms.locomotion = {{nim::TagHash(1), 1, 1.2f, {1, 0}}, {nim::TagHash(2), 1, 2.5f, {1, 0}}, {nim::TagHash(3), 1, 1.0f, {-1, 0}}};
+        ms.idle = nim::MotionClip{nim::TagHash(4), 3, 0, {}};
+        CHECK(!nim::select_motion(ms, {0.1f, 0}).locomotion);
+        CHECK(nim::select_motion(ms, {1.2f, 0}).locomotion == size_t(0));
+        CHECK(nim::select_motion(ms, {2.6f, 0}).locomotion == size_t(1));
+        CHECK(nim::select_motion(ms, {-0.9f, 0}).locomotion == size_t(2));
+        CHECK(std::abs(nim::select_motion(ms, {1.8f, 0}).rate - 1.5f) < 0.01f);  // nearest is the 1.2 m/s walk
+
+        nim::MapGameplay g;
+        g.scripts.resize(2);
+        g.characters.resize(1);
+        g.characters[0].name_estimate = "ue_elite_guard";
+        nim::MapFiringArea fa;
+        fa.outline = {{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}};
+        fa.triangles = {{0, 1, 2}, {0, 2, 3}};
+        g.firing_areas.push_back(fa);
+        g.objectives.push_back({0, {0}});
+        nim::MapSquad sq;
+        sq.objective = 0;
+        sq.members = {0, 0};
+        nim::MapGameplayPoint pt;
+        pt.position = {5, 5, 0};
+        sq.positions = {pt};
+        g.squads.push_back(sq);
+        auto run = [&](bool invisible, std::array<float, 3> player, float seconds) {
+            nim::AiParams prm;
+            prm.player_invisible = invisible;
+            nim::AiSimulation sim(g, prm, 7);
+            for (int i = 0; i < int(seconds * 10); ++i) sim.step(0.1f, player);
+            return sim.agents();
+        };
+        const auto a = run(true, {1000, 0, 0}, 60), b = run(true, {1000, 0, 0}, 60);
+        CHECK(a.size() == 2 && a[0].sight == 40.0f);
+        CHECK(a[0].position == b[0].position && a[1].position == b[1].position);  // deterministic for a seed
+        bool inside = true, moved = false;
+        for (const auto& x : a) {
+            inside = inside && x.position[0] >= -0.01f && x.position[0] <= 10.01f && x.position[1] >= -0.01f && x.position[1] <= 10.01f;
+            moved = moved || std::abs(x.position[0] - 5) > 0.5f || std::abs(x.position[1] - 5) > 0.5f;
+        }
+        CHECK(inside && moved);
+        CHECK(a[0].awareness == 0 && a[0].alert == nim::AiAlert::Unaware);
+        // The player standing next to them: awareness rises (hearing at least), but an invisible
+        // player changes nothing about where they go.
+        const auto c = run(true, {5, 6, 0}, 5), d = run(true, {1000, 0, 0}, 5);
+        CHECK(c[0].awareness > 0.5f && c[0].alert != nim::AiAlert::Unaware);
+        CHECK(c[0].position == d[0].position && c[1].position == d[1].position);
+        const auto e = run(false, {5, 6, 0}, 5);
+        CHECK(e[0].alert == nim::AiAlert::Alerted);
+        CHECK(!nim::ai_estimates(nim::AiParams{}).empty());
     }
 
     if (g_failures) return 1;

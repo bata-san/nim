@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -157,6 +158,39 @@ bool is_additive(const AnimationRig& rig, const AnimationClip& clip);
 // by the clip translation (object space, relative to bind). Root motion is dropped.
 void pose_skeleton(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip, float frame,
                    std::vector<BoneTransform>& object, bool authored_local_offsets = false);
+
+// The clips of an entity's motion banks (components whose resource is 80803936 name a bank
+// 80803BE9 at resource +0xE8; bank order is the animation graph's clip index). In bank order,
+// duplicates dropped.
+std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity);
+// Root travel of a clip: the animated translation track of the lowest-numbered bone that has one,
+// first to last frame. speed is horizontal metres per second at `fps` (推定: the clip rate is not
+// decoded; callers pass their estimate).
+struct ClipRootMotion {
+    TagHash clip;
+    uint32_t frames = 0;
+    uint16_t bone = 0;
+    float seconds = 0;
+    std::array<float, 3> delta{};
+    float speed = 0;
+};
+ClipRootMotion measure_clip_root_motion(const AnimationClip& clip, float fps);
+// Marathon's locomotion clips are in place (no root travel), so the travel a clip stands for is
+// read from its feet (推定): the two ankle bones (bind height 0.08..0.25 m, mirrored sideways),
+// posed over every frame. During stance (the lower half of a foot's height range) the foot slides
+// opposite to the travel; speed = mean stance slide speed of both feet, direction = the opposite of
+// that slide in the object's xy. cyclic: first and last pose match within 3 cm.
+std::optional<std::array<int, 2>> find_feet(const Skeleton& skeleton);
+struct ClipGait {
+    TagHash clip;
+    float seconds = 0;
+    float speed = 0;                     // m/s, horizontal
+    std::array<float, 2> direction{};    // unit xy in object space (x = forward), zero when standing
+    float lift = 0;                      // max foot height range, metres
+    bool cyclic = false;
+};
+ClipGait measure_clip_gait(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip,
+                           std::array<int, 2> feet, float fps);
 
 // ---- Skin weights ---------------------------------------------------------------------------------
 // The game's compute_skinning reads the bone binding from vb0's position w (s16): |w| < 0x800 is

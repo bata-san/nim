@@ -1322,4 +1322,96 @@ SkinWeights decode_skin_weights(const VertexBuffer& vb0, const VertexBuffer& ski
     return out;
 }
 
+std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity) {
+    std::vector<TagHash> out;
+    const auto bytes = pm.read(entity);
+    TagReader r(bytes);
+    const auto comps = r.vec_at(0x08);
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
+        if (!e || e->type != 8 || e->reference != kClassComponent) continue;
+        try {
+            const auto cb = pm.read(c);
+            TagReader cr(cb);
+            const auto [resource, cls] = resource_at(cr, 0x18);
+            if (cls != 0x80803936) continue;
+            for (const auto clip : read_motion_bank(pm, cr.tag_at(resource + 0xE8)))
+                if (!clip.is_none() && std::ranges::find(out, clip) == out.end()) out.push_back(clip);
+        } catch (const std::exception&) {
+        }
+    }
+    return out;
+}
+
+ClipRootMotion measure_clip_root_motion(const AnimationClip& clip, float fps) {
+    ClipRootMotion m;
+    m.clip = clip.tag;
+    m.frames = clip.frame_count;
+    m.seconds = clip.frame_count > 1 ? float(clip.frame_count - 1) / fps : 0.0f;
+    // The lowest-numbered bone with an animated translation track carries the body's motion.
+    const AnimationClip::Track<std::array<float, 3>>* best = nullptr;
+    for (const auto& t : clip.translations)
+        if (t.frames.size() > 1 && (!best || t.bone < best->bone)) best = &t;
+    if (!best || m.seconds <= 0) return m;
+    m.bone = best->bone;
+    for (size_t a = 0; a < 3; ++a) m.delta[a] = best->frames.back()[a] - best->frames.front()[a];
+    m.speed = std::hypot(m.delta[0], m.delta[1]) / m.seconds;
+    return m;
+}
+
+std::optional<std::array<int, 2>> find_feet(const Skeleton& skeleton) {
+    std::optional<std::array<int, 2>> best;
+    float best_z = 1e9f;
+    for (size_t a = 0; a < skeleton.size(); ++a) {
+        const auto& pa = skeleton.bind[a].translation;
+        if (pa[2] < 0.08f || pa[2] > 0.25f || std::abs(pa[1]) < 0.08f) continue;
+        for (size_t b = a + 1; b < skeleton.size(); ++b) {
+            const auto& pb = skeleton.bind[b].translation;
+            if (std::abs(pa[1] + pb[1]) > 0.02f || std::abs(pa[2] - pb[2]) > 0.02f || std::abs(pa[0] - pb[0]) > 0.02f) continue;
+            if (pa[2] < best_z) best_z = pa[2], best = std::array<int, 2>{int(a), int(b)};
+        }
+    }
+    return best;
+}
+
+ClipGait measure_clip_gait(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip,
+                           std::array<int, 2> feet, float fps) {
+    ClipGait g;
+    g.clip = clip.tag;
+    const uint32_t n = clip.frame_count;
+    g.seconds = n > 1 ? float(n - 1) / fps : 0.0f;
+    if (n < 3) return g;
+    std::vector<std::array<std::array<float, 3>, 2>> track(n);
+    std::vector<BoneTransform> pose;
+    std::vector<BoneTransform> first;
+    for (uint32_t f = 0; f < n; ++f) {
+        pose_skeleton(skeleton, rig, clip, float(f), pose);
+        if (f == 0) first = pose;
+        for (int k = 0; k < 2; ++k) track[f][k] = pose[size_t(feet[k])].translation;
+    }
+    float err = 0;
+    for (size_t b = 0; b < pose.size() && b < first.size(); ++b)
+        for (size_t a = 0; a < 3; ++a) err = std::max(err, std::abs(pose[b].translation[a] - first[b].translation[a]));
+    g.cyclic = err < 0.03f;
+    float vx = 0, vy = 0, total = 0;
+    for (int k = 0; k < 2; ++k) {
+        float lo = 1e9f, hi = -1e9f;
+        for (const auto& t : track) lo = std::min(lo, t[k][2]), hi = std::max(hi, t[k][2]);
+        g.lift = std::max(g.lift, hi - lo);
+        const float stance = lo + 0.5f * (hi - lo);
+        for (uint32_t f = 1; f < n; ++f) {
+            if (track[f][k][2] > stance || track[f - 1][k][2] > stance) continue;
+            vx += track[f][k][0] - track[f - 1][k][0];
+            vy += track[f][k][1] - track[f - 1][k][1];
+            total += 1.0f / fps;
+        }
+    }
+    if (total <= 0 || g.lift < 0.04f) return g;  // feet never leave the ground: standing
+    const float sx = -vx / total, sy = -vy / total, speed = std::hypot(sx, sy);
+    g.speed = speed;
+    if (speed > 1e-3f) g.direction = {sx / speed, sy / speed};
+    return g;
+}
+
 } // namespace nim
