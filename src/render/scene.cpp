@@ -1181,10 +1181,9 @@ std::vector<ModelSkinPose> PreviewAnimation::poses(const AnimationClip& clip, fl
         const auto wrist = *equipment_wrist;
         std::vector<BoneTransform> sampled = rig.default_pose;
         sample_clip(clip, frame, sampled);
-        // Use the recorded socket rotation and its offset from the recorded wrist. Anchor that
-        // offset to the posed wrist so different body proportions still hold the prop.
-        auto placement = sampled[socket];
-        for (size_t i = 0; i < 3; ++i) placement.translation[i] += source[rig.skeleton_bone[wrist]].translation[i] - sampled[wrist].translation[i];
+        // Convert the recorded socket to the recorded wrist's local space, then apply
+        // it to the preview wrist. This preserves the grip under rotation and scale too.
+        const auto placement = source[rig.skeleton_bone[wrist]] * inverse(sampled[wrist]) * sampled[socket];
         held.emplace(ModelSkinPose{e->model, {}, placement});
         pose_skeleton(e->skeleton, e->rig, e->clip, frame, held->bones, true);
         for (size_t b = 0; b < held->bones.size(); ++b) held->bones[b] = held->bones[b] * e->skeleton.inverse_bind[b];
@@ -1735,19 +1734,7 @@ void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<st
     standalone_decal_ = mesh.dynamic && !assembled_ && std::ranges::all_of(mesh.groups, [](const auto& group) {
         return group.stage == kStageDecal;
     });
-    if (assembled_) {
-        auto packed = mesh.model_cb[13];
-        for (const auto& part : parts)
-            if (part.model_cb[13][3] > packed[3]) packed = part.model_cb[13];
-        auto use_common_range = [&](PreparedMesh& part) {
-            // Only replace the parameters for streams re-packed by the CPU.
-            if (std::ranges::none_of(part.buffers, [](const auto& b) {
-                    return !b.skin_pos.empty() && b.skin.bones.empty();
-                })) part.model_cb[12] = part.model_cb[13] = packed;
-        };
-        use_common_range(mesh);
-        for (auto& part : parts) use_common_range(part);
-    }
+    // Each part's skin stream and object constants share its own packing origin.
     std::vector<std::pair<V3, float>> bounds{{mesh.center, mesh.radius}};
     V3 lo = mesh.center - V3{mesh.radius, mesh.radius, mesh.radius};
     V3 hi = mesh.center + V3{mesh.radius, mesh.radius, mesh.radius};

@@ -555,6 +555,7 @@ const char* view_mode_name(ViewMode m);
 struct LightingParams {
     ViewMode mode = ViewMode::Lit;
     float time = 0, delta_time = 0;  // seconds, shared with the model's material clock
+    float frame_delta_time = 1.0f / 60.0f;  // real frame interval for camera exposure
     bool optimize = true;  // reference path for pixel comparisons / timestamp benchmarks
     float exposure = 1.0f;
     float sun_azimuth = 0.9f, sun_elevation = 0.75f;  // radians

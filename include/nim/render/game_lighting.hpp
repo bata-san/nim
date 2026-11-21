@@ -332,6 +332,8 @@ class GameLighting {
 public:
     void init(PackageManager& pm, Gpu& gpu);
     bool ready() const { return shading_.loaded() && final_combine_.loaded(); }
+    // Resolve frame inputs before recording the G-buffer; materials and lighting share this exposure.
+    void prepare_frame(Gpu& gpu, const GBuffer& gb, const LightingParams& p);
     // `transparents` runs after the shading pass with the HDR target's RTV (the G-buffer depth is
     // then in DEPTH_READ, bound through gb.dsv_ro).
     using TransparentFn = std::function<void(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE hdr)>;

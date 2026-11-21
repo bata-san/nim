@@ -803,11 +803,13 @@ private:
             scene.upload(gpu, std::move(mesh), layouts);
             const auto view = make_view(frame_sphere(scene.center(), scene.radius(), kThumbSize, kThumbSize));
             auto* cl = gpu.immediate();
-            scene.render_gbuffer(gpu, cl, gb, view);
             LightingParams params;
             params.atmosphere = false;
             params.entity_preview = preview;
             params.auto_exposure = params.temporal_aa = false;
+            lighting.prepare_frame(gpu, gb, params);
+            scene.set_exposure(lighting.exposure());
+            scene.render_gbuffer(gpu, cl, gb, view);
             GameLighting::TransparentFn transparent;
             if (scene.has_transparent()) transparent = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                 scene.render_transparent(gpu, c, gb, hdr, view, lighting.externs());
@@ -1519,6 +1521,7 @@ public:
     bool capture_requested = false;
     bool show_fps = true;
     TagHash scene_component;
+    char channel_filter[96]{};
     ChannelValues channel_overrides;  // object channels the user set for the live mesh
     uint32_t scene_permutation = 0, scene_permutation_count = 0;
     bool keep_camera = false;
@@ -1539,6 +1542,7 @@ public:
         std::string error;
         bool playing = true, dirty = false;
         float frame = 0, speed = 1;
+        char filter[96]{};
     };
     std::optional<Animation> anim;
     static constexpr float kClipFps = 30;
@@ -1747,46 +1751,58 @@ public:
         if (!ImGui::CollapsingHeader((ui::trf(ui::S::ChannelsHeader, used.size()) + "###channels").c_str(),
                                      ImGuiTreeNodeFlags_DefaultOpen))
             return;
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled(ui::tr(ui::S::ChannelsHint));
-        ImGui::PopTextWrapPos();
+        const float em = ImGui::GetFontSize();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##channel_filter", ui::tr(ui::S::ChannelFilter), channel_filter, sizeof(channel_filter));
+        const auto filter = lower_ascii(channel_filter);
         bool changed = false;
-        if (ImGui::BeginTable("##channels", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
-            ImGui::TableSetupColumn(ui::tr(ui::S::ColChannel), ImGuiTableColumnFlags_WidthStretch, 1.2f);
-            ImGui::TableSetupColumn(ui::tr(ui::S::ColStage), ImGuiTableColumnFlags_WidthFixed);
-            ImGui::TableSetupColumn(ui::tr(ui::S::ColValue), ImGuiTableColumnFlags_WidthStretch, 2.0f);
-            ImGui::TableHeadersRow();
-            for (const auto& [hash, use] : used) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                const char* name = object_channel_name(hash);
-                const bool overridden = channel_overrides.count(hash) != 0;
-                if (overridden) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.8f, 0.3f, 1});
-                ImGui::TextUnformatted(name ? name : std::format("{:08X}", hash).c_str());
-                if (overridden) ImGui::PopStyleColor();
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("%s%s", use.vs ? "VS" : "", use.ps ? (use.vs ? "+PS" : "PS") : "");
-                ImGui::TableNextColumn();
-                float4 v = overridden ? channel_overrides[hash] : use.value;
-                ImGui::PushID(int(hash));
-                const ImGuiStyle& st = ImGui::GetStyle();
-                ImGui::SetNextItemWidth(-(ImGui::CalcTextSize("01").x + st.FramePadding.x * 4 + st.ItemSpacing.x * 2));
-                if (ImGui::DragFloat4("##v", v.data(), 0.01f, -10.0f, 10.0f, "%.2f")) {
-                    channel_overrides[hash] = v;
-                    changed = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("0")) { channel_overrides[hash] = {0, 0, 0, 0}; changed = true; }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("1")) { channel_overrides[hash] = {1, 1, 1, 1}; changed = true; }
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
-        }
-        if (!channel_overrides.empty() && ImGui::SmallButton(ui::tr(ui::S::ResetDefault))) {
+        ImGui::BeginDisabled(channel_overrides.empty());
+        if (ImGui::Button(ui::tr(ui::S::ResetAll))) {
             channel_overrides.clear();
             changed = true;
         }
+        ImGui::EndDisabled();
+        bool found = false;
+        for (const auto& [hash, use] : used) {
+            const auto id = std::format("{:08X}", hash);
+            const char* name = object_channel_name(hash);
+            if (!filter.empty() && !contains_ci(id, filter) && (!name || !contains_ci(name, filter))) continue;
+            found = true;
+            ImGui::PushID(int(hash));
+            auto override = channel_overrides.find(hash);
+            const bool overridden = override != channel_overrides.end();
+            const auto label = name ? std::format("{}  ({})###value", name, id) : id + "###value";
+            if (overridden) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.8f, 0.3f, 1});
+            const bool edit = ImGui::TreeNodeEx(label.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
+            if (overridden) ImGui::PopStyleColor();
+            if (edit) {
+                ImGui::TextDisabled("%s%s", use.vs ? "VS" : "", use.ps ? (use.vs ? " + PS" : "PS") : "");
+                float4 v = overridden ? override->second : use.value;
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::DragFloat4("##v", v.data(), 0.01f, -10.0f, 10.0f, "%.3f")) {
+                    channel_overrides[hash] = v;
+                    changed = true;
+                }
+                const bool zero = ImGui::Button("0", {em * 2.5f, 0});
+                ImGui::SameLine();
+                const bool one = ImGui::Button("1", {em * 2.5f, 0});
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!channel_overrides.contains(hash));
+                if (ImGui::Button(ui::tr(ui::S::ResetDefault))) {
+                    channel_overrides.erase(hash);
+                    changed = true;
+                }
+                ImGui::EndDisabled();
+                if (zero || one) {
+                    const float value = one ? 1.0f : 0.0f;
+                    channel_overrides[hash] = {value, value, value, value};
+                    changed = true;
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (!found) ImGui::TextDisabled("%s", ui::tr(ui::S::NoMatches));
         if (changed) scene.set_channels(channel_overrides);
     }
 
@@ -1794,6 +1810,7 @@ public:
         if (loading && *loading == tag) return;
         stop_map();
         channel_overrides.clear();
+        channel_filter[0] = '\0';
         loading = tag;
         no_drawable_tag.reset();
         no_drawable_reason.clear();
@@ -1838,6 +1855,7 @@ public:
                     weather_states.clear();
                     apply_weather();
                     scene.upload(g, std::move(*r->mesh), layouts);
+                    scene.set_channels(channel_overrides);
                     if (game_ready) set_entity_preview(game_lighting, entity_preview_active);
                     if (!r->animation) {
                         anim.reset();
@@ -2175,7 +2193,7 @@ public:
         // right: the live view, map details below
         ImGui::SameLine(0, 0);
         ImGui::BeginChild("mapscene", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-        if (details_h <= 0) details_h = 220 * sc;
+        if (details_h <= 0) details_h = 310 * sc;
         const float view_h_px = std::max(120 * sc, ImGui::GetContentRegionAvail().y - details_h - 6 * sc);
         const ImVec2 view_origin = ImGui::GetCursorScreenPos();
         const float view_w_px = ImGui::GetContentRegionAvail().x;
@@ -2322,60 +2340,80 @@ public:
     void animation_panel() {
         if (!anim || !scene.skinned()) return;
         Animation& a = *anim;
-        ImGui::Spacing();
-        if (!ImGui::CollapsingHeader((ui::trf(ui::S::AnimHeader, a.binding.clips.size()) + "###anim").c_str(),
-                                     ImGuiTreeNodeFlags_DefaultOpen))
-            return;
         if (a.alternate && ImGui::Checkbox(ui::tr(ui::S::PartClips), &a.part_only)) {
             std::swap(a.binding, *a.alternate);
             a.clip = -1;
+            a.filter[0] = '\0';
             a.error.clear();
             a.dirty = true;
         }
         const auto& binding = a.binding;
         const auto& clips = binding.clips;
-        ImGui::TextDisabled(ui::tr(ui::S::SkeletonLine), binding.skeleton.component.str().c_str(), binding.skeleton.size(),
-                            binding.rig.component.str().c_str());
-        if (binding.inferred_binding) ImGui::TextDisabled(ui::tr(ui::S::SkeletonEstimated));
-        if (!binding.followers.empty()) ImGui::TextDisabled(ui::tr(ui::S::FollowerParts), binding.followers.size());
-        if (binding.model != a.model) ImGui::TextDisabled(ui::tr(ui::S::SourcePart), binding.model.str().c_str());
         if (clips.empty()) {
-            ImGui::TextDisabled(ui::tr(ui::S::NoClips));
+            ImGui::TextDisabled("%s", ui::tr(ui::S::NoClips));
             return;
         }
-        if (clips.front().bone_groups != binding.rig.bone_groups)
-            ImGui::TextDisabled(ui::tr(ui::S::ClipsSameRig));
-        ImGui::TextDisabled(ui::tr(binding.authored_clips ? ui::S::AuthoredMotionBank : ui::S::RigCompatibleClips));
         const float em = ImGui::GetFontSize();
-        ImGui::SetNextItemWidth(-1);
         const std::string preview = a.clip < 0 ? std::string(ui::tr(ui::S::BindPose))
                                                : ui::trf(ui::S::ClipFrames, clips[size_t(a.clip)].tag.str(),
                                                              clips[size_t(a.clip)].frames);
-        if (begin_combo("##clip", preview.c_str(), ImGuiComboFlags_HeightLarge)) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SetNextWindowSizeConstraints({0, 0}, {FLT_MAX, em * 23});
+        if (begin_combo("##clip", preview.c_str())) {
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            ImGui::SetNextItemWidth(-1);
+            const bool enter = ImGui::InputTextWithHint("##clip_filter", ui::tr(ui::S::ClipFilter), a.filter,
+                sizeof(a.filter), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+            const auto filter = lower_ascii(a.filter);
             if (ImGui::Selectable(ui::tr(ui::S::BindPose), a.clip < 0)) {
                 a.clip = -1;
+                a.error.clear();
                 a.dirty = true;
             }
-            ImGuiListClipper clip;
-            clip.Begin(int(clips.size()));
-            while (clip.Step())
-                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+            std::vector<int> visible;
+            for (int i = 0; i < int(clips.size()); ++i) {
+                const auto& c = clips[size_t(i)];
+                if (filter.empty() || contains_ci(c.tag.str(), filter) ||
+                    contains_ci(std::format("{:08X}", c.name_hash), filter))
+                    visible.push_back(i);
+            }
+            if (visible.empty()) ImGui::TextDisabled("%s", ui::tr(ui::S::NoMatches));
+            if (enter && visible.size() == 1) {
+                select_clip(visible.front());
+                ImGui::CloseCurrentPopup();
+            }
+            const float rows = float(std::clamp<size_t>(visible.size(), 1, 12));
+            ImGui::BeginChild("clip_choices", {0, ImGui::GetTextLineHeightWithSpacing() * rows},
+                              ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            ImGuiListClipper list;
+            list.Begin(int(visible.size()));
+            while (list.Step())
+                for (int row = list.DisplayStart; row < list.DisplayEnd; ++row) {
+                    const int i = visible[size_t(row)];
                     const auto& c = clips[size_t(i)];
                     std::string tag = c.tag.str();
                     if (c.shell_specific) tag += std::string(" ") + ui::tr(ui::S::ShellClipLabel);
                     if (c.shared_bones) tag += std::string(" ") + ui::tr(ui::S::SharedClipLabel);
-                    if (ImGui::Selectable(ui::trf(ui::S::ClipFramesItem, tag, c.frames, i).c_str(), a.clip == i)) select_clip(i);
+                    if (ImGui::Selectable(ui::trf(ui::S::ClipFramesItem, tag, c.frames, i).c_str(), a.clip == i,
+                                          ImGuiSelectableFlags_NoAutoClosePopups)) {
+                        select_clip(i);
+                        ImGui::CloseCurrentPopup();
+                    }
                 }
+            ImGui::EndChild();
             ImGui::EndCombo();
         }
-        if (!a.error.empty()) ImGui::TextColored({1, 0.45f, 0.4f, 1}, "%s", a.error.c_str());
-        if (a.clip < 0) return;
-        if (clips[size_t(a.clip)].shared_bones) ImGui::TextDisabled(ui::tr(ui::S::SharedBodyClip));
-        auto equipment = binding.equipment | std::views::filter([&](const auto& e) { return e.source_clip == a.loaded.tag; });
+        if (!a.error.empty()) {
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextColored({1, 0.45f, 0.4f, 1}, "%s", a.error.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        auto equipment = binding.equipment | std::views::filter([&](const auto& e) { return a.clip >= 0 && e.source_clip == a.loaded.tag; });
         if (!equipment.empty()) {
             const TagHash active = a.equipment_model.is_none() ? equipment.front().model : a.equipment_model;
             ImGui::SetNextItemWidth(-1);
-            if (begin_combo(ui::tr(ui::S::EquipmentCandidate), active.str().c_str())) {
+            const auto label = std::format("{}  {}", ui::tr(ui::S::EquipmentCandidate), active.str());
+            if (begin_combo("##equipment", label.c_str())) {
                 for (const auto& option : equipment)
                     if (ImGui::Selectable(option.model.str().c_str(), active == option.model)) {
                         a.equipment_model = option.model;
@@ -2384,22 +2422,56 @@ public:
                 ImGui::EndCombo();
             }
         }
-        if (ImGui::Button(a.playing ? ui::tr(ui::S::Pause) : ui::tr(ui::S::Play), {em * 5, 0})) a.playing = !a.playing;
-        ImGui::SameLine();
-        if (ImGui::Button("<")) select_clip(a.clip > 0 ? a.clip - 1 : int(clips.size()) - 1);
-        ImGui::SameLine();
-        if (ImGui::Button(">")) select_clip((a.clip + 1) % int(clips.size()));
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec), is_additive(binding.rig, a.loaded) ? ui::tr(ui::S::Additive) : "",
-                            ui::trf(ui::S::Seconds, float(a.loaded.frame_count) / kClipFps).c_str());
-        ImGui::SetNextItemWidth(-1);
+        const bool selected = a.clip >= 0;
         const float last = float(std::max(1u, a.loaded.frame_count) - 1);
-        if (ImGui::SliderFloat("##frame", &a.frame, 0, last, ui::tr(ui::S::FrameFmt))) {
+        ImGui::BeginDisabled(!selected);
+        ImGui::SetNextItemWidth(-1);
+        auto seek = [&](float target) {
+            a.frame = std::clamp(target, 0.0f, last);
             a.playing = false;
             a.dirty = true;
-        }
+        };
+        if (ImGui::SliderFloat("##frame", &a.frame, 0, last, ui::tr(ui::S::FrameFmt), ImGuiSliderFlags_AlwaysClamp))
+            seek(a.frame);
+        ImGui::EndDisabled();
+
+        const int clip_index = a.clip;
+        if (ImGui::Button("<##prev_clip", {em * 2.1f, 0}))
+            select_clip(clip_index > 0 ? clip_index - 1 : int(clips.size()) - 1);
+        ImGui::SetItemTooltip("%s", ui::tr(ui::S::PrevClip));
+        ImGui::SameLine();
+        if (ImGui::Button(">##next_clip", {em * 2.1f, 0})) select_clip((clip_index + 1) % int(clips.size()));
+        ImGui::SetItemTooltip("%s", ui::tr(ui::S::NextClip));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!selected);
+        if (ImGui::Button(a.playing ? ui::tr(ui::S::Pause) : ui::tr(ui::S::Play), {em * 5, 0})) a.playing = !a.playing;
+        ImGui::SameLine();
+        if (ImGui::Button("|<##rewind", {em * 2.1f, 0})) seek(0);
+        ImGui::SetItemTooltip("%s", ui::tr(ui::S::Rewind));
+        ImGui::SameLine();
+        if (ImGui::Button("-1##frame", {em * 2.1f, 0})) seek(std::ceil(a.frame) - 1);
+        ImGui::SameLine();
+        if (ImGui::Button("+1##frame", {em * 2.1f, 0})) seek(std::floor(a.frame) + 1);
+        ImGui::EndDisabled();
+
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##speed", &a.speed, 0.1f, 2.0f, ui::tr(ui::S::SpeedFmt));
+        ImGui::SliderFloat("##speed", &a.speed, 0.1f, 2.0f, ui::tr(ui::S::SpeedFmt), ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::TreeNode(ui::tr(ui::S::AnimationInfo))) {
+            ImGui::TextDisabled("%s", ui::tr(binding.authored_clips ? ui::S::AuthoredMotionBank : ui::S::RigCompatibleClips));
+            ImGui::TextDisabled(ui::tr(ui::S::SkeletonLine), binding.skeleton.component.str().c_str(), binding.skeleton.size(),
+                                binding.rig.component.str().c_str());
+            if (binding.inferred_binding) ImGui::TextDisabled("%s", ui::tr(ui::S::SkeletonEstimated));
+            if (!binding.followers.empty()) ImGui::TextDisabled(ui::tr(ui::S::FollowerParts), binding.followers.size());
+            if (binding.model != a.model) ImGui::TextDisabled(ui::tr(ui::S::SourcePart), binding.model.str().c_str());
+            if (a.clip >= 0) {
+                if (clips[size_t(a.clip)].shared_bones) ImGui::TextDisabled("%s", ui::tr(ui::S::SharedBodyClip));
+                ImGui::TextDisabled("%s  %s%s", clip_codec_name(a.loaded.codec),
+                    is_additive(binding.rig, a.loaded) ? ui::tr(ui::S::Additive) : "",
+                    ui::trf(ui::S::Seconds, float(a.loaded.frame_count) / kClipFps).c_str());
+            }
+            ImGui::TreePop();
+        }
+
     }
 
     void record(ID3D12GraphicsCommandList* cl) {
@@ -2408,17 +2480,21 @@ public:
         const float material_dt = material_playing ? ImGui::GetIO().DeltaTime * material_speed : 0;
         material_time += material_dt;
         scene.set_material_frame(material_time, material_dt);
-        if (game_ready) scene.set_exposure(game_lighting.exposure());
+        light.frame_delta_time = ImGui::GetIO().DeltaTime;
         light.time = material_time;
         light.delta_time = material_dt;
         light.entity_preview = entity_preview_active && !map_scene;
-        if (game_ready) {
-            scene.set_global_channel_values(game_lighting.update_global_channels(light));
-            scene.set_global_channels(game_lighting.world_channels());
-            scene.set_material_time_of_day(game_lighting.time_of_day(light));
-        }
-        ViewMatrices vm = game_ready && light.mode == ViewMode::Lit ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
         try {
+            const bool game_view = game_ready && light.mode == ViewMode::Lit;
+            if (game_ready) {
+                if (game_view) game_lighting.prepare_frame(gpu, gb, light);
+                else game_lighting.update_global_channels(light);
+                scene.set_exposure(game_view ? game_lighting.exposure() : light.exposure);
+                scene.set_global_channel_values(game_lighting.externs().channels);
+                scene.set_global_channels(game_lighting.world_channels());
+                scene.set_material_time_of_day(game_lighting.time_of_day(light));
+            }
+            ViewMatrices vm = game_view ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
@@ -3143,7 +3219,7 @@ public:
         // right: live view + details
         ImGui::SameLine(0, 0);
         ImGui::BeginChild("scene", {right_w, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-        if (details_h <= 0) details_h = 220 * sc;
+        if (details_h <= 0) details_h = 310 * sc;
         const float view_h_px = std::max(120 * sc, ImGui::GetContentRegionAvail().y - details_h - 6 * sc);
         viewport_ui({ImGui::GetContentRegionAvail().x, view_h_px});
         ImGui::InvisibleButton("##hsplit", {ImGui::GetContentRegionAvail().x, 6 * sc});
@@ -3442,36 +3518,67 @@ public:
         ImGui::PopFont();
         ImGui::SameLine();
         if (ImGui::SmallButton(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(scene.tag().str().c_str());
+        if (!ImGui::BeginTabBar("model_details")) return;
+        if (anim && scene.skinned() && ImGui::BeginTabItem(ui::tr(ui::S::AnimationTab))) {
+            animation_panel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ui::tr(ui::S::ParametersTab))) {
+            material_panel();
+            channels_panel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ui::tr(ui::S::ModelInfoTab))) {
+            model_info_panel();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    void material_panel() {
+        if (scene_permutation_count > 1) {
+            ImGui::TextUnformatted(ui::tr(ui::S::MaterialVariant));
+            ImGui::SetNextItemWidth(-1);
+            int permutation = int(scene_permutation);
+            ImGui::BeginDisabled(loading.has_value());
+            if (begin_combo("##material_variant", std::to_string(permutation).c_str(), ImGuiComboFlags_HeightLarge)) {
+                ImGuiListClipper list;
+                list.Begin(int(scene_permutation_count));
+                while (list.Step())
+                    for (int i = list.DisplayStart; i < list.DisplayEnd; ++i)
+                        if (ImGui::Selectable(std::to_string(i).c_str(), i == permutation) && i != permutation) {
+                            loading = scene.tag();
+                            worker.request_live(scene.tag(), i, channel_overrides);
+                        }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+        }
+        if (ImGui::CollapsingHeader(ui::tr(ui::S::MaterialAnimation))) {
+            ImGui::PushID("material_playback");
+            if (ImGui::Button(material_playing ? ui::tr(ui::S::Pause) : ui::tr(ui::S::Play)))
+                material_playing = !material_playing;
+            ImGui::SameLine();
+            if (ImGui::Button(ui::tr(ui::S::Rewind))) material_time = 0;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::DragFloat("##material_time", &material_time, 0.01f, 0, 86400, ui::tr(ui::S::TimeFmt),
+                                  ImGuiSliderFlags_AlwaysClamp)) material_playing = false;
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, ui::tr(ui::S::SpeedFmt),
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopID();
+        }
+    }
+
+    void model_info_panel() {
         ImGui::TextDisabled(ui::tr(ui::S::LodLine), scene.lod(), scene.groups().size(), scene.radius());
         if (scene.dynamic()) {
-            if (scene_component.is_none()) {
-                ImGui::TextDisabled(ui::tr(ui::S::NoEntityComponent));
-            } else {
-                ImGui::TextDisabled(ui::tr(ui::S::EntityComponent), scene_component.str().c_str());
-                if (scene_permutation_count > 1) {
-                    int perm = int(scene_permutation);
-                    ImGui::SetNextItemWidth(200 * ImGui::GetStyle().FontScaleDpi);
-                    if (ImGui::SliderInt(ui::tr(ui::S::MaterialVariant), &perm, 0, int(scene_permutation_count) - 1) &&
-                        perm != int(scene_permutation)) {
-                        loading = scene.tag();
-                        worker.request_live(scene.tag(), perm, channel_overrides);
-                        scene_permutation = uint32_t(perm);
-                    }
-                }
-            }
+            if (scene_component.is_none()) ImGui::TextDisabled("%s", ui::tr(ui::S::NoEntityComponent));
+            else ImGui::TextDisabled(ui::tr(ui::S::EntityComponent), scene_component.str().c_str());
+            ImGui::PushTextWrapPos(0);
             for (const auto& n : scene.notes()) ImGui::TextColored({1, 0.75f, 0.3f, 1}, "%s", n.c_str());
+            ImGui::PopTextWrapPos();
         }
-        animation_panel();
-        if (ImGui::CollapsingHeader(ui::tr(ui::S::MaterialAnimation), ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox((std::string(ui::tr(ui::S::Play)) + "##material").c_str(), &material_playing);
-            ImGui::SameLine();
-            if (ImGui::SmallButton(ui::tr(ui::S::Rewind2))) material_time = 0;
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::DragFloat("##material_time", &material_time, 0.01f, 0, 86400, ui::tr(ui::S::TimeFmt))) material_playing = false;
-            ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##material_speed", &material_speed, 0.0f, 4.0f, ui::tr(ui::S::SpeedFmt));
-        }
-        channels_panel();
         estimates_panel();
         if (engine == Engine::Game && game_ready)
             ImGui::TextDisabled(ui::tr(ui::S::ShadingLine),
@@ -4024,23 +4131,30 @@ public:
     }
 
     // -- MOVIES --
-    // Default track of a localized movie: the one for the second text language (estimated
-    // mapping, channel = text language slot + 1), else the first language track.
+    // Localized USM channel numbers follow the text slots with the Japanese and Latin American Spanish channels swapped.
+    static std::optional<TextLanguage> movie_track_language(int channel) {
+        if (channel == 2) return TextLanguage::SpanishLatAm;
+        if (channel == 6) return TextLanguage::Japanese;
+        if (channel < 1 || size_t(channel) > kTextLanguageCount) return std::nullopt;
+        return TextLanguage(channel - 1);
+    }
+
     int default_movie_channel(const MovieEntry& m) const {
         if (m.info.audio.empty()) return 0;
         if (m.info.audio.size() > 1) {
             for (const auto& a : m.info.audio)
-                if (a.channel == language + 1) return a.channel;
+                if (movie_track_language(a.channel) == TextLanguage(language)) return a.channel;
             for (const auto& a : m.info.audio)
-                if (a.channel == 1) return 1;
+                if (movie_track_language(a.channel) == TextLanguage::English) return a.channel;
         }
         return m.info.audio.front().channel;
     }
 
     static std::string movie_track_label(const MovieEntry& m, const UsmInfo::Audio& a) {
         std::string name;
-        if (m.info.audio.size() > 1 && a.channel >= 1 && size_t(a.channel) <= kTextLanguageCount)
-            name = ui::trf(ui::S::TrackEstimated, text_language_name(size_t(a.channel - 1)));
+        const auto locale = movie_track_language(a.channel);
+        if (m.info.audio.size() > 1 && locale)
+            name = ui::trf(ui::S::TrackEstimated, text_language_name(size_t(*locale)));
         else
             name = m.info.audio.size() > 1 ? ui::tr(ui::S::Default) : ui::tr(ui::S::Voice);
         name += std::format("  ch{} {} {}ch", a.channel, usm_audio_codec_name(a.codec), a.channels);

@@ -151,7 +151,8 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
     ae_columns_rt_ = target(columns, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 3 * kBloomLevels);
     post_ldr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 1);
     for (uint32_t i = 0; i < 2; ++i) taa_history_[i] = target(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 2 + i);
-    lens_blur_ = target((w + 3) / 4, (h + 3) / 4, DXGI_FORMAT_R8G8B8A8_UNORM, 3 * kBloomLevels + 4);
+    // The authored upsample copies HDR bloom values for the lens texture multiply.
+    lens_blur_ = target((w + 3) / 4, (h + 3) / 4, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 4);
     taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -161,12 +162,13 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
 // Auto exposure: autoexposure_sample_columns writes, per column of the smallest bloom level, the
 // centre-weighted sums of log2 luminance, luminance and weight over 22 rows; the engine reduces
 // them on the CPU. The columns were sampled with 1 / exposure (extern 38 +0xC0.z), so the average
-// is the scene's luminance before exposure. Read back a frame or two late (the oldest finished copy).
+// is the scene's luminance before exposure. Use the newest finished measurement from a previous frame.
 void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
     const bool automatic = p.post && p.auto_exposure && ae_columns_.loaded() && bloom_initial_.loaded() && bloom_down_.loaded();
     if (!automatic) {
         ae_valid_ = false;
         ae_fence_ = {};
+        if (p.exposure > 2 * exposure_ || exposure_ > 2 * p.exposure) taa_valid_ = false;
         exposure_ = p.exposure;
         return;
     }
@@ -209,7 +211,7 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
             const float target = std::clamp(key * std::exp2(ch(0x01, 0)) / std::max(ae_luminance_, 1e-6f), lo, hi);
             if (!ae_valid_) ae_auto_ = target;
             else {
-                const float dt = p.delta_time > 0 ? std::min(p.delta_time, 0.25f) : 1.0f / 60.0f;
+                const float dt = std::clamp(p.frame_delta_time, 0.0f, 0.25f);
                 const float rate = target < ae_auto_ ? 3.0f : 1.5f;  // darken faster than brighten
                 ae_auto_ = std::exp2(std::lerp(std::log2(ae_auto_), std::log2(target), 1 - std::exp(-rate * dt)));
             }

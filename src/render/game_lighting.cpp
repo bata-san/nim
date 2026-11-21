@@ -1736,17 +1736,20 @@ void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) 
     ext_.world_channels = values;
 }
 
+void GameLighting::prepare_frame(Gpu& gpu, const GBuffer& gb, const LightingParams& p) {
+    if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
+    update_global_channels(p);
+    update_exposure(gpu, p);
+}
+
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                           const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow, bool needs_light_grid) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (p.entity_preview)
         ext_.note_estimate("entity preview: orbit_goliath_013b room probe near the origin",
                            "the isolated asset does not store a location; it is previewed in the authored interior probe");
-    if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
     const bool shadowed = shadow && shadow->valid && shadow->depth;
     ProfileScope ps_setup("frame.light.setup");
-    update_global_channels(p);
-    update_exposure(gpu, p);
     fill_externs(gb, vm, p, shadowed);
     // Validate every dependency before recording any render-target transitions.
     const auto frame = ext_.frame_constants();
@@ -2044,7 +2047,7 @@ void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosph
         try {
             const Scope* scopes[] = {&frame_scope_, &view_scope_};
             atm_.lens_glare.load(pm, gpu, a->lens_glare, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, true});
-            atm_.lens_upsample.load(pm, gpu, a->lens_upsample, scopes, {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+            atm_.lens_upsample.load(pm, gpu, a->lens_upsample, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
         } catch (const std::exception& ex) {
             atm_notes_.push_back(std::format("map lens glare not loaded: {}", ex.what()));
         }

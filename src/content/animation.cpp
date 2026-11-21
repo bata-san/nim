@@ -106,22 +106,25 @@ std::vector<TagHash> read_child_entities(PackageManager& pm, const TagReader& r,
     return result;
 }
 
-// S8080A313 groups optional equipment parts. A slot with one choice has a unique preview; every
-// choice of every slot (outfits, variants) is worn on the same skeleton.
-std::vector<TagHash> read_equipment_entities(PackageManager& pm, const TagReader& r, size_t resource, bool all_choices) {
+// S8080A313 has independent slots (S8080A320) with alternative entities (S8080A322).
+using EquipmentSlots = std::vector<std::vector<TagHash>>;
+
+EquipmentSlots read_equipment_entities(PackageManager& pm, const TagReader& r, size_t resource) {
     const auto slots = r.vec_at(resource + 0x98);
-    std::vector<TagHash> result;
+    EquipmentSlots result;
     if (slots.element_class != 0x8080A320) return result;
     for (uint64_t i = 0; i < slots.count; ++i) {
         const auto choices = r.vec_at(slots.data + size_t(i) * 0x18 + 8);
-        if (choices.element_class != 0x8080A322 || (!all_choices && choices.count != 1)) continue;
+        if (choices.element_class != 0x8080A322) continue;
+        std::vector<TagHash> slot;
         for (uint64_t k = 0; k < choices.count; ++k) {
             const size_t row = choices.data + size_t(k) * 0x18;
             const auto child = resolve_wide_hash(pm, r.u32_at(row + 8), r.u64_at(row + 0x10));
             if (!child) continue;
             const Entry* entry = pm.entry(*child);
-            if (entry && entry->type == 8 && entry->reference == kClassEntity) result.push_back(*child);
+            if (entry && entry->type == 8 && entry->reference == kClassEntity) slot.push_back(*child);
         }
+        if (!slot.empty()) result.push_back(std::move(slot));
     }
     return result;
 }
@@ -312,7 +315,7 @@ ModelRigIndex index_model_skeletons(
     std::unordered_set<uint32_t> skeletons, rigs;
     std::unordered_map<uint32_t, std::vector<TagHash>> children_of_component;
     std::unordered_map<uint32_t, std::vector<TagHash>> colocated_of_component;
-    std::unordered_map<uint32_t, std::vector<TagHash>> equipment_of_component;
+    std::unordered_map<uint32_t, EquipmentSlots> equipment_of_component;
     std::unordered_map<uint32_t, std::pair<TagHash, TagHash>> bank_of_component;
     std::unordered_map<uint32_t, uint32_t> shell_of_component;
     std::unordered_set<uint32_t> shell_values;
@@ -339,7 +342,7 @@ ModelRigIndex index_model_skeletons(
                     children_of_component.emplace(tag.value, read_child_entities(pm, r, resource, assemblies ? &colocated : nullptr));
                     if (!colocated.empty()) colocated_of_component.emplace(tag.value, std::move(colocated));
                 } else if (cls == 0x8080A313 && assemblies)
-                    equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource, true));
+                    equipment_of_component.emplace(tag.value, read_equipment_entities(pm, r, resource));
                 else if (motions && cls == 0x80803936)
                     bank_of_component.emplace(tag.value, std::pair{r.tag_at(resource + 0xE8), r.tag_at(resource + 0xF4)});
                 else if (motions && cls == 0x808041DA && r.u32_at(resource + 0x140) == 0x808041DE) {
@@ -358,7 +361,7 @@ ModelRigIndex index_model_skeletons(
         std::vector<uint32_t> models;
         std::vector<TagHash> children;
         std::vector<TagHash> colocated;
-        std::vector<TagHash> equipment;
+        EquipmentSlots equipment;
         std::vector<TagHash> clips;
     };
     struct MotionOwners {
@@ -529,45 +532,6 @@ ModelRigIndex index_model_skeletons(
     }
     if (assemblies) {
         assemblies->clear();
-        std::unordered_map<uint32_t, std::vector<TagHash>> by_root;
-        std::unordered_map<uint32_t, std::unordered_set<uint32_t>> roots_of;
-        std::unordered_set<uint32_t> ambiguous_roots;
-        for (const auto& [entity, node] : bindings) {
-            if (node.models.size() != 1 || (node.equipment.empty() && node.colocated.empty())) continue;
-            const uint32_t root = node.models.front();
-            std::vector<TagHash> pending = node.equipment;
-            pending.insert(pending.end(), node.colocated.begin(), node.colocated.end());
-            std::unordered_set<uint32_t> seen{entity};
-            std::vector<TagHash> parts;
-            while (!pending.empty()) {
-                const auto child = pending.back();
-                pending.pop_back();
-                if (!seen.insert(child.value).second) continue;
-                const auto it = bindings.find(child.value);
-                if (it == bindings.end()) continue;
-                for (uint32_t model : it->second.models) {
-                    if (model == root) continue;
-                    parts.emplace_back(model);
-                }
-                pending.insert(pending.end(), it->second.equipment.begin(), it->second.equipment.end());
-                pending.insert(pending.end(), it->second.colocated.begin(), it->second.colocated.end());
-            }
-            std::ranges::sort(parts);
-            parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
-            const auto [found, fresh] = by_root.try_emplace(root, parts);
-            if (!fresh && found->second != parts) ambiguous_roots.insert(root);
-        }
-        for (auto& [root, parts] : by_root) {
-            if (parts.empty() || ambiguous_roots.contains(root)) continue;
-            for (TagHash model : parts) roots_of[model.value].insert(root);
-            parts.insert(parts.begin(), TagHash(root));
-            assemblies->emplace(root, parts);
-        }
-        for (const auto& [model, roots] : roots_of) {
-            if (roots.size() == 1) assemblies->try_emplace(model, assemblies->at(*roots.begin()));
-        }
-        // Models directly owned by the same entity share its object space. Keep rigid parts
-        // too: machines and props can be split across several model components.
         std::unordered_map<uint32_t, uint32_t> bones_of;
         auto skinned_bones = [&](uint32_t model) -> uint32_t {
             if (const auto it = bones_of.find(model); it != bones_of.end()) return it->second;
@@ -579,30 +543,81 @@ ModelRigIndex index_model_skeletons(
             }
             return bones_of[model] = bones;
         };
-        std::unordered_map<uint32_t, std::vector<TagHash>> groups;
-        std::unordered_set<uint32_t> grouped_twice;
-        for (const auto& [entity, node] : bindings) {
-            if (node.models.size() < 2) continue;
+        using AssemblyGroups = std::unordered_map<uint32_t, std::vector<TagHash>>;
+        AssemblyGroups by_root, by_member;
+        std::unordered_set<uint32_t> ambiguous_roots, ambiguous_members;
+        auto record_group = [](AssemblyGroups& groups, std::unordered_set<uint32_t>& ambiguous,
+                               TagHash model, const std::vector<TagHash>& parts) {
+            const auto [found, fresh] = groups.try_emplace(model.value, parts);
+            if (!fresh && found->second != parts) ambiguous.insert(model.value);
+        };
+
+        // Follow every co-located child. Within a slot prefer the explicitly previewed model,
+        // or the first authored choice that has geometry. Only the catalog pass flattens slots.
+        std::unordered_set<uint32_t> path;
+        auto collect = [&](auto&& self, uint32_t entity, TagHash selected, bool catalog) -> std::vector<TagHash> {
+            const auto found = bindings.find(entity);
+            if (found == bindings.end() || !path.insert(entity).second) return {};
+            const auto& node = found->second;
             std::vector<TagHash> parts;
             for (uint32_t model : node.models) parts.emplace_back(model);
+            for (TagHash child : node.colocated) {
+                const auto group = self(self, child.value, selected, catalog);
+                parts.insert(parts.end(), group.begin(), group.end());
+            }
+            for (const auto& slot : node.equipment) {
+                std::vector<TagHash> choice;
+                for (TagHash child : slot) {
+                    auto group = self(self, child.value, selected, catalog);
+                    if (catalog) {
+                        parts.insert(parts.end(), group.begin(), group.end());
+                    } else if (!selected.is_none() && std::ranges::find(group, selected) != group.end()) {
+                        choice = std::move(group);
+                        break;
+                    } else if (choice.empty()) {
+                        choice = std::move(group);
+                        if (selected.is_none() && !choice.empty()) break;
+                    }
+                }
+                parts.insert(parts.end(), choice.begin(), choice.end());
+            }
+            path.erase(entity);
             std::ranges::sort(parts);
             parts.erase(std::unique(parts.begin(), parts.end()), parts.end());
+            return parts;
+        };
+        auto root_first = [](std::vector<TagHash>& parts, TagHash root) {
+            const auto it = std::ranges::find(parts, root);
+            std::rotate(parts.begin(), it, it + 1);
+        };
+        for (const auto& [entity, node] : bindings) {
+            if (node.models.empty() || (node.models.size() == 1 && node.equipment.empty() && node.colocated.empty())) continue;
+            auto parts = collect(collect, entity, {}, false);
             if (parts.size() < 2) continue;
-            auto root = std::ranges::max_element(parts, [&](TagHash a, TagHash b) {
-                const auto key = [&](TagHash t) {
-                    const auto it = out.find(t.value);
-                    return std::pair(it != out.end() && !it->second.rig.is_none(), skinned_bones(t.value));
-                };
-                return key(a) < key(b);
-            });
-            std::rotate(parts.begin(), root, root + 1);
-            for (TagHash part : parts) {
-                const auto [found, fresh] = groups.try_emplace(part.value, parts);
-                if (!fresh && found->second != parts) grouped_twice.insert(part.value);
+            std::vector<uint32_t> owned = node.models;
+            std::ranges::sort(owned);
+            auto score = [&](uint32_t m) {
+                const auto binding = out.find(m);
+                return std::pair(binding != out.end() && !binding->second.rig.is_none(), skinned_bones(m));
+            };
+            const TagHash root(*std::ranges::max_element(owned, {}, score));
+            root_first(parts, root);
+            record_group(by_root, ambiguous_roots, root, parts);
+            for (TagHash model : parts)
+                if (model != root) record_group(by_member, ambiguous_members, model, parts);
+            for (TagHash alternate : collect(collect, entity, {}, true)) {
+                if (std::ranges::find(parts, alternate) != parts.end()) continue;
+                auto selected = collect(collect, entity, alternate, false);
+                if (std::ranges::find(selected, alternate) == selected.end()) continue;
+                root_first(selected, root);
+                record_group(by_member, ambiguous_members, alternate, selected);
             }
         }
-        for (const auto& [model, parts] : groups)
-            if (!grouped_twice.contains(model)) assemblies->try_emplace(model, parts);
+        for (auto& [model, parts] : by_root)
+            if (!ambiguous_roots.contains(model)) assemblies->emplace(model, std::move(parts));
+        for (auto& [model, parts] : by_member)
+            if (!ambiguous_members.contains(model) && !ambiguous_roots.contains(model))
+                assemblies->try_emplace(model, std::move(parts));
     }
     return out;
 }
@@ -629,6 +644,25 @@ int32_t matching_bind_joint(const Skeleton& source, const Skeleton& target, size
 std::vector<int32_t> assembly_pose_map(const Skeleton& source, const Skeleton& target) {
     std::vector<int32_t> direct;
     for (size_t b = 0; b < target.size(); ++b) direct.push_back(matching_bind_joint(source, target, b));
+    // Exact shared joints establish a common object space. A named descendant can have
+    // a different bind offset on a variant: keep its own offset and follow the source
+    // joint's motion instead of attaching it to a less specific ancestor.
+    for (size_t b = 0; b < target.size(); ++b) {
+        if (direct[b] >= 0 || target.parents[b] < 0) continue;
+        const auto name = target.hashes[b];
+        if (std::ranges::count(target.hashes, name) != 1 || std::ranges::count(source.hashes, name) != 1) continue;
+        const auto src = std::ranges::find(source.hashes, name);
+        const auto index = size_t(src - source.hashes.begin());
+        int32_t a = source.parents[index], c = target.parents[b];
+        while (a >= 0 && c >= 0 && source.hashes[size_t(a)] == target.hashes[size_t(c)]) {
+            if (source.parents[size_t(a)] >= 0 && direct[size_t(c)] == a) {
+                direct[b] = int32_t(index);
+                break;
+            }
+            a = source.parents[size_t(a)];
+            c = target.parents[size_t(c)];
+        }
+    }
     std::vector<int32_t> result = direct;
     for (size_t b = 0; b < target.size(); ++b) {
         int32_t p = int32_t(b);

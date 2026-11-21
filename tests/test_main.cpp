@@ -240,6 +240,10 @@ int main() {
         attachment.bind.resize(5);
         attachment.bind[1] = mechanism.bind[2];
         CHECK((assembly_pose_map(mechanism, attachment) == std::vector<int32_t>{0, 2, 2, 2, -1}));
+
+        Skeleton variant = mechanism;
+        variant.bind[2].translation[2] += 0.1f;
+        CHECK((assembly_pose_map(mechanism, variant) == std::vector<int32_t>{0, 1, 2}));
     }
 
     {

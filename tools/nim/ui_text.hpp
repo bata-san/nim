@@ -232,6 +232,16 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
       "맵 {}: 메시 {}개 / 인스턴스 {}개{}")                                                                                \
     X(LogSkipped, " ({} スキップ)", " ({} skipped)", " ({}개 건너뜀)")                                                   \
     X(ErrMapStopped, "マップの読込を停止: {}", "Map loading stopped: {}", "맵 불러오기 중지: {}")                         \
+    X(AnimationTab, "アニメーション", "Animation", "애니메이션") \
+    X(ParametersTab, "パラメータ", "Parameters", "매개변수") \
+    X(ModelInfoTab, "モデル情報", "Model info", "모델 정보") \
+    X(AnimationInfo, "リグ・クリップ情報", "Rig and clip info", "리그 및 클립 정보") \
+    X(ClipFilter, "クリップタグ / 名前ハッシュ", "Clip tag / name hash", "클립 태그 / 이름 해시") \
+    X(ChannelFilter, "パラメータ名 / ハッシュ", "Parameter name / hash", "매개변수 이름 / 해시") \
+    X(ResetAll, "すべて既定値に戻す", "Reset all to defaults", "모두 기본값으로 되돌리기") \
+    X(NoMatches, "一致する項目がありません", "No matches", "일치하는 항목이 없습니다") \
+    X(PrevClip, "前のクリップ", "Previous clip", "이전 클립") \
+    X(NextClip, "次のクリップ", "Next clip", "다음 클립") \
     X(AnimHeader, "アニメーション (クリップ {})", "Animation (clips {})", "애니메이션 (클립 {})")                         \
     X(PartClips, "選択パーツのクリップ", "Clips of the selected part", "선택한 파츠의 클립")                              \
     X(SkeletonLine, "スケルトン %s (%zu ボーン)   リグ %s", "Skeleton %s (%zu bones)   rig %s",                           \
