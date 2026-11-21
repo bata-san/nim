@@ -126,7 +126,7 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
                 d.blend_state = draw.blend_state();
                 if (d.blend_state < 0) throw std::runtime_error(std::format("{}: draw has no blend state", s->def.draw.str()));
                 d.depth_func = D3D12_COMPARISON_FUNC_GREATER_EQUAL;  // reversed depth, read only
-                d.drop_extra_targets = true;  // SV_Target4 (motion / coverage) has no attachment here
+                d.additional_rtv_formats = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, GBuffer::kFormats[3]};
                 for (const auto& in : shader_inputs(load_shader_bytecode(pm, draw.stage(ShaderStage::Vertex).shader))) {
                     if (_stricmp(in.semantic.c_str(), "TEXCOORD") == 0) s->instance_float4s = std::max(s->instance_float4s, in.index + 1);
                     else  // POSITION etc.: a model drawn per particle; its geometry reference is not decoded
@@ -436,7 +436,9 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     const D3D12_RECT sc{0, 0, LONG(gb.width()), LONG(gb.height())};
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
-    cl->OMSetRenderTargets(1, &hdr, FALSE, &gb.dsv_ro);
+    Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {hdr, gb.null_rtv, gb.null_rtv, gb.null_rtv, gb.rtv[3]};
+    cl->OMSetRenderTargets(5, targets, FALSE, &gb.dsv_ro);
     ext.set_texture(kParticle, 0x08, history_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kHistoryFloat4s);
     ext.set_texture(kParticle, 0x10, history_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, total_ * kHistoryFloat4s);
     GamePipeline::VolumeBatch draw_batch;
@@ -452,6 +454,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
                                            used * s.instance_float4s * 16, s.instance_float4s * 16};
         guard(s, [&] { s.draw.draw_instances(gpu, cl, ext, scopes, vbv, used, draw_batch); });
     }
+    Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, instances_.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Gpu::barrier(cl, history_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }

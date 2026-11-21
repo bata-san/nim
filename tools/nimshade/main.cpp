@@ -15,6 +15,7 @@
 //            [--entity-range BEGIN:END] (diagnostic half-open indices in the region's model list)
 //            [--verify-static-motion] (16 frozen TAA frames must have < 0.1 px motion)
 //            [--no-froxel-noise] (compare the original uniform-density atmosphere permutation)
+//            [--no-froxel-history] (compare per-frame density without reprojection)
 //            [--dump-lighting] (light/depth/sky/froxel buffers and camera metadata)
 #include "sampler.hpp"
 #include "nim/content/animation.hpp"
@@ -101,6 +102,7 @@ int run(int argc, char** argv) {
     bool dump_lighting = false;
     bool no_froxels = false;
     bool no_froxel_noise = false;
+    bool no_froxel_history = false;
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
     std::optional<std::pair<size_t, size_t>> entity_range;
@@ -132,6 +134,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--dump-lighting") dump_lighting = true;
         else if (args[i] == "--no-froxels") no_froxels = true;
         else if (args[i] == "--no-froxel-noise") no_froxel_noise = true;
+        else if (args[i] == "--no-froxel-history") no_froxel_history = true;
         else if (args[i] == "--verify-static-motion") verify_static_motion = true;
         else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
         else if (args[i] == "--entity-range" && i + 1 < args.size()) {
@@ -557,6 +560,7 @@ int run(int argc, char** argv) {
     lp.assume_lights_on = assume_lights_on;
     lp.froxel_fog = !no_froxels;
     lp.froxel_noise = !no_froxel_noise;
+    lp.froxel_temporal = !no_froxel_history;
     lp.probe_distance_fade = probe_distance_fade;
     lp.time_of_day = time_of_day;
     lp.day_night_state = day_night_state;
@@ -934,6 +938,7 @@ int run(int argc, char** argv) {
             if (!f) throw std::runtime_error("lighting dump failed");
         };
         save("lighting-depth.bin", depth);
+        save("lighting-motion.bin", gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8));
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-ibl.bin", gpu.read_texture(gl.specular_ibl(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
@@ -1185,6 +1190,8 @@ int run(int argc, char** argv) {
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
             render_game(gpu.immediate());
             gpu.flush();
+            if (lp.froxel_fog && gl.externs().get_v(0x65, 0x20)[3] != 0)
+                throw std::runtime_error("Froxel history was reused after resize");
             verify_lut(vm);
             const auto depth = gl.externs().texture(ext::Deferred, 0x98);
             if (depth.resource != gb.depth.Get()) throw std::runtime_error("Stale depth binding after resize");
@@ -1203,6 +1210,46 @@ int run(int argc, char** argv) {
             if (!pass && !moving && gl.temporal_aa_on(lp)) throw std::runtime_error("Camera rotation did not produce motion vectors");
             std::println("verified resized frame {}x{}: current depth / sky, finite motion ({} moving pixels)", w, h, moving);
         }
+        if (lp.froxel_fog && lp.froxel_temporal) {
+            constexpr auto read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            constexpr uint8_t froxel = 0x65;
+            auto frame_density = [&](const View& camera, bool history, bool expect_history) {
+                gpu.begin_frame(0);
+                lp.froxel_temporal = history;
+                prepare_game_frame();
+                vm = gl.temporal_view(camera, lp);
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                render_game(gpu.immediate());
+                gpu.flush();
+                const auto& ext = gl.externs();
+                const auto* prior = ext.texture(froxel, 0x90).resource;
+                auto* current = ext.texture(froxel, 0x98).resource;
+                if (!current || prior == current || (ext.get_v(froxel, 0x20)[3] > 0) != expect_history)
+                    throw std::runtime_error("Froxel temporal bindings do not match the expected history state");
+                return gpu.read_texture(current, read, 8);
+            };
+            View moved = view;
+            const V3 shift{0.35f, 0.2f, 0.3f};
+            moved.eye = moved.eye + shift;
+            moved.target = moved.target + shift;
+            const auto independent = frame_density(moved, false, false);
+            frame_density(view, true, false);
+            const auto temporal = frame_density(moved, true, true);
+            verify_lut(vm);
+            if (temporal.size() != independent.size() || temporal.size() % 8)
+                throw std::runtime_error("Froxel history changed the density volume size");
+            size_t different = 0;
+            for (size_t i = 0; i < temporal.size(); i += 8)
+                different += !std::equal(temporal.begin() + i, temporal.begin() + i + 8, independent.begin() + i);
+            if (!different) throw std::runtime_error("Froxel reprojection did not affect the density volume");
+            // A large teleport at the same orientation must drop the previous density.
+            moved.eye = moved.eye + V3{40, 0, 0};
+            moved.target = moved.target + V3{40, 0, 0};
+            frame_density(moved, true, false);
+            std::println("verified froxel history: {} changed voxels after camera motion, reset after teleport and resize", different);
+            vm = gl.temporal_view(view, lp);
+        }
+        lp.froxel_temporal = false;  // exposure tests isolate post-processing from temporal density
         if (gl.temporal_aa_on(lp)) {
             const bool ssr = lp.ssr;
             lp.auto_exposure = false;

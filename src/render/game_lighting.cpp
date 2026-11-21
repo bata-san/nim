@@ -1362,6 +1362,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
 }
 
 void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
+    froxel_history_valid_ = false;
     // Conditional extern bindings may still reference the targets about to be released. Own
     // this invalidation here so headless callers and GUI callers have the same resize contract.
     auto clear_owned = [&](uint8_t id, uint32_t offset, ID3D12Resource* old) {
@@ -1751,6 +1752,7 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
 }
 
 void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) {
+    if (values != global_overrides_) froxel_history_valid_ = false;
     global_overrides_ = values;
     ext_.world_channels = values;
 }
@@ -1789,6 +1791,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ps_setup.stop();
     ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
     const bool atmosphere = atm_.valid && p.atmosphere;
+    if (!froxels_on(p)) froxel_history_valid_ = false;
     shading_.validate(ext_, scopes);
     const bool post = p.post && post_ready();
     if (!post) final_combine_.validate(ext_, scopes);
@@ -2031,6 +2034,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
 // the density LUT and the sun path; the remaining extern 7 values are the global fog / sky
 // channels copied in their own order (estimate), the engine code that copies them is not data.
 void GameLighting::set_atmosphere(PackageManager& pm, Gpu& gpu, const MapAtmosphere* a) {
+    froxel_history_valid_ = false;
     ae_valid_ = false;
     ae_fence_ = {};
     taa_valid_ = false;

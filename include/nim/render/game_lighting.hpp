@@ -716,8 +716,17 @@ private:
     GamePipeline froxel_density_, froxel_inscatter_;
     GamePipeline froxel_density_no_sun_, froxel_inscatter_no_sun_;
     GamePipeline froxel_density_noise_, froxel_density_noise_no_sun_;
-    ComPtr<ID3D12Resource> froxel_density_vol_, froxel_vol_;  // RGBA16F 3D
+    std::array<ComPtr<ID3D12Resource>, 2> froxel_density_vol_;
+    ComPtr<ID3D12Resource> froxel_vol_;  // RGBA16F 3D
     uint32_t froxel_w_ = 0, froxel_h_ = 0;
+    uint32_t froxel_density_index_ = 0;
+    bool froxel_history_valid_ = false;
+    struct FroxelHistoryView {
+        M4 projection;
+        V3 eye, forward;
+        float near_plane, time, time_of_day, day_night_state;
+        bool noise, shadowed, interior, environment;
+    } froxel_history_view_{};
     // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice
     // depth = near + (far - near) t^(1 / curve).
     static constexpr uint32_t kFroxelDepth = 96, kFroxelTile = 8;

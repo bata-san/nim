@@ -596,6 +596,7 @@ struct LightingParams {
     // With the atmosphere: the engine's froxel volume (cascade_raymarch_atmosphere_volume and
     // its _inscatter pass) for the height fog's density, sun shadowing and in-scatter.
     bool froxel_fog = true;
+    bool froxel_temporal = true;  // original density reprojection; history weight and reset policy are estimates
     // Full-map viewing keeps every authored probe active at its own spatial bounds. The
     // optional camera-distance fade is an unverified interpretation of +0x3C/+0x40.
     bool probe_distance_fade = false;
