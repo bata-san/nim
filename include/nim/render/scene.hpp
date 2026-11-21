@@ -185,6 +185,7 @@ struct PreparedMesh {
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no parts supported by the connected passes
     bool inferred_dynamic_lod = false;
+    bool distance_field_preview = false; // preview-only material state and camera framing
     bool intact_preview = false;
     bool inferred_transparent_stage = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement

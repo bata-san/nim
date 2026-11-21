@@ -466,7 +466,7 @@ int run(int argc, char** argv) {
         std::println("dynamic model: {} components indexed in {:.1f}s, materials {}", mats.size(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                      it == mats.end() ? "none" : it->second.component.str());
-        auto mesh = prepare_entity_preview(pm, mesh_tag, mats, assemblies);
+        auto mesh = prepare_entity_preview(pm, mesh_tag, mats, assemblies, -1, &channel_values);
         for (const auto& part : mesh.attachments) std::println("assembled part {}", part.tag.str());
         std::vector<ModelSkinPose> poses;
         if (list_clips) {

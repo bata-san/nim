@@ -1143,13 +1143,52 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
     return out;
 }
 
+namespace {
+void prepare_distance_field_preview(PreparedMesh& mesh) {
+    // These original shaders shape the proxy mesh with two smoothly joined spheres.
+    const auto group = std::ranges::find_if(mesh.groups, [](const PreparedMesh::Group& g) {
+        return g.vs_material.shader.value == 0x80A438CC && g.ps_material.shader.value == 0x80A438CF;
+    });
+    if (group == mesh.groups.end()) return;
+
+    ExternStore inputs;
+    inputs.set(ext::Frame, 0x00, 0.0f);
+    const float4 origin{0, 0, 0, 1};
+    const ChannelContext channels{&mesh.channel_overrides, nullptr, &mesh.channel_defaults, &inputs, &origin};
+    auto cb = group->vs_cb0;
+    run_tfx(group->vs_material.bytecode, group->vs_material.constants, cb, with_channels(inputs.environment(), channels, true));
+    const auto xyz = [](const float4& v) { return V3{v[0], v[1], v[2]}; };
+    const V3 a = xyz(cb[3]), b = xyz(cb[5]);
+    // Signed distance is depressed by at most one quarter of the smooth-union
+    // width plus the magnitude of the sampled noise. The hit threshold is .01.
+    const float margin = std::abs(cb[6][0]) * 0.25f + std::abs(cb[9][0]) + 0.01f;
+    const V3 separation = b - a;
+    const float distance = std::sqrt(dot(separation, separation));
+    const float ra = cb[2][0], rb = cb[4][0];
+    const float along = distance > 0 ? std::clamp(0.5f + (rb - ra) / (2 * distance), 0.0f, 1.0f) : 0.0f;
+    const float scale = cb[1][0];
+    const float extent = scale * (std::max(ra + along * distance, rb + (1 - along) * distance) + margin);
+    const V3 center = xyz(cb[0]) + (a + separation * along) * scale;
+    if (std::isfinite(extent) && extent > mesh.radius && std::isfinite(dot(center, center))) {
+        mesh.center = center;
+        mesh.radius = extent;
+    }
+    // The effect's activation is supplied at run time. Start the standalone preview
+    // before dissolve, preserving authored defaults and explicit overrides.
+    mesh.channel_defaults.try_emplace(0xFC4AD52C, float4{});
+    mesh.distance_field_preview = true;
+}
+}  // namespace
+
 PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
                                     const ModelAssemblyIndex& assemblies, int permutation,
                                     const ChannelValues* channels, PrepareCache* cache) {
     auto prepare = [&](TagHash tag, int variant) {
         const auto it = materials.find(tag.value);
-        return prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache);
+        auto mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache);
+        prepare_distance_field_preview(mesh);
+        return mesh;
     };
     auto result = prepare(model, permutation);
     const auto assembly = assemblies.find(model.value);
@@ -1852,6 +1891,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         material_externs_->note_estimate("dynamic LOD: regular parts take precedence over the auxiliary representation",
                                          "role 3 with mask 0x0F overlaps the regular LODs");
 
+    if (mesh.distance_field_preview)
+        material_externs_->note_estimate("distance-field preview: bounds from the initial spheres; default dissolve 0 if unset",
+                                         "native vertex material evaluated at time zero; activation and later bounds depend on runtime channels");
     if (mesh.intact_preview)
         material_externs_->note_estimate("intact entity: fragmented shell groups disabled",
                                          "the flagged shell techniques overlap the intact skinned mesh");
