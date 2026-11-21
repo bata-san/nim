@@ -1273,6 +1273,131 @@ int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
     return 0;
 }
 
+// Gameplay scripts an activity places: node -> entity (8080BAAD, hash64 at node +0x30) ->
+// components (8080BADB) -> BlockScript definitions (80800000) they name. Each definition carries
+// its module path ("bs\slots\squad_group.bs"); prints the modules with their placement count and
+// the first positions, plus (with -v) every placement.
+int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose) {
+    pm.build_hash64_index();
+    std::unordered_map<uint32_t, std::string> module_of;  // script definition -> module
+    auto module = [&](uint32_t script) -> const std::string& {
+        auto it = module_of.find(script);
+        if (it != module_of.end()) return it->second;
+        std::string name;
+        try {
+            const auto d = pm.read(TagHash(script));
+            const std::string text(d.begin(), d.end());
+            const auto at = text.find("bs\\");
+            if (at != std::string::npos) name = text.c_str() + at;
+        } catch (...) {
+        }
+        return module_of.emplace(script, name.empty() ? TagHash(script).str() : name).first->second;
+    };
+    struct Placement { std::array<float, 3> p; TagHash node_table, entity, component; uint32_t script; };
+    std::map<std::string, std::vector<Placement>> by_module;
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> entity_scripts;  // (component, script)
+    for (const auto& m : list_activity_maps(pm)) {
+        if (m.activity != activity) continue;
+        const auto tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+        const auto layout = load_map_layout(pm, m.bubble, tables);
+        std::println("{} map[{}] bubble {} {}: {} node tables", m.activity.str(), m.activity_map, m.bubble.str(), m.name, layout.node_tables.size());
+        for (const auto table : layout.node_tables) {
+            std::vector<uint8_t> data;
+            try { data = pm.read(table); } catch (...) { continue; }
+            TagReader r(data);
+            const auto nodes = r.vec_at(0x08);
+            for (uint64_t k = 0; k < nodes.count; ++k) {
+                const size_t e = nodes.data + size_t(k) * 0x90;
+                if (e + 0x90 > data.size()) break;
+                const uint64_t h64 = r.u64_at(e + 0x30);
+                if (!h64 || h64 == ~0ull) continue;
+                const auto ent = pm.resolve64(h64);
+                if (!ent) continue;
+                auto it = entity_scripts.find(ent->value);
+                if (it == entity_scripts.end()) {
+                    std::vector<std::pair<uint32_t, uint32_t>> found;
+                    try {
+                        const auto ed = pm.read(*ent);
+                        std::set<uint32_t> seen;
+                        for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                            uint32_t v; std::memcpy(&v, ed.data() + o, 4);
+                            const TagHash c(v);
+                            if (!c.is_pkg_ref() || !seen.insert(v).second) continue;
+                            const Entry* ce = pm.entry(c);
+                            if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                            const auto cd = pm.read(c);
+                            std::set<uint32_t> scripts;
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t w; std::memcpy(&w, cd.data() + q, 4);
+                                const TagHash sh(w);
+                                if (!sh.is_pkg_ref()) continue;
+                                const Entry* se = pm.entry(sh);
+                                if (se && se->type == 8 && se->reference == 0x80800000 && scripts.insert(w).second) found.emplace_back(v, w);
+                            }
+                        }
+                    } catch (...) {
+                    }
+                    it = entity_scripts.emplace(ent->value, std::move(found)).first;
+                }
+                const std::array<float, 3> pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
+                for (const auto& [component, script] : it->second)
+                    by_module[module(script)].push_back({pos, table, *ent, TagHash(component), script});
+            }
+        }
+    }
+    // Most gameplay objects (squad groups, spawn points, objectives) are not placed on nodes:
+    // they hang off the activity's script hierarchy. Count every component of the map's package
+    // family by the script modules it names.
+    if (const auto maps = list_activity_maps(pm); !maps.empty()) {
+        TagHash bubble;
+        for (const auto& m : maps) if (m.activity == activity) bubble = m.bubble;
+        if (const PackageInfo* home = bubble.is_none() ? nullptr : pm.info(bubble.pkg_id())) {
+            const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
+            std::map<std::string, size_t> components;
+            for (const auto& info : pm.packages()) {
+                if (!info.name.starts_with(family)) continue;
+                Package& pk = pm.open(info);
+                for (uint32_t i = 0; i < pk.entries().size(); ++i) {
+                    const Entry& en = pk.entries()[i];
+                    if (en.type != 8 || en.reference != 0x8080BADB) continue;
+                    std::vector<uint8_t> d;
+                    try { d = pk.read_entry(i); } catch (...) { continue; }
+                    std::set<std::string> names;
+                    for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+                        uint32_t v; std::memcpy(&v, d.data() + o, 4);
+                        const TagHash h(v);
+                        if (!h.is_pkg_ref()) continue;
+                        const Entry* se = pm.entry(h);
+                        if (se && se->type == 8 && se->reference == 0x80800000) names.insert(module(v));
+                    }
+                    for (const auto& n : names) ++components[n];
+                }
+            }
+            std::vector<std::pair<size_t, std::string>> sorted;
+            for (const auto& [n, c] : components) sorted.emplace_back(c, n);
+            std::ranges::sort(sorted, std::greater{});
+            std::println("components of the {}* family by script module:", family);
+            for (const auto& [c, n] : sorted) std::println("{:6} {}", c, n);
+        }
+    }
+    std::println("node-placed script components:");
+    std::vector<std::pair<std::string, const std::vector<Placement>*>> order;
+    for (const auto& [name, list] : by_module) order.emplace_back(name, &list);
+    std::ranges::sort(order, [](const auto& a, const auto& b) { return a.second->size() > b.second->size(); });
+    for (const auto& [name, list] : order) {
+        std::set<uint32_t> scripts;
+        for (const auto& pl : *list) scripts.insert(pl.script);
+        std::println("{:5} {} ({} definitions)", list->size(), name, scripts.size());
+        const size_t shown = verbose ? list->size() : std::min<size_t>(list->size(), 3);
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& pl = (*list)[i];
+            std::println("        ({:.1f} {:.1f} {:.1f}) entity {} component {} script {} table {}", pl.p[0], pl.p[1], pl.p[2],
+                         pl.entity.str(), pl.component.str(), TagHash(pl.script).str(), pl.node_table.str());
+        }
+    }
+    return 0;
+}
+
 int cmd_map_entities(PackageManager& pm, TagHash bubble) {
     const PackageInfo* home = pm.info(bubble.pkg_id());
     if (!home) return 1;
@@ -2877,6 +3002,8 @@ int main(int argc, char** argv) {
         }
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "map-gameplay" && args.size() >= 2)
+            return cmd_map_gameplay(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-components" && args.size() >= 2)
             return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0,
