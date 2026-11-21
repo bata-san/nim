@@ -65,16 +65,18 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     };
     constexpr auto f16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
     {
-        // SV_Target1 is the output's luma (for the anti-aliasing passes nim does not run).
+        // SV_Target1 is only needed by the FXAA input. The TAA shader derives its own luma.
         GamePipeline::Options opt{DXGI_FORMAT_R8G8B8A8_UNORM, false};
         opt.drop_extra_targets = true;
         load(post_tonemap_, "screen_area_global_lut3d", opt);
-        // fxaa reads one texture: the colour with the luma in alpha. The same tonemap, drawn
-        // again, puts its SV_Target1 (luma) into that alpha (target 0 masked off).
-        GamePipeline::Options luma{DXGI_FORMAT_R8G8B8A8_UNORM, false};
-        luma.additional_rtv_formats = {DXGI_FORMAT_R8G8B8A8_UNORM};
-        luma.write_masks = {0, D3D12_COLOR_WRITE_ENABLE_ALPHA};
-        load(post_luma_, "screen_area_global_lut3d", luma);
+        // FXAA reads one RGBA texture. Write the native tonemap MRTs together and
+        // copy only the second target's alpha into the colour target.
+        GamePipeline::Options luma{DXGI_FORMAT_R8G8B8A8_UNORM, false, {DXGI_FORMAT_R8G8B8A8_UNORM}};
+        luma.write_masks = {D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COLOR_WRITE_ENABLE_ALPHA};
+        load(post_tonemap_luma_, "screen_area_global_lut3d", luma);
+        GamePipeline::Options pack{DXGI_FORMAT_R8G8B8A8_UNORM, false};
+        pack.write_masks = {D3D12_COLOR_WRITE_ENABLE_ALPHA};
+        load(post_pack_luma_, "copy_texture", pack);
         load(fxaa_, "fxaa", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
         // TAA: the variant with neighbourhood clipping in YCoCg (the decoded one, docs/PROGRESS.md 3.8).
         load(taa_, "resolve_taa_use_clipping_use_ycocg", {f16, false});
@@ -103,7 +105,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
     lens_blur_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_, &grading_fill_, &grading_convert_})
+    for (GamePipeline* gp : {&post_tonemap_, &post_tonemap_luma_, &post_pack_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_, &grading_fill_, &grading_convert_})
         gp->release(gpu);
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
@@ -517,7 +519,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
-    const bool aa = !taa && p.antialias && post_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
     if (!taa) taa_valid_ = false;
     if (taa) {
         // Tonemap into the resolve's input, resolve it against the history into the other history
@@ -569,16 +571,22 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         viewport(cl, w_, h_);
         post_tonemap_.draw(gpu, cl, e, scopes);
     } else {
-        // Tonemap into the fxaa input (colour, then its luma into alpha), then fxaa into lit.
+        // Reuse the final output for luma until FXAA writes the resolved colour.
         const auto ldr_rtv = rtv(3 * kBloomLevels + 1);
         Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE targets[]{ldr_rtv, gb.lit_rtv};
+        cl->OMSetRenderTargets(2, targets, FALSE, nullptr);
         viewport(cl, w_, h_);
-        post_tonemap_.draw(gpu, cl, e, scopes);
-        const D3D12_CPU_DESCRIPTOR_HANDLE both[2] = {gb.lit_rtv, ldr_rtv};
-        cl->OMSetRenderTargets(2, both, FALSE, nullptr);
-        post_luma_.draw(gpu, cl, e, scopes);
-        Gpu::barrier(cl, post_ldr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        post_tonemap_luma_.draw(gpu, cl, e, scopes);
+        cl->OMSetRenderTargets(1, &ldr_rtv, FALSE, nullptr);
+        end(gb.lit.Get());
+        e.set_texture(pp, 0x00, gb.lit.Get());
+        e.set(pp, 0x50, size4(w_, h_));
+        e.set(pp, 0xC0, float4{1, 1, 1, 1});
+        post_pack_luma_.draw(gpu, cl, e, scopes);
+        e.set_texture(pp, 0x00, nullptr);
+        end(post_ldr_.Get());
+        Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         // Extern 0x33: the input at +0x00; at +0x50..+0x58 FXAA 3.11's subpixel amount, edge threshold and
         // minimum edge threshold (cb0[3..5].x).
         constexpr uint8_t kAntialias = 0x33;

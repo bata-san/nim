@@ -620,7 +620,7 @@ private:
     void update_exposure(Gpu& gpu, const LightingParams& p);
     void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p,
                      const ScopeBufferFn& scopes, bool distorted);
-    GamePipeline post_tonemap_, post_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_down_finite_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
+    GamePipeline post_tonemap_, post_tonemap_luma_, post_pack_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_down_finite_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
     GamePipeline grading_fill_, grading_convert_;
     static constexpr int kBloomLevels = 4;  // 1/3, 1/6, 1/12, 1/24
     struct BloomLevel {
