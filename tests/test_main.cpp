@@ -170,6 +170,16 @@ int main() {
                                   0x68, 8, 0x11, 0x68, 9, 0x11, 0x68, 10, 0x11};
         const auto mapped = tfx_animated_atlas_operands(layers);
         CHECK(mapped.size() == 3 && mapped[2].step == 2 && mapped[2].count == 7 && mapped[2].scale == 10);
+        std::vector<uint8_t> shared{0x68, 3, 0x11, 0x68, 4, 0x11};
+        for (uint8_t scale = 5; scale <= 29; scale += 3)
+            shared.insert(shared.end(), {0x68, scale, 0x11, 0x68, uint8_t(scale + 1), 0xBB, 0x69, uint8_t(scale + 2), 0});
+        const auto shared_slots = tfx_animated_atlas_operands(shared);
+        const uint8_t expected_slots[]{1, 2, 1, 1, 1, 2, 2, 2, 1, 2, 2};
+        CHECK(shared_slots.size() == std::size(expected_slots));
+        for (size_t i = 0; i < shared_slots.size() && i < std::size(expected_slots); ++i)
+            CHECK(shared_slots[i].texture_slot == expected_slots[i]);
+        CHECK(shared_slots.size() == 11 && shared_slots[0].count == AtlasOperands::kUnspecified &&
+              shared_slots[8].count == 25 && shared_slots[10].count == 31);
         TfxEnvironment env;
         env.texture_layer_count = [](uint8_t) { return float4{0.125f, 0.25f, 0.125f, 0.03125f}; };
         env.atlas_frame_count = [](uint8_t operand, uint8_t texture) {

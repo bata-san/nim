@@ -2080,16 +2080,18 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (texture->tile_count > 1) atlases.emplace_back(slot, texture.get());
         if (!atlases.empty()) {
             const auto atlas_operands = tfx_animated_atlas_operands(item.ps_material.bytecode);
-            const bool matching_slots = atlases.size() == 1 ||
-                (atlases.size() == 2 && atlases[0].first == 2 && atlases[1].first == 3) ||
-                (atlases.size() == 3 && atlases[0].first == 0 && atlases[1].first == 1 && atlases[2].first == 2);
-            if (matching_slots && atlases.size() == atlas_operands.size()) {
-                for (size_t i = 0; i < atlases.size(); ++i) {
-                    const auto& atlas = *atlases[i].second;
-                    if (!std::ranges::all_of(atlas.tile_uv, [](float v) { return v > 0 && v <= 1; }))
-                        throw UnsupportedMeshPart("Invalid animated texture atlas UVs");
-                    item.ps_atlases.push_back({atlas_operands[i], atlas.tile_uv, atlas.tile_count});
+            for (const auto& operands : atlas_operands) {
+                const auto binding = operands.texture_slot == AtlasOperands::kUnspecified && atlases.size() == 1
+                    ? atlases.begin()
+                    : std::ranges::find(atlases, operands.texture_slot, &decltype(atlases)::value_type::first);
+                if (binding == atlases.end()) {
+                    item.ps_atlases.clear();
+                    break;
                 }
+                const auto& atlas = *binding->second;
+                if (!std::ranges::all_of(atlas.tile_uv, [](float v) { return v > 0 && v <= 1; }))
+                    throw UnsupportedMeshPart("Invalid animated texture atlas UVs");
+                item.ps_atlases.push_back({operands, atlas.tile_uv, atlas.tile_count});
             }
         }
         item.vs_live = g.vs_live;
@@ -2732,12 +2734,13 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         const auto atlases = std::span(item.ps_atlases);
         env.texture_layer_count = [atlases](uint8_t operand) {
             for (const auto& atlas : atlases)
-                if (operand == atlas.operands.scale || operand == atlas.operands.step) return atlas.uv;
+                if (operand == atlas.operands.scale || (atlas.operands.step != AtlasOperands::kUnspecified && operand == atlas.operands.step))
+                    return atlas.uv;
             throw std::runtime_error("TFX: texture atlas UV operand is unresolved");
         };
         env.atlas_frame_count = [atlases](uint8_t operand, uint8_t) {
             for (const auto& atlas : atlases)
-                if (operand == atlas.operands.count) return float(atlas.frames);
+                if (atlas.operands.count != AtlasOperands::kUnspecified && operand == atlas.operands.count) return float(atlas.frames);
             throw std::runtime_error("TFX: texture atlas frame count operand is unresolved");
         };
         ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",

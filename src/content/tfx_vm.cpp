@@ -247,6 +247,16 @@ std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> 
         }
         ip += len;
     }
+    // PS 80A54A27 / 80A7C4E9 sample the same two atlases with several transforms.
+    // cb0[39] and [74] use fixed offsets. The other nine transforms select a frame.
+    if (scales == std::vector<uint8_t>{3, 4, 5, 8, 11, 14, 17, 20, 23, 26, 29} &&
+        steps == std::vector<uint8_t>{6, 9, 12, 15, 18, 21, 24, 27, 30} &&
+        counts == std::vector<uint8_t>{7, 10, 13, 16, 19, 22, 25, 28, 31}) {
+        constexpr auto absent = AtlasOperands::kUnspecified;
+        return {{3, absent, absent, 1}, {4, absent, absent, 2},
+                {5, 6, 7, 1}, {8, 9, 10, 1}, {11, 12, 13, 1}, {14, 15, 16, 2}, {17, 18, 19, 2},
+                {20, 21, 22, 2}, {23, 24, 25, 1}, {26, 27, 28, 2}, {29, 30, 31, 2}};
+    }
     if (counts.size() != scales.size() || counts.size() != steps.size()) return {};
     if (counts.size() == 1) {
         // Sky: step 0, then a count/scale pair. Object state: consecutive scale/step/count.
@@ -258,11 +268,11 @@ std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> 
     // PS 80B7E4CF blends consecutive frames on t2 and uses a changing frame on t3.
     if (steps == std::vector<uint8_t>{0, 7} && counts == std::vector<uint8_t>{4, 8} &&
         scales == std::vector<uint8_t>{5, 6})
-        return {{5, 0, 4}, {6, 7, 8}};
+        return {{5, 0, 4, 2}, {6, 7, 8, 3}};
     // The three-layer material samples t0/t1/t2 in these operand groups (PS 80B088FF).
     if (steps == std::vector<uint8_t>{0, 1, 2} && counts == std::vector<uint8_t>{5, 6, 7} &&
         scales == std::vector<uint8_t>{8, 9, 10})
-        return {{8, 0, 5}, {9, 1, 6}, {10, 2, 7}};
+        return {{8, 0, 5, 0}, {9, 1, 6, 1}, {10, 2, 7, 2}};
     return {};
 }
 
