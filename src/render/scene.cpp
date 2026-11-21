@@ -2033,12 +2033,20 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.vs_cb0 = arena_.upload(gpu, g.vs_cb0.data(), g.vs_cb0.size() * sizeof(float4));
         item.vs_material = std::move(g.vs_material);
         item.ps_material = std::move(g.ps_material);
-        if (const auto texture = g.textures.find(0); texture != g.textures.end() &&
-            texture->second->tile_count > 1 && tfx_animated_atlas_operand(item.ps_material.bytecode)) {
-            const auto& atlas = *texture->second;
-            if (!std::all_of(atlas.tile_uv.begin(), atlas.tile_uv.end(), [](float v) { return v > 0 && v <= 1; }))
-                throw UnsupportedMeshPart("Invalid animated texture atlas UVs");
-            item.ps_atlas = Item::AnimatedAtlas{atlas.tile_uv, atlas.tile_count};
+        std::vector<std::pair<uint32_t, const Texture*>> atlases;
+        for (const auto& [slot, texture] : g.textures)
+            if (texture->tile_count > 1) atlases.emplace_back(slot, texture.get());
+        if (!atlases.empty()) {
+            const auto atlas_operands = tfx_animated_atlas_operands(item.ps_material.bytecode);
+            if (atlases.size() == atlas_operands.size() && (atlases.size() == 1 ||
+                (atlases[0].first == 0 && atlases[1].first == 1 && atlases[2].first == 2))) {
+                for (size_t i = 0; i < atlases.size(); ++i) {
+                    const auto& atlas = *atlases[i].second;
+                    if (!std::ranges::all_of(atlas.tile_uv, [](float v) { return v > 0 && v <= 1; }))
+                        throw UnsupportedMeshPart("Invalid animated texture atlas UVs");
+                    item.ps_atlases.push_back({atlas_operands[i], atlas.tile_uv, atlas.tile_count});
+                }
+            }
         }
         item.vs_live = g.vs_live;
         item.ps_live = g.ps_live;
@@ -2675,6 +2683,22 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         scope_ready[slot].store(a, std::memory_order_release);
         return a;
     };
+    auto bind_atlases = [&](TfxEnvironment& env, const Item& item) {
+        if (item.ps_atlases.empty()) return;
+        const auto atlases = std::span(item.ps_atlases);
+        env.texture_layer_count = [atlases](uint8_t operand) {
+            for (const auto& atlas : atlases)
+                if (operand == atlas.operands.scale || operand == atlas.operands.step) return atlas.uv;
+            throw std::runtime_error("TFX: texture atlas UV operand is unresolved");
+        };
+        env.atlas_frame_count = [atlases](uint8_t operand, uint8_t) {
+            for (const auto& atlas : atlases)
+                if (operand == atlas.operands.count) return float(atlas.frames);
+            throw std::runtime_error("TFX: texture atlas frame count operand is unresolved");
+        };
+        ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
+                          "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
+    };
     auto material_env = [&](const Item& it, const ChannelContext& channels, bool vs) {
         auto env = with_channels(base, channels, vs);
         if (it.preview_sky_weights[0]) {
@@ -2684,13 +2708,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                 return value;
             };
         }
-        if (!vs && it.ps_atlas) {
-            const auto& atlas = *it.ps_atlas;
-            env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
-            env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
-            ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
-                              "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
-        }
+        if (!vs) bind_atlases(env, it);
         return env;
     };
     // The object's position is per placement: one set of constants for each (on this thread).
@@ -2874,13 +2892,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             ChannelContext ec = job.channels;
             if (job.origin) ec.world_position = &job.origin_storage;
             auto env = with_channels(base, ec, job.vs);
-            if (!job.vs && it.ps_atlas) {
-                const auto& atlas = *it.ps_atlas;
-                env.texture_layer_count = [&atlas](uint8_t) { return atlas.uv; };
-                env.atlas_frame_count = [&atlas](uint8_t, uint8_t) { return float(atlas.frames); };
-                ext.note_estimate("animated texture atlas: TFX 0x68 UVs and 0x69 frame count",
-                                  "operand pairs and shader sampling match atlas metadata and successive frames in the game texture");
-            }
+            if (!job.vs) bind_atlases(env, it);
             const auto& material = job.vs ? it.vs_material : it.ps_material;
             evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env);
         } catch (const std::exception& ex) {

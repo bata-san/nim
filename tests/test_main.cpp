@@ -152,8 +152,19 @@ int main() {
 
     {
         const uint8_t atlas[] = {0x68, 0, 0xBB, 0x53, 0, 0x69, 4, 0, 0x53, 1, 0x68, 5, 0x11, 0x53, 2};
-        CHECK(tfx_animated_atlas_operand(atlas) == 4);
-        CHECK(!tfx_animated_atlas_operand(std::span(atlas).first(10)));
+        const auto sky_atlas = tfx_animated_atlas_operands(atlas);
+        CHECK(sky_atlas.size() == 1 && sky_atlas.front().count == 4);
+        CHECK(tfx_animated_atlas_operands(std::span(atlas).first(10)).empty());
+        const uint8_t object_atlas[] = {0x68, 3, 0x11, 0x68, 4, 0xBB, 0x62, 0xF2, 0x17, 0x53, 0xD4,
+                                        0x29, 0x00, 0x69, 5, 0x00};
+        const auto material = tfx_animated_atlas_operands(object_atlas);
+        CHECK(material.size() == 1 && material.front().count == 5);
+        CHECK(tfx_animated_atlas_operands(std::span(object_atlas).subspan(3)).empty());
+        const uint8_t layers[] = {0x68, 0, 0xBB, 0x68, 1, 0xBB, 0x68, 2, 0xBB,
+                                  0x69, 5, 0, 0x69, 6, 0, 0x69, 7, 0,
+                                  0x68, 8, 0x11, 0x68, 9, 0x11, 0x68, 10, 0x11};
+        const auto mapped = tfx_animated_atlas_operands(layers);
+        CHECK(mapped.size() == 3 && mapped[2].step == 2 && mapped[2].count == 7 && mapped[2].scale == 10);
         TfxEnvironment env;
         env.texture_layer_count = [](uint8_t) { return float4{0.125f, 0.25f, 0.125f, 0.03125f}; };
         env.atlas_frame_count = [](uint8_t operand, uint8_t texture) {

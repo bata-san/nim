@@ -388,8 +388,8 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> scope_slots;                   // (root parameter, scope_defs_ slot)
         std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
         std::vector<float4> vs_constants, ps_constants;
-        struct AnimatedAtlas { float4 uv; uint16_t frames; };
-        std::optional<AnimatedAtlas> ps_atlas;
+        struct AnimatedAtlas { AtlasOperands operands; float4 uv; uint16_t frames; };
+        std::vector<AnimatedAtlas> ps_atlases;
         D3D12_GPU_VIRTUAL_ADDRESS vs_address = 0, ps_address = 0;
         // Stages that read the object's own position (object channel interpolated_world_position):
         // their constants differ per placement. -1 = not scanned yet.

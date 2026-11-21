@@ -48,8 +48,9 @@ struct TfxResult {
 
 // Inspect texture/sampler assignments without evaluating numeric expressions.
 TfxResult inspect_tfx_bindings(std::span<const uint8_t> bytecode);
-// The paired 0x68/0x69 expressions for a diagonally packed animated atlas bound to t0.
-std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bytecode);
+// Known 0x68/0x69 operand layouts for diagonally packed animated atlases in texture-slot order.
+struct AtlasOperands { uint8_t scale, step, count; };
+std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> bytecode);
 
 // Runs a TFX expression program. `constants` are the stage's bytecode constants; `out` is the
 // cbuffer (pre-filled with the stage's initial cbuffer contents) the program writes into.

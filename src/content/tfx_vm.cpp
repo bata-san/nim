@@ -230,26 +230,34 @@ TfxResult inspect_tfx_bindings(std::span<const uint8_t> bc) {
     return result;
 }
 
-std::optional<uint8_t> tfx_animated_atlas_operand(std::span<const uint8_t> bc) {
-    std::optional<uint8_t> count_operand, scale_operand;
-    bool has_step = false;
+std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> bc) {
+    std::vector<uint8_t> steps, scales, counts;
     for (size_t ip = 0; ip < bc.size();) {
         const auto [name, len] = op_info(bc[ip]);
         if (!name || ip + len > bc.size()) return {};
         if (bc[ip] == 0x80) break;
         if (bc[ip] == 0x68) {
-            if (bc[ip + 1] == 0 && bc[ip + 2] == 0xBB && !has_step) has_step = true;
-            else if (bc[ip + 2] == 0x11 && !scale_operand) scale_operand = bc[ip + 1];
+            if (bc[ip + 2] == 0xBB) steps.push_back(bc[ip + 1]);
+            else if (bc[ip + 2] == 0x11) scales.push_back(bc[ip + 1]);
             else return {};
         }
         if (bc[ip] == 0x69) {
-            if (bc[ip + 2] != 0 || count_operand) return {};
-            count_operand = bc[ip + 1];
+            if (bc[ip + 2] != 0) return {};
+            counts.push_back(bc[ip + 1]);
         }
         ip += len;
     }
-    if (has_step && count_operand && scale_operand && *scale_operand == *count_operand + 1)
-        return count_operand;
+    if (counts.size() != scales.size() || counts.size() != steps.size()) return {};
+    if (counts.size() == 1) {
+        // Sky: step 0, then a count/scale pair. Object state: consecutive scale/step/count.
+        if ((steps[0] == 0 && counts[0] != 0 && scales[0] == counts[0] + 1) ||
+            (steps[0] == scales[0] + 1 && counts[0] == steps[0] + 1))
+            return {{scales[0], steps[0], counts[0]}};
+    }
+    // The three-layer material samples t0/t1/t2 in these operand groups (PS 80B088FF).
+    if (steps == std::vector<uint8_t>{0, 1, 2} && counts == std::vector<uint8_t>{5, 6, 7} &&
+        scales == std::vector<uint8_t>{8, 9, 10})
+        return {{8, 0, 5}, {9, 1, 6}, {10, 2, 7}};
     return {};
 }
 

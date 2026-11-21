@@ -74,6 +74,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     }
     load(bloom_initial_, "bloom_initial_downsample_block_3x3", {f16, false});
     load(bloom_down_, "downsample_block_2x2", {f16, false});
+    load(bloom_down_finite_, "downsample_block_2x2_with_nan_kill", {f16, false});
     load(bloom_blur_h_, "gaussian_10_horz", {f16, false});
     load(bloom_blur_v_, "gaussian_10_vert", {f16, false});
     load(bloom_add_, "weighted_add", {f16, false});
@@ -109,7 +110,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
     lens_blur_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_})
+    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_})
         gp->release(gpu);
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
@@ -336,9 +337,15 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             e.set_texture(pp, 0x00, src.down.Get());
             e.set(pp, 0x60, size4(src.w, src.h));
             e.set(pp, 0x50, size4(dst.w, dst.h));
-            e.set(pp, 0xC0, float4{0, 0, 0, 0});  // .x: source mip
+            const bool sanitize = i == 1 && bloom_down_finite_.loaded();
+            // The first reduction sanitizes non-finite HDR samples before they enter the
+            // rest of the pyramid or the logarithmic luminance meter.
+            e.set(pp, 0xC0, sanitize ? float4{0, 0, 0, 1} : float4{});  // replacement or source mip
+            if (sanitize)
+                e.note_estimate("bloom: non-finite first reduction sample = (0,0,0,1)",
+                                "original downsample_block_2x2_with_nan_kill; replacement from the same-engine reference");
             begin(dst.down.Get(), uint32_t(3 * i), dst.w, dst.h);
-            bloom_down_.draw(gpu, cl, e, scopes);
+            (sanitize ? bloom_down_finite_ : bloom_down_).draw(gpu, cl, e, scopes);
             end(dst.down.Get());
         }
     }
