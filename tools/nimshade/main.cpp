@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <iterator>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -470,6 +471,25 @@ int run(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                      it == mats.end() ? "none" : it->second.component.str());
         auto mesh = prepare_entity_preview(pm, mesh_tag, mats, assemblies, -1, &channel_values);
+        // FBX texture bakes (tools/fbx): dump each opaque part's original VS/PS, then draw it through
+        // <dir>/<part>.gs.dxil, a geometry shader that moves every triangle into the atlas.
+        if (const char* dir = std::getenv("NIM_BAKE_GS_DIR")) {
+            std::erase_if(mesh.groups, [](const auto& g) { return g.stage != 0; });
+            for (auto& g : mesh.groups) {
+                const fs::path base(dir);
+                std::ofstream(base / std::format("{}.vs.dxil", g.info.part), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(g.vs.data()), std::streamsize(g.vs.size()));
+                std::ofstream(base / std::format("{}.ps.dxil", g.info.part), std::ios::binary)
+                    .write(reinterpret_cast<const char*>(g.ps.data()), std::streamsize(g.ps.size()));
+                std::println("bake part {} topology {} first index {} count {}", g.info.part, g.part.primitive_type,
+                             g.part.index_start, g.part.index_count);
+                std::ifstream f(base / std::format("{}.gs.dxil", g.info.part), std::ios::binary);
+                if (f) g.bake_gs.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                else if (!std::getenv("NIM_BAKE_DUMP_ONLY"))
+                    throw std::runtime_error(std::format("missing bake geometry shader for part {}", g.info.part));
+            }
+            if (std::getenv("NIM_BAKE_DUMP_ONLY")) return 0;
+        }
         for (const auto& part : mesh.attachments) std::println("assembled part {}", part.tag.str());
         std::vector<ModelSkinPose> poses;
         if (list_clips) {
@@ -488,6 +508,7 @@ int run(int argc, char** argv) {
             if (!anim || anim->clips.empty())
                 throw std::runtime_error(std::format("clip {} is incompatible with the preview's skinned models", clip.tag.str()));
             restrict_preview_clip(clip, anim->clips.front());
+            std::println("animation skeleton {} rig {}", anim->skeleton.component.str(), anim->rig.component.str());
             if (anim->clips.front().shared_bones) std::println("retargeted {} shared body bones", anim->clips.front().shared_bones);
             prepare_preview_equipment(pm, mesh, *anim, rigs, all, mats);
             for (const auto& option : anim->equipment) std::println("equipment candidate {}", option.model.str());

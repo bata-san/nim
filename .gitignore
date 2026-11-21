@@ -8,3 +8,4 @@ build-*/
 nim_layout.ini
 nim_d3d.log
 captures/
+__pycache__/

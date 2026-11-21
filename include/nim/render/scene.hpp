@@ -179,6 +179,9 @@ struct PreparedMesh {
         // Constant buffers the object supplies itself (terrain: VS b11 = position offset and
         // texcoord transform), by (stage, register).
         std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_cbuffers;
+        // Texture-space bakes (export tools): a DXIL geometry shader placed between the original VS and
+        // PS that moves each triangle into an atlas (its own PSO, never shared).
+        std::vector<uint8_t> bake_gs;
     };
     TagHash tag;
     TagHash assembly_root;

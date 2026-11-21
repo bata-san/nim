@@ -2317,6 +2317,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.pRootSignature = item.root_sig.Get();
         pd.VS = {g.vs.data(), g.vs.size()};
         pd.PS = {g.ps.data(), g.ps.size()};
+        pd.GS = {g.bake_gs.data(), g.bake_gs.size()};
         // G-buffer decals blend into some targets and leave the others alone (their state masks them).
         bool blended = false;
         if (transparent) {
@@ -2374,10 +2375,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                                              mesh.buffers.at(g.buffers).ib.is_32bit};
         ProfileScope profile_pso("add.pso");
         HRESULT pipeline_hr = S_OK;
-        if (auto existing = shared_pipelines.find(pipeline_key); existing != shared_pipelines.end()) item.pso = existing->second;
+        if (auto existing = shared_pipelines.find(pipeline_key); g.bake_gs.empty() && existing != shared_pipelines.end()) item.pso = existing->second;
         else {
             pipeline_hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&item.pso));
-            if (SUCCEEDED(pipeline_hr)) shared_pipelines.emplace(pipeline_key, item.pso);
+            if (SUCCEEDED(pipeline_hr) && g.bake_gs.empty()) shared_pipelines.emplace(pipeline_key, item.pso);
         }
         if (const HRESULT hr = pipeline_hr; FAILED(hr)) {
             std::string vs_in, layout;
@@ -2407,6 +2408,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
             else {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = pd;
+                sd.GS = {};
                 sd.DSVFormat = DXGI_FORMAT_D32_FLOAT;  // the sun's separate depth-only target
                 sd.NumRenderTargets = 0;
                 for (auto& f : sd.RTVFormats) f = DXGI_FORMAT_UNKNOWN;

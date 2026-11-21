@@ -66,6 +66,10 @@ target_link_libraries(nimcli PRIVATE nim_render)
 add_executable(nimshade tools/nimshade/main.cpp)
 target_link_libraries(nimshade PRIVATE nim_render windowscodecs ole32 dbghelp winmm)
 
+# ---- nimfbx_extract: dynamic model + clip -> asset.json for tools/fbx -----------
+add_executable(nimfbx_extract tools/fbx/extract.cpp)
+target_link_libraries(nimfbx_extract PRIVATE nim_core)
+
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)
 add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_text.cpp
