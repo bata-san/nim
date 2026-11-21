@@ -152,12 +152,17 @@ VertexBuffer load_vertex_buffer(PackageManager& pm, TagHash header);
 // The placement stream used by layout 26. Each record is SNORM16x4 position/scale,
 // UNORM8x4 rotation and UNORM8x4 color. Keep the original GPU stream byte-for-byte.
 inline constexpr uint32_t kClassDecoratorGroup = 0x8080857D;
+struct DecoratorCluster {
+    float4 min, max;
+    uint32_t first_instance, instance_count, part_id;
+};
 struct DecoratorGroup {
-    TagHash model, bounds;
+    TagHash model;
     VertexBuffer instances;
     std::array<std::array<float, 4>, 6> decode{}; // extern 0x4A +0x20 through +0x70
     std::vector<uint32_t> part_offsets;    // by mesh part external_identifier, plus end sentinel
-    std::vector<uint32_t> cluster_offsets; // by bounding box, plus end sentinel
+    std::vector<float4> part_distance_thresholds;
+    std::vector<DecoratorCluster> clusters;
 };
 DecoratorGroup load_decorator_group(PackageManager& pm, TagHash tag);
 IndexBuffer load_index_buffer(PackageManager& pm, TagHash header);

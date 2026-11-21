@@ -2,6 +2,7 @@
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <format>
 #include <stdexcept>
@@ -375,7 +376,6 @@ DecoratorGroup load_decorator_group(PackageManager& pm, TagHash tag) {
     const TagReader source(stream);
     DecoratorGroup result;
     result.model = TagReader(model).tag_at(0x08);
-    result.bounds = group.tag_at(0x4C);
     const auto decode = read_class(source.tag_at(0x14), 0x80808586);
     const BinaryReader constants(decode);
     for (size_t i = 0; i < result.decode.size(); ++i) constants.copy_at(i * 16, result.decode[i]);
@@ -387,11 +387,15 @@ DecoratorGroup load_decorator_group(PackageManager& pm, TagHash tag) {
     if (result.instances.stride != 16 || result.instances.data.empty() || result.instances.data.size() % 16)
         throw std::runtime_error("Invalid decorator instance stream: " + header.str());
     const size_t count = result.instances.data.size() / 16;
+    auto checked_table = [&](const TagReader& reader, size_t field, uint32_t cls, size_t stride) {
+        const auto table = reader.vec_at(field);
+        if (table.element_class != cls || table.data > reader.size() || table.count > (reader.size() - table.data) / stride)
+            throw std::runtime_error(std::format("Invalid decorator table +0x{:X}: {}", field, tag.str()));
+        return table;
+    };
     auto offsets = [&](size_t field) {
-        const auto table = group.vec_at(field);
-        if (table.count < 2 || table.element_class != 0x80800007 || table.data > group.size() ||
-            table.count > (group.size() - table.data) / sizeof(uint32_t))
-            throw std::runtime_error("Invalid decorator range table: " + tag.str());
+        const auto table = checked_table(group, field, 0x80800007, sizeof(uint32_t));
+        if (table.count < 2) throw std::runtime_error("Missing decorator ranges: " + tag.str());
         std::vector<uint32_t> values(size_t(table.count));
         std::memcpy(values.data(), group.span().data() + table.data, values.size() * sizeof(uint32_t));
         if (values.front() != 0 || values.back() != count || !std::is_sorted(values.begin(), values.end()))
@@ -399,7 +403,44 @@ DecoratorGroup load_decorator_group(PackageManager& pm, TagHash tag) {
         return values;
     };
     result.part_offsets = offsets(0x18);
-    result.cluster_offsets = offsets(0x38);
+    const auto cluster_offsets = offsets(0x38);
+    const auto settings_bytes = read_class(TagReader(model).tag_at(0x30), 0x8080859B);
+    const TagReader settings(settings_bytes);
+    const auto distances = checked_table(settings, 0x18, 0x80800090, sizeof(float4));
+    if (distances.count + 1 != result.part_offsets.size())
+        throw std::runtime_error("Decorator distance table does not match part count: " + tag.str());
+    result.part_distance_thresholds.resize(size_t(distances.count));
+    for (size_t i = 0; i < distances.count; ++i) {
+        auto& values = result.part_distance_thresholds[i];
+        settings.copy_at(distances.data + i * sizeof(float4), values);
+        if (!std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v) && v >= 0; }) ||
+            !std::is_sorted(values.begin(), values.end()))
+            throw std::runtime_error("Invalid decorator distance thresholds: " + tag.str());
+    }
+
+    const auto bounds_bytes = read_class(group.tag_at(0x4C), 0x8080A7F5);
+    const TagReader bounds(bounds_bytes);
+    constexpr size_t kBoundsStride = 48;
+    const auto boxes = checked_table(bounds, 0x08, 0x8080A7F7, kBoundsStride);
+    if (boxes.count + 1 != cluster_offsets.size())
+        throw std::runtime_error("Decorator bounds do not match cluster count: " + tag.str());
+    result.clusters.reserve(size_t(boxes.count));
+    for (size_t i = 0; i < boxes.count; ++i) {
+        const uint32_t first = cluster_offsets[i];
+        const uint32_t end = cluster_offsets[i + 1];
+        const auto part_end = std::upper_bound(result.part_offsets.begin(), result.part_offsets.end(), first);
+        if (first == end || part_end == result.part_offsets.end() || end > *part_end)
+            throw std::runtime_error("Decorator cluster crosses part ranges: " + tag.str());
+        const auto part_id = uint32_t(part_end - result.part_offsets.begin() - 1);
+        DecoratorCluster cluster{{}, {}, first, end - first, part_id};
+        bounds.copy_at(boxes.data + i * kBoundsStride, cluster.min);
+        bounds.copy_at(boxes.data + i * kBoundsStride + sizeof(float4), cluster.max);
+        for (size_t axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(cluster.min[axis]) || !std::isfinite(cluster.max[axis]) || cluster.min[axis] > cluster.max[axis])
+                throw std::runtime_error("Invalid decorator cluster bounds: " + tag.str());
+        }
+        result.clusters.push_back(cluster);
+    }
     return result;
 }
 

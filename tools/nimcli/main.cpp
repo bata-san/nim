@@ -2355,38 +2355,30 @@ int cmd_decorators(PackageManager& pm, TagHash tag) {
                 if (size_t(part.external_identifier) + 1 >= placements.part_offsets.size())
                     throw std::runtime_error("Missing decorator instance range for mesh part: " + placements.model.str());
         }
-        const auto* bounds_entry = pm.entry(placements.bounds);
-        if (!bounds_entry || bounds_entry->reference != 0x8080A7F5)
-            throw std::runtime_error("Missing decorator cluster bounds: " + group.str());
-        const auto bounds_bytes = pm.read(placements.bounds);
-        const TagReader bounds(bounds_bytes);
-        const auto clusters = bounds.vec_at(0x08);
-        if (clusters.count + 1 != placements.cluster_offsets.size() || clusters.element_class != 0x8080A7F7 ||
-            clusters.data > bounds.size() || clusters.count > (bounds.size() - clusters.data) / 48)
-            throw std::runtime_error("Decorator cluster range and bounds counts differ: " + group.str());
         const BinaryReader instances(placements.instances.data);
         float max_outside = 0;
         size_t outside = 0;
-        for (size_t c = 0; c < clusters.count; ++c) {
-            std::array<float, 4> lo, hi;
-            bounds.copy_at(clusters.data + c * 48, lo);
-            bounds.copy_at(clusters.data + c * 48 + 16, hi);
-            for (size_t i = placements.cluster_offsets[c]; i < placements.cluster_offsets[c + 1]; ++i) {
+        for (const auto& cluster : placements.clusters) {
+            const size_t end = size_t(cluster.first_instance) + cluster.instance_count;
+            for (size_t i = cluster.first_instance; i < end; ++i) {
                 float distance = 0;
                 for (size_t axis = 0; axis < 3; ++axis) {
                     const float value = float(instances.read_at<int16_t>(i * 16 + 2 * axis));
                     const float position = std::max(-1.0f, value / 32767.0f) * placements.decode[0][axis] + placements.decode[1][axis];
-                    if (!std::isfinite(position) || !std::isfinite(lo[axis]) || !std::isfinite(hi[axis]) || lo[axis] > hi[axis])
-                        throw std::runtime_error("Invalid decorator cluster data: " + group.str());
-                    distance = std::max({distance, lo[axis] - position, position - hi[axis]});
+                    if (!std::isfinite(position))
+                        throw std::runtime_error("Invalid decorator instance position: " + group.str());
+                    distance = std::max({distance, cluster.min[axis] - position, position - cluster.max[axis]});
                 }
                 max_outside = std::max(max_outside, distance);
                 outside += distance > 0.03f;
             }
         }
-        std::println("{} model {} stream {} | {} instances, {} part ranges, {} clusters | {} origins outside bounds by >3 cm (max {:.3f} m)",
+        const auto [min_distance, max_distance] = std::ranges::minmax_element(
+            placements.part_distance_thresholds, {}, [](const float4& v) { return v.back(); });
+        std::println("{} model {} stream {} | {} instances, {} parts, {} clusters | final distance thresholds {:.1f} to {:.1f} | {} origins outside bounds by >3 cm (max {:.3f} m)",
             group.str(), placements.model.str(), placements.instances.data_tag.str(), placements.part_offsets.back(),
-            placements.part_offsets.size() - 1, clusters.count, outside, max_outside);
+            placements.part_distance_thresholds.size(), placements.clusters.size(), min_distance->back(), max_distance->back(),
+            outside, max_outside);
     }
     std::println("{} decorator groups", groups.size());
     return 0;
