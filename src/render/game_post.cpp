@@ -169,6 +169,7 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
     const auto inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const D3D12_CPU_DESCRIPTOR_HANDLE vectors{base.ptr + 10 * inc}, resolved{base.ptr + 11 * inc};
+    const D3D12_CPU_DESCRIPTOR_HANDLE minmax{base.ptr + 12 * inc};
     if (!distortion_) {
         if (!distortion_dsv_) {
             const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
@@ -181,6 +182,9 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
         const D3D12_CLEAR_VALUE clear{GBuffer::kDepthFormat, {.DepthStencil = {0, 0}}};
         distortion_depth_ = gpu.texture2d(w, h, DXGI_FORMAT_R32G8X24_TYPELESS,
                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear);
+        distortion_view_depth_ = gpu.texture2d(w, h, DXGI_FORMAT_R16G16_FLOAT,
+                                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, sample, nullptr);
+        dev->CreateRenderTargetView(distortion_view_depth_.Get(), nullptr, minmax);
         dev->CreateRenderTargetView(distortion_.Get(), nullptr, vectors);
         dev->CreateRenderTargetView(distorted_hdr_.Get(), nullptr, resolved);
         const D3D12_DEPTH_STENCIL_VIEW_DESC desc{GBuffer::kDepthFormat, D3D12_DSV_DIMENSION_TEXTURE2D};
@@ -191,23 +195,33 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
     const auto dsv = distortion_dsv_->GetCPUDescriptorHandleForHeapStart();
     const float zero[4]{};
     viewport(cl, w, h);
-    Gpu::barrier(cl, distortion_.Get(), sample, target);
+    Gpu::barrier(cl, distortion_view_depth_.Get(), sample, target);
     cl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0, 0, 0, nullptr);
-    cl->OMSetRenderTargets(1, &vectors, FALSE, &dsv);
+    // Target 0 holds the four individual depths; distortion only reads target 1 (min/max).
+    const D3D12_CPU_DESCRIPTOR_HANDLE depth_targets[]{gb.null_rtv, minmax};
+    cl->OMSetRenderTargets(2, depth_targets, FALSE, &dsv);
     constexpr uint8_t hdao = 0x21;
     ext_.set(hdao, 0x60, size4(w, h));
     ext_.set(hdao, 0x70, size4(w_, h_));
     ext_.set_texture(hdao, 0x50, gb.depth.Get(), GBuffer::kDepthSrvFormat);
+    const float4 decode = ext_.get_v(ext::Deferred, 0x00);
+    // Device depth is reversed and clears to zero. Decode that endpoint to the largest
+    // finite value representable in the RG16F surface before the native reciprocal.
+    constexpr float inv_far = 1.0f / 65504.0f;
+    ext_.set(hdao, 0x80, float4{inv_far, decode[1] - inv_far, 0, 0});
     distortion_depth_downsample_.draw(gpu, cl, ext_, scopes);
+    ext_.set_texture(hdao, 0x50, nullptr);
+    Gpu::barrier(cl, distortion_view_depth_.Get(), target, sample);
+    Gpu::barrier(cl, distortion_.Get(), sample, target);
     cl->ClearRenderTargetView(vectors, zero, 0, nullptr);
+    cl->OMSetRenderTargets(1, &vectors, FALSE, &dsv);
     {
-        const float4 decode = ext_.get_v(ext::Deferred, 0x00);
         ext_.set(ext::Deferred, 0x00, float4{0, 1, 0, 0});
-        ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
+        ext_.set_texture(ext::Deferred, 0x98, distortion_view_depth_.Get());
         ext_.set_texture(ext::Deferred, 0xD8, gb.depth.Get(), DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
         ext_.set(0x4C, 0x20, offset);
-        ext_.note_estimate("distortion: full-resolution view depth and stencil; UV amplitude 255 / framebuffer size",
-                           "UV amplitude inferred from a same-engine reference; native half-resolution uber depth is unverified");
+        ext_.note_estimate("distortion: sky depth capped at 65504 m; UV amplitude 255 / framebuffer size",
+                           "finite RG16F endpoint for the viewer's infinite projection; amplitude inferred from a same-engine reference");
         draw(cl, w, h);
         ext_.set(ext::Deferred, 0x00, decode);
         ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);

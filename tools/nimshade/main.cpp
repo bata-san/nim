@@ -1116,6 +1116,23 @@ int run(int argc, char** argv) {
             if (error > 0.003f) throw std::runtime_error(std::format("Atmosphere LUT / CPU equation mismatch: {}", error));
             std::println("verified atmosphere LUT: {}x{}, finite transmittance, zero-distance = 1, CPU max error {}{}",
                 desc.Width, desc.Height, error, white ? "" : " (nonuniform source: analytic comparison skipped)");
+            if (scene.distortion_draws()) {
+                auto* reduced = gl.distortion_view_depth();
+                if (!reduced) throw std::runtime_error("Native distortion view depth was not produced");
+                const auto reduced_desc = reduced->GetDesc();
+                if (reduced_desc.Format != DXGI_FORMAT_R16G16_FLOAT || reduced_desc.Width != (gb.width() + 1) / 2 ||
+                    reduced_desc.Height != (gb.height() + 1) / 2)
+                    throw std::runtime_error("Stale or incompatible distortion view depth");
+                const auto reduced_pixels = gpu.read_texture(reduced, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+                for (size_t i = 0; i < reduced_pixels.size(); i += 4) {
+                    uint16_t pair[2];
+                    std::memcpy(pair, &reduced_pixels[i], sizeof(pair));
+                    const float closest = half(pair[0]), farthest = half(pair[1]);
+                    if (!std::isfinite(closest) || !std::isfinite(farthest) || closest <= 0 || farthest < closest)
+                        throw std::runtime_error("Invalid native min/max depth for distortion");
+                }
+                std::println("verified distortion view depth: {}x{}, finite ordered min/max", reduced_desc.Width, reduced_desc.Height);
+            }
             if (gl.volumetrics_drawn()) {
                 const auto depths = gpu.read_texture(gl.volumetric_depth(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 16);
                 const auto* values = reinterpret_cast<const float*>(depths.data());
@@ -1137,7 +1154,7 @@ int run(int argc, char** argv) {
             gb.resize(gpu, w, h);
             View moved = view;
             moved.width = w; moved.height = h;
-            moved.target = moved.eye + normalize(V3{1, 0, 1});  // mostly empty sky, rotated from the previous view
+            if (!pass) moved.target = moved.eye + normalize(V3{1, 0, 1});  // rotate toward mostly empty sky
             prepare_game_frame();
             vm = gl.temporal_view(moved, lp);
             scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);

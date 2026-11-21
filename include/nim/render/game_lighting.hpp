@@ -430,6 +430,7 @@ public:
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
     ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
+    ID3D12Resource* distortion_view_depth() const { return distortion_view_depth_.Get(); }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
     // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
     float exposure() const { return exposure_; }
@@ -505,7 +506,7 @@ private:
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists
     ComPtr<ID3D12Resource> hdr_;
     GamePipeline distortion_depth_downsample_, distortion_resolve_;
-    ComPtr<ID3D12Resource> distortion_, distortion_depth_, distorted_hdr_;
+    ComPtr<ID3D12Resource> distortion_, distortion_depth_, distortion_view_depth_, distorted_hdr_;
     ComPtr<ID3D12DescriptorHeap> distortion_dsv_;
     void render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb,
                             const DistortionFn& draw, const ScopeBufferFn& scopes);

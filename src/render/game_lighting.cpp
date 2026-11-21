@@ -1186,6 +1186,7 @@ void GameLighting::release(Gpu& gpu) {
     hdr_.Reset();
     distortion_.Reset();
     distortion_depth_.Reset();
+    distortion_view_depth_.Reset();
     distorted_hdr_.Reset();
     distortion_dsv_.Reset();
     distortion_depth_downsample_ = {};
@@ -1241,10 +1242,10 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         }
     };
     {
-        GamePipeline::Options opt{DXGI_FORMAT_R8G8B8A8_UNORM};
+        GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16_FLOAT}};
         opt.depth_func = D3D12_COMPARISON_FUNC_ALWAYS;
         opt.depth_write = true;
-        load_sky(distortion_depth_downsample_, "downsample_depth_buffer", opt);
+        load_sky(distortion_depth_downsample_, "downsample_depth_to_2x2_and_min_max", opt);
         load_sky(distortion_resolve_, "resolve_taa_distort", {DXGI_FORMAT_R16G16B16A16_FLOAT});
     }
     rigid_scope_ = load_scope(pm, globals_.scope("rigid_model"));
@@ -1350,7 +1351,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 12};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 13};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
@@ -1372,6 +1373,7 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
     distortion_.Reset();
     distortion_depth_.Reset();
+    distortion_view_depth_.Reset();
     distorted_hdr_.Reset();
     D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
     hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
@@ -1906,7 +1908,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->RSSetScissorRects(1, &sc);
     }
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
-    if ((p.ssao && hdao_.loaded()) || volumetrics || transparents || distortions) render_linear_depth(gpu, cl, gb, vm);
+    if ((p.ssao && hdao_.loaded()) || volumetrics || transparents) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) { ProfileScope ps_("frame.light.ssao"); render_ssao(gpu, cl, gb, vm, scopes); }
     lights_drawn_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
     vol_drawn_ = 0;
