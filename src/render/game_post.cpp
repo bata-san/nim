@@ -81,6 +81,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         // TAA: the variant with neighbourhood clipping in YCoCg (the decoded one, docs/PROGRESS.md 3.8).
         load(taa_, "resolve_taa_use_clipping_use_ycocg", {f16, false});
         load(taa_copy_, "copy_texture_bilinear", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+        load(taa_seed_, "copy_texture", {f16, false});
     }
     load(bloom_initial_, "bloom_initial_downsample_block_3x3", {f16, false});
     load(bloom_down_, "downsample_block_2x2", {f16, false});
@@ -105,7 +106,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
     lens_blur_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_tonemap_luma_, &post_pack_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_, &grading_fill_, &grading_convert_})
+    for (GamePipeline* gp : {&post_tonemap_, &post_tonemap_luma_, &post_pack_luma_, &fxaa_, &taa_, &taa_copy_, &taa_seed_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_, &grading_fill_, &grading_convert_})
         gp->release(gpu);
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
@@ -296,7 +297,6 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
     if (!automatic) {
         ae_valid_ = false;
         ae_fence_ = {};
-        if (p.exposure > 2 * exposure_ || exposure_ > 2 * p.exposure) taa_valid_ = false;
         exposure_ = p.exposure;
         return;
     }
@@ -347,7 +347,6 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
         }
     }
     const float next = (ae_valid_ ? ae_auto_ : 1.0f) * p.exposure;
-    if (next > 2 * exposure_ || exposure_ > 2 * next) taa_valid_ = false;
     exposure_ = next;
 }
 
@@ -522,6 +521,32 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
     if (!taa) taa_valid_ = false;
     if (taa) {
+        const float current_exposure = e.frame_constants()[1][0];
+        const float ratio = current_exposure / taa_history_exposure_;
+        // History is already tonemapped. A linear RGB correction would alter its highlights
+        // and grading. Reduce its weight continuously over one stop of exposure change.
+        const float k = taa_valid_ && std::isfinite(ratio) && ratio > 0
+            ? std::max(0.0f, 1.0f - std::abs(std::log2(ratio))) : 0.0f;
+        const uint32_t cur = taa_current_ ^ 1;
+        ext_.note_estimate("taa: fade history by exposure difference, zero at one stop",
+                           "history is tonemapped; native exposure rejection settings are unknown");
+        if (k == 0) {
+            cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+            viewport(cl, w_, h_);
+            post_tonemap_.draw(gpu, cl, e, scopes);
+            end(gb.lit.Get());
+            e.set_texture(pp, 0x00, gb.lit.Get());
+            e.set(pp, 0x50, size4(w_, h_));
+            e.set(pp, 0xC0, float4{1, 1, 1, 1});
+            begin(taa_history_[cur].Get(), 3 * kBloomLevels + 2 + cur, w_, h_);
+            taa_seed_.draw(gpu, cl, e, scopes);
+            end(taa_history_[cur].Get());
+            e.set_texture(pp, 0x00, nullptr);
+            taa_current_ = cur;
+            taa_history_exposure_ = current_exposure;
+            taa_valid_ = true;
+            return;
+        }
         // Tonemap into the resolve's input, resolve it against the history into the other history
         // target, then copy that into lit.
         const auto ldr_rtv = rtv(3 * kBloomLevels + 1);
@@ -538,8 +563,6 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         //   w = lerp(cb0[3], cb0[6], saturate(|motion px| / 50)^0.9)   otherwise
         //   out = frame * (1 - w) + clipped history * w
         constexpr uint8_t kTaa = 0x6A;
-        const uint32_t cur = taa_current_ ^ 1;
-        const float k = taa_valid_ ? 1.0f : 0.0f;  // no history yet: the frame alone
         e.set(kTaa, 0x00, 0.75f * k);
         e.set(kTaa, 0x04, 0.92f * k);
         e.set(kTaa, 0x08, 0.92f * k);
@@ -559,6 +582,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         taa_.draw(gpu, cl, e, scopes);
         end(taa_history_[cur].Get());
         taa_current_ = cur;
+        taa_history_exposure_ = current_exposure;
         taa_valid_ = true;
         e.set_texture(pp, 0x00, taa_history_[cur].Get());
         e.set(pp, 0x50, size4(w_, h_));
@@ -603,7 +627,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
 }
 
 bool GameLighting::temporal_aa_on(const LightingParams& p) const {
-    return p.post && p.temporal_aa && post_ready() && taa_.loaded() && taa_copy_.loaded();
+    return p.post && p.temporal_aa && post_ready() && taa_.loaded() && taa_copy_.loaded() && taa_seed_.loaded();
 }
 
 // The jitter walks the Halton (2, 3) sequence over 8 frames, centred on the pixel (estimate: the

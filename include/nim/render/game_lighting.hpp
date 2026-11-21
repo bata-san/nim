@@ -634,11 +634,12 @@ private:
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     // resolve_taa: two RGBA16F history targets (written / read alternately); copy_texture_bilinear
     // puts the resolved frame into the 8-bit output.
-    GamePipeline taa_, taa_copy_;
+    GamePipeline taa_, taa_copy_, taa_seed_;
     std::array<ComPtr<ID3D12Resource>, 2> taa_history_;
     uint32_t taa_current_ = 0;
     uint64_t taa_index_ = 0;
     bool taa_valid_ = false;       // the history holds the previous frame
+    float taa_history_exposure_ = 1;
     View taa_prev_view_;
     bool taa_prev_valid_ = false;
     std::array<ComPtr<ID3D12Resource>, 3> ae_readback_;

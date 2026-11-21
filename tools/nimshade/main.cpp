@@ -1203,6 +1203,39 @@ int run(int argc, char** argv) {
             if (!pass && !moving && gl.temporal_aa_on(lp)) throw std::runtime_error("Camera rotation did not produce motion vectors");
             std::println("verified resized frame {}x{}: current depth / sky, finite motion ({} moving pixels)", w, h, moving);
         }
+        if (gl.temporal_aa_on(lp)) {
+            const bool ssr = lp.ssr;
+            lp.auto_exposure = false;
+            lp.ssr = false;
+            lp.antialias = false;
+            // Hold the same jittered camera while toggling the resolve, so any pixel
+            // difference comes from history and not a changed subpixel sample.
+            auto render_exposure = [&](bool taa, float exposure) {
+                gpu.begin_frame(0);
+                lp.temporal_aa = taa;
+                lp.exposure = exposure;
+                prepare_game_frame();
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                render_game(gpu.immediate());
+                gpu.flush();
+            };
+            render_exposure(false, 2.0f);
+            const auto reference = gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+            render_exposure(true, 1.0f);  // seed the history at a lower exposure
+            render_exposure(true, 2.0f);  // one stop rejects that history
+            const auto actual = gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+            int max_delta = 0;
+            for (size_t i = 0; i < reference.size(); ++i)
+                max_delta = std::max(max_delta, std::abs(int(reference[i]) - int(actual[i])));
+            if (max_delta > 1) throw std::runtime_error(std::format("TAA retained old exposure: max channel difference {}", max_delta));
+            std::println("verified TAA history: exact one-stop change matches current tonemap (max 8-bit delta {})", max_delta);
+            render_exposure(true, 2.0f * std::sqrt(2.0f));
+            const float remaining_weight = gl.externs().get_f(0x6A, 0x04);
+            if (std::abs(remaining_weight - 0.46f) > 0.0001f)
+                throw std::runtime_error("Half-stop exposure change did not reduce TAA history weight");
+            std::println("verified TAA history weight after half a stop: {}", remaining_weight);
+            lp.ssr = ssr;
+        }
         if (lp.ssr && gl.ssr_source() && !vm.ortho) {
             lp.auto_exposure = false;
             lp.temporal_aa = false;
