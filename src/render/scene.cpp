@@ -2038,8 +2038,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (texture->tile_count > 1) atlases.emplace_back(slot, texture.get());
         if (!atlases.empty()) {
             const auto atlas_operands = tfx_animated_atlas_operands(item.ps_material.bytecode);
-            if (atlases.size() == atlas_operands.size() && (atlases.size() == 1 ||
-                (atlases[0].first == 0 && atlases[1].first == 1 && atlases[2].first == 2))) {
+            const bool matching_slots = atlases.size() == 1 ||
+                (atlases.size() == 2 && atlases[0].first == 2 && atlases[1].first == 3) ||
+                (atlases.size() == 3 && atlases[0].first == 0 && atlases[1].first == 1 && atlases[2].first == 2);
+            if (matching_slots && atlases.size() == atlas_operands.size()) {
                 for (size_t i = 0; i < atlases.size(); ++i) {
                     const auto& atlas = *atlases[i].second;
                     if (!std::ranges::all_of(atlas.tile_uv, [](float v) { return v > 0 && v <= 1; }))

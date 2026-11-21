@@ -160,6 +160,11 @@ int main() {
         const auto material = tfx_animated_atlas_operands(object_atlas);
         CHECK(material.size() == 1 && material.front().count == 5);
         CHECK(tfx_animated_atlas_operands(std::span(object_atlas).subspan(3)).empty());
+        const uint8_t dual_atlas[] = {0x68, 0, 0xBB, 0x69, 4, 0, 0x68, 5, 0x11,
+                                       0x68, 6, 0x11, 0x68, 7, 0xBB, 0x69, 8, 0};
+        const auto dual = tfx_animated_atlas_operands(dual_atlas);
+        CHECK(dual.size() == 2 && dual[0].step == 0 && dual[0].count == 4 && dual[0].scale == 5);
+        CHECK(dual.size() == 2 && dual[1].step == 7 && dual[1].count == 8 && dual[1].scale == 6);
         const uint8_t layers[] = {0x68, 0, 0xBB, 0x68, 1, 0xBB, 0x68, 2, 0xBB,
                                   0x69, 5, 0, 0x69, 6, 0, 0x69, 7, 0,
                                   0x68, 8, 0x11, 0x68, 9, 0x11, 0x68, 10, 0x11};

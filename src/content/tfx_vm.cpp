@@ -254,6 +254,11 @@ std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> 
             (steps[0] == scales[0] + 1 && counts[0] == steps[0] + 1))
             return {{scales[0], steps[0], counts[0]}};
     }
+    // The two-layer object effect samples t2 and t3 with separate UVs and frame counts.
+    // PS 80B7E4CF blends consecutive frames on t2 and uses a changing frame on t3.
+    if (steps == std::vector<uint8_t>{0, 7} && counts == std::vector<uint8_t>{4, 8} &&
+        scales == std::vector<uint8_t>{5, 6})
+        return {{5, 0, 4}, {6, 7, 8}};
     // The three-layer material samples t0/t1/t2 in these operand groups (PS 80B088FF).
     if (steps == std::vector<uint8_t>{0, 1, 2} && counts == std::vector<uint8_t>{5, 6, 7} &&
         scales == std::vector<uint8_t>{8, 9, 10})
