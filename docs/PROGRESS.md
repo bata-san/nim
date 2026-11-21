@@ -435,7 +435,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - 自動露出: autoexposure_sample_columns (1/16 の bloom 段の列ごとの log 輝度和) を読み戻し、key 0.18、
   2^ch05..2^ch06 にクランプ (推定)。bloom: bloom_initial_downsample → downsample ×4 → gaussian_10 縦横 →
   weighted_add → copy_texture_bilinear、強度 0.04 (推定)。トーンマップ: screen_area_global_lut3d mode 4 +
-  恒等 32³ LUT (グレーディング層のデータは未発見)。
+  元シェーダーで生成した 32³ LUT (グレーディング層のデータは未発見、§3.52)。
 - FXAA: エンジンの `fxaa` (80A7434E, PS 80A7434A = FXAA 3.11 quality)。入力 t0 は「RGB = 色, A = 輝度」の 1 枚。
   トーンマップは輝度を SV_Target1 に出すので、同じパイプラインをもう一度、target0 をマスク 0、target1 =
   入力テクスチャの A だけ書くマスクで描いて合成する。extern 0x33: +0x00 入力, +0x50/+0x54/+0x58 =
@@ -1326,6 +1326,13 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - `nimcli decorators TAG` で配置タグまたはマップのバブルから監査。Perimeter 416,101、Marsh 502,355、Outpost 32,254、低温アーカイブ 82,113、計 1,032,823 レコード。全メッシュ部品 ID の範囲が存在し、クラスタ範囲の件数は全境界ボックスと一致した。復号した原点のうち 55 件は対応する境界から 3 cm を超えて外れ、最大 0.776 m。復号した原点と境界が常に一致するという仮定はカリングに使えない。
 - 4 モデルの通常描画には、元 VS が extern 0x61 から読むカスケード別テクスチャと変換行列の生成が残る。診断用の元シェーダー `80A7490A` はこの extern を読まないが、通常の G-buffer 用材質パスでは読まれる。
 - Release ビルド、CTest 2/2。Outpost の既存描画とリサイズ検証を実行し、G-buffer と影マスクは全画素一致、最終 RGB の最大差は 8 bit で 1。D3D12 デバッグログ 0 B。
+
+### 3.52 元の SDR 色補正 LUT と FXAA の輝度
+
+- `color_grading_fill_using_matrix` (`80A7460B`、PS `80A74607`) で 1024×32 の RGBA16F ストリップを生成し、`color_grading_convert_to_volume_texture_sdr` (`80A74642`、CS `80A7463F`) で 32³ RGBA8 に展開する。サイズは両シェーダーに固定されている。既定 LUT は初回だけ GPU で生成し、リサイズ時も再利用する。
+- SDR 変換はアルファに `0.299 R + 0.587 G + 0.114 B + 0.001 A` を格納する。トーンマップの SV_Target1 がこの値を FXAA に出力する。従来の CPU 製 LUT は全点のアルファが 1 で、通常のトーンマップ経路では FXAA に輝度差が渡らなかった。
+- 原データからマップ別の補正層はまだ特定できていない。b7 の有効層数 0、行列の恒等値、モード 4 と他のパラメータは既定プレビュー値。実ゲームと同じ発色かどうかも未検証。
+- RTX 2080 で Outpost と低温アーカイブの LUT を GPU から読み戻し、全 32³ 点で期待 RGB との最大誤差 0.002151、輝度との最大誤差 0.002537 を確認。固定露出の Outpost では FXAA の有無で 7,391 / 130,351 画素に差が出た。両マップで大小リサイズ、低温アーカイブで静止 TAA 16 フレームも通過。Release ビルド、CTest 2/2、D3D12 デバッグログ 0 B。
 
 ## 4. 既知の未解決・注意
 - 通常のビルド先は `build/`。シェーダー調査には `tools/re/dump.sh` と `tools/re/decomp.py` を使用する。過去の個別解析スクリプトと検証出力はプロジェクト外へ整理した。`tools/re/` の旧スクリプトは Git 履歴からも参照できる。

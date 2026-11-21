@@ -1034,6 +1034,31 @@ int run(int argc, char** argv) {
             const float value = exponent == 31 ? INFINITY : exponent ? std::ldexp(1 + mantissa, exponent - 15) : std::ldexp(mantissa, -14);
             return (v & 0x8000) ? -value : value;
         };
+        if (lp.post) {
+            if (!gl.post_ready()) throw std::runtime_error("Original SDR post-processing did not load");
+            auto* lut = gl.grading_lut();
+            if (!lut) throw std::runtime_error("Native color grading LUT was not generated");
+            const auto desc = lut->GetDesc();
+            constexpr uint32_t side = 32;
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM ||
+                desc.Width != side || desc.Height != side || desc.DepthOrArraySize != side)
+                throw std::runtime_error("Unexpected native color grading LUT layout");
+            const auto data = gpu.read_texture(lut, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+            if (data.size() != side * side * side * 4) throw std::runtime_error("Incomplete native color grading LUT");
+            float max_rgb_error = 0, max_luma_error = 0;
+            for (uint32_t z = 0; z < side; ++z) for (uint32_t y = 0; y < side; ++y) for (uint32_t x = 0; x < side; ++x) {
+                const size_t i = ((size_t(z) * side + y) * side + x) * 4;
+                const std::array<float, 3> rgb{float(x) / (side - 1), float(y) / (side - 1), float(z) / (side - 1)};
+                for (size_t c = 0; c < rgb.size(); ++c)
+                    max_rgb_error = std::max(max_rgb_error, std::abs(data[i + c] / 255.0f - rgb[c]));
+                const float luma = 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2];
+                max_luma_error = std::max(max_luma_error, std::abs(data[i + 3] / 255.0f - luma));
+            }
+            // Allow one UNORM8 step after the half-float strip and the compute conversion.
+            if (max_rgb_error > 1.0f / 255 || max_luma_error > 1.0f / 255)
+                throw std::runtime_error(std::format("Native color grading LUT mismatch: RGB {}, luma {}", max_rgb_error, max_luma_error));
+            std::println("verified color grading LUT: 32x32x32, RGB max error {}, luma max error {}", max_rgb_error, max_luma_error);
+        }
         auto verify_lut = [&](const ViewMatrices& camera) {
             if (gl.cubemap_count() != gl.cubemaps_requested()) throw std::runtime_error("Original cubemap preparation omitted volumes");
             if (gl.cubemaps_failed()) throw std::runtime_error("Original cubemap volume draw failed");

@@ -435,7 +435,8 @@ public:
     // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
     float exposure() const { return exposure_; }
     float scene_luminance() const { return ae_luminance_; }  // auto exposure's measured average (unexposed)
-    bool post_ready() const { return post_tonemap_.loaded(); }
+    bool post_ready() const { return post_tonemap_.loaded() && grading_fill_.loaded() && grading_convert_.loaded(); }
+    ID3D12Resource* grading_lut() const { return grading_lut_.Get(); }
     // Temporal anti-aliasing: this frame's view, jittered by a sub-pixel offset when resolve_taa
     // runs, with the previous frame's view (same jitter) for the G-buffer's motion vectors. Call
     // once per rendered frame and use the result for the G-buffer and render().
@@ -615,9 +616,11 @@ private:
     void load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
     void resize_post(Gpu& gpu, uint32_t w, uint32_t h);
     void release_post(Gpu& gpu);
+    void generate_grading_lut(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     void update_exposure(Gpu& gpu, const LightingParams& p);
     void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes);
     GamePipeline post_tonemap_, post_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_down_finite_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
+    GamePipeline grading_fill_, grading_convert_;
     static constexpr int kBloomLevels = 4;  // 1/3, 1/6, 1/12, 1/24
     struct BloomLevel {
         ComPtr<ID3D12Resource> down, blur, sum;  // downsampled, horizontal pass, result
@@ -625,7 +628,7 @@ private:
     };
     std::array<BloomLevel, kBloomLevels> bloom_;
     ComPtr<ID3D12Resource> post_ldr_;  // the tonemapped colour with its luma in alpha (the fxaa input)
-    ComPtr<ID3D12Resource> ae_columns_rt_, grading_lut_, black_, lens_blur_;
+    ComPtr<ID3D12Resource> ae_columns_rt_, grading_strip_, grading_lut_, black_, lens_blur_;
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;
     // resolve_taa: two RGBA16F history targets (written / read alternately); copy_texture_bilinear
     // puts the resolved frame into the 8-bit output.

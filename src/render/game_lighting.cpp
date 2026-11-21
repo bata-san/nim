@@ -1790,7 +1790,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(ext::Postprocess, 0x00, hdr_.Get());
     const bool atmosphere = atm_.valid && p.atmosphere;
     shading_.validate(ext_, scopes);
-    const bool post = p.post && post_tonemap_.loaded();
+    const bool post = p.post && post_ready();
     if (!post) final_combine_.validate(ext_, scopes);
     if (atmosphere) sky_.validate(ext_, scopes);
     // The complete pass graph (atmosphere, lighting volumes, exposure, grading and temporal

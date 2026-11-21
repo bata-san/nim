@@ -14,6 +14,8 @@ namespace nim {
 namespace {
 // Extern blocks of the post passes (TFX extern ids).
 constexpr uint8_t kScreenArea = 0x1E;  // screen_area: the lut3d / color grading passes
+constexpr uint32_t kGradingSize = 32;   // fixed lattice dimensions in both original shaders
+constexpr float kSdrTonemapMode = 4.0f;
 constexpr uint8_t kMotion = 0x38;      // bloom_initial_downsample's offset texture (motion)
 
 void viewport(ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h) {
@@ -80,48 +82,85 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     load(bloom_add_, "weighted_add", {f16, false});
     load(ae_columns_, "autoexposure_sample_columns", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
 
-    // The grading LUT (32^3, sampled with the tonemapped colour). The engine fills it with the
-    // color_grading_fill_* passes from grading layers (scope color_grading_ubershader) whose source
-    // data is not found; with no layers and an identity matrix those passes write the identity.
-    Texture lut;
-    lut.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    lut.width = lut.height = lut.depth = 32;
-    lut.data.resize(size_t(32) * 32 * 32 * 4);
-    for (uint32_t z = 0; z < 32; ++z)
-        for (uint32_t y = 0; y < 32; ++y)
-            for (uint32_t x = 0; x < 32; ++x) {
-                uint8_t* t = &lut.data[((size_t(z) * 32 + y) * 32 + x) * 4];
-                t[0] = uint8_t((x * 255 + 15) / 31);
-                t[1] = uint8_t((y * 255 + 15) / 31);
-                t[2] = uint8_t((z * 255 + 15) / 31);
-                t[3] = 255;
-            }
-    grading_lut_ = gpu.texture(lut);
+    load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
+    load(grading_convert_, "color_grading_convert_to_volume_texture_sdr", {});
     Texture black;
     black.dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     black.width = black.height = 1;
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 5};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 6};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
 void GameLighting::release_post(Gpu& gpu) {
     post_ldr_.Reset();
     lens_blur_.Reset();
-    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_})
+    for (GamePipeline* gp : {&post_tonemap_, &post_luma_, &fxaa_, &taa_, &taa_copy_, &bloom_initial_, &bloom_down_, &bloom_down_finite_, &bloom_blur_h_, &bloom_blur_v_, &bloom_add_, &ae_columns_, &grading_fill_, &grading_convert_})
         gp->release(gpu);
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
     for (auto& l : bloom_) l = {};
     ae_columns_rt_.Reset();
+    grading_strip_.Reset();
     grading_lut_.Reset();
     black_.Reset();
     post_rtv_heap_.Reset();
     for (auto& r : ae_readback_) r.Reset();
     ae_fence_ = {};
     ae_valid_ = false;
+}
+
+void GameLighting::generate_grading_lut(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes) {
+    constexpr auto sampled = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    constexpr auto compute_read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    constexpr uint32_t width = kGradingSize * kGradingSize;
+    auto* dev = gpu.device();
+    grading_strip_ = gpu.texture2d(width, kGradingSize, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+    const auto base = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const auto increment = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE strip_rtv{base.ptr + (3 * kBloomLevels + 5) * increment};
+    dev->CreateRenderTargetView(grading_strip_.Get(), nullptr, strip_rtv);
+
+    D3D12_RESOURCE_DESC volume{};
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    volume.Width = volume.Height = volume.DepthOrArraySize = kGradingSize;
+    volume.MipLevels = 1;
+    volume.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    volume.SampleDesc.Count = 1;
+    volume.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> lut;
+    check_hr(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &volume, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                         nullptr, IID_PPV_ARGS(&lut)), "SDR color grading volume");
+
+    // Scope color_grading_ubershader b7: 241 float4s with the layer count at [0].x.
+    // Authored layer records are unresolved. Use the native matrix pass with no active layers.
+    constexpr size_t grading_scope_bytes = 241 * sizeof(float4);
+    const auto cb = gpu.dynamic(grading_scope_bytes);
+    std::memset(cb.cpu, 0, grading_scope_bytes);
+    const ScopeBufferFn grading_scopes = [&, va = cb.gpu](ShaderStage stage, uint32_t reg) {
+        return stage == ShaderStage::Pixel && reg == 7 ? va : scopes(stage, reg);
+    };
+    ExternStore grading;
+    grading.set(kScreenArea, 0xE0, float4{});
+    grading.set(kScreenArea, 0xF0, float4{});
+    grading.set(kScreenArea, 0x120, M4{{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}}});
+    grading.set(kScreenArea, 0x160, 0.0f);
+    grading.set(kScreenArea, 0x1A0, kSdrTonemapMode);
+    for (uint32_t field : {0x1A4u, 0x1A8u, 0x1ACu, 0x1B0u}) grading.set(kScreenArea, field, 0.0f);
+    viewport(cl, width, kGradingSize);
+    cl->OMSetRenderTargets(1, &strip_rtv, FALSE, nullptr);
+    grading_fill_.draw(gpu, cl, grading, grading_scopes);
+
+    Gpu::barrier(cl, grading_strip_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, compute_read);
+    grading.set_texture(kScreenArea, 0x00, grading_strip_.Get());
+    grading.set_texture(kScreenArea, 0x60, lut.Get());
+    grading_convert_.dispatch(gpu, cl, grading, scopes, kGradingSize / 8, kGradingSize / 8, kGradingSize);
+    Gpu::barrier(cl, lut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, sampled);
+    grading_lut_ = std::move(lut);
 }
 
 void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
@@ -310,6 +349,7 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
 }
 
 void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes) {
+    if (!grading_lut_) generate_grading_lut(gpu, cl, scopes);
     ID3D12Device* dev = gpu.device();
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -458,14 +498,14 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     e.set_texture(kScreenArea, 0x38, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x50, bloom_tex);
     e.set_texture(kScreenArea, 0x58, unshadowed_.Get());
-    e.set(kScreenArea, 0x90, float4{32, 0, 0, 0});
+    e.set(kScreenArea, 0x90, float4{float(kGradingSize), 0, 0, 0});
     e.set(kScreenArea, 0x170, float4{0, 1, 0, 0});  // chromatic aberration ramps (none)
     e.set(kScreenArea, 0x180, float4{0, 1, 0, 0});
     e.set(kScreenArea, 0x190, float4{1, 1, 0, 0});
-    e.set(kScreenArea, 0x1A0, 4.0f);
+    e.set(kScreenArea, 0x1A0, kSdrTonemapMode);
     ext_.note_estimate("tonemap: screen_area_global_lut3d mode 4 (the curve whose constants the technique carries), hue / highlight options 0, no chromatic aberration",
                        "engine screen_area settings (extern 0x1E) not in game data");
-    ext_.note_estimate("grading: identity 32^3 LUT (color_grading_fill with no layers, identity matrix)",
+    ext_.note_estimate("grading: native SDR LUT from no layers and an identity matrix",
                        "grading layer data (scope color_grading_ubershader) source not found");
     ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -548,7 +588,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
 }
 
 bool GameLighting::temporal_aa_on(const LightingParams& p) const {
-    return p.post && p.temporal_aa && post_tonemap_.loaded() && taa_.loaded() && taa_copy_.loaded();
+    return p.post && p.temporal_aa && post_ready() && taa_.loaded() && taa_copy_.loaded();
 }
 
 // The jitter walks the Halton (2, 3) sequence over 8 frames, centred on the pixel (estimate: the
