@@ -1808,7 +1808,6 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     cl->RSSetScissorRects(1, &sc);
     const auto hdr = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     const float clear[4]{};
-    cl->ClearRenderTargetView(hdr, clear, 0, nullptr);
 
     // Viewer environment (estimate): sky reflection into the IBL buffer, background after shading.
     const bool own_env = ext_.texture(ext::Deferred, 0xD0).resource == env_.Get();
@@ -1978,6 +1977,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ps_ssr.stop();
     if (own_env) Gpu::barrier(cl, env_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    cl->ClearRenderTargetView(hdr, clear, 0, nullptr);
     cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
     cl->SetGraphicsRootSignature(nullptr);
     { ProfileScope ps_("frame.light.shading"); shading_.draw(gpu, cl, ext_, scopes, true); }

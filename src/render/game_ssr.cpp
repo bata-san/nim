@@ -98,6 +98,9 @@ void GameLighting::load_ssr(PackageManager& pm, Gpu& gpu, std::span<const Scope*
             if (tag.is_none()) throw std::runtime_error(std::format("{} is not in render globals", name));
             pipeline->load(pm, gpu, tag, scopes, {});
         }
+        const auto copy = globals_.pipeline("copy_texture");
+        if (copy.is_none()) throw std::runtime_error("copy_texture is not in render globals");
+        ssr_scale_history_.load(pm, gpu, copy, scopes, {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
         D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
         D3D12_COMMAND_SIGNATURE_DESC sd{};
         sd.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
@@ -118,6 +121,8 @@ void GameLighting::release_ssr(Gpu& gpu) {
                     std::addressof(ssr_color_), std::addressof(ssr_weight_), std::addressof(ssr_args_buf_),
                     std::addressof(ssr_rays_buf_), std::addressof(ssr_stencil_), std::addressof(ssr_history_)})
         r->Reset();
+    ssr_scale_history_.release(gpu);
+    ssr_copy_inputs_.reset();
     dispatch_sig_.Reset();
     ssr_w_ = ssr_h_ = 0;
     ssr_loaded_ = ssr_history_valid_ = false;
@@ -154,7 +159,8 @@ void GameLighting::keep_ssr_history(ID3D12GraphicsCommandList* cl, const ViewMat
     Gpu::barrier(cl, ssr_history_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ssr_history_vp_ = vm.vp_abs;
-    ssr_history_valid_ = true;
+    ssr_history_exposure_ = ext_.frame_constants()[1][0];
+    ssr_history_valid_ = std::isfinite(ssr_history_exposure_) && ssr_history_exposure_ > 0;
 }
 
 // Called with the specular IBL buffer (env_) in RENDER_TARGET state, the G-buffer readable and the
@@ -165,6 +171,8 @@ bool GameLighting::render_ssr(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& 
     if (ssr_w_ != w_ || ssr_h_ != h_) resize_ssr(gpu);
     // The reflection source is the previous frame's lit image: nothing to reflect on the first frame.
     if (!hiz_mips_ || !ssr_history_valid_) return false;
+    const float scale = ext_.frame_constants()[1][0] / ssr_history_exposure_;
+    if (!std::isfinite(scale) || scale <= 0) return false;
     const uint32_t hw = (w_ + 1) / 2, hh = (h_ + 1) / 2;
     const float W = float(w_), H = float(h_);
 
@@ -247,16 +255,40 @@ bool GameLighting::render_ssr(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& 
     }
     Gpu::barrier(cl, hiz_.Get(), kUav, kRead);
 
-    // 2. Reflection source: the last frame's image at half resolution, reprojected.
+    // 2. Reflection source: reproject the previous frame in the current exposure domain.
+    // The IBL buffer is already exposed. Use the HDR target as scratch before shading writes it.
+    ID3D12Resource* history = ssr_history_.Get();
+    constexpr auto render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    const bool reexpose = scale != 1;
+    if (reexpose) {
+        if (!ssr_copy_inputs_) ssr_copy_inputs_ = std::make_unique<ExternStore>();
+        auto& copy = *ssr_copy_inputs_;
+        copy.set_texture(ext::Postprocess, 0x00, history);
+        copy.set(ext::Postprocess, 0x50, float4{W, H, 1 / W, 1 / H});
+        copy.set(ext::Postprocess, 0xC0, float4{scale, scale, scale, 1});
+        const auto rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_VIEWPORT viewport{0, 0, W, H, 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(w_), LONG(h_)};
+        cl->RSSetViewports(1, &viewport);
+        cl->RSSetScissorRects(1, &scissor);
+        cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        ssr_scale_history_.draw(gpu, cl, copy, scopes);
+        copy.set_texture(ext::Postprocess, 0x00, nullptr);
+        cl->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+        history = hdr_.Get();
+        Gpu::barrier(cl, history, render_target, kRead);
+    }
     ext_.set(kSsr, 0x150, float4{W, H, 65504.0f, 0});  // .z: luminance clamp, .w: tonemap weight factor
     ext_.set(kSsr, 0x160, float4{1, 1, kEdgeFade, 0}); // .x: weight of the reprojected image, .y: nearer depths are left out
     ext_.set(kSsr, 0x170, float4{2, 2, kRoughnessCutoff, kBlurRadius});  // .xy: source pixels per output pixel
-    ext_.set_texture(kSsr, 0x10, ssr_history_.Get());
-    ext_.set_texture(kSsr, 0x18, ssr_history_.Get());
+    ext_.set_texture(kSsr, 0x10, history);
+    ext_.set_texture(kSsr, 0x18, history);
     Gpu::barrier(cl, ssr_source_.Get(), kRead, kUav);
     mip_uav(0x68, ssr_source_.Get(), 0);
     ssr_source_gen_.dispatch(gpu, cl, ext_, scopes, groups(hw, 8), groups(hh, 8), 1);
     Gpu::barrier(cl, ssr_source_.Get(), kUav, kRead);
+    ext_.set_texture(kSsr, 0x18, nullptr);
+    if (reexpose) Gpu::barrier(cl, history, kRead, render_target);
     main_fill(0);
 
     // 3. One ray per 2x2 pixels that reflects: direction, blur radius and the ray list.

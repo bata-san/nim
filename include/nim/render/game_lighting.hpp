@@ -366,6 +366,7 @@ public:
     bool light_grid_drawn() const { return grid_ready_; }
     // Half-resolution SSR buffers (UNORDERED_ACCESS between frames): RGBA16F radiance (w: 0 no ray,
     // 1 fallback, 2 hit) and R32 hit distance (float bits).
+    ID3D12Resource* ssr_source() const { return ssr_source_.Get(); }
     ID3D12Resource* ssr_radiance() const { return ssr_radiance_.Get(); }
     ID3D12Resource* ssr_hit_distance() const { return ssr_dir_.Get(); }
     static M4 inverse_matrix(const M4& m);  // general 4x4 inverse (the SSR pixel <-> world transforms)
@@ -705,6 +706,9 @@ private:
     uint32_t ssr_w_ = 0, ssr_h_ = 0, ssr_mips_ = 0, hiz_mips_ = 0;
     bool ssr_loaded_ = false, ssr_history_valid_ = false, ssr_drawn_ = false;
     M4 ssr_history_vp_;
+    float ssr_history_exposure_ = 1;
+    GamePipeline ssr_scale_history_;
+    std::unique_ptr<ExternStore> ssr_copy_inputs_;
     void release_froxels(Gpu& gpu);
     bool froxels_on(const LightingParams& p) const;
     void render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, const LightingParams& p, const SunShadow* shadow);

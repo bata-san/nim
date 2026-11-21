@@ -1203,6 +1203,44 @@ int run(int argc, char** argv) {
             if (!pass && !moving && gl.temporal_aa_on(lp)) throw std::runtime_error("Camera rotation did not produce motion vectors");
             std::println("verified resized frame {}x{}: current depth / sky, finite motion ({} moving pixels)", w, h, moving);
         }
+        if (lp.ssr && gl.ssr_source() && !vm.ortho) {
+            lp.auto_exposure = false;
+            lp.temporal_aa = false;
+            auto frame_at_exposure = [&](float exposure) {
+                gpu.begin_frame(0);
+                lp.exposure = exposure;
+                prepare_game_frame();
+                vm = gl.temporal_view(view, lp);
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                render_game(gpu.immediate());
+                gpu.flush();
+            };
+            auto read_source = [&](float exposure) {
+                gl.drop_ssr_history();
+                frame_at_exposure(1);
+                if (gl.ssr_drawn()) throw std::runtime_error("SSR used invalidated history");
+                frame_at_exposure(exposure);
+                if (!gl.ssr_drawn()) throw std::runtime_error("SSR reflection source missing after warmup");
+                constexpr auto read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                return gpu.read_texture(gl.ssr_source(), read, 8);
+            };
+            const auto base = read_source(1), brighter = read_source(2);
+            const auto* a = reinterpret_cast<const uint16_t*>(base.data());
+            const auto* b = reinterpret_cast<const uint16_t*>(brighter.data());
+            float max_error = 0;
+            size_t lit = 0;
+            for (size_t i = 0; i < base.size() / 2; ++i) {
+                if (i % 4 == 3) continue;
+                const float expected = half(a[i]) * 2, actual = half(b[i]);
+                if (!std::isfinite(expected) || !std::isfinite(actual))
+                    throw std::runtime_error("Non-finite SSR source after exposure step");
+                max_error = std::max(max_error, std::abs(actual - expected) / std::max(1.0f, std::abs(expected)));
+                lit += expected > 0.01f;
+            }
+            if (!lit || max_error > 0.005f)
+                throw std::runtime_error(std::format("SSR history exposure correction mismatch: {} lit channels, error {}", lit, max_error));
+            std::println("verified SSR history: 1-to-2 exposure step, {} lit channels, max normalized error {}", lit, max_error);
+        }
     }
 
     return 0;
