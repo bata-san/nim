@@ -159,6 +159,77 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
     ae_fence_ = {};
 }
 
+void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb,
+                                       const DistortionFn& draw, const ScopeBufferFn& scopes) {
+    constexpr auto sample = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    constexpr auto target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    const uint32_t w = (w_ + 1) / 2, h = (h_ + 1) / 2;
+    auto* dev = gpu.device();
+    const auto inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE vectors{base.ptr + 10 * inc}, resolved{base.ptr + 11 * inc};
+    if (!distortion_) {
+        if (!distortion_dsv_) {
+            const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+            check_hr(dev->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&distortion_dsv_)), "distortion DSV heap");
+        }
+        distortion_ = gpu.texture2d(w, h, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, sample, nullptr);
+        distorted_hdr_ = gpu.texture2d(w_, h_, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                       D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, sample, nullptr);
+        const D3D12_CLEAR_VALUE clear{GBuffer::kDepthFormat, {.DepthStencil = {0, 0}}};
+        distortion_depth_ = gpu.texture2d(w, h, DXGI_FORMAT_R32G8X24_TYPELESS,
+                                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear);
+        dev->CreateRenderTargetView(distortion_.Get(), nullptr, vectors);
+        dev->CreateRenderTargetView(distorted_hdr_.Get(), nullptr, resolved);
+        const D3D12_DEPTH_STENCIL_VIEW_DESC desc{GBuffer::kDepthFormat, D3D12_DSV_DIMENSION_TEXTURE2D};
+        dev->CreateDepthStencilView(distortion_depth_.Get(), &desc, distortion_dsv_->GetCPUDescriptorHandleForHeapStart());
+    }
+    // The reference engine uses (0.13281, 0.23611) at 1920x1080, or 255 pixels per axis.
+    const float4 offset{255.0f / float(w_), 255.0f / float(h_), 0, 0};
+    const auto dsv = distortion_dsv_->GetCPUDescriptorHandleForHeapStart();
+    const float zero[4]{};
+    viewport(cl, w, h);
+    Gpu::barrier(cl, distortion_.Get(), sample, target);
+    cl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0, 0, 0, nullptr);
+    cl->OMSetRenderTargets(1, &vectors, FALSE, &dsv);
+    constexpr uint8_t hdao = 0x21;
+    ext_.set(hdao, 0x60, size4(w, h));
+    ext_.set(hdao, 0x70, size4(w_, h_));
+    ext_.set_texture(hdao, 0x50, gb.depth.Get(), GBuffer::kDepthSrvFormat);
+    distortion_depth_downsample_.draw(gpu, cl, ext_, scopes);
+    cl->ClearRenderTargetView(vectors, zero, 0, nullptr);
+    {
+        const float4 decode = ext_.get_v(ext::Deferred, 0x00);
+        ext_.set(ext::Deferred, 0x00, float4{0, 1, 0, 0});
+        ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
+        ext_.set_texture(ext::Deferred, 0xD8, gb.depth.Get(), DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
+        ext_.set(0x4C, 0x20, offset);
+        ext_.note_estimate("distortion: full-resolution view depth and stencil; UV amplitude 255 / framebuffer size",
+                           "UV amplitude inferred from a same-engine reference; native half-resolution uber depth is unverified");
+        draw(cl, w, h);
+        ext_.set(ext::Deferred, 0x00, decode);
+        ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
+        ext_.set_texture(ext::Deferred, 0xD8, nullptr);
+    }
+    Gpu::barrier(cl, distortion_.Get(), target, sample);
+    Gpu::barrier(cl, distorted_hdr_.Get(), sample, target);
+    viewport(cl, w_, h_);
+    cl->OMSetRenderTargets(1, &resolved, FALSE, nullptr);
+    constexpr uint8_t resolve = 0x6A;
+    ext_.set(resolve, 0x70, offset);
+    ext_.set_texture(resolve, 0x68, distortion_.Get());
+    ext_.set_texture(resolve, 0x58, hdr_.Get());
+    distortion_resolve_.draw(gpu, cl, ext_, scopes);
+    ext_.set_texture(resolve, 0x68, nullptr);
+    ext_.set_texture(resolve, 0x58, nullptr);
+    Gpu::barrier(cl, distorted_hdr_.Get(), target, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Gpu::barrier(cl, hdr_.Get(), sample, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->CopyResource(hdr_.Get(), distorted_hdr_.Get());
+    Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, sample);
+    Gpu::barrier(cl, distorted_hdr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, sample);
+}
+
 // Auto exposure: autoexposure_sample_columns writes, per column of the smallest bloom level, the
 // centre-weighted sums of log2 luminance, luminance and weight over 22 rows; the engine reduces
 // them on the CPU. The columns were sampled with 1 / exposure (extern 38 +0xC0.z), so the average

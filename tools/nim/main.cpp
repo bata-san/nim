@@ -814,7 +814,11 @@ private:
             if (scene.has_transparent()) transparent = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                 scene.render_transparent(gpu, c, gb, hdr, view, lighting.externs());
             };
-            lighting.render(gpu, cl, gb, view, params, transparent, nullptr, scene.has_visible_light_grid());
+            GameLighting::DistortionFn distortion;
+            if (scene.has_visible_distortion()) distortion = [&](auto* c, uint32_t w, uint32_t h) {
+                scene.render_distortion(gpu, c, w, h, view, lighting.externs());
+            };
+            lighting.render(gpu, cl, gb, view, params, transparent, nullptr, scene.has_visible_light_grid(), distortion);
             auto texture = gpu.texture2d(kThumbSize, kThumbSize, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr);
             Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2522,8 +2526,12 @@ public:
                     if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
                     if (fx) particles.render(gpu, c, gb, hdr, vm, game_lighting.externs(), light.delta_time);
                 };
+                GameLighting::DistortionFn distortion;
+                if (scene.has_visible_distortion()) distortion = [&](auto* c, uint32_t w, uint32_t h) {
+                    scene.render_distortion(gpu, c, w, h, vm, game_lighting.externs());
+                };
                 game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow,
-                                     scene.has_visible_light_grid() || (fx && particles.has_emitters_near(vm.eye)));
+                                     scene.has_visible_light_grid() || (fx && particles.has_emitters_near(vm.eye)), distortion);
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {

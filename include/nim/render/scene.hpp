@@ -327,6 +327,10 @@ public:
     // Call from GameLighting's callback: inputs belong to this frame, after its atmosphere passes.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
                             const ViewMatrices& vm, const ExternStore& inputs);
+    bool has_visible_distortion() const;
+    uint32_t distortion_draws() const { return distortion_draws_; }
+    void render_distortion(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h,
+                           const ViewMatrices& vm, const ExternStore& inputs);
     bool has_transparent() const { return !transparent_items_.empty(); }
     bool has_visible_light_grid() const;
     // CPU skinning, per model. Each pose holds pose * inverse bind in skeleton order.
@@ -443,7 +447,8 @@ private:
     std::optional<VisibilityKey> visibility_key_;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
-    std::vector<size_t> transparent_items_;
+    std::vector<size_t> transparent_items_, distortion_items_;
+    uint32_t distortion_draws_ = 0;
     std::vector<size_t> decal_items_;
     bool standalone_decal_ = false;
     std::vector<SceneGroupInfo> info_;

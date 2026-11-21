@@ -117,6 +117,7 @@ void write_srv(ID3D12Device* dev, ID3D12Resource* r, DXGI_FORMAT fmt, BindingKin
         // A first mip selects that one mip (a mip chain's source while the next is written).
         sd.Texture2D.MostDetailedMip = UINT(first);
         sd.Texture2D.MipLevels = elements ? elements : first ? 1 : UINT(-1);
+        if (sd.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) sd.Texture2D.PlaneSlice = 1;
         break;
     }
     dev->CreateShaderResourceView(r, &sd, h);
@@ -648,7 +649,7 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     }
     if (opt.depth_func || opt.stencil_volume) {
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        pd.DepthStencilState.DepthWriteMask = opt.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         pd.DepthStencilState.DepthFunc = opt.stencil_volume ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : opt.depth_func;
     }
     if (opt.stencil_volume || opt.stencil_test) {
@@ -1183,6 +1184,12 @@ void GameLighting::release(Gpu& gpu) {
     if (cube_filter_) cube_filter_->release(gpu);
     cube_filter_.reset();
     hdr_.Reset();
+    distortion_.Reset();
+    distortion_depth_.Reset();
+    distorted_hdr_.Reset();
+    distortion_dsv_.Reset();
+    distortion_depth_downsample_ = {};
+    distortion_resolve_ = {};
     rtv_heap_.Reset();
     w_ = h_ = 0;
 }
@@ -1233,6 +1240,13 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
             shading_.notes.push_back(std::format("{} not loaded: {}", name, ex.what()));
         }
     };
+    {
+        GamePipeline::Options opt{DXGI_FORMAT_R8G8B8A8_UNORM};
+        opt.depth_func = D3D12_COMPARISON_FUNC_ALWAYS;
+        opt.depth_write = true;
+        load_sky(distortion_depth_downsample_, "downsample_depth_buffer", opt);
+        load_sky(distortion_resolve_, "resolve_taa_distort", {DXGI_FORMAT_R16G16B16A16_FLOAT});
+    }
     rigid_scope_ = load_scope(pm, globals_.scope("rigid_model"));
     transparent_scope_ = load_scope(pm, globals_.scope("transparent"));
     transparent_adv_scope_ = load_scope(pm, globals_.scope("transparent_advanced"));
@@ -1336,7 +1350,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 12};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
@@ -1356,6 +1370,9 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     clear_owned(ext::Deferred, 0xC8, light_specular_.Get());
     clear_owned(ext::Deferred, 0xD0, env_.Get());
     for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
+    distortion_.Reset();
+    distortion_depth_.Reset();
+    distorted_hdr_.Reset();
     D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R16G16B16A16_FLOAT, {0, 0, 0, 0}};
     hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -1743,7 +1760,8 @@ void GameLighting::prepare_frame(Gpu& gpu, const GBuffer& gb, const LightingPara
 }
 
 void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                          const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow, bool needs_light_grid) {
+                          const LightingParams& p, const TransparentFn& transparents, SunShadow* shadow, bool needs_light_grid,
+                          const DistortionFn& distortions) {
     if (!ready()) throw std::runtime_error("Original game lighting is unavailable");
     if (p.entity_preview)
         ext_.note_estimate("entity preview: orbit_goliath_013b room probe near the origin",
@@ -1888,7 +1906,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->RSSetScissorRects(1, &sc);
     }
     const bool volumetrics = p.volumetrics && !vol_lights_.empty() && vol_downsample_.loaded() && vol_blur_.loaded() && vol_upres_.loaded();
-    if ((p.ssao && hdao_.loaded()) || volumetrics || transparents) render_linear_depth(gpu, cl, gb, vm);
+    if ((p.ssao && hdao_.loaded()) || volumetrics || transparents || distortions) render_linear_depth(gpu, cl, gb, vm);
     if (p.ssao && hdao_.loaded()) { ProfileScope ps_("frame.light.ssao"); render_ssao(gpu, cl, gb, vm, scopes); }
     lights_drawn_ = cubemaps_drawn_ = cubemaps_failed_ = 0;
     vol_drawn_ = 0;
@@ -1939,6 +1957,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         Gpu::barrier(cl, light_specular_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
     const auto* preview_probe = p.entity_preview && !cubemaps_.empty() ? &cubemaps_.front() : nullptr;
+    if (transparents || distortions) prepare_transparent_reflection(vm, preview_probe);
     if (transparents && (sky_ambient || preview_probe) && needs_light_grid) {
         try {
             ProfileScope ps_("frame.light.grid");
@@ -1989,6 +2008,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
     else ssr_history_valid_ = false;  // a later frame must not reflect an image this old
+    if (distortions && distortion_depth_downsample_.loaded() && distortion_resolve_.loaded())
+        render_distortions(gpu, cl, gb, distortions, scopes);
     if (post) {
         { ProfileScope ps_("frame.light.post"); render_post(gpu, cl, gb, p, scopes); }
     } else {

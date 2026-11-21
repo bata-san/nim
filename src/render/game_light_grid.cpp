@@ -318,35 +318,6 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
     }
     ext_.set_scope_constants(ShaderStage::Pixel, 3, cb);
     ext_.set_scope_constants(ShaderStage::Vertex, 3, cb);
-    std::array<float4, 37> advanced{};
-    advanced[6][3] = 1;
-    const CubemapVolume* reflect = preview;
-    if (!preview) {  // the smallest map volume whose box holds the eye
-        float best = 0;
-        for (const auto& cv : cubemaps_) {
-            if (!cv.specular) continue;
-            M4 local;
-            for (size_t c = 0; c < 4; ++c) std::copy_n(cv.volume.local_to_world.begin() + c * 4, 4, local.c[c].begin());
-            const M4 inv = inverse_matrix(local);
-            const float q[3] = {vm.eye.x, vm.eye.y, vm.eye.z};
-            bool inside = true;
-            for (size_t r = 0; r < 3 && inside; ++r) {
-                const float x = inv.c[0][r] * q[0] + inv.c[1][r] * q[1] + inv.c[2][r] * q[2] + inv.c[3][r];
-                inside = std::abs(x) <= 1;
-            }
-            const float size = cv.volume.extents[0] * cv.volume.extents[1] * cv.volume.extents[2];
-            if (inside && (!reflect || size < best)) reflect = &cv, best = size;
-        }
-    }
-    if (reflect) {
-        const CubemapVolume* preview = reflect;
-        advanced[10][3] = preview->volume.unk30;
-        advanced[11][3] = preview->max_mip;
-        advanced[14][3] = 1;
-        advanced[15][3] = preview->squared ? 0.0f : 1.0f;
-        advanced[16] = {1, 1, 1, 0};
-        ext_.set_texture(ext::Transparent, 0xE0, preview->specular.Get());
-    }
     if (preview) {
         ext_.note_estimate("transparent preview: orbit_goliath_013b probe SH and reflection cube",
                            "the fixed preview uses the room probe for all materials; variable per-object reflection selection is unresolved");
@@ -358,12 +329,50 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
                                            grid_light_count_, grid_light_misses_),
                                "light PS registers by pattern: falloff = the (-a, b, 0, 0) init, colour = falloff - 1, cone = falloff - 3, weight = the +0x150 product; "
                                "point / spot from the node +X axis, cone exponent and clip planes dropped, no capsule length, one SH lobe; values taken when the grid is rebuilt");
-        ext_.note_estimate(reflect ? "transparent_advanced: reflection cube of the smallest map volume holding the eye, object occlusion one"
+    }
+    grid_ready_ = true;
+}
+
+void GameLighting::prepare_transparent_reflection(const ViewMatrices& vm, const CubemapVolume* preview) {
+    std::array<float4, 37> advanced{};
+    advanced[6][3] = 1;
+    const CubemapVolume* reflect = preview;
+    if (!preview) {  // the smallest map volume whose box holds the eye
+        const float q[3] = {vm.eye.x, vm.eye.y, vm.eye.z};
+        float best = 0;
+        for (const auto& cv : cubemaps_) {
+            if (!cv.specular) continue;
+            const auto& placement = cv.volume.local_to_world;
+            bool within_bounds = true;
+            for (size_t r = 0; r < 3; ++r) {
+                const float bound = std::abs(placement[r]) + std::abs(placement[r + 4]) + std::abs(placement[r + 8]);
+                within_bounds &= std::abs(q[r] - placement[r + 12]) <= bound;
+            }
+            if (!within_bounds) continue;
+            M4 local;
+            for (size_t c = 0; c < 4; ++c) std::copy_n(placement.begin() + c * 4, 4, local.c[c].begin());
+            const M4 inv = inverse_matrix(local);
+            bool inside = true;
+            for (size_t r = 0; r < 3 && inside; ++r) {
+                const float x = inv.c[0][r] * q[0] + inv.c[1][r] * q[1] + inv.c[2][r] * q[2] + inv.c[3][r];
+                inside = std::abs(x) <= 1;
+            }
+            const float size = cv.volume.extents[0] * cv.volume.extents[1] * cv.volume.extents[2];
+            if (inside && (!reflect || size < best)) reflect = &cv, best = size;
+        }
+    }
+    if (reflect) {
+        advanced[10][3] = reflect->volume.unk30;
+        advanced[11][3] = reflect->max_mip;
+        advanced[14][3] = 1;
+        advanced[15][3] = reflect->squared ? 0.0f : 1.0f;
+        advanced[16] = {1, 1, 1, 0};
+        ext_.set_texture(ext::Transparent, 0xE0, reflect->specular.Get());
+    }
+    ext_.note_estimate(reflect ? "transparent_advanced: reflection cube of the smallest map volume holding the eye, object occlusion one"
                                    : "transparent_advanced: sky reflection (no map volume holds the eye), object occlusion one",
                            "the engine selects the cube per object; nim uses one per frame");
-    }
     ext_.set_scope_constants(ShaderStage::Pixel, 8, advanced);
-    grid_ready_ = true;
 }
 
 void GameLighting::render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow) {

@@ -213,6 +213,7 @@ public:
         // Instanced quads: a per-instance stream of this many float4s (TEXCOORD0..n-1), each
         // instance drawn as a 4-vertex strip (draw_instances). 0 = none.
         uint32_t instance_float4s = 0;
+        bool depth_write = false;
         // A graphics technique that also carries a compute stage: load that stage instead.
         bool compute_stage = false;
     };
@@ -337,10 +338,12 @@ public:
     // `transparents` runs after the shading pass with the HDR target's RTV (the G-buffer depth is
     // then in DEPTH_READ, bound through gb.dsv_ro).
     using TransparentFn = std::function<void(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE hdr)>;
+    using DistortionFn = std::function<void(ID3D12GraphicsCommandList*, uint32_t, uint32_t)>;
     // `shadow`: a sun shadow map rendered this frame (StaticMeshScene::render_shadow), resolved
     // into the shading pass's sun shadow mask; without one the mask is white (unshadowed).
     void render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const LightingParams& p,
-                const TransparentFn& transparents = {}, SunShadow* shadow = nullptr, bool needs_light_grid = true);
+                const TransparentFn& transparents = {}, SunShadow* shadow = nullptr, bool needs_light_grid = true,
+                const DistortionFn& distortions = {});
     void release(Gpu& gpu);
 
     // A map's local lights (load_map_lights), drawn each frame with their own lighting-apply
@@ -501,6 +504,11 @@ private:
     void render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists
     ComPtr<ID3D12Resource> hdr_;
+    GamePipeline distortion_depth_downsample_, distortion_resolve_;
+    ComPtr<ID3D12Resource> distortion_, distortion_depth_, distorted_hdr_;
+    ComPtr<ID3D12DescriptorHeap> distortion_dsv_;
+    void render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb,
+                            const DistortionFn& draw, const ScopeBufferFn& scopes);
     // Viewer environment (not game data): nim's sky as the specular-IBL light buffer and background.
     ComPtr<ID3D12Resource> env_;
     ComPtr<ID3D12RootSignature> env_rs_;
@@ -668,6 +676,7 @@ private:
     // Render-global channel slot -> value chosen for the map's lights (LightingParams::assume_lights_on).
     std::map<size_t, float> light_state_;
     void choose_light_state();
+    void prepare_transparent_reflection(const ViewMatrices& vm, const CubemapVolume* preview);
     void render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow);
     GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_, grid_sun_;
     std::array<ComPtr<ID3D12Resource>, 2> grid_sun_vis_;  // [0] result, [1] the "previous" input, all 1

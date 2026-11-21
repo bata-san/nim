@@ -25,6 +25,7 @@ namespace nim {
 namespace {
 constexpr uint8_t kStageShadow = 4;
 constexpr uint8_t kStageTransparent = 8;
+constexpr uint8_t kStageDistortion = 9;
 constexpr uint8_t kStageDecal = 2;
 
 // The sky layer's VS returns a zero clip position when cb0[1].x is zero.
@@ -43,6 +44,7 @@ std::array<uint8_t, 2> sky_visibility_weights(std::span<const uint8_t> code) {
 }
 
 size_t stage_slot(uint8_t stage) {
+    if (stage == kStageDistortion) return 4;
     return stage == kStageDecal ? 3 : stage == kStageShadow ? 2 : stage == kStageTransparent ? 1 : 0;
 }
 }
@@ -600,6 +602,8 @@ void StaticMeshScene::release(Gpu& gpu) {
         if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
     items_.clear();
     transparent_items_.clear();
+    distortion_items_.clear();
+    distortion_draws_ = 0;
     decal_items_.clear();
     standalone_decal_ = false;
     table_cache_.clear();
@@ -929,7 +933,7 @@ bool pack_skin_streams(const VertexBuffer& vb0, V3 scale, float range, std::vect
 }
 
 // Dynamic model stages with a connected draw pass.
-constexpr uint8_t kDrawnStages[] = {0, kStageDecal, kStageTransparent};
+constexpr uint8_t kDrawnStages[] = {0, kStageDecal, kStageTransparent, kStageDistortion};
 class UnsupportedMeshPart : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -1528,9 +1532,9 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     texture_cache.shared = cache;
 
     struct Pending { StaticMeshGroup group; StaticMeshPart part; Technique tech; };
-    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageShadow; };
+    auto drawn = [](uint8_t st) { return st == 0 || st == kStageTransparent || st == kStageDistortion || st == kStageShadow; };
     std::vector<Pending> pending;
-    std::array<uint8_t, 4> stage_lods{};
+    std::array<uint8_t, 5> stage_lods{};
     for (const auto& g : mesh.groups)
         if (drawn(g.render_stage))
             stage_lods[stage_slot(g.render_stage)] |= std::max<uint8_t>(1, mesh.parts.at(g.part_index).lod_category);
@@ -1552,16 +1556,17 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             out.notes.push_back(std::format("{} part {}: {}", tag.str(), gr.part_index, ex.what()));
         }
     }
-    // The transparent parts outside the groups (SStaticMesh +0x20): their own buffers and LOD
+    // Special parts outside the groups (SStaticMesh +0x20): their own buffers and LOD
     // categories, chosen like the groups' (the highest detail unless every LOD is kept).
-    uint8_t special_lods = 0;
+    std::array<uint8_t, 5> special_lods{};
     for (const auto& sp : mesh.special_parts)
-        if (sp.render_stage == kStageTransparent) special_lods |= std::max<uint8_t>(1, sp.lod_category);
-    const uint8_t special_highest = uint8_t(special_lods & -int(special_lods));
+        if (sp.render_stage == kStageTransparent || sp.render_stage == kStageDistortion)
+            special_lods[stage_slot(sp.render_stage)] |= std::max<uint8_t>(1, sp.lod_category);
     for (const auto& sp : mesh.special_parts) {
-        if (sp.render_stage != kStageTransparent || sp.technique.is_none() || sp.index.is_none() || sp.vertex0.is_none()) continue;
+        if ((sp.render_stage != kStageTransparent && sp.render_stage != kStageDistortion) || sp.technique.is_none() || sp.index.is_none() || sp.vertex0.is_none()) continue;
         if (sp.primitive_type != 3 && sp.primitive_type != 5) continue;
-        if (!(std::max<uint8_t>(1, sp.lod_category) & (all_lods ? special_lods : special_highest))) continue;
+        const auto available = special_lods[stage_slot(sp.render_stage)];
+        if (!(std::max<uint8_t>(1, sp.lod_category) & (all_lods ? available : uint8_t(available & -int(available))))) continue;
         if (mesh.buffers.size() >= 255 || mesh.parts.size() >= 0xFFFF) break;
         try {
             Technique t = load_technique(pm, sp.technique);
@@ -1578,7 +1583,7 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
             mesh.parts.push_back(part);
             pending.push_back({StaticMeshGroup{index, sp.render_stage, sp.input_layout}, part, std::move(t)});
         } catch (const std::exception& ex) {
-            out.notes.push_back(std::format("{} transparent part: {}", tag.str(), ex.what()));
+            out.notes.push_back(std::format("{} special part (stage {}): {}", tag.str(), sp.render_stage, ex.what()));
         }
     }
     if (std::none_of(pending.begin(), pending.end(), [](const Pending& p) { return p.group.render_stage != kStageShadow; }))
@@ -1784,7 +1789,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         throw std::invalid_argument("Sky order requires one key per dynamic placement");
     scopes_resolved_ = false;
     // All or nothing: a mesh that fails validation leaves no partial parts behind.
-    const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count();
+    const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count(), distortion = distortion_items_.size();
     const size_t instances = instance_total_, culls = cull_groups_.size();
     const size_t uncullable = uncullable_opaque_.size();
     const size_t decals = decal_items_.size();
@@ -1801,6 +1806,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         }
         items_.resize(items);
         transparent_items_.resize(transparent);
+        distortion_items_.resize(distortion);
         decal_items_.resize(decals);
         sets_.resize(sets);
         info_.resize(infos);
@@ -2240,6 +2246,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
+        const bool distortion = g.stage == kStageDistortion;
         if (transparent && dynamic_ && g.blend == 8 && mesh.radius >= 10) {
             item.preview_sky_weights = sky_visibility_weights(item.vs_material.bytecode);
             if (item.preview_sky_weights[0])
@@ -2271,7 +2278,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             pd.BlendState.RenderTarget[4] = blend_desc(blend, 4);  // original motion blend / coverage
             if (!motion) pd.BlendState.RenderTarget[4].RenderTargetWriteMask = 0;
         }
-        else if (g.blend >= 0) {
+        else if (distortion) {
+            pd.BlendState.RenderTarget[0] = blend_desc(g.blend < 0 ? 8 : g.blend);
+        } else if (g.blend >= 0) {
             pd.BlendState.IndependentBlendEnable = TRUE;
             for (int r = 0; r < 4; ++r) {
                 pd.BlendState.RenderTarget[r] = blend_desc(g.blend, r);
@@ -2284,9 +2293,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = TRUE;
         pd.DepthStencilState.DepthEnable = TRUE;
-        pd.DepthStencilState.DepthWriteMask = (decal ? !standalone_decal_ : transparent || blended)
+        pd.DepthStencilState.DepthWriteMask = (decal ? !standalone_decal_ : transparent || distortion || blended)
             ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
-        pd.DepthStencilState.DepthFunc = transparent || blended || decal ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
+        pd.DepthStencilState.DepthFunc = transparent || distortion || blended || decal ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
         pd.InputLayout = {ied.data(), UINT(ied.size())};
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         // Strips restart at the all-ones index.
@@ -2294,8 +2303,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             pd.IBStripCutValue = mesh.buffers.at(g.buffers).ib.is_32bit ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
                                                                        : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
         // SV_Target4 is the motion vector. Slots 1..3 are null RTVs with writes disabled.
-        pd.NumRenderTargets = authored_shadow ? 0 : transparent ? 5 : 4;
-        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : GBuffer::kFormats[r];
+        pd.NumRenderTargets = authored_shadow ? 0 : transparent ? 5 : distortion ? 1 : 4;
+        for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : distortion ? DXGI_FORMAT_R8G8B8A8_UNORM : GBuffer::kFormats[r];
         for (const auto& output : outputs)
             if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw UnsupportedMeshPart(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
@@ -2336,7 +2345,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
 
         if (authored_shadow) {
             item.shadow_pso = item.pso;
-        } else if (!transparent && !decal && sky_order.empty()) {
+        } else if (!transparent && !distortion && !decal && sky_order.empty()) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
             const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
@@ -2359,6 +2368,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         items_.push_back(std::move(item));
         upload_guard.committed = true;
         if (transparent) transparent_items_.push_back(items_.size() - 1);
+        else if (distortion) distortion_items_.push_back(items_.size() - 1);
         else if (decal) decal_items_.push_back(items_.size() - 1);
         else if (cull == UINT32_MAX && !authored_shadow) uncullable_opaque_.push_back(items_.size() - 1);
         if (!authored_shadow) info_.push_back(std::move(g.info));
@@ -2376,10 +2386,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (!group.dynamic) {
             // A translucent layer may only have one authored LOD while the opaque mesh has four.
             // Keep that layer at the nearest level actually supplied for its own stage.
-            std::array<uint8_t, 4> stage_levels{};
+            std::array<uint8_t, 5> stage_levels{};
             for (size_t i = group.first_item; i < group.end_item; ++i)
                 stage_levels[stage_slot(items_[i].stage)] |= items_[i].lod_mask;
-            group.levels = stage_levels[0] | stage_levels[1] | stage_levels[3];
+            group.levels = stage_levels[0] | stage_levels[1] | stage_levels[3] | stage_levels[4];
             group.authored_shadow = stage_levels[2] != 0;
             for (size_t i = group.first_item; i < group.end_item; ++i) {
                 auto& item = items_[i];
@@ -2623,7 +2633,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         return scope_frame_[slot] = upload.gpu;
     };
     const bool transparent = render_stage == kStageTransparent;
-    const auto& candidates = transparent ? transparent_items_ : render_stage == kStageDecal ? decal_items_ : visible_opaque_;
+    const auto& candidates = transparent ? transparent_items_ : render_stage == kStageDistortion ? distortion_items_ : render_stage == kStageDecal ? decal_items_ : visible_opaque_;
     if (!material_scratch_) material_scratch_ = std::make_unique<MaterialScratch>();
     // Material constants are evaluated after the walk, on the worker pool when the scene is a map
     // (no per-item extern writes): each live (object, technique, stage) once, into its first
@@ -3035,6 +3045,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             }
         }
     };
+    if (stage == kStageDistortion) {
+        record(cl, distortion_items_, false);
+        return;
+    }
     const std::span<const size_t> opaque(stage == kStageDecal ? decal_items_ : visible_opaque_);
     std::array<DrawBundle*, kDrawBundles> bundles{};
     size_t available = 0;
@@ -3334,6 +3348,7 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
 }
 
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
+    distortion_draws_ = 0;
     srv_frame_ = (srv_frame_ + 1) % kSrvCopies;
     ProfileScope ps_cull("frame.gbuffer.cull");
     cull(gpu, vm, gb.height());
@@ -3345,7 +3360,7 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     if (skin_dirty_) update_skin(cl);
     const float clear[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) cl->ClearRenderTargetView(gb.rtv[i], clear, 0, nullptr);
-    cl->ClearDepthStencilView(gb.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+    cl->ClearDepthStencilView(gb.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
     if (items_.size() == transparent_count()) return;
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
     draw_items(gpu, cl, 0, gb.width(), gb.height(), vm);
@@ -3417,6 +3432,25 @@ void StaticMeshScene::render_rain_occlusion(Gpu& gpu, ID3D12GraphicsCommandList*
     rain.offset = {0.5f - e.x / h2, 0.5f + e.y / h2, e.z / rain.top.range, 0};
     rain.items = items_.size();
     rain.valid = true;
+}
+
+bool StaticMeshScene::has_visible_distortion() const {
+    return std::ranges::any_of(distortion_items_, [&](size_t i) { return item_instances(items_[i]) != 0; });
+}
+
+void StaticMeshScene::render_distortion(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h,
+                                        const ViewMatrices& vm, const ExternStore& inputs) {
+    distortion_draws_ = 0;
+    if (!material_externs_ || !has_visible_distortion()) return;
+    auto& ext = *material_externs_;
+    ext.copy_block_from(ext::Atmosphere, inputs);
+    ext.copy_block_from(ext::Transparent, inputs);
+    ext.copy_block_from(ext::Deferred, inputs);
+    ext.copy_block_from(0x4C, inputs);
+    update_materials(gpu, w, h, vm, kStageDistortion, &inputs);
+    draw_items(gpu, cl, kStageDistortion, w, h, vm, false);
+    for (size_t i : distortion_items_) distortion_draws_ += item_instances(items_[i]);
+    ext.set_texture(ext::Deferred, 0xD8, nullptr);
 }
 
 void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
