@@ -13,6 +13,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <span>
 #include <unordered_map>
@@ -146,6 +147,7 @@ std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>&
 // activity node tables (Outpost: four nodes a few metres apart at (148, 52, -4.7), next to the two
 // 808035B8 nodes). Payload +0x00: a name hash. The node transform gives position and facing.
 inline constexpr uint32_t kClassStartComponent = 0x80802D32;
+inline constexpr uint32_t kClassAiSquad = 0x80805BE0;  // native squad slot (3.66)
 inline constexpr float kStartEyeHeight = 1.7f;  // viewer eye above a start (estimate, not engine data)
 struct MapStart {
     std::array<float, 3> position{};
@@ -248,11 +250,16 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
 //  - loot containers: nodes carrying a label list (80802EC2) whose entity has a dynamic model.
 //  - label lists (80802EC2, node component payload +0x10): u32 count, then FNV-1 name hashes. On
 //    Outpost the first is a zone (the hash zone_region components test) and the second a kind.
-//  - script objects: BlockScript components (8080BADB naming an 80800000 definition, which holds
-//    its module path, e.g. "bs/world/prefabs/uesc_scan_drone.bs" with backslashes) that store a
-//    node's 64-bit placement id (node +0x70) at some offset.
-// Squads (slots/squad_group) and point groups (native 8080B831, e.g. pg_spawn_points) live in the
-// activity's script hierarchy and name no node: their spawn positions are not decoded.
+//  - script objects: components of the map's package family (8080BADB). A BlockScript one names
+//    an 80800000 definition holding its module path (e.g. "bs/world/prefabs/uesc_scan_drone.bs"
+//    with backslashes); a native one (no definition) has its class id at +0xAC. They store node
+//    placement ids (node +0x70), and refer to each other by slot id (3.66).
+// Squads (3.66): native class 80805BE0 components listing characters by the 64-bit hash of an
+// 8080B1A7 descriptor in the shared globals; the descriptor's entity has a character.bs
+// component. A squad links by slot id to location components (natives 80805B64, 80805AD8,
+// 80809943) whose placement ids give its spawn positions, and is linked from its
+// slots/squad_group. These positions are nodes of their own, not the start-component spawn
+// points, which no squad names.
 struct MapGameplayPoint {
     std::array<float, 3> position{};
     std::array<float, 4> rotation{0, 0, 0, 1};  // quaternion x, y, z, w
@@ -260,14 +267,37 @@ struct MapGameplayPoint {
     uint64_t id = 0;                           // node +0x70
     std::vector<uint32_t> labels;              // 80802EC2 name hashes (empty entries dropped)
 };
+// A character a squad can spawn: an 8080B1A7 descriptor (shared globals) whose entity (hash64 at
+// +0x60) has a bs/character/character.bs component. labels: its 80802EC2 list.
+struct MapCharacter {
+    TagHash item, entity;
+    std::vector<uint32_t> labels;
+    // 推定: the squad member slot name most often given to this character in squads that spawn only
+    // it, without "_core" / "_N" (e.g. uesc_assault_elite_lmg_uesc). No name string is stored with
+    // the descriptor; empty when no such squad exists.
+    std::string name_estimate;
+};
 struct MapScriptObject {
     TagHash component, definition;
-    std::string module;  // the definition's module path, else its tag
+    std::string module;         // the definition's module path, else "native CLASS"
+    uint32_t native_class = 0;  // +0xAC of a component without a BlockScript definition
+    uint64_t slot = 0;          // the slot's own 64-bit id (0x20 after the slot header)
+    std::vector<std::pair<uint32_t, std::string>> names;            // name table: (field offset, name)
     std::vector<std::pair<uint32_t, MapGameplayPoint>> placements;  // (component offset, node)
+    std::vector<std::pair<uint32_t, size_t>> characters;            // (offset, MapGameplay::characters)
+    std::vector<std::pair<uint32_t, size_t>> links;                 // (offset, MapGameplay::scripts) by slot id
+};
+struct MapSquad {
+    size_t script = 0;                       // the squad component (MapGameplay::scripts)
+    std::optional<size_t> group;             // the squad_group linking to it (MapGameplay::scripts)
+    std::vector<size_t> members;             // one per spawned member (MapGameplay::characters)
+    std::vector<MapGameplayPoint> positions; // distinct nodes of the linked location components
 };
 struct MapGameplay {
     std::vector<MapGameplayPoint> spawns, loot;
-    std::vector<MapScriptObject> scripts;
+    std::vector<MapScriptObject> scripts;  // components that place, spawn or link something, or are linked to
+    std::vector<MapCharacter> characters;
+    std::vector<MapSquad> squads;
     std::vector<std::pair<std::string, size_t>> modules;  // script components of the package family, by module
     size_t nodes = 0;
 };

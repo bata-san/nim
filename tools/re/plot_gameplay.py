@@ -3,8 +3,9 @@
 #   ./build/Release/nimcli.exe map-gameplay 80AFB43D --json out/gameplay_outpost.json
 #   python tools/re/plot_gameplay.py out/gameplay_outpost.json out/gameplay_outpost.png
 #
-# Grey: the map's static placements. Spawn points are coloured by archetype (the entity the node
-# names), loot containers are small squares, script objects are labelled with their module name.
+# Grey: the map's static placements. Left: spawn points coloured by archetype (the entity the node
+# names). Middle: loot containers by zone label, script objects labelled with their module name.
+# Right: squad spawn positions (3.66) coloured by the squad's first character (names are 推定).
 import json
 import sys
 from collections import Counter, defaultdict
@@ -16,7 +17,7 @@ import matplotlib.pyplot as plt
 
 src, dst = sys.argv[1], sys.argv[2]
 d = json.load(open(src))
-fig, axes = plt.subplots(1, 2, figsize=(22, 11), dpi=110)
+fig, axes = plt.subplots(1, 3, figsize=(33, 11), dpi=100)
 
 statics = d['statics']
 xs = [p['p'][0] for p in d['spawns'] + d['loot']]
@@ -54,7 +55,7 @@ for i, z in enumerate(sorted(zones, key=lambda z: -zones[z])):
     pts = [p for p in d['loot'] if (p['labels'][0] if p['labels'] else '-') == z]
     ax.scatter([p['p'][0] for p in pts], [p['p'][1] for p in pts], s=6, marker='s', color=cmap(i % 20), label=f'zone {z} ({len(pts)})')
 seen = set()
-for o in d['scripts']:
+for o in [o for o in d['scripts'] if not o['module'].startswith('native')]:
     name = o['module'].replace('\\', '/').split('/')[-1].replace('.bs', '').replace('.es', '')
     for p in o['points'][:1]:
         x, y = p['p'][0], p['p'][1]
@@ -64,6 +65,21 @@ for o in d['scripts']:
         if (name, round(x / 20), round(y / 20)) not in seen:
             seen.add((name, round(x / 20), round(y / 20)))
             ax.annotate(name, (x, y), fontsize=5.5, xytext=(3, 3), textcoords='offset points')
+ax.legend(loc='upper left', fontsize=7, markerscale=2)
+
+# Right: squads by character.
+ax = axes[2]
+squads = d.get('squads', [])
+chars = d.get('characters', [])
+background(ax, f"squads ({len(squads)}) at their spawn positions, by first character")
+by_char = defaultdict(list)
+for sq in squads:
+    if sq['members'] and sq['points']:
+        c = chars[sq['members'][0]]
+        by_char[c['name'] or c['item']].append(sq)
+for i, (name, sqs) in enumerate(sorted(by_char.items(), key=lambda kv: -len(kv[1]))):
+    pts = [p for sq in sqs for p in sq['points']]
+    ax.scatter([p['p'][0] for p in pts], [p['p'][1] for p in pts], s=10, color=cmap(i % 20), label=f'{name} ({len(sqs)} squads)')
 ax.legend(loc='upper left', fontsize=7, markerscale=2)
 fig.tight_layout()
 fig.savefig(dst)

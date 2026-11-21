@@ -1276,6 +1276,55 @@ int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
 // An activity's gameplay placements (load_map_gameplay, docs/PROGRESS.md 3.65): spawn points by
 // archetype, loot containers and script objects with their node positions, and the census of the
 // family's script components by module. -v lists every point; --json FILE writes them all.
+// Every BlockScript definition (80800000) in the install with its module path; FILTER keeps paths
+// containing that text.
+int cmd_bs_modules(PackageManager& pm, const std::string& filter) {
+    for (const auto& info : pm.packages()) {
+        Package& pk = pm.open(info);
+        for (uint32_t i = 0; i < pk.entries().size(); ++i) {
+            const Entry& en = pk.entries()[i];
+            if (en.type != 8 || en.reference != 0x80800000) continue;
+            std::vector<uint8_t> d;
+            try { d = pk.read_entry(i); } catch (...) { continue; }
+            const std::string text(d.begin(), d.end());
+            const auto at = text.find("bs\\");
+            const std::string name = at == std::string::npos ? std::string() : std::string(text.c_str() + at);
+            if (!filter.empty() && name.find(filter) == std::string::npos) continue;
+            std::println("{}  {:>6}  {:<40} {}", TagHash::make(info.pkg_id, uint16_t(i)).str(), en.file_size, info.name, name);
+        }
+    }
+    return 0;
+}
+
+// Exploration: 64-bit references between the type-8 tags of packages named PREFIX*.
+// Prints "edge SRC +OFF DST" for every aligned u64 that is the hash64 of another tag.
+int cmd_h64_graph(PackageManager& pm, const std::string& prefix) {
+    std::unordered_map<uint64_t, TagHash> by64;
+    for (const auto& info : pm.packages())
+        for (const auto& h : pm.open(info).hash64s()) by64.try_emplace(h.hash64, h.hash32);
+    for (const auto& info : pm.packages()) {
+        if (!info.name.starts_with(prefix)) continue;
+        Package& pk = pm.open(info);
+        for (uint32_t i = 0; i < pk.entries().size(); ++i) {
+            const Entry& en = pk.entries()[i];
+            if (en.type != 8) continue;
+            std::vector<uint8_t> d;
+            try { d = pk.read_entry(i); } catch (...) { continue; }
+            const TagHash self = TagHash::make(info.pkg_id, uint16_t(i));
+            for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+                uint64_t w;
+                std::memcpy(&w, d.data() + o, 8);
+                if (w == 0 || w == ~0ull) continue;
+                if (auto f = by64.find(w); f != by64.end()) {
+                    const Entry* de = pm.entry(f->second);
+                    std::println("edge {} {:08X} +{:X} {} {:08X}", self.str(), en.reference, o, f->second.str(), de ? de->reference : 0);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const char* json) {
     pm.build_hash64_index();
     const MapGameplay g = load_map_gameplay(pm, activity);
@@ -1305,8 +1354,44 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
     std::println("{}: {} nodes", activity.str(), g.nodes);
     group("spawn points (entity has the start component 80802D32)", g.spawns);
     group("loot containers (labelled nodes with a dynamic model)", g.loot);
-    std::println("script objects placed on nodes: {}", g.scripts.size());
+    auto char_name = [&](size_t c) {
+        const auto& ch = g.characters[c];
+        return ch.name_estimate.empty() ? ch.item.str() : ch.name_estimate;
+    };
+    std::println("characters (8080B1A7 descriptors squads spawn; names 推定 from squad slot names): {}", g.characters.size());
+    for (const auto& ch : g.characters) {
+        std::string l;
+        for (const auto h : ch.labels) l += std::format(" {:08X}", h);
+        std::println("  {} entity {} labels{}  {}", ch.item.str(), ch.entity.str(), l, ch.name_estimate.empty() ? "-" : ch.name_estimate);
+    }
+    {
+        std::map<std::string, std::pair<size_t, size_t>> by_char;  // name -> (squads, members)
+        size_t placed = 0, members = 0;
+        for (const auto& sq : g.squads) {
+            std::set<size_t> seen;
+            for (const auto m : sq.members) {
+                ++by_char[char_name(m)].second;
+                if (seen.insert(m).second) ++by_char[char_name(m)].first;
+            }
+            members += sq.members.size();
+            placed += !sq.positions.empty();
+        }
+        std::println("squads (native {:08X}): {}, {} with spawn positions, {} members", kClassAiSquad, g.squads.size(), placed, members);
+        for (const auto& [n, v] : by_char) std::println("  {:4} squads {:4} members  {}", v.first, v.second, n);
+        for (const auto& sq : g.squads) {
+            if (!verbose) break;
+            const auto& o = g.scripts[sq.script];
+            std::string who;
+            for (const auto m : sq.members) who += " " + char_name(m);
+            std::string at;
+            for (const auto& pt : sq.positions) at += std::format(" ({:.1f} {:.1f} {:.1f})", pt.position[0], pt.position[1], pt.position[2]);
+            std::println("  {} group {}:{} @{}", o.component.str(), sq.group ? g.scripts[*sq.group].component.str() : "-", who, at.empty() ? " -" : at);
+        }
+    }
+    std::println("script objects: {} ({} place nodes)", g.scripts.size(),
+                 std::ranges::count_if(g.scripts, [](const auto& o) { return !o.placements.empty(); }));
     for (const auto& o : g.scripts) {
+        if (o.placements.empty()) continue;
         std::string l;
         for (size_t i = 0; i < o.placements.size() && (verbose || i < 4); ++i) {
             const auto& [off, p] = o.placements[i];
@@ -1336,6 +1421,30 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
             for (const char c : o.module) module += c == '\\' ? std::string("\\\\") : std::string(1, c);
             j += std::format("{}{{\"component\":\"{}\",\"module\":\"{}\",\"points\":[", i ? "," : "", o.component.str(), module);
             for (size_t k = 0; k < o.placements.size(); ++k) j += (k ? "," : "") + point(o.placements[k].second);
+            j += std::format("],\"slot\":\"{:016X}\",\"names\":[", o.slot);
+            for (size_t k = 0; k < o.names.size(); ++k) j += std::format("{}\"{}\"", k ? "," : "", o.names[k].second);
+            j += "],\"characters\":[";
+            for (size_t k = 0; k < o.characters.size(); ++k) j += std::format("{}{}", k ? "," : "", o.characters[k].second);
+            j += "],\"links\":[";
+            for (size_t k = 0; k < o.links.size(); ++k) j += std::format("{}{}", k ? "," : "", o.links[k].second);
+            j += "]}";
+        }
+        j += "],\"characters\":[";
+        for (size_t i = 0; i < g.characters.size(); ++i) {
+            const auto& c = g.characters[i];
+            std::string l;
+            for (const auto h : c.labels) l += std::format("{}\"{:08X}\"", l.empty() ? "" : ",", h);
+            j += std::format("{}{{\"item\":\"{}\",\"entity\":\"{}\",\"name\":\"{}\",\"labels\":[{}]}}", i ? "," : "", c.item.str(),
+                             c.entity.str(), c.name_estimate, l);
+        }
+        j += "],\"squads\":[";
+        for (size_t i = 0; i < g.squads.size(); ++i) {
+            const auto& sq = g.squads[i];
+            j += std::format("{}{{\"component\":\"{}\",\"group\":\"{}\",\"members\":[", i ? "," : "",
+                             g.scripts[sq.script].component.str(), sq.group ? g.scripts[*sq.group].component.str() : "");
+            for (size_t k = 0; k < sq.members.size(); ++k) j += std::format("{}{}", k ? "," : "", sq.members[k]);
+            j += "],\"points\":[";
+            for (size_t k = 0; k < sq.positions.size(); ++k) j += (k ? "," : "") + point(sq.positions[k]);
             j += "]}";
         }
         // The map's static placements (positions only): context for overview plots.
@@ -2961,6 +3070,8 @@ int main(int argc, char** argv) {
         }
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "h64-graph" && args.size() >= 2) return cmd_h64_graph(pm, args[1]);
+        if (cmd == "bs-modules") return cmd_bs_modules(pm, args.size() >= 2 ? args[1] : std::string());
         if (cmd == "map-gameplay" && args.size() >= 2) {
             bool verbose = false;
             const char* json = nullptr;

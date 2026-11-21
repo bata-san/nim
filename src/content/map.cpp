@@ -1112,7 +1112,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         }
     }
     if (bubble.is_none()) throw std::runtime_error(std::format("{}: not an activity with maps", activity.str()));
-    // Script components of the map's package family; those that store a node's placement id.
+    // Script components of the map's package family (3.65, 3.66).
     std::unordered_map<uint32_t, std::string> modules;
     auto module_of = [&](uint32_t script) -> const std::string& {
         if (auto it = modules.find(script); it != modules.end()) return it->second;
@@ -1125,6 +1125,91 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         }
         return modules.emplace(script, name.empty() ? TagHash(script).str() : name).first->second;
     };
+    // Characters: 8080B1A7 descriptors whose entity (+0x60 hash64) has a bs/character/character.bs
+    // component. Squads name them by the descriptor's own hash64.
+    std::unordered_map<uint32_t, bool> character_entity;
+    auto is_character = [&](TagHash ent) {
+        if (auto it = character_entity.find(ent.value); it != character_entity.end()) return it->second;
+        bool yes = false;
+        try {
+            const auto ed = pm.read(ent);
+            std::set<uint32_t> seen;
+            for (size_t o = 0; o + 4 <= ed.size() && !yes; o += 4) {
+                uint32_t v;
+                std::memcpy(&v, ed.data() + o, 4);
+                const TagHash c(v);
+                if (!c.is_pkg_ref() || !seen.insert(v).second) continue;
+                const Entry* ce = pm.entry(c);
+                if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                const auto cd = pm.read(c);
+                for (size_t q = 0; q + 4 <= cd.size() && !yes; q += 4) {
+                    uint32_t w;
+                    std::memcpy(&w, cd.data() + q, 4);
+                    if (const TagHash dh(w); dh.is_pkg_ref())
+                        if (const Entry* de = pm.entry(dh); de && de->type == 8 && de->reference == 0x80800000)
+                            yes = module_of(w).ends_with("\\character\\character.bs");
+                }
+            }
+        } catch (...) {
+        }
+        return character_entity.emplace(ent.value, yes).first->second;
+    };
+    std::unordered_map<uint32_t, std::optional<size_t>> character_of;  // 8080B1A7 tag -> out.characters
+    auto character = [&](TagHash item) -> std::optional<size_t> {
+        if (auto it = character_of.find(item.value); it != character_of.end()) return it->second;
+        std::optional<size_t> res;
+        try {
+            const auto d = pm.read(item);
+            if (d.size() >= 0x68) {
+                TagReader r(d);
+                if (const auto ent = pm.resolve64(r.u64_at(0x60)); ent && is_character(*ent)) {
+                    MapCharacter c{item, *ent, {}};
+                    for (size_t o = 0; o + 0x1C <= d.size(); o += 4)
+                        if (r.u32_at(o) == 0x80802EC2) {
+                            const uint32_t n = std::min(r.u32_at(o + 0x14), 16u);
+                            for (uint32_t q = 0; q < n && o + 0x1C + q * 4 <= d.size(); ++q)
+                                if (const uint32_t h = r.u32_at(o + 0x18 + q * 4); h != 0x811C9DC5u) c.labels.push_back(h);
+                            break;
+                        }
+                    res = out.characters.size();
+                    out.characters.push_back(std::move(c));
+                }
+            }
+        } catch (...) {
+        }
+        return character_of.emplace(item.value, res).first->second;
+    };
+    // A component's name table (8080B1E2 at +0x80): records 89AB8080 {u64 string offset from the
+    // field, u32 component, u32 class, u64 offset}, 0x20 after it 88AB8080 {u32 component, u32
+    // class, u64 field offset}; the strings follow the records.
+    auto names_of = [&](uint32_t table) {
+        std::vector<std::pair<uint32_t, std::string>> names;
+        const TagHash t(table);
+        if (!t.is_pkg_ref()) return names;
+        const Entry* e = pm.entry(t);
+        if (!e || e->type != 8 || e->reference != 0x8080B1E2) return names;
+        try {
+            const auto d = pm.read(t);
+            TagReader r(d);
+            for (size_t o = 0; o + 0x30 <= d.size(); o += 4) {
+                if (r.u32_at(o) != 0x8080AB89u) continue;
+                const size_t at = o + 4 + size_t(r.u64_at(o + 4));
+                if (at >= d.size() || r.u32_at(o + 0x20) != 0x8080AB88u) continue;
+                const char* c = reinterpret_cast<const char*>(d.data() + at);
+                names.emplace_back(uint32_t(r.u64_at(o + 0x2C)), std::string(c, strnlen(c, d.size() - at)));
+            }
+        } catch (...) {
+        }
+        std::ranges::sort(names);
+        return names;
+    };
+    // Slot header: 12 bytes shared by every slot instance; the slot's 64-bit id sits 0x20 after it.
+    // Components refer to other slots by that id (a squad to its spawn location, a point group's
+    // owner to the group).
+    static constexpr uint8_t kSlotHeader[12] = {0x11, 0x34, 0xD5, 0x92, 0x55, 0xC2, 0x5F, 0xC9, 0x98, 0xFB, 0xA8, 0x2E};
+    std::vector<MapScriptObject> all;
+    std::vector<std::vector<uint8_t>> raw;
+    std::unordered_map<uint64_t, size_t> by_slot;
     std::map<std::string, size_t> census;
     const PackageInfo* home = pm.info(bubble.pkg_id());
     const std::string family = home ? home->name.substr(0, home->name.rfind('_') + 1) : std::string();
@@ -1140,6 +1225,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
             } catch (...) {
                 continue;
             }
+            if (d.size() < 0xB0) continue;
             MapScriptObject obj;
             obj.component = TagHash::make(info.pkg_id, uint16_t(i));
             for (size_t o = 0; o + 8 <= d.size(); o += 4) {
@@ -1152,15 +1238,96 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
                     }
                 uint64_t w;
                 std::memcpy(&w, d.data() + o, 8);
+                if (w == 0 || w == ~0ull) continue;
                 if (auto f = by_id.find(w); f != by_id.end()) obj.placements.emplace_back(uint32_t(o), f->second);
+                else if (const auto t = pm.resolve64(w))
+                    if (const Entry* te = pm.entry(*t); te && te->type == 8 && te->reference == 0x8080B1A7)
+                        if (const auto c = character(*t)) obj.characters.emplace_back(uint32_t(o), *c);
             }
-            if (obj.definition.is_none()) continue;
+            if (obj.definition.is_none()) {
+                std::memcpy(&obj.native_class, d.data() + 0xAC, 4);
+                obj.module = std::format("native {:08X}", obj.native_class);
+            }
             ++census[obj.module];
-            if (!obj.placements.empty()) out.scripts.push_back(std::move(obj));
+            uint32_t table;
+            std::memcpy(&table, d.data() + 0x80, 4);
+            obj.names = names_of(table);
+            const auto hdr = std::search(d.begin(), d.end(), std::begin(kSlotHeader), std::end(kSlotHeader));
+            if (hdr != d.end() && size_t(hdr - d.begin()) + 0x28 <= d.size()) {
+                std::memcpy(&obj.slot, &*hdr + 0x20, 8);
+                if (obj.slot && obj.slot != ~0ull) by_slot.try_emplace(obj.slot, all.size());
+            }
+            all.push_back(std::move(obj));
+            raw.push_back(std::move(d));
         }
+    }
+    std::vector<char> linked(all.size(), 0);
+    for (size_t k = 0; k < all.size(); ++k) {
+        const auto& d = raw[k];
+        for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+            uint64_t w;
+            std::memcpy(&w, d.data() + o, 8);
+            if (w == 0 || w == ~0ull || w == all[k].slot) continue;
+            if (auto f = by_slot.find(w); f != by_slot.end() && f->second != k) {
+                all[k].links.emplace_back(uint32_t(o), f->second);
+                linked[f->second] = 1;
+            }
+        }
+    }
+    // Keep the components that place, spawn or link something, and the ones linked to.
+    std::vector<size_t> index(all.size(), SIZE_MAX);
+    for (size_t k = 0; k < all.size(); ++k)
+        if (!all[k].placements.empty() || !all[k].characters.empty() || !all[k].links.empty() || linked[k]) {
+            index[k] = out.scripts.size();
+            out.scripts.push_back(std::move(all[k]));
+        }
+    for (auto& obj : out.scripts) {
+        std::erase_if(obj.links, [&](const auto& l) { return index[l.second] == SIZE_MAX; });
+        for (auto& l : obj.links) l.second = index[l.second];
     }
     out.modules.assign(census.begin(), census.end());
     std::ranges::stable_sort(out.modules, [](const auto& a, const auto& b) { return a.second > b.second; });
+    // Squads: their members, group and spawn positions (3.66).
+    std::vector<std::optional<size_t>> group_of(out.scripts.size());
+    for (size_t k = 0; k < out.scripts.size(); ++k)
+        if (out.scripts[k].module.ends_with("\\slots\\squad_group.bs"))
+            for (const auto& l : out.scripts[k].links) group_of[l.second] = k;
+    std::vector<std::map<std::string, size_t>> votes(out.characters.size());
+    for (size_t k = 0; k < out.scripts.size(); ++k) {
+        const auto& o = out.scripts[k];
+        if (o.native_class != kClassAiSquad || o.characters.empty()) continue;
+        MapSquad sq;
+        sq.script = k;
+        sq.group = group_of[k];
+        for (const auto& c : o.characters) sq.members.push_back(c.second);
+        std::set<uint64_t> seen;
+        for (const auto& l : o.links) {
+            const auto& target = out.scripts[l.second];
+            if (target.native_class == kClassAiSquad || !target.definition.is_none()) continue;
+            for (const auto& pl : target.placements)
+                if (seen.insert(pl.second.id).second) sq.positions.push_back(pl.second);
+        }
+        // Name votes: squads spawning a single character, member slots named NAME[_core][_N].
+        if (std::ranges::all_of(sq.members, [&](size_t m) { return m == sq.members.front(); })) {
+            std::set<std::string> bases;
+            for (const auto& [off, n] : o.names) {
+                if (n == "perception" || n == "population_label" || n == "tier" || n == "channel") continue;
+                std::string b = n;
+                if (const auto u = b.find_last_of('_'); u != std::string::npos && u + 1 < b.size() &&
+                    std::all_of(b.begin() + u + 1, b.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                    b.resize(u);
+                if (b.ends_with("_core")) b.resize(b.size() - 5);
+                bases.insert(b);
+            }
+            if (bases.size() == 1) ++votes[sq.members.front()][*bases.begin()];
+        }
+        out.squads.push_back(std::move(sq));
+    }
+    for (size_t c = 0; c < out.characters.size(); ++c) {
+        size_t best = 0;
+        for (const auto& [n, v] : votes[c])
+            if (v > best) best = v, out.characters[c].name_estimate = n;
+    }
     return out;
 }
 
