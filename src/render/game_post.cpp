@@ -16,7 +16,13 @@ namespace {
 constexpr uint8_t kScreenArea = 0x1E;  // screen_area: the lut3d / color grading passes
 constexpr uint32_t kGradingSize = 32;   // fixed lattice dimensions in both original shaders
 constexpr float kSdrTonemapMode = 4.0f;
-constexpr uint8_t kMotion = 0x38;      // bloom_initial_downsample's offset texture (motion)
+constexpr uint8_t kBloomDistortion = 0x38; // bloom_initial_downsample's signed offset inputs
+constexpr uint32_t kDistortedHdrRtv = 11;
+
+float4 distortion_uv_scale(uint32_t w, uint32_t h) {
+    // The reference engine uses (0.13281, 0.23611) at 1920x1080, or 255 pixels per axis.
+    return {255.0f / float(w), 255.0f / float(h), 0, 0};
+}
 
 void viewport(ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h) {
     const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
@@ -207,7 +213,7 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
     auto* dev = gpu.device();
     const auto inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto base = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-    const D3D12_CPU_DESCRIPTOR_HANDLE vectors{base.ptr + 10 * inc}, resolved{base.ptr + 11 * inc};
+    const D3D12_CPU_DESCRIPTOR_HANDLE vectors{base.ptr + 10 * inc}, resolved{base.ptr + kDistortedHdrRtv * inc};
     const D3D12_CPU_DESCRIPTOR_HANDLE minmax{base.ptr + 12 * inc};
     if (!distortion_) {
         if (!distortion_dsv_) {
@@ -229,8 +235,7 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
         const D3D12_DEPTH_STENCIL_VIEW_DESC desc{GBuffer::kDepthFormat, D3D12_DSV_DIMENSION_TEXTURE2D};
         dev->CreateDepthStencilView(distortion_depth_.Get(), &desc, distortion_dsv_->GetCPUDescriptorHandleForHeapStart());
     }
-    // The reference engine uses (0.13281, 0.23611) at 1920x1080, or 255 pixels per axis.
-    const float4 offset{255.0f / float(w_), 255.0f / float(h_), 0, 0};
+    const float4 offset = distortion_uv_scale(w_, h_);
     const auto dsv = distortion_dsv_->GetCPUDescriptorHandleForHeapStart();
     const float zero[4]{};
     viewport(cl, w, h);
@@ -277,11 +282,7 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
     distortion_resolve_.draw(gpu, cl, ext_, scopes);
     ext_.set_texture(resolve, 0x68, nullptr);
     ext_.set_texture(resolve, 0x58, nullptr);
-    Gpu::barrier(cl, distorted_hdr_.Get(), target, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Gpu::barrier(cl, hdr_.Get(), sample, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyResource(hdr_.Get(), distorted_hdr_.Get());
-    Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, sample);
-    Gpu::barrier(cl, distorted_hdr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, sample);
+    Gpu::barrier(cl, distorted_hdr_.Get(), target, sample);
 }
 
 // Auto exposure: autoexposure_sample_columns writes, per column of the smallest bloom level, the
@@ -348,7 +349,8 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
     exposure_ = next;
 }
 
-void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p, const ScopeBufferFn& scopes) {
+void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p,
+                               const ScopeBufferFn& scopes, bool distorted) {
     if (!grading_lut_) generate_grading_lut(gpu, cl, scopes);
     ID3D12Device* dev = gpu.device();
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -365,7 +367,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     auto& e = ext_;
     if (!e.zero_policy(kScreenArea)) e.zero_when_missing(kScreenArea, "screen_area value not set by nim: zero");
     if (!e.zero_policy(ext::Postprocess)) e.zero_when_missing(ext::Postprocess, "postprocess value not set by nim: zero");
-    if (!e.zero_policy(kMotion)) e.zero_when_missing(kMotion, "no motion vectors (static camera): zero");
+    ID3D12Resource* const image = distorted ? distorted_hdr_.Get() : hdr_.Get();
     const uint8_t pp = ext::Postprocess;
     constexpr std::string_view engine = "engine post setting (not in game data)";
 
@@ -374,9 +376,12 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     const bool automatic = p.auto_exposure && pyramid && ae_columns_.loaded();
     if (bloom || automatic) {
         // bloom_initial_downsample: a 3x3 filter of HDR at third resolution, scaled by the
-        // luminance curve x L^2 + y L + z (extern 38 +0xC0) with the luminance in .w; motion
-        // offsets (extern 0x38) off.
+        // luminance curve x L^2 + y L + z (Postprocess +0xC0) with the luminance in .w.
+        // The authored shader adds the sampled RG-minus-BA UV offset before its four HDR taps.
         const auto& l0 = bloom_[0];
+        e.set_texture(kBloomDistortion, 0x00, distorted ? distortion_.Get() : black_.Get());
+        e.set(kBloomDistortion, 0x20, distorted ? distortion_uv_scale(w_, h_) : float4{});
+        e.set(kBloomDistortion, 0x30, float4{});
         e.set_texture(pp, 0x00, hdr_.Get());
         e.set(pp, 0x50, size4(l0.w, l0.h));
         e.set(pp, 0x60, size4(w_, h_));
@@ -384,6 +389,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1 (no threshold)", engine);
         begin(l0.down.Get(), 0, l0.w, l0.h);
         bloom_initial_.draw(gpu, cl, e, scopes);
+        e.set_texture(kBloomDistortion, 0x00, nullptr);
         end(l0.down.Get());
         for (int i = 1; i < kBloomLevels; ++i) {
             const auto& src = bloom_[size_t(i - 1)];
@@ -477,12 +483,13 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             e.set_texture(pp, 0x00, lens_blur_.Get());
             const float prior = e.has(ext::Frame, 0x24, 4) ? e.get_f(ext::Frame, 0x24) : 0.0f;
             e.set(ext::Frame, 0x24, 1.0f);
-            Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const auto hdr_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+            Gpu::barrier(cl, image, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto hdr_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+            if (distorted) hdr_rtv.ptr += kDistortedHdrRtv * inc;
             cl->OMSetRenderTargets(1, &hdr_rtv, FALSE, nullptr);
             viewport(cl, w_, h_);
             atm_.lens_glare.draw(gpu, cl, e, scopes);
-            end(hdr_.Get());
+            end(image);
             e.set(ext::Frame, 0x24, prior);
             ext_.note_estimate("lens glare: coarsest blurred bloom level, quarter-resolution upsample, Frame +0x24 = 1",
                                "map-authored optics techniques and texture; original broad filter and brightness are unknown");
@@ -493,7 +500,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
 
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
     // LUT at +0x30, then out = LUT * t2 (+0x58) + t1 (+0x50).
-    e.set_texture(kScreenArea, 0x00, hdr_.Get());
+    e.set_texture(kScreenArea, 0x00, image);
     e.set_texture(kScreenArea, 0x30, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x38, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x50, bloom_tex);

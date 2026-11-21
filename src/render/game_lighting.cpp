@@ -2010,11 +2010,12 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
     else ssr_history_valid_ = false;  // a later frame must not reflect an image this old
-    if (distortions && distortion_depth_downsample_.loaded() && distortion_resolve_.loaded())
-        render_distortions(gpu, cl, gb, distortions, scopes);
+    const bool distorted = distortions && distortion_depth_downsample_.loaded() && distortion_resolve_.loaded();
+    if (distorted) render_distortions(gpu, cl, gb, distortions, scopes);
     if (post) {
-        { ProfileScope ps_("frame.light.post"); render_post(gpu, cl, gb, p, scopes); }
+        { ProfileScope ps_("frame.light.post"); render_post(gpu, cl, gb, p, scopes, distorted); }
     } else {
+        ext_.set_texture(ext::Postprocess, 0x00, distorted ? distorted_hdr_.Get() : hdr_.Get());
         Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
         final_combine_.draw(gpu, cl, ext_, scopes, true);
