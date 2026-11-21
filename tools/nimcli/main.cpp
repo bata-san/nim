@@ -1273,127 +1273,86 @@ int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
     return 0;
 }
 
-// Gameplay scripts an activity places: node -> entity (8080BAAD, hash64 at node +0x30) ->
-// components (8080BADB) -> BlockScript definitions (80800000) they name. Each definition carries
-// its module path ("bs\slots\squad_group.bs"); prints the modules with their placement count and
-// the first positions, plus (with -v) every placement.
-int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose) {
+// An activity's gameplay placements (load_map_gameplay, docs/PROGRESS.md 3.65): spawn points by
+// archetype, loot containers and script objects with their node positions, and the census of the
+// family's script components by module. -v lists every point; --json FILE writes them all.
+int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const char* json) {
     pm.build_hash64_index();
-    std::unordered_map<uint32_t, std::string> module_of;  // script definition -> module
-    auto module = [&](uint32_t script) -> const std::string& {
-        auto it = module_of.find(script);
-        if (it != module_of.end()) return it->second;
-        std::string name;
-        try {
-            const auto d = pm.read(TagHash(script));
-            const std::string text(d.begin(), d.end());
-            const auto at = text.find("bs\\");
-            if (at != std::string::npos) name = text.c_str() + at;
-        } catch (...) {
-        }
-        return module_of.emplace(script, name.empty() ? TagHash(script).str() : name).first->second;
+    const MapGameplay g = load_map_gameplay(pm, activity);
+    auto labels = [](const MapGameplayPoint& p) {
+        std::string l;
+        for (const auto h : p.labels) l += std::format("{}{:08X}", l.empty() ? "" : " ", h);
+        return l;
     };
-    struct Placement { std::array<float, 3> p; TagHash node_table, entity, component; uint32_t script; };
-    std::map<std::string, std::vector<Placement>> by_module;
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> entity_scripts;  // (component, script)
-    for (const auto& m : list_activity_maps(pm)) {
-        if (m.activity != activity) continue;
-        const auto tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
-        const auto layout = load_map_layout(pm, m.bubble, tables);
-        std::println("{} map[{}] bubble {} {}: {} node tables", m.activity.str(), m.activity_map, m.bubble.str(), m.name, layout.node_tables.size());
-        for (const auto table : layout.node_tables) {
-            std::vector<uint8_t> data;
-            try { data = pm.read(table); } catch (...) { continue; }
-            TagReader r(data);
-            const auto nodes = r.vec_at(0x08);
-            for (uint64_t k = 0; k < nodes.count; ++k) {
-                const size_t e = nodes.data + size_t(k) * 0x90;
-                if (e + 0x90 > data.size()) break;
-                const uint64_t h64 = r.u64_at(e + 0x30);
-                if (!h64 || h64 == ~0ull) continue;
-                const auto ent = pm.resolve64(h64);
-                if (!ent) continue;
-                auto it = entity_scripts.find(ent->value);
-                if (it == entity_scripts.end()) {
-                    std::vector<std::pair<uint32_t, uint32_t>> found;
-                    try {
-                        const auto ed = pm.read(*ent);
-                        std::set<uint32_t> seen;
-                        for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
-                            uint32_t v; std::memcpy(&v, ed.data() + o, 4);
-                            const TagHash c(v);
-                            if (!c.is_pkg_ref() || !seen.insert(v).second) continue;
-                            const Entry* ce = pm.entry(c);
-                            if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
-                            const auto cd = pm.read(c);
-                            std::set<uint32_t> scripts;
-                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
-                                uint32_t w; std::memcpy(&w, cd.data() + q, 4);
-                                const TagHash sh(w);
-                                if (!sh.is_pkg_ref()) continue;
-                                const Entry* se = pm.entry(sh);
-                                if (se && se->type == 8 && se->reference == 0x80800000 && scripts.insert(w).second) found.emplace_back(v, w);
-                            }
-                        }
-                    } catch (...) {
-                    }
-                    it = entity_scripts.emplace(ent->value, std::move(found)).first;
-                }
-                const std::array<float, 3> pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
-                for (const auto& [component, script] : it->second)
-                    by_module[module(script)].push_back({pos, table, *ent, TagHash(component), script});
+    auto group = [&](const char* title, const std::vector<MapGameplayPoint>& points) {
+        std::map<uint32_t, std::vector<const MapGameplayPoint*>> by_entity;
+        for (const auto& p : points) by_entity[p.entity.value].push_back(&p);
+        std::println("{}: {} points, {} archetypes", title, points.size(), by_entity.size());
+        for (const auto& [e, list] : by_entity) {
+            std::map<std::string, size_t> by_label;
+            for (const auto* p : list) ++by_label[labels(*p)];
+            std::println("  entity {} model {}: {} points", TagHash(e).str(), list.front()->model.is_none() ? "-" : list.front()->model.str(), list.size());
+            if (verbose) {
+                for (const auto* p : list)
+                    std::println("    ({:.1f} {:.1f} {:.1f}) [{}] id {:016X}", p->position[0], p->position[1], p->position[2], labels(*p), p->id);
+            } else {
+                std::string l;
+                for (const auto& [k, n] : by_label) l += std::format(" [{}]x{}", k, n);
+                std::println("   {}", l);
             }
         }
+    };
+    std::println("{}: {} nodes", activity.str(), g.nodes);
+    group("spawn points (entity has the start component 80802D32)", g.spawns);
+    group("loot containers (labelled nodes with a dynamic model)", g.loot);
+    std::println("script objects placed on nodes: {}", g.scripts.size());
+    for (const auto& o : g.scripts) {
+        std::string l;
+        for (size_t i = 0; i < o.placements.size() && (verbose || i < 4); ++i) {
+            const auto& [off, p] = o.placements[i];
+            l += std::format(" +0x{:X}=({:.1f} {:.1f} {:.1f})", off, p.position[0], p.position[1], p.position[2]);
+        }
+        if (!verbose && o.placements.size() > 4) l += std::format(" ... {} in all", o.placements.size());
+        std::println("  {} {}:{}", o.component.str(), o.module, l);
     }
-    // Most gameplay objects (squad groups, spawn points, objectives) are not placed on nodes:
-    // they hang off the activity's script hierarchy. Count every component of the map's package
-    // family by the script modules it names.
-    if (const auto maps = list_activity_maps(pm); !maps.empty()) {
-        TagHash bubble;
-        for (const auto& m : maps) if (m.activity == activity) bubble = m.bubble;
-        if (const PackageInfo* home = bubble.is_none() ? nullptr : pm.info(bubble.pkg_id())) {
-            const std::string family = home->name.substr(0, home->name.rfind('_') + 1);
-            std::map<std::string, size_t> components;
-            for (const auto& info : pm.packages()) {
-                if (!info.name.starts_with(family)) continue;
-                Package& pk = pm.open(info);
-                for (uint32_t i = 0; i < pk.entries().size(); ++i) {
-                    const Entry& en = pk.entries()[i];
-                    if (en.type != 8 || en.reference != 0x8080BADB) continue;
-                    std::vector<uint8_t> d;
-                    try { d = pk.read_entry(i); } catch (...) { continue; }
-                    std::set<std::string> names;
-                    for (size_t o = 0; o + 4 <= d.size(); o += 4) {
-                        uint32_t v; std::memcpy(&v, d.data() + o, 4);
-                        const TagHash h(v);
-                        if (!h.is_pkg_ref()) continue;
-                        const Entry* se = pm.entry(h);
-                        if (se && se->type == 8 && se->reference == 0x80800000) names.insert(module(v));
-                    }
-                    for (const auto& n : names) ++components[n];
+    std::println("script components of the package family by module:");
+    for (const auto& [m, n] : g.modules) std::println("  {:5} {}", n, m);
+    if (json) {
+        std::string j = std::format("{{\"activity\":\"{}\",\"spawns\":[", activity.str());
+        auto point = [&](const MapGameplayPoint& p) {
+            std::string l;
+            for (const auto h : p.labels) l += std::format("{}\"{:08X}\"", l.empty() ? "" : ",", h);
+            return std::format("{{\"p\":[{:.3f},{:.3f},{:.3f}],\"q\":[{:.5f},{:.5f},{:.5f},{:.5f}],\"entity\":\"{}\",\"model\":\"{}\",\"id\":\"{:016X}\",\"labels\":[{}]}}",
+                               p.position[0], p.position[1], p.position[2], p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3],
+                               p.entity.str(), p.model.is_none() ? "" : p.model.str(), p.id, l);
+        };
+        for (size_t i = 0; i < g.spawns.size(); ++i) j += (i ? "," : "") + point(g.spawns[i]);
+        j += "],\"loot\":[";
+        for (size_t i = 0; i < g.loot.size(); ++i) j += (i ? "," : "") + point(g.loot[i]);
+        j += "],\"scripts\":[";
+        for (size_t i = 0; i < g.scripts.size(); ++i) {
+            const auto& o = g.scripts[i];
+            std::string module;
+            for (const char c : o.module) module += c == '\\' ? std::string("\\\\") : std::string(1, c);
+            j += std::format("{}{{\"component\":\"{}\",\"module\":\"{}\",\"points\":[", i ? "," : "", o.component.str(), module);
+            for (size_t k = 0; k < o.placements.size(); ++k) j += (k ? "," : "") + point(o.placements[k].second);
+            j += "]}";
+        }
+        // The map's static placements (positions only): context for overview plots.
+        j += "],\"statics\":[";
+        bool first = true;
+        for (const auto& m : list_activity_maps(pm)) {
+            if (m.activity != activity) continue;
+            const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+            for (const auto& st : layout.statics)
+                for (const auto& row : st.rows) {
+                    j += std::format("{}[{:.1f},{:.1f},{:.1f}]", first ? "" : ",", row[3], row[7], row[11]);
+                    first = false;
                 }
-            }
-            std::vector<std::pair<size_t, std::string>> sorted;
-            for (const auto& [n, c] : components) sorted.emplace_back(c, n);
-            std::ranges::sort(sorted, std::greater{});
-            std::println("components of the {}* family by script module:", family);
-            for (const auto& [c, n] : sorted) std::println("{:6} {}", c, n);
         }
-    }
-    std::println("node-placed script components:");
-    std::vector<std::pair<std::string, const std::vector<Placement>*>> order;
-    for (const auto& [name, list] : by_module) order.emplace_back(name, &list);
-    std::ranges::sort(order, [](const auto& a, const auto& b) { return a.second->size() > b.second->size(); });
-    for (const auto& [name, list] : order) {
-        std::set<uint32_t> scripts;
-        for (const auto& pl : *list) scripts.insert(pl.script);
-        std::println("{:5} {} ({} definitions)", list->size(), name, scripts.size());
-        const size_t shown = verbose ? list->size() : std::min<size_t>(list->size(), 3);
-        for (size_t i = 0; i < shown; ++i) {
-            const auto& pl = (*list)[i];
-            std::println("        ({:.1f} {:.1f} {:.1f}) entity {} component {} script {} table {}", pl.p[0], pl.p[1], pl.p[2],
-                         pl.entity.str(), pl.component.str(), TagHash(pl.script).str(), pl.node_table.str());
-        }
+        j += "]}\n";
+        std::ofstream(json, std::ios::binary) << j;
+        std::println("wrote {}", json);
     }
     return 0;
 }
@@ -3002,8 +2961,15 @@ int main(int argc, char** argv) {
         }
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
-        if (cmd == "map-gameplay" && args.size() >= 2)
-            return cmd_map_gameplay(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");
+        if (cmd == "map-gameplay" && args.size() >= 2) {
+            bool verbose = false;
+            const char* json = nullptr;
+            for (size_t i = 2; i < args.size(); ++i) {
+                if (args[i] == "-v") verbose = true;
+                else if (args[i] == "--json" && i + 1 < args.size()) json = args[++i].c_str();
+            }
+            return cmd_map_gameplay(pm, TagHash(parse_hex(args[1])), verbose, json);
+        }
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-components" && args.size() >= 2)
             return cmd_map_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0,

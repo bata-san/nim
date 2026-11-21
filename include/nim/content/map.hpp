@@ -240,6 +240,40 @@ std::vector<MapStatic> load_map_sky_objects(PackageManager& pm, const MapLayout&
 MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials);
 
+// ---- gameplay placements ------------------------------------------------------------------
+// See docs/PROGRESS.md 3.65. An activity's node tables (bubble + phases) place gameplay objects:
+//  - spawn points: a node naming (hash64 at +0x30) an entity whose components include the start
+//    component 80802D32 (the class of the player starts). Each such entity is one spawn-point
+//    archetype; which side or character uses an archetype is not decoded.
+//  - loot containers: nodes carrying a label list (80802EC2) whose entity has a dynamic model.
+//  - label lists (80802EC2, node component payload +0x10): u32 count, then FNV-1 name hashes. On
+//    Outpost the first is a zone (the hash zone_region components test) and the second a kind.
+//  - script objects: BlockScript components (8080BADB naming an 80800000 definition, which holds
+//    its module path, e.g. "bs/world/prefabs/uesc_scan_drone.bs" with backslashes) that store a
+//    node's 64-bit placement id (node +0x70) at some offset.
+// Squads (slots/squad_group) and point groups (native 8080B831, e.g. pg_spawn_points) live in the
+// activity's script hierarchy and name no node: their spawn positions are not decoded.
+struct MapGameplayPoint {
+    std::array<float, 3> position{};
+    std::array<float, 4> rotation{0, 0, 0, 1};  // quaternion x, y, z, w
+    TagHash entity, model;                     // model: the entity's dynamic model, if any
+    uint64_t id = 0;                           // node +0x70
+    std::vector<uint32_t> labels;              // 80802EC2 name hashes (empty entries dropped)
+};
+struct MapScriptObject {
+    TagHash component, definition;
+    std::string module;  // the definition's module path, else its tag
+    std::vector<std::pair<uint32_t, MapGameplayPoint>> placements;  // (component offset, node)
+};
+struct MapGameplay {
+    std::vector<MapGameplayPoint> spawns, loot;
+    std::vector<MapScriptObject> scripts;
+    std::vector<std::pair<std::string, size_t>> modules;  // script components of the package family, by module
+    size_t nodes = 0;
+};
+// Needs the hash64 index (PackageManager::build_hash64_index).
+MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity);
+
 // ---- particle systems (FX) ----------------------------------------------------------------
 // A GPU particle system (808081E8, 64 bytes): +0x00 its definition (808081EF: header floats at
 // +0x128 / +0x134 and an FX expression program not decoded), then techniques: +0x04

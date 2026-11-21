@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 
@@ -1026,6 +1028,139 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                 ++out.placements;
             }
     }
+    return out;
+}
+
+MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
+    MapGameplay out;
+    struct EntityInfo { bool spawn = false; TagHash model; };
+    std::unordered_map<uint32_t, EntityInfo> entities;
+    auto entity_info = [&](TagHash ent) -> const EntityInfo& {
+        if (auto it = entities.find(ent.value); it != entities.end()) return it->second;
+        EntityInfo info;
+        try {
+            const auto ed = pm.read(ent);
+            std::set<uint32_t> seen;
+            for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, ed.data() + o, 4);
+                const TagHash c(v);
+                if (!c.is_pkg_ref() || !seen.insert(v).second) continue;
+                const Entry* ce = pm.entry(c);
+                if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                const auto cd = pm.read(c);
+                TagReader cr(cd);
+                if (cd.size() >= 0xA8 && cr.u32_at(0xA4) == kClassStartComponent) info.spawn = true;
+                for (size_t q = 0; q + 4 <= cd.size() && info.model.is_none(); q += 4) {
+                    const TagHash m(cr.u32_at(q));
+                    if (!m.is_pkg_ref()) continue;
+                    if (const Entry* me = pm.entry(m); me && me->type == 8 && me->reference == 0x8080881C) info.model = m;
+                }
+            }
+        } catch (...) {
+        }
+        return entities.emplace(ent.value, info).first->second;
+    };
+    std::unordered_map<uint64_t, MapGameplayPoint> by_id;
+    TagHash bubble;
+    for (const auto& m : list_activity_maps(pm)) {
+        if (m.activity != activity) continue;
+        bubble = m.bubble;
+        const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+        for (const auto table : layout.node_tables) {
+            std::vector<uint8_t> data;
+            try {
+                data = pm.read(table);
+            } catch (...) {
+                continue;
+            }
+            TagReader r(data);
+            const auto nodes = r.vec_at(0x08);
+            for (uint64_t k = 0; k < nodes.count; ++k) {
+                const size_t e = nodes.data + size_t(k) * 0x90;
+                if (e + 0x90 > data.size()) break;
+                ++out.nodes;
+                MapGameplayPoint pt;
+                for (size_t a = 0; a < 4; ++a) pt.rotation[a] = r.f32_at(e + a * 4);
+                for (size_t a = 0; a < 3; ++a) pt.position[a] = r.f32_at(e + 0x10 + a * 4);
+                pt.id = r.u64_at(e + 0x70);
+                bool start = false;  // a start component on the node itself (the player starts)
+                for (size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78)), guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                    const uint64_t next = r.u64_at(p);
+                    if (r.u32_at(p - 4) == kClassStartComponent) start = true;
+                    if (r.u32_at(p - 4) == 0x80802EC2) {
+                        const uint32_t n = std::min(r.u32_at(p + 0x10), 16u);
+                        for (uint32_t q = 0; q < n && p + 0x18 + q * 4 <= data.size(); ++q)
+                            if (const uint32_t h = r.u32_at(p + 0x14 + q * 4); h != 0x811C9DC5u) pt.labels.push_back(h);
+                    }
+                    if (!next) break;
+                    p += size_t(next);
+                }
+                const uint64_t h64 = r.u64_at(e + 0x30);
+                bool spawn = start;
+                if (h64 && h64 != ~0ull)
+                    if (const auto ent = pm.resolve64(h64)) {
+                        pt.entity = *ent;
+                        const auto& info = entity_info(*ent);
+                        pt.model = info.model;
+                        spawn = spawn || info.spawn;
+                        if (!spawn && !pt.labels.empty() && !info.model.is_none()) out.loot.push_back(pt);
+                    }
+                if (spawn) out.spawns.push_back(pt);
+                if (pt.id && pt.id != ~0ull) by_id.try_emplace(pt.id, std::move(pt));
+            }
+        }
+    }
+    if (bubble.is_none()) throw std::runtime_error(std::format("{}: not an activity with maps", activity.str()));
+    // Script components of the map's package family; those that store a node's placement id.
+    std::unordered_map<uint32_t, std::string> modules;
+    auto module_of = [&](uint32_t script) -> const std::string& {
+        if (auto it = modules.find(script); it != modules.end()) return it->second;
+        std::string name;
+        try {
+            const auto d = pm.read(TagHash(script));
+            const std::string text(d.begin(), d.end());
+            if (const auto at = text.find("bs\\"); at != std::string::npos) name = text.c_str() + at;
+        } catch (...) {
+        }
+        return modules.emplace(script, name.empty() ? TagHash(script).str() : name).first->second;
+    };
+    std::map<std::string, size_t> census;
+    const PackageInfo* home = pm.info(bubble.pkg_id());
+    const std::string family = home ? home->name.substr(0, home->name.rfind('_') + 1) : std::string();
+    for (const auto& info : pm.packages()) {
+        if (family.empty() || !info.name.starts_with(family)) continue;
+        Package& pk = pm.open(info);
+        for (uint32_t i = 0; i < pk.entries().size(); ++i) {
+            const Entry& en = pk.entries()[i];
+            if (en.type != 8 || en.reference != 0x8080BADB) continue;
+            std::vector<uint8_t> d;
+            try {
+                d = pk.read_entry(i);
+            } catch (...) {
+                continue;
+            }
+            MapScriptObject obj;
+            obj.component = TagHash::make(info.pkg_id, uint16_t(i));
+            for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+                uint32_t v;
+                std::memcpy(&v, d.data() + o, 4);
+                if (const TagHash h(v); h.is_pkg_ref() && obj.definition.is_none())
+                    if (const Entry* se = pm.entry(h); se && se->type == 8 && se->reference == 0x80800000) {
+                        obj.definition = h;
+                        obj.module = module_of(v);
+                    }
+                uint64_t w;
+                std::memcpy(&w, d.data() + o, 8);
+                if (auto f = by_id.find(w); f != by_id.end()) obj.placements.emplace_back(uint32_t(o), f->second);
+            }
+            if (obj.definition.is_none()) continue;
+            ++census[obj.module];
+            if (!obj.placements.empty()) out.scripts.push_back(std::move(obj));
+        }
+    }
+    out.modules.assign(census.begin(), census.end());
+    std::ranges::stable_sort(out.modules, [](const auto& a, const auto& b) { return a.second > b.second; });
     return out;
 }
 
