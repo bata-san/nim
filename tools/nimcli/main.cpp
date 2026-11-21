@@ -1388,6 +1388,44 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
             std::println("  {} group {}:{} @{}", o.component.str(), sq.group ? g.scripts[*sq.group].component.str() : "-", who, at.empty() ? " -" : at);
         }
     }
+    {
+        std::map<std::string, size_t> by_name;
+        float area = 0;
+        for (const auto& fa : g.firing_areas) {
+            ++by_name[fa.name];
+            for (const auto& tri : fa.triangles) {
+                const auto &a = fa.outline[tri[0]], &b = fa.outline[tri[1]], &c = fa.outline[tri[2]];
+                area += std::abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) * 0.5f;
+            }
+        }
+        size_t with_obj = 0;
+        for (const auto& sq : g.squads) with_obj += sq.objective.has_value();
+        std::println("firing areas (native {:08X}): {} ({:.0f} m2 of floor summed, areas overlap), objectives (native {:08X}): {}, squads with an objective: {}",
+                     kClassAiFiringArea, g.firing_areas.size(), area, kClassAiObjective, g.objectives.size(), with_obj);
+        if (verbose) {
+            for (const auto& fa : g.firing_areas) {
+                float cx = 0, cy = 0, cz = 0;
+                for (const auto& v : fa.outline) cx += v[0], cy += v[1], cz += v[2];
+                const float n = float(std::max<size_t>(fa.outline.size(), 1));
+                std::println("  {} {:<28} {} vertices, floor ({:.1f} {:.1f} {:.1f}), height {:.1f}", g.scripts[fa.script].component.str(), fa.name,
+                             fa.outline.size(), cx / n, cy / n, cz / n, fa.height);
+            }
+            for (const auto& ob : g.objectives) {
+                std::string l;
+                for (const auto a : ob.firing_areas) l += " " + g.firing_areas[a].name;
+                std::println("  objective {}:{}", g.scripts[ob.script].component.str(), l);
+            }
+        }
+        std::println("point groups (native {:08X}): {}", kClassPointGroup, g.point_groups.size());
+        for (const auto& pg : g.point_groups) {
+            if (!verbose && pg.spline.empty()) continue;
+            float len = 0;
+            for (size_t i = 1; i < pg.spline.size(); ++i)
+                len += std::hypot(pg.spline[i][0] - pg.spline[i - 1][0], pg.spline[i][1] - pg.spline[i - 1][1], pg.spline[i][2] - pg.spline[i - 1][2]);
+            std::println("  {} owner {}: {} points{}", g.scripts[pg.script].component.str(), pg.owner ? g.scripts[*pg.owner].module : "-",
+                         pg.points.size(), pg.spline.empty() ? std::string() : std::format(", spline {} samples {:.0f} m", pg.spline.size(), len));
+        }
+    }
     std::println("script objects: {} ({} place nodes)", g.scripts.size(),
                  std::ranges::count_if(g.scripts, [](const auto& o) { return !o.placements.empty(); }));
     for (const auto& o : g.scripts) {
@@ -1440,12 +1478,42 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
         j += "],\"squads\":[";
         for (size_t i = 0; i < g.squads.size(); ++i) {
             const auto& sq = g.squads[i];
-            j += std::format("{}{{\"component\":\"{}\",\"group\":\"{}\",\"members\":[", i ? "," : "",
-                             g.scripts[sq.script].component.str(), sq.group ? g.scripts[*sq.group].component.str() : "");
+            j += std::format("{}{{\"component\":\"{}\",\"group\":\"{}\",\"objective\":{},\"members\":[", i ? "," : "",
+                             g.scripts[sq.script].component.str(), sq.group ? g.scripts[*sq.group].component.str() : "",
+                             sq.objective ? std::to_string(*sq.objective) : std::string("null"));
             for (size_t k = 0; k < sq.members.size(); ++k) j += std::format("{}{}", k ? "," : "", sq.members[k]);
             j += "],\"points\":[";
             for (size_t k = 0; k < sq.positions.size(); ++k) j += (k ? "," : "") + point(sq.positions[k]);
             j += "]}";
+        }
+        auto vec3s = [](const std::vector<std::array<float, 3>>& v) {
+            std::string r;
+            for (size_t k = 0; k < v.size(); ++k) r += std::format("{}[{:.2f},{:.2f},{:.2f}]", k ? "," : "", v[k][0], v[k][1], v[k][2]);
+            return r;
+        };
+        j += "],\"firing_areas\":[";
+        for (size_t i = 0; i < g.firing_areas.size(); ++i) {
+            const auto& fa = g.firing_areas[i];
+            std::string tris;
+            for (size_t k = 0; k < fa.triangles.size(); ++k)
+                tris += std::format("{}[{},{},{}]", k ? "," : "", fa.triangles[k][0], fa.triangles[k][1], fa.triangles[k][2]);
+            j += std::format("{}{{\"component\":\"{}\",\"name\":\"{}\",\"height\":{:.2f},\"outline\":[{}],\"triangles\":[{}]}}", i ? "," : "",
+                             g.scripts[fa.script].component.str(), fa.name, fa.height, vec3s(fa.outline), tris);
+        }
+        j += "],\"objectives\":[";
+        for (size_t i = 0; i < g.objectives.size(); ++i) {
+            std::string l;
+            for (size_t k = 0; k < g.objectives[i].firing_areas.size(); ++k) l += std::format("{}{}", k ? "," : "", g.objectives[i].firing_areas[k]);
+            j += std::format("{}{{\"component\":\"{}\",\"firing_areas\":[{}]}}", i ? "," : "", g.scripts[g.objectives[i].script].component.str(), l);
+        }
+        j += "],\"point_groups\":[";
+        for (size_t i = 0; i < g.point_groups.size(); ++i) {
+            const auto& pg = g.point_groups[i];
+            std::string owner;
+            if (pg.owner)
+                for (const char c : g.scripts[*pg.owner].module) owner += c == '\\' ? std::string("\\\\") : std::string(1, c);
+            j += std::format("{}{{\"component\":\"{}\",\"owner\":\"{}\",\"points\":[{}],\"spline\":[{}]}}", i ? "," : "",
+                             g.scripts[pg.script].component.str(), owner, vec3s(pg.points), vec3s(pg.spline));
         }
         // The map's static placements (positions only): context for overview plots.
         j += "],\"statics\":[";

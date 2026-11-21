@@ -1275,10 +1275,11 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         }
     }
     // Keep the components that place, spawn or link something, and the ones linked to.
-    std::vector<size_t> index(all.size(), SIZE_MAX);
+    std::vector<size_t> index(all.size(), SIZE_MAX), orig;
     for (size_t k = 0; k < all.size(); ++k)
         if (!all[k].placements.empty() || !all[k].characters.empty() || !all[k].links.empty() || linked[k]) {
             index[k] = out.scripts.size();
+            orig.push_back(k);
             out.scripts.push_back(std::move(all[k]));
         }
     for (auto& obj : out.scripts) {
@@ -1287,6 +1288,102 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     }
     out.modules.assign(census.begin(), census.end());
     std::ranges::stable_sort(out.modules, [](const auto& a, const auto& b) { return a.second > b.second; });
+    // Firing areas, objectives and point groups (3.67).
+    auto typed_list = [](const std::vector<uint8_t>& d, uint32_t type) -> std::pair<size_t, size_t> {
+        for (size_t o = 0; o + 0x14 <= d.size(); o += 4) {
+            uint32_t a, c;
+            std::memcpy(&a, d.data() + o, 4);
+            std::memcpy(&c, d.data() + o + 12, 4);
+            if (a != 0x8080BFCDu || c != type) continue;
+            uint64_t n;
+            std::memcpy(&n, d.data() + o + 4, 8);
+            return {o + 0x14, size_t(n)};
+        }
+        return {0, 0};
+    };
+    auto header = [&](const std::vector<uint8_t>& d) -> size_t {
+        const auto it = std::search(d.begin(), d.end(), std::begin(kSlotHeader), std::end(kSlotHeader));
+        return it == d.end() ? SIZE_MAX : size_t(it - d.begin());
+    };
+    auto rotate = [](const std::array<float, 4>& q, std::array<float, 3> v) {
+        const float x = q[0], y = q[1], z = q[2], w = q[3];
+        const float tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
+        return std::array<float, 3>{v[0] + w * tx + (y * tz - z * ty), v[1] + w * ty + (z * tx - x * tz), v[2] + w * tz + (x * ty - y * tx)};
+    };
+    std::vector<std::optional<size_t>> area_of(out.scripts.size()), owner_of(out.scripts.size());
+    for (size_t k = 0; k < out.scripts.size(); ++k)
+        for (const auto& l : out.scripts[k].links)
+            if (!owner_of[l.second]) owner_of[l.second] = k;
+    for (size_t k = 0; k < out.scripts.size(); ++k) {
+        const auto& o = out.scripts[k];
+        const auto& d = raw[orig[k]];
+        const size_t hh = header(d);
+        if (hh == SIZE_MAX) continue;
+        TagReader r(d);
+        if (o.native_class == kClassAiFiringArea && hh + 0x194 <= d.size()) {
+            const auto [vo, nv] = typed_list(d, 0x80800094);
+            const auto [io, ni] = typed_list(d, 0x8080BA19);
+            if (!nv || vo + nv * 16 > d.size() || io + ni * 3 > d.size()) continue;  // template without a polygon
+            MapFiringArea fa;
+            fa.script = k;
+            for (size_t a = 0; a < 4; ++a) fa.rotation[a] = r.f32_at(hh + 0x70 + a * 4);
+            for (size_t a = 0; a < 3; ++a) fa.translation[a] = r.f32_at(hh + 0x80 + a * 4);
+            fa.height = r.f32_at(hh + 0x190);
+            const std::array<float, 4> inv{-fa.rotation[0], -fa.rotation[1], -fa.rotation[2], fa.rotation[3]};
+            for (size_t v = 0; v < nv; ++v) {
+                std::array<float, 3> local{};
+                for (size_t a = 0; a < 3; ++a) local[a] = r.f32_at(vo + v * 16 + a * 4) - fa.translation[a];
+                fa.outline.push_back(rotate(inv, local));
+            }
+            for (size_t i = 0; i < ni; ++i)
+                if (d[io + i * 3] < nv && d[io + i * 3 + 1] < nv && d[io + i * 3 + 2] < nv)
+                    fa.triangles.push_back({d[io + i * 3], d[io + i * 3 + 1], d[io + i * 3 + 2]});
+            // Debug path: string record 80800065 {u64 length, chars}; the last one is the area's.
+            for (size_t at = d.size() >= 16 ? (d.size() - 16) & ~size_t(3) : 0; at > hh; at -= 4) {
+                if (r.u32_at(at) != 0x80800065u) continue;
+                const size_t n = size_t(r.u64_at(at + 4));
+                if (at + 12 + n > d.size()) break;
+                std::string path(reinterpret_cast<const char*>(d.data() + at + 12), strnlen(reinterpret_cast<const char*>(d.data() + at + 12), n));
+                fa.name = path.substr(path.find_last_of('.') + 1);
+                break;
+            }
+            area_of[k] = out.firing_areas.size();
+            out.firing_areas.push_back(std::move(fa));
+        }
+    }
+    std::vector<std::optional<size_t>> objective_of(out.scripts.size());
+    for (size_t k = 0; k < out.scripts.size(); ++k) {
+        const auto& o = out.scripts[k];
+        if (o.native_class == kClassAiObjective) {
+            MapObjective ob;
+            ob.script = k;
+            std::set<size_t> seen;
+            for (const auto& l : o.links)
+                if (area_of[l.second] && seen.insert(*area_of[l.second]).second) ob.firing_areas.push_back(*area_of[l.second]);
+            objective_of[k] = out.objectives.size();
+            out.objectives.push_back(std::move(ob));
+        } else if (o.native_class == kClassPointGroup) {
+            MapPointGroup pg;
+            pg.script = k;
+            pg.owner = owner_of[k];
+            std::set<size_t> seen;
+            for (const auto& l : o.links) {
+                const auto& target = out.scripts[l.second];
+                if (target.native_class != kClassPoint || !seen.insert(l.second).second) continue;
+                const auto& pd = raw[orig[l.second]];
+                const size_t ph = header(pd);
+                if (ph == SIZE_MAX || ph + 0x8C > pd.size()) continue;
+                TagReader pr(pd);
+                pg.points.push_back({pr.f32_at(ph + 0x80), pr.f32_at(ph + 0x84), pr.f32_at(ph + 0x88)});
+            }
+            const auto [so, ns] = typed_list(raw[orig[k]], 0x80800090);
+            const auto& d = raw[orig[k]];
+            TagReader r(d);
+            for (size_t i = 0; i < ns && so + i * 16 + 12 <= d.size(); ++i)
+                pg.spline.push_back({r.f32_at(so + i * 16), r.f32_at(so + i * 16 + 4), r.f32_at(so + i * 16 + 8)});
+            out.point_groups.push_back(std::move(pg));
+        }
+    }
     // Squads: their members, group and spawn positions (3.66).
     std::vector<std::optional<size_t>> group_of(out.scripts.size());
     for (size_t k = 0; k < out.scripts.size(); ++k)
@@ -1299,6 +1396,8 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         MapSquad sq;
         sq.script = k;
         sq.group = group_of[k];
+        for (const auto& l : o.links)
+            if (objective_of[l.second] && !sq.objective) sq.objective = objective_of[l.second];
         for (const auto& c : o.characters) sq.members.push_back(c.second);
         std::set<uint64_t> seen;
         for (const auto& l : o.links) {

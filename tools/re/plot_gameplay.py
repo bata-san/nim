@@ -5,7 +5,8 @@
 #
 # Grey: the map's static placements. Left: spawn points coloured by archetype (the entity the node
 # names). Middle: loot containers by zone label, script objects labelled with their module name.
-# Right: squad spawn positions (3.66) coloured by the squad's first character (names are 推定).
+# Right: squad spawn positions (3.66) coloured by the squad's first character (names are 推定),
+# firing areas (orange) and point-group splines (blue, e.g. scan drone paths) (3.67).
 import json
 import sys
 from collections import Counter, defaultdict
@@ -67,11 +68,18 @@ for o in [o for o in d['scripts'] if not o['module'].startswith('native')]:
             ax.annotate(name, (x, y), fontsize=5.5, xytext=(3, 3), textcoords='offset points')
 ax.legend(loc='upper left', fontsize=7, markerscale=2)
 
-# Right: squads by character.
+# Right: squads by character, over their firing areas (3.67) and point-group paths.
 ax = axes[2]
 squads = d.get('squads', [])
 chars = d.get('characters', [])
-background(ax, f"squads ({len(squads)}) at their spawn positions, by first character")
+areas = d.get('firing_areas', [])
+background(ax, f"squads ({len(squads)}) by first character, firing areas ({len(areas)}), paths")
+from matplotlib.patches import Polygon
+for fa in areas:
+    ax.add_patch(Polygon([v[:2] for v in fa['outline']], closed=True, facecolor='#ffd27f', edgecolor='#d08a00', linewidth=0.4, alpha=0.5))
+for pg in d.get('point_groups', []):
+    if len(pg['spline']) > 1:
+        ax.plot([v[0] for v in pg['spline']], [v[1] for v in pg['spline']], color='#3070d0', linewidth=1.0)
 by_char = defaultdict(list)
 for sq in squads:
     if sq['members'] and sq['points']:

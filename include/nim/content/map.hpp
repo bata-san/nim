@@ -147,7 +147,11 @@ std::vector<const MapCubemap*> map_cubemap_region(const std::vector<MapCubemap>&
 // activity node tables (Outpost: four nodes a few metres apart at (148, 52, -4.7), next to the two
 // 808035B8 nodes). Payload +0x00: a name hash. The node transform gives position and facing.
 inline constexpr uint32_t kClassStartComponent = 0x80802D32;
-inline constexpr uint32_t kClassAiSquad = 0x80805BE0;  // native squad slot (3.66)
+inline constexpr uint32_t kClassAiSquad = 0x80805BE0;       // native squad slot (3.66)
+inline constexpr uint32_t kClassAiObjective = 0x80805B33;   // a squad's objective: firing areas (3.67)
+inline constexpr uint32_t kClassAiFiringArea = 0x8080B0D1;  // floor polygon prism (3.67)
+inline constexpr uint32_t kClassPointGroup = 0x8080B831;    // named points, optionally a spline (3.67)
+inline constexpr uint32_t kClassPoint = 0x8080B83C;         // one point of a point group (3.67)
 inline constexpr float kStartEyeHeight = 1.7f;  // viewer eye above a start (estimate, not engine data)
 struct MapStart {
     std::array<float, 3> position{};
@@ -287,9 +291,38 @@ struct MapScriptObject {
     std::vector<std::pair<uint32_t, size_t>> characters;            // (offset, MapGameplay::characters)
     std::vector<std::pair<uint32_t, size_t>> links;                 // (offset, MapGameplay::scripts) by slot id
 };
+// AI behaviour areas and routes (3.67). Offsets are from the slot header.
+//  - firing area (8080B0D1): world->local transform (quaternion h+0x70, translation h+0x80; a
+//    point maps to local as R*p + t), a floor polygon (typed list 80800094 of float4, local z =
+//    floor) triangulated by a byte list 8080BA19 (3 indices per triangle), and the prism height
+//    at h+0x190. The component ends with its debug path; name = its last segment.
+//  - objective (80805B33): links to firing areas. Each squad links to one objective.
+//  - point group (8080B831): links to points (8080B83C: quaternion h+0x70, world position h+0x80)
+//    and, for paths (e.g. uesc_scan_drone pg_drone_path), a typed list 80800090 of float4 world
+//    positions sampling a spline.
+struct MapFiringArea {
+    size_t script = 0;                         // MapGameplay::scripts
+    std::string name;                          // e.g. fa_walkway
+    std::array<float, 4> rotation{0, 0, 0, 1}; // stored world->local quaternion
+    std::array<float, 3> translation{};        // stored world->local translation
+    std::vector<std::array<float, 3>> outline; // floor polygon, world space
+    std::vector<std::array<uint8_t, 3>> triangles;
+    float height = 0;
+};
+struct MapObjective {
+    size_t script = 0;
+    std::vector<size_t> firing_areas;  // MapGameplay::firing_areas
+};
+struct MapPointGroup {
+    size_t script = 0;
+    std::optional<size_t> owner;                // the first component linking to it
+    std::vector<std::array<float, 3>> points;   // its 8080B83C points, in link order
+    std::vector<std::array<float, 3>> spline;   // sampled path, if any
+};
 struct MapSquad {
     size_t script = 0;                       // the squad component (MapGameplay::scripts)
     std::optional<size_t> group;             // the squad_group linking to it (MapGameplay::scripts)
+    std::optional<size_t> objective;         // MapGameplay::objectives
     std::vector<size_t> members;             // one per spawned member (MapGameplay::characters)
     std::vector<MapGameplayPoint> positions; // distinct nodes of the linked location components
 };
@@ -298,6 +331,9 @@ struct MapGameplay {
     std::vector<MapScriptObject> scripts;  // components that place, spawn or link something, or are linked to
     std::vector<MapCharacter> characters;
     std::vector<MapSquad> squads;
+    std::vector<MapFiringArea> firing_areas;
+    std::vector<MapObjective> objectives;
+    std::vector<MapPointGroup> point_groups;
     std::vector<std::pair<std::string, size_t>> modules;  // script components of the package family, by module
     size_t nodes = 0;
 };
