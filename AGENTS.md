@@ -8,6 +8,10 @@
    - Render with game resources only; no fallback rendering. Unknown engine values are explicit,
      listed estimates (`ExternStore::note_estimate` / `estimate*`), shown as 推定 in the UI.
    - Never touch the running game (BattlEye); the install is read-only; no GPU/memory capture.
+   - Static, read-only analysis of the on-disk Marathon.exe is allowed (user decision, 2026-11-22),
+     e.g. to read the native code BlockScript compiles to. Never run, patch, unpack or decrypt it,
+     never bypass its protection, never commit or ship any part of it, and build nothing that reads
+     or alters a running game.
    - Never commit or ship game data or `oo2core_9_win64.dll`. `out/` is gitignored scratch.
    - User instruction: never use Computer Use. GUI interaction checks are not required; verify headlessly.
    - "Implement" means: build, test, commit, push, release when appropriate, then verify.
