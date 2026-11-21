@@ -612,6 +612,11 @@ void StaticMeshScene::release(Gpu& gpu) {
     cull_groups_.clear();
     uncullable_opaque_.clear();
     visible_opaque_.clear();
+    visible_opaque_other_.clear();
+    visible_static_indices_other_.clear();
+    visible_static_groups_other_.clear();
+    visibility_key_.reset();
+    visibility_key_other_.reset();
     for (auto& bundle : draw_bundles_) bundle = {};
     instance_total_ = 0;
     texture_cache_.clear();
@@ -3392,6 +3397,14 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
     const VisibilityKey key{{vm.eye.x, vm.eye.y, vm.eye.z, vm.fwd.x, vm.fwd.y, vm.fwd.z,
                              vm.right.x, vm.right.y, vm.right.z, vm.up.x, vm.up.y, vm.up.z,
                              vm.fx, vm.fy, vm.ortho, far_z}, shadow_generation_, height, shadow};
+    if (visibility_shadow_ != shadow) {
+        std::swap(visibility_key_, visibility_key_other_);
+        std::swap(visible_opaque_, visible_opaque_other_);
+        std::swap(visible_static_indices_, visible_static_indices_other_);
+        std::swap(visible_static_groups_, visible_static_groups_other_);
+        for (auto& group : cull_groups_) group.swap_view();
+        visibility_shadow_ = shadow;
+    }
     if (!visibility_key_ || *visibility_key_ != key) {
         rebuild_visibility(vm, height, shadow);
         visibility_key_ = key;

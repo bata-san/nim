@@ -448,7 +448,11 @@ private:
         bool shadow;
         bool operator==(const VisibilityKey&) const = default;
     };
-    std::optional<VisibilityKey> visibility_key_;
+    // The main view and the shadow view each keep their culling result, so alternating between
+    // them does not rebuild either one while the camera holds still. The active one lives in the
+    // fields the draws read; the other is parked in the *_other members and swapped in when needed.
+    std::optional<VisibilityKey> visibility_key_, visibility_key_other_;
+    bool visibility_shadow_ = false;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
     std::vector<size_t> transparent_items_, distortion_items_;
@@ -517,11 +521,30 @@ private:
         std::array<uint32_t, 8> first{}, count{};  // visible instances per LOD level, in that order
         std::vector<uint32_t> visible_indices;  // this view's compacted instance stream (static groups)
         uint8_t visible_lods = 0;
+        struct Parked {
+            std::vector<uint32_t> visible_placements, visible_indices;
+            std::vector<float> visible_depths;
+            std::array<uint32_t, 8> first{}, count{};
+            uint32_t visible = 0, stream_offset = 0;
+            uint8_t visible_lods = 0;
+        } other;
+        void swap_view() {
+            std::swap(visible_placements, other.visible_placements);
+            std::swap(visible_indices, other.visible_indices);
+            std::swap(visible_depths, other.visible_depths);
+            std::swap(first, other.first);
+            std::swap(count, other.count);
+            std::swap(visible, other.visible);
+            std::swap(stream_offset, other.stream_offset);
+            std::swap(visible_lods, other.visible_lods);
+        }
     };
     std::array<std::vector<uint32_t>, 8> cull_scratch_;
     std::vector<uint32_t> visible_static_indices_, visible_static_groups_;
     std::vector<CullGroup> cull_groups_;
     std::vector<size_t> uncullable_opaque_, visible_opaque_;
+    std::vector<uint32_t> visible_static_indices_other_, visible_static_groups_other_;
+    std::vector<size_t> visible_opaque_other_;
     struct DrawBundle {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;

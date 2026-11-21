@@ -232,6 +232,7 @@ public:
     void draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
               std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures);
     void validate(const ExternStore& ext, const ScopeBufferFn& scopes) const;
+    void validate(const ExternStore& ext, const ScopeBufferFn& scopes, std::vector<std::vector<float4>>* keep) const;
     // Light volumes: the pipeline is shared by every technique with the same shaders; each draw
     // brings its own technique's TFX, constants and cbuffer (textures and samplers must match), or
     // the pipeline's own with `materials` null. `ps_textures`: views the engine binds itself
@@ -308,6 +309,7 @@ private:
     ID3D12CommandSignature* indirect_signature_ = nullptr;  // set for the span of dispatch_indirect
     ID3D12Resource* indirect_args_ = nullptr;
     uint32_t cbuffer_floor_ = 256;
+    std::vector<std::vector<float4>> validated_constants_;
     TagHash tag_;
     std::vector<Stage> stages_;
     struct PendingView { uint32_t slot; BindingKind kind; ExternStore::Tex view; bool uav; };

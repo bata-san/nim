@@ -750,7 +750,9 @@ void GamePipeline::dispatch_indirect(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
 
 void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                            bool validated, uint32_t x, uint32_t y, uint32_t z, const Geometry* geometry) {
-    if (!validated) validate(ext, scopes);
+    // Validating evaluates the stages' own TFX; a draw without other materials keeps that result.
+    const bool keep = !validated && cbuffer_floor_ == 256 && !(geometry && (geometry->materials || geometry->constants));
+    if (!validated) validate(ext, scopes, keep ? &validated_constants_ : nullptr);
     if (!pso_) return;
     ID3D12Device* dev = gpu.device();
     std::optional<TfxEnvironment> env;  // only when a stage was not evaluated ahead
@@ -802,7 +804,9 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
         const TechniqueStage& tfx = geometry && geometry->materials ? geometry->materials->stage(st.which) : st.tfx;
         const auto& textures = st.extern_textures;
         const bool ahead = geometry && geometry->constants;  // evaluated ahead (evaluate_stages)
-        if (!ahead) {
+        if (keep) {
+            st.constants.swap(validated_constants_[stage_index]);
+        } else if (!ahead) {
             auto& cb = st.constants;
             cb.assign(tfx.cbuffer_init.begin(), tfx.cbuffer_init.end());
             cb.resize(std::max<size_t>(cb.size(), cbuffer_floor_));
@@ -920,12 +924,26 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
 }
 
 void GamePipeline::validate(const ExternStore& ext, const ScopeBufferFn& scopes) const {
+    validate(ext, scopes, nullptr);
+}
+
+// `keep`: the stages' constants as evaluated here (st.tfx, 256-register floor), so a draw that
+// validates first does not run the same TFX again.
+void GamePipeline::validate(const ExternStore& ext, const ScopeBufferFn& scopes, std::vector<std::vector<float4>>* keep) const {
     if (!loaded()) throw std::runtime_error("Game pipeline is not loaded");
-    for (const auto& st : stages_) {
-        std::vector<float4> cb(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
+    if (keep) keep->resize(stages_.size());
+    std::optional<TfxEnvironment> env;
+    std::vector<float4> local;
+    for (size_t stage_index = 0; stage_index < stages_.size(); ++stage_index) {
+        const auto& st = stages_[stage_index];
+        auto& cb = keep ? (*keep)[stage_index] : local;
+        cb.assign(st.tfx.cbuffer_init.begin(), st.tfx.cbuffer_init.end());
         cb.resize(std::max<size_t>(cb.size(), 256));
-        auto textures = st.extern_textures;
-        if (!st.tfx.bytecode.empty()) run_tfx(st.tfx.bytecode, st.tfx.constants, cb, ext.environment());
+        const auto& textures = st.extern_textures;
+        if (!st.tfx.bytecode.empty()) {
+            if (!env) env = ext.environment();
+            run_tfx(st.tfx.bytecode, st.tfx.constants, cb, *env, nullptr, false);
+        }
         for (auto [reg, param] : st.cbvs)
             if (int32_t(reg) != st.tfx.cbuffer_slot && (!scopes || !scopes(st.which, reg)))
                 throw std::runtime_error(std::format("{}: missing shared cbuffer b{}", st.tfx.shader.str(), reg));
@@ -943,7 +961,7 @@ void GamePipeline::validate(const ExternStore& ext, const ScopeBufferFn& scopes)
             uint32_t stride = 0, elements = 0;
             uint64_t first_element = 0;
             DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-            std::string source;
+            const TfxExternTexture* source_texture = nullptr;
             bool null_view = false;
             for (const auto& et : textures) if (et.slot == slot) {
                 const auto offset = uint32_t(et.offset) * 8;
@@ -953,12 +971,15 @@ void GamePipeline::validate(const ExternStore& ext, const ScopeBufferFn& scopes)
                 elements = view.elements;
                 first_element = view.first_element;
                 format = view.format;
-                source = std::format(" extern {} byte 0x{:X}", et.extern_id, offset);
+                source_texture = &et;
                 null_view = !resource && ext.estimate_null_texture(et.extern_id, offset);
             }
             if (null_view) continue;
-            if (!resource || (kind_is_texture(kind) && !resource_fits(resource, kind)))
+            if (!resource || (kind_is_texture(kind) && !resource_fits(resource, kind))) {
+                const std::string source = source_texture ?
+                    std::format(" extern {} byte 0x{:X}", source_texture->extern_id, uint32_t(source_texture->offset) * 8) : std::string();
                 throw std::runtime_error(std::format("{}: missing/incompatible t{}{}; no replacement is permitted", st.tfx.shader.str(), slot, source));
+            }
             validate_resource_view({resource, format, stride, elements, first_element}, kind, false);
         }
     }
