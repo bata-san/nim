@@ -35,7 +35,8 @@ bool structural(uint32_t cls) {
 }
 
 std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr,
-                                        std::vector<TagHash>* node_tables = nullptr) {
+                                        std::vector<TagHash>* node_tables = nullptr,
+                                        std::vector<TagHash>* decorator_groups = nullptr) {
     pm.build_hash64_index();
     std::vector<TagHash> queue{bubble}, found;
     std::set<uint32_t> seen{bubble.value};
@@ -61,6 +62,11 @@ std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std:
             if (ce->reference == kClassTerrain) {
                 seen.insert(c.value);
                 if (terrains) terrains->push_back(c);
+                return;
+            }
+            if (ce->reference == kClassDecoratorGroup) {
+                seen.insert(c.value);
+                if (decorator_groups) decorator_groups->push_back(c);
                 return;
             }
             if (!structural(ce->reference)) return;
@@ -734,9 +740,9 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     MapLayout out;
     out.bubble = bubble;
     std::vector<TagHash> terrain_tags;
-    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables);
+    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables, &out.decorator_groups);
     for (const auto table : additional_tables) {
-        const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables);
+        const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables, &out.decorator_groups);
         out.instance_tags.insert(out.instance_tags.end(), tags.begin(), tags.end());
     }
     auto unique = [](auto& tags) { std::sort(tags.begin(), tags.end()); tags.erase(std::unique(tags.begin(), tags.end()), tags.end()); };
@@ -744,6 +750,7 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     auto deduplicate = [](auto& tags) { std::set<TagHash> seen; std::erase_if(tags, [&](TagHash t) { return !seen.insert(t).second; }); };
     deduplicate(out.instance_tags);
     deduplicate(out.node_tables);
+    deduplicate(out.decorator_groups);
     unique(terrain_tags);
     for (TagHash t : terrain_tags) {
         try {

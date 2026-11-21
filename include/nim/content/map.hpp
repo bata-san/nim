@@ -79,6 +79,7 @@ struct MapLayout {
     std::vector<TagHash> node_tables;    // the SMapNodeTables (placed entities, lights, ...)
     std::vector<MapStatic> statics;      // one per distinct mesh
     std::vector<Terrain> terrains;       // terrain patches
+    std::vector<TagHash> decorator_groups; // placement streams referenced by the map nodes
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
 };

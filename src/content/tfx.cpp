@@ -358,6 +358,51 @@ VertexBuffer load_vertex_buffer(PackageManager& pm, TagHash header) {
     return vb;
 }
 
+DecoratorGroup load_decorator_group(PackageManager& pm, TagHash tag) {
+    auto read_class = [&](TagHash ref, uint32_t cls) {
+        const auto* entry = pm.entry(ref);
+        if (!entry || entry->type != 8 || entry->reference != cls)
+            throw std::runtime_error(std::format("Decorator {}: expected {:08X} at {}", tag.str(), cls, ref.str()));
+        return pm.read(ref);
+    };
+    const auto group_bytes = read_class(tag, kClassDecoratorGroup);
+    const TagReader group(group_bytes);
+    const auto models = group.vec_at(0x08);
+    if (models.count != 1 || models.element_class != 0x80808598)
+        throw std::runtime_error("Unrecognized decorator model table: " + tag.str());
+    const auto model = read_class(group.tag_at(models.data), 0x80808599);
+    const auto stream = read_class(group.tag_at(0x48), 0x8080858B);
+    const TagReader source(stream);
+    DecoratorGroup result;
+    result.model = TagReader(model).tag_at(0x08);
+    result.bounds = group.tag_at(0x4C);
+    const auto decode = read_class(source.tag_at(0x14), 0x80808586);
+    const BinaryReader constants(decode);
+    for (size_t i = 0; i < result.decode.size(); ++i) constants.copy_at(i * 16, result.decode[i]);
+    const TagHash header = source.tag_at(0x18);
+    const auto* entry = pm.entry(header);
+    if (!entry || entry->type != 32 || entry->subtype != 4)
+        throw std::runtime_error("Invalid decorator vertex header: " + header.str());
+    result.instances = load_vertex_buffer(pm, header);
+    if (result.instances.stride != 16 || result.instances.data.empty() || result.instances.data.size() % 16)
+        throw std::runtime_error("Invalid decorator instance stream: " + header.str());
+    const size_t count = result.instances.data.size() / 16;
+    auto offsets = [&](size_t field) {
+        const auto table = group.vec_at(field);
+        if (table.count < 2 || table.element_class != 0x80800007 || table.data > group.size() ||
+            table.count > (group.size() - table.data) / sizeof(uint32_t))
+            throw std::runtime_error("Invalid decorator range table: " + tag.str());
+        std::vector<uint32_t> values(size_t(table.count));
+        std::memcpy(values.data(), group.span().data() + table.data, values.size() * sizeof(uint32_t));
+        if (values.front() != 0 || values.back() != count || !std::is_sorted(values.begin(), values.end()))
+            throw std::runtime_error("Decorator ranges do not match vertex stream: " + tag.str());
+        return values;
+    };
+    result.part_offsets = offsets(0x18);
+    result.cluster_offsets = offsets(0x38);
+    return result;
+}
+
 IndexBuffer load_index_buffer(PackageManager& pm, TagHash header) {
     auto h = pm.read(header);
     BinaryReader r(h);

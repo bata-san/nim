@@ -19,6 +19,7 @@
 //   nimcli [--install DIR] shader TAG [OUT.asm]         disassemble a shader header's DXBC
 //   nimcli [--install DIR] render-resources [TAG]      original pipeline/scope resource sources (TSV)
 //   nimcli [--install DIR] technique TAG               technique stages, textures (with headers), constants
+//   nimcli [--install DIR] decorators TAG             audit a decorator placement group or map bubble
 //   nimcli [--install DIR] find CLASS                   list every tag of a class
 //   nimcli [--install DIR] probe-audit BUBBLE [OUT.tsv]  exhaustive map-family probe inventory and cross-check
 //   nimcli [--install DIR] environment BUBBLE [ACTIVITY] [-v]  every global channel expression, by entity
@@ -2338,6 +2339,59 @@ int cmd_refs(PackageManager& pm, TagHash tag, uint32_t cls) {
     return 0;
 }
 
+int cmd_decorators(PackageManager& pm, TagHash tag) {
+    const auto* entry = pm.entry(tag);
+    if (!entry) throw std::runtime_error("Unknown decorator group or bubble: " + tag.str());
+    std::vector<TagHash> groups;
+    if (entry->reference == kClassDecoratorGroup) groups.push_back(tag);
+    else if (entry->reference == kClassBubbleParent) groups = load_map_layout(pm, tag).decorator_groups;
+    else throw std::runtime_error("Expected a decorator group or bubble: " + tag.str());
+
+    for (TagHash group : groups) {
+        const auto placements = load_decorator_group(pm, group);
+        const auto model = load_dynamic_model(pm, placements.model);
+        for (const auto& mesh : model.meshes) {
+            for (const auto& part : mesh.parts)
+                if (size_t(part.external_identifier) + 1 >= placements.part_offsets.size())
+                    throw std::runtime_error("Missing decorator instance range for mesh part: " + placements.model.str());
+        }
+        const auto* bounds_entry = pm.entry(placements.bounds);
+        if (!bounds_entry || bounds_entry->reference != 0x8080A7F5)
+            throw std::runtime_error("Missing decorator cluster bounds: " + group.str());
+        const auto bounds_bytes = pm.read(placements.bounds);
+        const TagReader bounds(bounds_bytes);
+        const auto clusters = bounds.vec_at(0x08);
+        if (clusters.count + 1 != placements.cluster_offsets.size() || clusters.element_class != 0x8080A7F7 ||
+            clusters.data > bounds.size() || clusters.count > (bounds.size() - clusters.data) / 48)
+            throw std::runtime_error("Decorator cluster range and bounds counts differ: " + group.str());
+        const BinaryReader instances(placements.instances.data);
+        float max_outside = 0;
+        size_t outside = 0;
+        for (size_t c = 0; c < clusters.count; ++c) {
+            std::array<float, 4> lo, hi;
+            bounds.copy_at(clusters.data + c * 48, lo);
+            bounds.copy_at(clusters.data + c * 48 + 16, hi);
+            for (size_t i = placements.cluster_offsets[c]; i < placements.cluster_offsets[c + 1]; ++i) {
+                float distance = 0;
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const float value = float(instances.read_at<int16_t>(i * 16 + 2 * axis));
+                    const float position = std::max(-1.0f, value / 32767.0f) * placements.decode[0][axis] + placements.decode[1][axis];
+                    if (!std::isfinite(position) || !std::isfinite(lo[axis]) || !std::isfinite(hi[axis]) || lo[axis] > hi[axis])
+                        throw std::runtime_error("Invalid decorator cluster data: " + group.str());
+                    distance = std::max({distance, lo[axis] - position, position - hi[axis]});
+                }
+                max_outside = std::max(max_outside, distance);
+                outside += distance > 0.03f;
+            }
+        }
+        std::println("{} model {} stream {} | {} instances, {} part ranges, {} clusters | {} origins outside bounds by >3 cm (max {:.3f} m)",
+            group.str(), placements.model.str(), placements.instances.data_tag.str(), placements.part_offsets.back(),
+            placements.part_offsets.size() - 1, clusters.count, outside, max_outside);
+    }
+    std::println("{} decorator groups", groups.size());
+    return 0;
+}
+
 int cmd_dynamic(PackageManager& pm, TagHash tag) {
     pm.build_hash64_index();
     DynamicModel m = load_dynamic_model(pm, tag);
@@ -2849,6 +2903,7 @@ int main(int argc, char** argv) {
         if (cmd == "nodes" && args.size() >= 2)
             return cmd_nodes(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "refs64" && args.size() >= 2) return cmd_refs64(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "decorators" && args.size() >= 2) return cmd_decorators(pm, TagHash(parse_hex(args[1])));
         if (cmd == "find" && args.size() >= 2) return cmd_find(pm, parse_hex(args[1]));
         if (cmd == "lookup" && args.size() >= 2) return cmd_lookup(pm, {args.begin() + 1, args.end()});
         if (cmd == "h64") return cmd_h64(pm, {args.begin() + 1, args.end()});
