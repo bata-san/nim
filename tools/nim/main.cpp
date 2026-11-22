@@ -2124,8 +2124,12 @@ public:
                         for (const auto fa : ai.gameplay->objectives[*sq.objective].firing_areas) areas.insert(fa);
                 g.wait_idle();
                 SunShadow walk_view;
-                for (const auto fa : areas) ai.sim->set_walk_grid(fa, build_walk_grid(g, scene, ai.gameplay->firing_areas[fa], walk_view));
+                for (const auto fa : areas)
+                    ai.sim->set_walk_grid(fa, build_walk_grid(g, scene, ai.gameplay->firing_areas[fa], walk_view, 0.25f,
+                                                              squad_spawn_points(*ai.gameplay, fa)));
+                add_ground_patches(g, scene, *ai.sim, walk_view);  // spawn and drop points the grids miss (3.72)
                 ai.actors.build(g, scene, layouts, std::move(p.characters), *ai.gameplay, *ai.sim, 4);
+                ai.actors.apply_radii(*ai.sim);
                 if (!p.ship.model.is_none()) ai.actors.build_dropships(g, scene, layouts, std::move(p.ship), 3);
                 for (const auto& n : ai.actors.notes()) ++map_add_failures["ai: " + n.substr(0, 110)];
                 info(ui::trf(ui::S::LogAiReady, ai.sim->agents().size(), ai.sim->drones().size(), ai.actors.slots(), p.seconds,

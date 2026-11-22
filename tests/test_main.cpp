@@ -466,6 +466,28 @@ int main() {
         const auto e = run(false, {5, 6, 0}, 5);
         CHECK(e[0].alert == nim::AiAlert::Alerted);
         CHECK(!nim::ai_estimates(nim::AiParams{}).empty());
+
+        // Walk grids (3.72): room to the nearest blocked cell, paths that follow the floor up
+        // steps of at most 0.45 m, and bodies kept apart by their radii.
+        nim::WalkGrid wg;
+        wg.x0 = 0, wg.y0 = 0, wg.cell = 0.25f, wg.w = wg.h = 40;
+        wg.height.assign(1600, 0.0f);
+        std::vector<uint8_t> free(1600, 1);
+        free[20 * 40 + 20] = 0;
+        wg.set_free(free);
+        CHECK(std::abs(wg.room[20 * 40 + 21] - 0.125f) < 1e-4f && std::abs(wg.room[20 * 40 + 24] - 0.875f) < 1e-4f);
+        CHECK(!wg.walkable(5.3f, 5.1f, 0.3f) && wg.walkable(6.2f, 5.1f, 0.5f) && !wg.walkable(6.2f, 5.1f, 0.9f));
+        nim::AiSimulation ws(g, nim::AiParams{}, 7);
+        auto stepped = wg;
+        for (uint32_t r = 0; r < 40; ++r)
+            for (uint32_t c = 30; c < 40; ++c) stepped.height[r * 40 + c] = 1.0f;  // a 1 m ledge from x = 7.5
+        ws.set_walk_grid(0, stepped);
+        CHECK(ws.path_clear({2, 2, 0}, {7, 2, 0}, 0.3f) && !ws.path_clear({2, 2, 0}, {9, 2, 1}, 0.3f));
+        CHECK(ws.ground(8, 2, 0.8f) == 1.0f && ws.ground(8, 2, -1.0f) == std::nullopt);
+        ws.set_character_radius(0, 0.6f);
+        for (int i = 0; i < 20; ++i) ws.step(0.1f, {1000, 0, 0});
+        const auto& sa = ws.agents();
+        CHECK(std::hypot(sa[0].position[0] - sa[1].position[0], sa[0].position[1] - sa[1].position[1]) > 1.1f);
     }
 
     if (g_failures) return 1;

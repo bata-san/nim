@@ -56,15 +56,20 @@ MotionChoice select_motion(const MotionSet& set, std::array<float, 2> local_velo
 
 // ---- walkable floor -----------------------------------------------------------------------------
 // Which cells of a firing area's floor are open (no prop or wall up to head height), from a
-// top-down depth render of the map's own geometry (render/ai_actors.hpp build_walk_grid).
+// top-down depth render of the map's own geometry (render/ai_actors.hpp build_walk_grid), or of
+// the ground around a spawn point (build_ground_patch).
 struct WalkGrid {
     float x0 = 0, y0 = 0, cell = 0.25f;  // world xy of cell (0, 0)'s corner, cell size (m)
     uint32_t w = 0, h = 0;
-    std::vector<uint8_t> open;           // w x h, row-major from y0
+    std::vector<uint8_t> open;           // w x h, row-major from y0: room >= 0.3 m
+    std::vector<float> room;             // w x h: m from the cell to the nearest blocked cell (0: blocked)
     std::vector<float> height;           // w x h top surface z (NaN: none drawn), for grounding
-    bool walkable(float x, float y) const;
+    float floor_offset = 0;              // the floor's height above the firing area's polygon (m)
+    // Sets room and open from the cells a body may stand in (w x h, before any clearance).
+    void set_free(const std::vector<uint8_t>& free);
+    bool walkable(float x, float y, float radius = 0.3f) const;
     std::optional<float> surface(float x, float y) const;
-    bool clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const;  // the straight segment
+    bool clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius = 0.3f) const;  // the straight segment
     size_t open_count() const;
 };
 
@@ -171,12 +176,29 @@ public:
     const WalkGrid* walk_grid(size_t firing_area) const { return has_walk_grid(firing_area) ? &grids_[firing_area] : nullptr; }
     bool has_walk_grid(size_t firing_area) const { return firing_area < grids_.size() && grids_[firing_area].w != 0; }
     float time() const { return time_; }
-    // The top surface under (x, y) nearest `z` (within 1.5 m) from the walk grids, if any.
+    // The top surface under (x, y) nearest `z` (within 1.5 m) from the walk grids and ground
+    // patches, if any.
     std::optional<float> ground(float x, float y, float z) const;
+    // Ground around points not on the firing-area grids' open floor (spawn points, dropship drop
+    // points): the caller renders a patch for each (build_ground_patch) and adds it. `from_above`:
+    // the floor is whatever lies below (a dropship's drop point), not near the point's height.
+    struct GroundNeed { std::array<float, 3> at; bool from_above = false; };
+    std::vector<GroundNeed> uncovered() const;
+    void add_ground_patch(WalkGrid patch);
+    size_t ground_patches() const { return patches_.size(); }
+    // A body's clearance from walls (m), per MapGameplay::characters (default 0.3).
+    void set_character_radius(size_t character, float radius);
+    float radius(const AiAgent& agent) const;
+    // Open floor at (x, y) near height z for a body of `radius`, on any grid or patch.
+    bool open_at(float x, float y, float z, float radius) const;
+    // The most room (m to a wall or prop) at (x, y) near height z over the grids and patches (0: none).
+    float room_at(float x, float y, float z) const;
+    // A straight walk from a to b following the floor (steps up to 0.45 m) over open cells.
+    bool path_clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const;
 
 private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
-    std::array<float, 3> sample_objective(size_t squad, const std::array<float, 3>& from);
+    std::array<float, 3> sample_objective(size_t squad, const std::array<float, 3>& from, float radius);
     std::array<float, 3> sample_area(size_t firing_area);
     void separate();
     std::array<float, 3> nearest_objective_point(size_t squad, const std::array<float, 3>& to) const;
@@ -189,6 +211,8 @@ private:
     std::vector<MotionSet> motions_;
     std::vector<Area> areas_;                     // MapGameplay::firing_areas
     std::vector<WalkGrid> grids_;                 // per firing area, empty = no grid
+    std::vector<WalkGrid> patches_;               // ground around uncovered spawn / drop points
+    std::vector<float> radius_;                   // per MapGameplay::characters
     std::vector<std::vector<size_t>> squad_areas_;  // per squad: firing areas of its objective
     std::vector<AiAgent> agents_;
     std::vector<AiDrone> drones_;

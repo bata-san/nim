@@ -267,18 +267,35 @@ void AiActors::build(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::ve
     std::vector<size_t> agents(characters_.size());
     for (const auto& a : sim.agents())
         if (a.character < by_character_.size() && by_character_[a.character]) ++agents[*by_character_[a.character]];
+    radius_.assign(characters_.size(), 0);
     for (size_t c = 0; c < characters_.size(); ++c) {
         const size_t n = std::min(per_character, agents[c]);
         for (size_t k = 0; k < n; ++k) {
             try {
                 const uint32_t actor = scene.add_actor(gpu, *characters_[c].mesh, layouts);
                 slots_.push_back({c, actor, std::nullopt, {}});
+                if (k) continue;
+                // The feet's reach in the idle pose (the points within 0.3 m of the lowest).
+                AiAgent idle;
+                ActorAnimator anim;
+                const auto points = scene.actor_points(actor, actor_poses(characters_[c], idle, anim, 0), 2);
+                if (points.empty()) continue;
+                const float lowest = std::ranges::min(points, {}, &V3::z).z;
+                float reach = 0;
+                for (const auto& p : points)
+                    if (p.z < lowest + 0.3f) reach = std::max(reach, std::hypot(p.x, p.y));
+                radius_[c] = std::clamp(reach + 0.1f, 0.3f, 0.9f);
             } catch (const std::exception& e) {
                 notes_.push_back(std::format("{}: {}", characters_[c].entity.str(), e.what()));
                 break;
             }
         }
     }
+}
+
+void AiActors::apply_radii(AiSimulation& sim) const {
+    for (size_t i = 0; i < by_character_.size(); ++i)
+        if (by_character_[i] && radius_[*by_character_[i]] > 0) sim.set_character_radius(i, radius_[*by_character_[i]]);
 }
 
 void AiActors::build_dropships(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
@@ -373,6 +390,7 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         wanted[s.character].erase(wanted[s.character].begin());
     }
     shown_ = 0;
+    checks_.clear();
     for (auto& s : slots_) {
         if (!s.agent) {
             scene.set_actor(s.actor, std::nullopt);
@@ -385,14 +403,40 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
             continue;
         }
         // Grounding (推定, in place of the engine's foot IK, not in game data): the lowest point
-        // of the posed mesh is put on the floor surface under the agent, eased at 12/s.
+        // of the posed mesh is put on the floor surface under the agent, and no point of the feet
+        // (within 0.15 m of the lowest) goes below the surface under that point (a step or slope
+        // up to 0.5 m above the floor under the agent), eased at 12/s.
         auto rows = actor_rows(a);
-        if (const auto lowest = scene.actor_lowest(s.actor, poses)) {
+        const auto points = scene.actor_points(s.actor, poses, 4);
+        if (!points.empty()) {
+            const float lowest = std::ranges::min(points, {}, &V3::z).z;
             // Leaving a dropship: the path's own height (falling from the ship, then the floor).
             const float floor = a.exit >= 0 ? a.position[2] : sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
-            const float target = floor - *lowest - a.position[2];
+            float target = floor - lowest - a.position[2];
+            if (a.exit < 0)
+                for (const auto& p : points) {
+                    if (p.z > lowest + 0.15f) continue;
+                    const float x = rows[0] * p.x + rows[1] * p.y + rows[3], y = rows[4] * p.x + rows[5] * p.y + rows[7];
+                    if (const auto top = sim.ground(x, y, floor); top && *top > floor && *top <= floor + 0.5f)
+                        target = std::max(target, *top - p.z - a.position[2]);
+                }
             s.lift = std::isnan(s.lift) || dt <= 0 ? target : s.lift + (target - s.lift) * std::min(1.0f, dt * 12);
             rows[11] += s.lift;
+            if (checking_) {
+                GroundCheck g{*s.agent, floor, 0, 0, sim.ground(a.position[0], a.position[1], a.position[2]).has_value()};
+                size_t body = 0, inside = 0;
+                for (const auto& p : scene.actor_points(s.actor, poses, 2)) {
+                    const float x = rows[0] * p.x + rows[1] * p.y + rows[3], y = rows[4] * p.x + rows[5] * p.y + rows[7], z = p.z + rows[11];
+                    const auto top = sim.ground(x, y, floor);
+                    if (z < floor + 0.5f && top) g.sink = std::max(g.sink, *top - z);
+                    if (z > floor + 0.3f && z < floor + 2) {
+                        ++body;
+                        inside += top && *top > z + 0.1f;
+                    }
+                }
+                g.inside = body ? float(inside) / float(body) : 0;
+                checks_.push_back(g);
+            }
         }
         scene.set_actor(s.actor, rows, std::move(poses));
         ++shown_;
@@ -401,20 +445,13 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
 
 // ---- walkable floor -----------------------------------------------------------------------------
 
-WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& area, SunShadow& view, float cell) {
-    WalkGrid grid;
-    if (area.outline.size() < 3 || area.triangles.empty()) return grid;
-    float lo_x = 1e9f, lo_y = 1e9f, hi_x = -1e9f, hi_y = -1e9f, lo_z = 1e9f, hi_z = -1e9f;
-    for (const auto& v : area.outline) {
-        lo_x = std::min(lo_x, v[0]), hi_x = std::max(hi_x, v[0]);
-        lo_y = std::min(lo_y, v[1]), hi_y = std::max(hi_y, v[1]);
-        lo_z = std::min(lo_z, v[2]), hi_z = std::max(hi_z, v[2]);
-    }
-    const float cx = (lo_x + hi_x) / 2, cy = (lo_y + hi_y) / 2;
-    float half = std::max(hi_x - lo_x, hi_y - lo_y) / 2 + 0.5f;
-    const uint32_t size = std::clamp(uint32_t(std::ceil(2 * half / cell)), 16u, 1024u);
-    cell = 2 * half / float(size);
-    const float top = hi_z + 2.0f, range = top - (lo_z - 2.0f);
+namespace {
+
+// Top surface heights (NaN: nothing drawn) of a size x size grid of `cell` m centred on (cx, cy),
+// row-major from the smallest y, looking straight down from `top` over `range` m (the shadow
+// pass: opaque geometry with shadow parts, alpha tested as the game's shadow shaders do).
+std::vector<float> top_down_heights(Gpu& gpu, StaticMeshScene& scene, SunShadow& view, float cx, float cy, float half, uint32_t size,
+                                    float top, float range) {
     view.resize(gpu, size);
     // Straight down from `top`: x right = world x, y up = world y, reversed depth over `range`.
     auto& vm = view.vm;
@@ -449,10 +486,61 @@ WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& 
     scene.render_shadow(gpu, gpu.immediate(), view);
     const auto bytes = gpu.read_texture(view.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
     const float* depth = reinterpret_cast<const float*>(bytes.data());
+    std::vector<float> out(size_t(size) * size, std::numeric_limits<float>::quiet_NaN());
+    for (uint32_t r = 0; r < size; ++r)
+        for (uint32_t c = 0; c < size; ++c)
+            if (const float dv = depth[size_t(size - 1 - r) * size + c]; dv > 0)  // texture row 0 = largest y
+                out[size_t(r) * size + c] = top - (1 - dv) * range;
+    return out;
+}
 
+// Spreads `free` from its cells over 4-neighbours whose surface differs by at most `step` m and
+// that `allow` admits (推定: the step a body walks up).
+template <class Allow>
+void flood_floor(std::vector<uint8_t>& free, const std::vector<float>& height, uint32_t size, float step, Allow allow) {
+    std::vector<uint32_t> queue;
+    for (uint32_t i = 0; i < free.size(); ++i)
+        if (free[i]) queue.push_back(i);
+    for (size_t q = 0; q < queue.size(); ++q) {
+        const uint32_t i = queue[q], r = i / size, c = i % size;
+        const uint32_t next[4] = {c > 0 ? i - 1 : UINT32_MAX, c + 1 < size ? i + 1 : UINT32_MAX, r > 0 ? i - size : UINT32_MAX,
+                                  r + 1 < size ? i + size : UINT32_MAX};
+        for (const uint32_t j : next) {
+            if (j == UINT32_MAX || free[j] || std::isnan(height[j]) || std::abs(height[j] - height[i]) > step || !allow(j)) continue;
+            free[j] = 1;
+            queue.push_back(j);
+        }
+    }
+}
+
+} // namespace
+
+WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& area, SunShadow& view, float cell,
+                         std::span<const std::array<float, 3>> extra) {
+    WalkGrid grid;
+    if (area.outline.size() < 3 || area.triangles.empty()) return grid;
+    float lo_x = 1e9f, lo_y = 1e9f, hi_x = -1e9f, hi_y = -1e9f, lo_z = 1e9f, hi_z = -1e9f;
+    for (const auto& v : area.outline) {
+        lo_x = std::min(lo_x, v[0]), hi_x = std::max(hi_x, v[0]);
+        lo_y = std::min(lo_y, v[1]), hi_y = std::max(hi_y, v[1]);
+        lo_z = std::min(lo_z, v[2]), hi_z = std::max(hi_z, v[2]);
+    }
+    // Spawn points of the squads using the area, at its height and within 40 m: their ground too.
+    const float area_lo_x = lo_x, area_hi_x = hi_x, area_lo_y = lo_y, area_hi_y = hi_y;
+    for (const auto& p : extra)
+        if (p[2] > lo_z - 1.5f && p[2] < hi_z + 1.5f && p[0] > area_lo_x - 40 && p[0] < area_hi_x + 40 && p[1] > area_lo_y - 40 && p[1] < area_hi_y + 40) {
+            lo_x = std::min(lo_x, p[0] - 2), hi_x = std::max(hi_x, p[0] + 2);
+            lo_y = std::min(lo_y, p[1] - 2), hi_y = std::max(hi_y, p[1] + 2);
+        }
+    const float cx = (lo_x + hi_x) / 2, cy = (lo_y + hi_y) / 2;
+    float half = std::max(hi_x - lo_x, hi_y - lo_y) / 2 + 0.5f;
+    const uint32_t size = std::clamp(uint32_t(std::ceil(2 * half / cell)), 16u, 1024u);
+    cell = 2 * half / float(size);
+    const float top = hi_z + 2.0f, range = top - (lo_z - 2.0f);
     grid.x0 = cx - half, grid.y0 = cy - half, grid.cell = cell, grid.w = grid.h = size;
-    std::vector<uint8_t> open(size_t(size) * size, 0);
-    grid.height.assign(size_t(size) * size, std::numeric_limits<float>::quiet_NaN());
+    grid.height = top_down_heights(gpu, scene, view, cx, cy, half, size, top, range);
+    std::vector<uint8_t> free(size_t(size) * size, 0), inside(size_t(size) * size, 0);
+    std::vector<float> polygon(size_t(size) * size, std::numeric_limits<float>::quiet_NaN());
     for (uint32_t r = 0; r < size; ++r) {
         const float y = grid.y0 + (float(r) + 0.5f) * cell;
         for (uint32_t c = 0; c < size; ++c) {
@@ -471,28 +559,78 @@ WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& 
                 break;
             }
             if (!floor) continue;
-            const float dv = depth[size_t(size - 1 - r) * size + c];  // texture row 0 = largest y
-            if (dv <= 0) continue;                                      // no surface: not floor
-            const float surface = top - (1 - dv) * range;
-            grid.height[size_t(r) * size + c] = surface;
-            open[size_t(r) * size + c] = surface > *floor - 0.35f && surface < *floor + 0.45f;
+            const size_t i = size_t(r) * size + c;
+            inside[i] = 1;
+            polygon[i] = *floor;
         }
     }
-    // Clearance for a body (0.3 m).
-    const int reach = std::max(1, int(std::ceil(0.3f / cell)));
-    grid.open.assign(open.size(), 0);
-    for (int r = 0; r < int(size); ++r)
-        for (int c = 0; c < int(size); ++c) {
-            bool ok = open[size_t(r) * size + size_t(c)] != 0;
-            for (int dr = -reach; ok && dr <= reach; ++dr)
-                for (int dc = -reach; ok && dc <= reach; ++dc) {
-                    if (dr * dr + dc * dc > reach * reach) continue;
-                    const int rr = r + dr, cc = c + dc;
-                    ok = rr >= 0 && cc >= 0 && rr < int(size) && cc < int(size) && open[size_t(rr) * size + size_t(cc)];
-                }
-            grid.open[size_t(r) * size + size_t(c)] = ok;
-        }
+    // The floor's height over the polygon: some areas' polygons lie on the floor, others about
+    // 0.95 m below it (Outpost). The most common surface offset from the polygon within -0.5..2 m
+    // (0.1 m bins, smoothed over neighbours) is the floor; open floor is within -0.35..+0.45 m of it.
+    std::array<uint32_t, 25> bins{};
+    for (size_t i = 0; i < polygon.size(); ++i)
+        if (inside[i] && !std::isnan(grid.height[i]))
+            if (const float d = grid.height[i] - polygon[i]; d >= -0.5f && d < 2.0f) ++bins[size_t((d + 0.5f) * 10)];
+    size_t mode = 5;  // offset 0
+    uint32_t best = 0;
+    for (size_t b = 0; b < bins.size(); ++b) {
+        const uint32_t v = bins[b] * 2 + (b ? bins[b - 1] : 0) + (b + 1 < bins.size() ? bins[b + 1] : 0);
+        if (v > best) best = v, mode = b;
+    }
+    const float offset = best ? float(mode) / 10 - 0.5f + 0.05f : 0.0f;
+    grid.floor_offset = offset;
+    // A floor well above the polygon: look again from 2 m above that floor (props up to head height).
+    if (offset > 0.2f) grid.height = top_down_heights(gpu, scene, view, cx, cy, half, size, top + offset, range + offset);
+    for (size_t i = 0; i < polygon.size(); ++i)
+        if (inside[i] && !std::isnan(grid.height[i]))
+            free[i] = grid.height[i] > polygon[i] + offset - 0.35f && grid.height[i] < polygon[i] + offset + 0.45f;
+    lo_z += offset, hi_z += offset;
+    // Outside the polygon: the floor that continues from its open floor (steps up to 0.3 m), at
+    // the area's height (to reach spawn points next to it).
+    flood_floor(free, grid.height, size, 0.3f, [&](uint32_t j) { return !inside[j] && grid.height[j] > lo_z - 1.5f && grid.height[j] < hi_z + 1.0f; });
+    grid.set_free(free);
     return grid;
+}
+
+WalkGrid build_ground_patch(Gpu& gpu, StaticMeshScene& scene, const std::array<float, 3>& at, bool from_above, SunShadow& view, float half,
+                            float cell) {
+    WalkGrid grid;
+    const uint32_t size = std::clamp(uint32_t(std::ceil(2 * half / cell)), 16u, 1024u);
+    cell = 2 * half / float(size);
+    const float top = from_above ? at[2] - 0.5f : at[2] + 2.0f, range = from_above ? 80.0f : 8.0f;
+    grid.x0 = at[0] - half, grid.y0 = at[1] - half, grid.cell = cell, grid.w = grid.h = size;
+    grid.height = top_down_heights(gpu, scene, view, at[0], at[1], half, size, top, range);
+    // The floor the point stands on (from above: whatever is highest below it), nearest the centre
+    // within 1 m, and the floor that continues from it (steps up to 0.3 m).
+    std::vector<uint8_t> free(size_t(size) * size, 0);
+    const int centre = int(size / 2), reach = int(std::ceil(1.0f / cell));
+    std::optional<size_t> seed;
+    int best = INT32_MAX;
+    for (int dr = -reach; dr <= reach; ++dr)
+        for (int dc = -reach; dc <= reach; ++dc) {
+            const size_t i = size_t(centre + dr) * size + size_t(centre + dc);
+            const float h = grid.height[i];
+            if (std::isnan(h) || (!from_above && std::abs(h - at[2]) > 1.0f) || dr * dr + dc * dc >= best) continue;
+            best = dr * dr + dc * dc, seed = i;
+        }
+    if (seed) {
+        free[*seed] = 1;
+        flood_floor(free, grid.height, size, 0.3f, [](uint32_t) { return true; });
+    }
+    grid.set_free(free);
+    return grid;
+}
+
+void add_ground_patches(Gpu& gpu, StaticMeshScene& scene, AiSimulation& sim, SunShadow& view) {
+    for (const auto& need : sim.uncovered()) sim.add_ground_patch(build_ground_patch(gpu, scene, need.at, need.from_above, view));
+}
+
+std::vector<std::array<float, 3>> squad_spawn_points(const MapGameplay& gameplay, size_t firing_area) {
+    std::vector<std::array<float, 3>> out;
+    for (const auto& sq : gameplay.squads)
+        if (sq.objective && std::ranges::contains(gameplay.objectives[*sq.objective].firing_areas, firing_area))
+            for (const auto& p : sq.positions) out.push_back(p.position);
+    return out;
 }
 
 // ---- indicators --------------------------------------------------------------------------------

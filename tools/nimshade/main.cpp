@@ -194,6 +194,7 @@ int run(int argc, char** argv) {
     uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
+    bool ai_ground_audit = false;  // --ai-ground-audit: every drawable agent posed in turn, its sink and body overlap
     std::optional<size_t> ai_subject;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -246,6 +247,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-actors" && i + 1 < args.size()) ai_per_character = std::stoull(args[++i]);
         else if (args[i] == "--ai-strip" && i + 1 < args.size()) ai_strip = uint32_t(std::stoul(args[++i])), ai_frame = true;
         else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
+        else if (args[i] == "--ai-ground-audit") ai_ground_audit = true;
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
@@ -312,7 +314,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-dropship-strip N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-dropship-strip N] [--ai-ground-audit]");
         return 2;
     }
     if (install.empty()) {
@@ -582,23 +584,29 @@ int run(int argc, char** argv) {
                 const auto tw = std::chrono::steady_clock::now();
                 std::set<size_t> wanted;
                 for (const auto& a : ai_sim->agents())
-                    if (std::hypot(a.position[0] - eye.x, a.position[1] - eye.y) < ai_range + 30)
+                    if (ai_ground_audit || std::hypot(a.position[0] - eye.x, a.position[1] - eye.y) < ai_range + 30)
                         if (const auto ob = ai_gameplay->squads[a.squad].objective)
                             for (const auto fa : ai_gameplay->objectives[*ob].firing_areas) wanted.insert(fa);
                 SunShadow walk_view;
                 size_t open = 0, cells = 0;
                 for (const auto fa : wanted) {
-                    auto grid = build_walk_grid(gpu, scene, ai_gameplay->firing_areas[fa], walk_view);
+                    const auto spawns = squad_spawn_points(*ai_gameplay, fa);
+                    auto grid = build_walk_grid(gpu, scene, ai_gameplay->firing_areas[fa], walk_view, 0.25f, spawns);
                     open += grid.open_count(), cells += grid.open.size();
                     ai_sim->set_walk_grid(fa, std::move(grid));
                 }
-                std::println("ai walk grids: {} firing areas, {:.0f} m2 open in {:.1f}s", wanted.size(), double(open) * 0.0625,
-                             std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
+                // Ground around the spawn and drop points the grids miss (3.72).
+                add_ground_patches(gpu, scene, *ai_sim, walk_view);
+                std::println("ai walk grids: {} firing areas, {:.0f} m2 open, {} ground patches in {:.1f}s", wanted.size(), double(open) * 0.0625,
+                             ai_sim->ground_patches(), std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
             }
-            for (float t = 0; t < ai_time; t += 0.1f) ai_sim->step(0.1f, player);
             std::vector<bool> characters_drawable;
             for (const auto& c : characters) characters_drawable.push_back(c.mesh != nullptr);
             ai_actors.build(gpu, scene, layouts, std::move(characters), *ai_gameplay, *ai_sim, ai_per_character);
+            ai_actors.apply_radii(*ai_sim);
+            std::vector<std::array<float, 3>> ai_start;
+            for (const auto& a : ai_sim->agents()) ai_start.push_back(a.position);
+            for (float t = 0; t < ai_time; t += 0.1f) ai_sim->step(0.1f, player);
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
             for (const auto& sq : ai_gameplay->squads)
                 if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
@@ -651,6 +659,51 @@ int run(int argc, char** argv) {
                 }
             }
             for (const auto& n : ai_actors.notes()) std::println("  ai note: {}", n);
+            if (ai_ground_audit) {
+                // Each drawable agent nearest the camera in turn (the camera at its head).
+                ai_actors.set_ground_checks(true);
+                std::vector<AiActors::GroundCheck> all;
+                for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
+                    const auto& a = ai_sim->agents()[k];
+                    if (!a.active || a.character >= characters_drawable.size() || !characters_drawable[a.character]) continue;
+                    ai_actors.update(scene, *ai_sim, {a.position[0], a.position[1], a.position[2] + 1.0f}, 0.0f, ai_range);
+                    for (const auto& g : ai_actors.ground_checks())
+                        if (g.agent == k) all.push_back(g);
+                }
+                ai_actors.set_ground_checks(false);
+                size_t off_grid = 0, sink10 = 0, sink30 = 0, inside10 = 0;
+                for (const auto& g : all) off_grid += !g.on_grid, sink10 += g.sink > 0.1f, sink30 += g.sink > 0.3f, inside10 += g.inside > 0.1f;
+                std::println("ai ground audit: {} agents, {} off the walk grids, sink > 0.1 m {}, > 0.3 m {}, body > 10% under a surface {}", all.size(),
+                             off_grid, sink10, sink30, inside10);
+                {
+                    size_t moved = 0, active = 0;
+                    for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
+                        const auto& a = ai_sim->agents()[k];
+                        if (!a.active) continue;
+                        ++active;
+                        moved += std::hypot(a.position[0] - ai_start[k][0], a.position[1] - ai_start[k][1]) > 1.5f;
+                    }
+                    size_t overlapped = 0;
+                    for (size_t k = 0; k < ai_sim->agents().size(); ++k)
+                        for (size_t j = k + 1; j < ai_sim->agents().size(); ++j) {
+                            const auto &a = ai_sim->agents()[k], &b = ai_sim->agents()[j];
+                            overlapped += a.active && b.active && std::abs(a.position[2] - b.position[2]) < 1 &&
+                                          std::hypot(a.position[0] - b.position[0], a.position[1] - b.position[1]) < 0.5f * (ai_sim->radius(a) + ai_sim->radius(b));
+                        }
+                    std::println("  moved more than 1.5 m: {} of {} active; {} pairs closer than half their radii", moved, active, overlapped);
+                    std::map<std::string, float> radii;
+                    for (const auto& a : ai_sim->agents()) radii[ai_gameplay->characters[a.character].name_estimate] = ai_sim->radius(a);
+                    for (const auto& [name, r] : radii) std::println("  radius {} {:.2f} m", name, r);
+                }
+                std::ranges::sort(all, [](const auto& x, const auto& y) { return std::max(x.sink, x.inside) > std::max(y.sink, y.inside); });
+                for (size_t k = 0; k < std::min<size_t>(all.size(), 25); ++k) {
+                    const auto& g = all[k];
+                    const auto& a = ai_sim->agents()[g.agent];
+                    std::println("  agent {} {} at ({:.1f} {:.1f} {:.1f}) floor {:.2f} sink {:.2f} inside {:.2f}{}{}", g.agent,
+                                 ai_gameplay->characters[a.character].name_estimate, a.position[0], a.position[1], a.position[2], g.floor, g.sink,
+                                 g.inside, g.on_grid ? "" : " off-grid", a.motion.locomotion ? " moving" : "");
+                }
+            }
             // --ai-frame: look at the drawable agent nearest the given view from open floor in
             // front of it (a point inside one of its squad's firing areas), 4 m away, at eye height.
             if (ai_frame) {

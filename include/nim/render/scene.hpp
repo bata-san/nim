@@ -351,6 +351,8 @@ public:
     size_t actor_count() const { return actors_.size(); }
     // The lowest z of the actor's skinned vertices (every 4th) in object space under `poses`.
     std::optional<float> actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const;
+    // Every `stride`-th skinned vertex of the actor in object space under `poses`.
+    std::vector<V3> actor_points(uint32_t actor, const std::vector<ModelSkinPose>& poses, size_t stride = 4) const;
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }

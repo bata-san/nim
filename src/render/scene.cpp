@@ -3326,6 +3326,40 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     return id;
 }
 
+std::vector<V3> StaticMeshScene::actor_points(uint32_t actor, const std::vector<ModelSkinPose>& poses, size_t stride) const {
+    std::vector<V3> out;
+    for (const auto index : actors_.at(actor).sets) {
+        const auto& set = sets_[index];
+        if (set.skin.bones.empty() || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
+        const auto pose = std::ranges::find(poses, set.model, &ModelSkinPose::model);
+        if (pose == poses.end()) continue;
+        const auto& bones = pose->bones;
+        for (size_t i = 0; i < set.skin.bones.size(); i += std::max<size_t>(stride, 1)) {
+            const uint8_t* v = set.vb0_cpu.data() + i * 24;
+            const V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
+                       s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
+            V3 sum{0, 0, 0};
+            float total = 0;
+            for (int k = 0; k < 4; ++k) {
+                const float wk = set.skin.weights[i][k];
+                const uint16_t bk = set.skin.bones[i][k];
+                if (wk <= 0 || bk >= bones.size()) continue;
+                const auto& t = bones[bk];
+                const float x = t.rotation[0], y = t.rotation[1], z = t.rotation[2], w = t.rotation[3], s = t.scale;
+                const V3 r{(1 - 2 * (y * y + z * z)) * p.x + 2 * (x * y - z * w) * p.y + 2 * (x * z + y * w) * p.z,
+                           2 * (x * y + z * w) * p.x + (1 - 2 * (x * x + z * z)) * p.y + 2 * (y * z - x * w) * p.z,
+                           2 * (x * z - y * w) * p.x + 2 * (y * z + x * w) * p.y + (1 - 2 * (x * x + y * y)) * p.z};
+                sum.x += wk * (r.x * s + t.translation[0]);
+                sum.y += wk * (r.y * s + t.translation[1]);
+                sum.z += wk * (r.z * s + t.translation[2]);
+                total += wk;
+            }
+            if (total > 0) out.push_back(V3{sum.x / total, sum.y / total, sum.z / total});
+        }
+    }
+    return out;
+}
+
 std::optional<float> StaticMeshScene::actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const {
     // Every 4th vertex of the actor's skinned sets, posed as update_skin does (object space).
     std::optional<float> lowest;

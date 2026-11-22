@@ -28,11 +28,48 @@ float dist2d(const std::array<float, 3>& a, const std::array<float, 3>& b) { ret
 
 // ---- walkable floor --------------------------------------------------------------------------------
 
-bool WalkGrid::walkable(float x, float y) const {
+void WalkGrid::set_free(const std::vector<uint8_t>& free) {
+    // Nearest blocked cell by two-pass propagation of nearest-site coordinates over 8 neighbours.
+    const size_t n = size_t(w) * h;
+    std::vector<int32_t> sx(n, -1), sy(n, -1);
+    auto d2 = [](int32_t ax, int32_t ay, int32_t bx, int32_t by) { return int64_t(ax - bx) * (ax - bx) + int64_t(ay - by) * (ay - by); };
+    for (uint32_t r = 0; r < h; ++r)
+        for (uint32_t c = 0; c < w; ++c)
+            if (!free[size_t(r) * w + c]) sx[size_t(r) * w + c] = int32_t(c), sy[size_t(r) * w + c] = int32_t(r);
+    auto relax = [&](int32_t c, int32_t r, int32_t oc, int32_t orow) {
+        if (oc < 0 || orow < 0 || oc >= int32_t(w) || orow >= int32_t(h)) return;
+        const size_t i = size_t(r) * w + size_t(c), j = size_t(orow) * w + size_t(oc);
+        if (sx[j] < 0) return;
+        if (sx[i] < 0 || d2(c, r, sx[j], sy[j]) < d2(c, r, sx[i], sy[i])) sx[i] = sx[j], sy[i] = sy[j];
+    };
+    for (int32_t r = 0; r < int32_t(h); ++r) {
+        for (int32_t c = 0; c < int32_t(w); ++c) relax(c, r, c - 1, r - 1), relax(c, r, c, r - 1), relax(c, r, c + 1, r - 1), relax(c, r, c - 1, r);
+        for (int32_t c = int32_t(w) - 1; c >= 0; --c) relax(c, r, c + 1, r);
+    }
+    for (int32_t r = int32_t(h) - 1; r >= 0; --r) {
+        for (int32_t c = int32_t(w) - 1; c >= 0; --c) relax(c, r, c + 1, r + 1), relax(c, r, c, r + 1), relax(c, r, c - 1, r + 1), relax(c, r, c + 1, r);
+        for (int32_t c = 0; c < int32_t(w); ++c) relax(c, r, c - 1, r);
+    }
+    room.assign(n, 0);
+    open.assign(n, 0);
+    for (int32_t r = 0; r < int32_t(h); ++r)
+        for (int32_t c = 0; c < int32_t(w); ++c) {
+            const size_t i = size_t(r) * w + size_t(c);
+            if (!free[i]) continue;
+            // From the cell's centre to the nearest blocked cell's edge, or to the grid's edge.
+            float d = float(std::min({c, r, int32_t(w) - 1 - c, int32_t(h) - 1 - r}) + 1) * cell - 0.5f * cell;
+            if (sx[i] >= 0) d = std::min(d, std::sqrt(float(d2(c, r, sx[i], sy[i]))) * cell - 0.5f * cell);
+            room[i] = std::max(d, 0.0f);
+            open[i] = room[i] >= 0.3f;
+        }
+}
+
+bool WalkGrid::walkable(float x, float y, float radius) const {
     if (!w) return true;
     const float fx = (x - x0) / cell, fy = (y - y0) / cell;
     if (fx < 0 || fy < 0 || fx >= float(w) || fy >= float(h)) return false;
-    return open[size_t(fy) * w + size_t(fx)] != 0;
+    const size_t i = size_t(fy) * w + size_t(fx);
+    return room.size() == open.size() ? room[i] > 0 && room[i] >= radius : open[i] != 0;
 }
 
 std::optional<float> WalkGrid::surface(float x, float y) const {
@@ -46,20 +83,81 @@ std::optional<float> WalkGrid::surface(float x, float y) const {
 
 std::optional<float> AiSimulation::ground(float x, float y, float z) const {
     std::optional<float> best;
-    for (const auto& g : grids_) {
-        const auto s = g.surface(x, y);
-        if (s && std::abs(*s - z) < 1.5f && (!best || std::abs(*s - z) < std::abs(*best - z))) best = s;
-    }
+    for (const auto* list : {&grids_, &patches_})
+        for (const auto& g : *list) {
+            const auto s = g.surface(x, y);
+            if (s && std::abs(*s - z) < 1.5f && (!best || std::abs(*s - z) < std::abs(*best - z))) best = s;
+        }
     return best;
 }
 
-bool WalkGrid::clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const {
+bool AiSimulation::open_at(float x, float y, float z, float radius) const {
+    for (const auto* list : {&grids_, &patches_})
+        for (const auto& g : *list)
+            if (g.w && g.walkable(x, y, radius))
+                if (const auto s = g.surface(x, y); s && std::abs(*s - z) < 0.6f) return true;
+    return false;
+}
+
+// Follows the floor from a to b in 0.125 m steps: each step must land on an open cell (of any
+// grid or patch) at most 0.45 m above or below the last (推定 step height). The first metre may
+// pass cells narrower than the body (an agent spawned against a wall walks out).
+bool AiSimulation::path_clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const {
+    if (std::ranges::none_of(grids_, [](const WalkGrid& g) { return g.w != 0; }) && patches_.empty()) return true;
+    const float d = std::hypot(b[0] - a[0], b[1] - a[1]);
+    const int steps = std::max(1, int(d / 0.125f));
+    float z = a[2];
+    for (int i = 0; i <= steps; ++i) {
+        const float t = float(i) / float(steps);
+        const float x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t;
+        const float r = d * t < 1.0f ? 0.01f : radius;
+        std::optional<float> best;
+        for (const auto* list : {&grids_, &patches_})
+            for (const auto& g : *list) {
+                if (!g.w || !g.walkable(x, y, r)) continue;
+                const auto s = g.surface(x, y);
+                if (s && std::abs(*s - z) <= 0.45f && (!best || std::abs(*s - z) < std::abs(*best - z))) best = s;
+            }
+        if (!best) return false;
+        z = *best;
+    }
+    return std::abs(z - b[2]) < 0.8f;
+}
+
+std::vector<AiSimulation::GroundNeed> AiSimulation::uncovered() const {
+    std::vector<GroundNeed> out;
+    auto add = [&](const std::array<float, 3>& p, bool above) {
+        for (const auto& n : out)
+            if (n.from_above == above && std::hypot(n.at[0] - p[0], n.at[1] - p[1]) < 6 && std::abs(n.at[2] - p[2]) < 1.5f) return;
+        out.push_back({p, above});
+    };
+    for (const auto& a : agents_)
+        if (!a.dropship && !open_at(a.position[0], a.position[1], a.position[2], 0.01f)) add(a.position, false);
+    for (const auto& d : dropships_) {
+        const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+        add({d.position[0] - 6 * c, d.position[1] - 6 * s, d.position[2]}, true);  // behind the bay
+    }
+    return out;
+}
+
+void AiSimulation::add_ground_patch(WalkGrid patch) {
+    if (patch.w) patches_.push_back(std::move(patch));
+}
+
+void AiSimulation::set_character_radius(size_t character, float radius) {
+    if (radius_.size() <= character) radius_.resize(character + 1, 0.3f);
+    radius_[character] = radius;
+}
+
+float AiSimulation::radius(const AiAgent& a) const { return a.character < radius_.size() ? radius_[a.character] : 0.3f; }
+
+bool WalkGrid::clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const {
     if (!w) return true;
     const float d = std::hypot(b[0] - a[0], b[1] - a[1]);
     const int steps = std::max(1, int(d / (cell * 0.5f)));
     for (int i = 0; i <= steps; ++i) {
         const float t = float(i) / float(steps);
-        if (!walkable(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)) return false;
+        if (!walkable(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, radius)) return false;
     }
     return true;
 }
@@ -282,23 +380,17 @@ void AiSimulation::set_walk_grid(size_t firing_area, WalkGrid grid) {
 
 // A random open point of the squad's firing areas that a straight walk from `from` reaches
 // (tries a few; keeps the agent where it is when none does).
-std::array<float, 3> AiSimulation::sample_objective(size_t squad, const std::array<float, 3>& from) {
+std::array<float, 3> AiSimulation::sample_objective(size_t squad, const std::array<float, 3>& from, float radius) {
     const auto& list = squad_areas_[squad];
     if (list.empty()) return from;
     for (int attempt = 0; attempt < 24; ++attempt) {
         const size_t index = list[std::uniform_int_distribution<size_t>(0, list.size() - 1)(rng_)];
-        const auto p = sample_area(index);
+        auto p = sample_area(index);
         if (!has_walk_grid(index)) return p;
-        const auto& grid = grids_[index];
-        if (!grid.walkable(p[0], p[1])) continue;
-        // The path must stay on open floor of whichever area it crosses (the start's or the goal's).
-        bool ok = grid.clear(from, p);
-        if (!ok)
-            for (const auto other : list)
-                if (other != index && has_walk_grid(other) && grids_[other].walkable(from[0], from[1]) && grids_[other].walkable(p[0], p[1]) &&
-                    grids_[other].clear(from, p))
-                    ok = true;
-        if (ok) return p;
+        if (!grids_[index].walkable(p[0], p[1], radius)) continue;
+        if (const auto s = grids_[index].surface(p[0], p[1])) p[2] = *s;
+        // The path follows open floor of any grid or ground patch (out of a spawn point too).
+        if (path_clear(from, p, radius)) return p;
     }
     return from;
 }
@@ -349,33 +441,37 @@ void AiSimulation::perceive(const std::array<float, 3>& eye, float yaw, float ra
     else alert = awareness >= params_.suspicious_at ? AiAlert::Suspicious : AiAlert::Unaware;
 }
 
-// Bodies keep apart (推定: 0.9 m between centres; the engine's avoidance is not in game data):
-// overlapping agents (squad members spawned on one point, crossing paths) are pushed apart
-// evenly, onto open floor only.
+// Bodies keep apart (推定; the engine's avoidance is not in game data): agents closer than the
+// sum of their radii (the feet's reach, AiActors::apply_radii) are pushed apart evenly, onto open
+// floor only, and an agent closer to a wall or prop than its radius steps 0.05 m per step towards
+// more room (spawn points next to props).
 void AiSimulation::separate() {
-    constexpr float kGap = 0.9f;
+    constexpr float kCell = 1.8f;  // >= the largest radius sum
     std::unordered_map<int64_t, std::vector<size_t>> cells;
-    auto key = [](float x, float y) { return (int64_t(std::floor(x / kGap)) << 32) ^ int64_t(uint32_t(int32_t(std::floor(y / kGap)))); };
+    auto key = [](int64_t x, int64_t y) { return (x << 32) ^ int64_t(uint32_t(int32_t(y))); };
     for (size_t i = 0; i < agents_.size(); ++i)
-        if (agents_[i].active && agents_[i].exit < 0) cells[key(agents_[i].position[0], agents_[i].position[1])].push_back(i);
+        if (agents_[i].active && agents_[i].exit < 0)
+            cells[key(int64_t(std::floor(agents_[i].position[0] / kCell)), int64_t(std::floor(agents_[i].position[1] / kCell)))].push_back(i);
     std::vector<std::array<float, 2>> push(agents_.size(), {0, 0});
     for (size_t i = 0; i < agents_.size(); ++i) {
         const auto& a = agents_[i];
         if (!a.active || a.exit >= 0) continue;
-        const int64_t cx = int64_t(std::floor(a.position[0] / kGap)), cy = int64_t(std::floor(a.position[1] / kGap));
+        const int64_t cx = int64_t(std::floor(a.position[0] / kCell)), cy = int64_t(std::floor(a.position[1] / kCell));
         for (int64_t ox = -1; ox <= 1; ++ox)
             for (int64_t oy = -1; oy <= 1; ++oy) {
-                const auto it = cells.find(((cx + ox) << 32) ^ int64_t(uint32_t(int32_t(cy + oy))));
+                const auto it = cells.find(key(cx + ox, cy + oy));
                 if (it == cells.end()) continue;
                 for (const size_t j : it->second) {
                     if (j <= i) continue;
                     const auto& b = agents_[j];
                     if (std::abs(a.position[2] - b.position[2]) > 1.5f) continue;
+                    const float gap = radius(a) + radius(b);
                     float dx = b.position[0] - a.position[0], dy = b.position[1] - a.position[1];
-                    float d = std::hypot(dx, dy);
-                    if (d >= kGap) continue;
-                    if (d < 1e-4f) dx = std::cos(float(i) * 2.4f), dy = std::sin(float(i) * 2.4f), d = 1;
-                    const float s = 0.5f * (kGap - d) / d;
+                    const float d = std::hypot(dx, dy);
+                    if (d >= gap) continue;
+                    if (d < 1e-4f) dx = std::cos(float(i) * 2.4f), dy = std::sin(float(i) * 2.4f);
+                    else dx /= d, dy /= d;
+                    const float s = 0.5f * (gap - d);
                     push[i][0] -= dx * s, push[i][1] -= dy * s;
                     push[j][0] += dx * s, push[j][1] += dy * s;
                 }
@@ -383,18 +479,47 @@ void AiSimulation::separate() {
     }
     for (size_t i = 0; i < agents_.size(); ++i) {
         auto& a = agents_[i];
-        const float nx = a.position[0] + push[i][0], ny = a.position[1] + push[i][1];
-        bool open = true;
-        for (const auto fa : squad_areas_[a.squad])
-            if (fa < grids_.size() && grids_[fa].w) open = grids_[fa].walkable(nx, ny) || !grids_[fa].walkable(a.position[0], a.position[1]);
-        if (open) a.position[0] = nx, a.position[1] = ny;
+        if (!a.active || a.exit >= 0) continue;
+        const float r = radius(a);
+        if (push[i][0] != 0 || push[i][1] != 0) {
+            const float nx = a.position[0] + push[i][0], ny = a.position[1] + push[i][1];
+            // Onto floor with room for it or no less room than it has, onto any free floor while
+            // badly overlapped (members spawned on one point), anywhere off the grids.
+            const float now = room_at(a.position[0], a.position[1], a.position[2]), next = room_at(nx, ny, a.position[2]);
+            const bool overlapped = std::hypot(push[i][0], push[i][1]) > 0.25f * r;
+            if (now <= 0 || next >= r || (next > 0 && (overlapped || next >= now - 0.1f))) a.position[0] = nx, a.position[1] = ny;
+            continue;  // no step towards room while pushed (it would gather them again)
+        }
+        const float here = room_at(a.position[0], a.position[1], a.position[2]);
+        if (here <= 0 || here >= r) continue;  // off the grids, or clear
+        float best = here;
+        std::array<float, 2> to{};
+        for (int k = 0; k < 8; ++k) {
+            const float ang = float(k) * kPi / 4, x = a.position[0] + 0.05f * std::cos(ang), y = a.position[1] + 0.05f * std::sin(ang);
+            if (const float room = room_at(x, y, a.position[2]); room > best) best = room, to = {x, y};
+        }
+        if (best > here) a.position[0] = to[0], a.position[1] = to[1];
     }
+}
+
+float AiSimulation::room_at(float x, float y, float z) const {
+    float best = 0;
+    for (const auto* list : {&grids_, &patches_})
+        for (const auto& g : *list) {
+            if (!g.w || g.room.size() != g.open.size()) continue;
+            const float fx = (x - g.x0) / g.cell, fy = (y - g.y0) / g.cell;
+            if (fx < 0 || fy < 0 || fx >= float(g.w) || fy >= float(g.h)) continue;
+            const size_t i = size_t(fy) * g.w + size_t(fx);
+            if (!std::isnan(g.height[i]) && std::abs(g.height[i] - z) < 0.6f) best = std::max(best, g.room[i]);
+        }
+    return best;
 }
 
 float AiSimulation::floor_below(size_t squad, float x, float y, float z) const {
     std::optional<float> best;
-    for (const auto& g : grids_)
-        if (const auto s = g.surface(x, y); s && *s <= z + 0.2f && (!best || *s > *best)) best = s;
+    for (const auto* list : {&grids_, &patches_})
+        for (const auto& g : *list)
+            if (const auto s = g.surface(x, y); s && *s <= z + 0.2f && (!best || *s > *best)) best = s;
     if (best) return *best;
     // The squad's firing area nearest in plan whose floor is below.
     float nearest = 1e18f;
@@ -518,7 +643,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         } else if (!squad_areas_[a.squad].empty() && (a.character >= motions_.size() || !motions_[a.character].locomotion.empty())) {
             if (a.wait > 0) {
                 a.wait -= dt;
-                if (a.wait <= 0) a.goal = sample_objective(a.squad, a.position);
+                if (a.wait <= 0) a.goal = sample_objective(a.squad, a.position, radius(a));
             } else if (dist2d(a.position, a.goal) < 0.3f) {
                 a.wait = std::uniform_real_distribution<float>(params_.wait_min, params_.wait_max)(rng_);
             } else {
@@ -548,6 +673,8 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         } else {
             a.velocity = {};
         }
+        // On the floor under it (the surface nearest its height), where a grid or patch has one.
+        if (const auto s = ground(a.position[0], a.position[1], a.position[2])) a.position[2] = *s;
         // Motion: velocity in the object's frame (x forward, y left).
         const float c = std::cos(a.yaw), s = std::sin(a.yaw);
         const std::array<float, 2> local{a.velocity[0] * c + a.velocity[1] * s, -a.velocity[0] * s + a.velocity[1] * c};

@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -85,6 +86,15 @@ public:
                          ActorDropship ship, size_t slots);
     void clear() { slots_.clear(), characters_.clear(), by_character_.clear(), ship_slots_.clear(), ship_ = {}; }
     size_t ships_shown() const { return ships_shown_; }
+    // Each drawable character's clearance from walls: how far its feet reach from its centre in
+    // the idle pose (+0.1 m, 0.3 to 0.9 m), given to the simulation.
+    void apply_radii(AiSimulation& sim) const;
+    // Ground audit (nimshade --ai-ground-audit): per shown agent after each update, how far its
+    // posed mesh goes below the floor surface under each vertex (`sink`, m, vertices up to 0.5 m
+    // above the floor) and the share of its body (0.3-2 m) under the walk grid's top surface.
+    struct GroundCheck { size_t agent; float floor, sink, inside; bool on_grid; };
+    void set_ground_checks(bool on) { checking_ = on; }
+    const std::vector<GroundCheck>& ground_checks() const { return checks_; }
     size_t slots() const { return slots_.size(); }
     size_t shown() const { return shown_; }
     const std::vector<ActorCharacter>& characters() const { return characters_; }
@@ -100,19 +110,30 @@ private:
     };
     std::vector<ActorCharacter> characters_;
     std::vector<std::optional<size_t>> by_character_;  // MapGameplay::characters -> characters_
+    std::vector<float> radius_;                        // per characters_ (0: unknown)
     std::vector<Slot> slots_;
     std::vector<std::string> notes_;
     size_t shown_ = 0;
     ActorDropship ship_;
     std::vector<uint32_t> ship_slots_;  // scene actors
     size_t ships_shown_ = 0;
+    bool checking_ = false;
+    std::vector<GroundCheck> checks_;
     void update_dropships(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float range);
 };
 
 // Open floor of a firing area: the scene drawn straight down into `view` (resized as needed;
 // reused between calls) from 2 m above the floor, each cell open when the top surface there is
 // the floor itself, then eroded by 0.3 m. Actors must be hidden. Waits for the GPU.
-WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& area, SunShadow& view, float cell = 0.25f);
+WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& area, SunShadow& view, float cell = 0.25f,
+                         std::span<const std::array<float, 3>> extra = {});
+// The ground around a point no firing-area grid covers (a spawn point, a dropship's drop point;
+// AiSimulation::uncovered): heights and the floor connected to the point's own.
+WalkGrid build_ground_patch(Gpu& gpu, StaticMeshScene& scene, const std::array<float, 3>& at, bool from_above, SunShadow& view,
+                            float half = 8.0f, float cell = 0.25f);
+void add_ground_patches(Gpu& gpu, StaticMeshScene& scene, AiSimulation& sim, SunShadow& view);
+// The spawn points of the squads whose objective uses `firing_area` (build_walk_grid's `extra`).
+std::vector<std::array<float, 3>> squad_spawn_points(const MapGameplay& gameplay, size_t firing_area);
 
 // ---- indicators --------------------------------------------------------------------------------
 struct AiOverlayOptions {
