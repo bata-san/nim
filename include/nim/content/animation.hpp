@@ -124,8 +124,22 @@ std::vector<int32_t> assembly_pose_map(const Skeleton& source, const Skeleton& t
 enum class ClipCodec : uint8_t { Static, Sampled, Raw, Curve };
 const char* clip_codec_name(ClipCodec c);
 
+// A clip's event track (docs/PROGRESS.md 3.90): header +0x160 Vec of relative pointers to
+// polymorphic events {u32 class, u16 frame, u16 kind, u32 value, ...} (each pointer lands just
+// past the class field):
+//   8080AE32 kind 5: +0x0C u32 name, the key of the entity's 8080AE30 sound tables;
+//   8080AE33 kind 4: value = key of the entity's 8080B4D1 dialogue tables (vocal barks);
+//   8080AE3B kind 2: value = a foot / contact id (0x1E/0x1F, 0x0A/0x0B, ...: footplants, not decoded);
+//   8080AE34 kind 3: value = a condition hash (not decoded).
+struct ClipEvent {
+    uint32_t frame = 0;
+    uint16_t kind = 0;
+    uint32_t cls = 0, value = 0, name = 0;
+};
+
 struct AnimationClip {
     TagHash tag;
+    std::vector<ClipEvent> events;
     uint32_t name_hash = 0;
     uint32_t frame_count = 1;
     uint32_t bone_count = 0;

@@ -62,7 +62,7 @@ Voice::Voice(AudioEngine& engine, uint32_t sample_rate, uint16_t channels) : rat
     case 8: fmt.dwChannelMask = KSAUDIO_SPEAKER_7POINT1_SURROUND; break;
     default: fmt.dwChannelMask = 0; break;
     }
-    if (FAILED(engine.xaudio()->CreateSourceVoice(&voice_, &fmt.Format))) voice_ = nullptr;
+    if (FAILED(engine.xaudio()->CreateSourceVoice(&voice_, &fmt.Format, 0, 4.0f))) voice_ = nullptr;
 }
 
 Voice::~Voice() {
@@ -106,6 +106,39 @@ bool Voice::submit_looping(std::shared_ptr<const std::vector<int16_t>> samples) 
     if (SUCCEEDED(voice_->SubmitSourceBuffer(&b))) return true;
     buffers_.pop_back();
     return false;
+}
+
+bool Voice::submit_from(std::shared_ptr<const std::vector<int16_t>> samples, uint32_t begin, uint32_t repeats) {
+    if (!voice_ || !samples || samples->empty() || !channels_) return false;
+    const uint32_t frames = uint32_t(samples->size() / channels_);
+    if (!frames) return false;
+    begin = std::min(begin, frames - 1);
+    std::lock_guard lock(mutex_);
+    release_finished();
+    XAUDIO2_BUFFER b{};
+    b.AudioBytes = UINT32(size_t(frames) * channels_ * sizeof(int16_t));
+    b.pAudioData = reinterpret_cast<const BYTE*>(samples->data());
+    b.Flags = XAUDIO2_END_OF_STREAM;
+    b.PlayBegin = begin;
+    b.PlayLength = frames - begin;
+    if (repeats) {
+        b.LoopBegin = 0;  // may lie before PlayBegin: the first pass starts at the seek point
+        b.LoopLength = frames;
+        b.LoopCount = repeats == ~0u ? XAUDIO2_LOOP_INFINITE : std::min<uint32_t>(repeats, XAUDIO2_MAX_LOOP_COUNT);
+    }
+    buffers_.push_back(samples);
+    if (SUCCEEDED(voice_->SubmitSourceBuffer(&b))) return true;
+    if (begin) {  // without the seek
+        b.PlayBegin = 0;
+        b.PlayLength = frames;
+        if (SUCCEEDED(voice_->SubmitSourceBuffer(&b))) return true;
+    }
+    buffers_.pop_back();
+    return false;
+}
+
+void Voice::set_ratio(float r) {
+    if (voice_) voice_->SetFrequencyRatio(std::clamp(r, 1.0f / 1024, 4.0f));
 }
 
 void Voice::start() {
@@ -746,6 +779,313 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
         }
     }
     active_voices_ = playing;
+}
+
+// ---- Entity sounds (3.90) -------------------------------------------------------------------------
+EntityAudioPlayer::EntityAudioPlayer(AudioEngine& engine) : engine_(engine) {
+    worker_ = std::thread([this] { work(); });
+}
+
+EntityAudioPlayer::~EntityAudioPlayer() {
+    clear();
+    {
+        std::lock_guard lk(mutex_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void EntityAudioPlayer::set_package(PackageManager& pm) {
+    clear();
+    std::lock_guard lk(mutex_);
+    pm_ = pm.fork();
+    ++generation_;
+    events_.clear(), event_requested_.clear(), pcm_.clear(), pcm_requested_.clear(), pcm_order_.clear();
+    pcm_bytes_ = 0;
+}
+
+void EntityAudioPlayer::clear() {
+    playing_.clear();
+    pending_.clear();
+    where_.clear();
+    active_ = 0;
+    std::lock_guard lk(mutex_);
+    jobs_.clear();
+    // Requests still queued are dropped: let them be asked again.
+    std::erase_if(event_requested_, [&](const auto& kv) { return !kv.second && !events_.contains(kv.first); });
+    std::erase_if(pcm_requested_, [&](const auto& kv) { return !kv.second && !pcm_.contains(kv.first); });
+}
+
+size_t EntityAudioPlayer::events_loaded() const {
+    std::lock_guard lk(mutex_);
+    return events_.size();
+}
+
+void EntityAudioPlayer::work() {
+    PackageManager* indexed = nullptr;
+    std::unordered_map<uint32_t, TagHash> streams;  // every Wwise stream, for sources an event does not list
+    for (;;) {
+        Job job;
+        PackageManager* pm = nullptr;
+        uint64_t gen = 0;
+        {
+            std::unique_lock lk(mutex_);
+            cv_.wait(lk, [&] { return stop_ || !jobs_.empty(); });
+            if (stop_) return;
+            job = std::move(jobs_.front());
+            jobs_.pop_front();
+            pm = pm_.get();
+            gen = generation_;
+        }
+        if (!pm) continue;
+        if (!job.event.is_none()) {
+            std::shared_ptr<const Event> out;
+            try {
+                if (indexed != pm) streams = index_wwise_streams(*pm), indexed = pm;
+                auto data = std::make_shared<const WwiseEventData>(load_wwise_event(*pm, job.event, &streams));
+                auto e = std::make_shared<Event>();
+                e->stops = wwise_stop_targets(*data->bank, data->play_id);
+                e->data = std::move(data);
+                out = std::move(e);
+            } catch (...) {
+            }
+            std::lock_guard lk(mutex_);
+            if (gen != generation_) continue;
+            if (out) events_[job.event.value] = std::move(out);
+            else event_requested_[job.event.value] = true;
+        } else {
+            std::shared_ptr<const PcmAudio> out;
+            try {
+                const auto bytes = wwise_source_bytes(*pm, *job.source_event, job.source);
+                if (!bytes.empty()) {
+                    auto pcm = wwise_downmix(decode_wem(bytes));
+                    if (pcm.frames() && pcm.sample_rate) out = std::make_shared<const PcmAudio>(std::move(pcm));
+                }
+            } catch (...) {
+            }
+            std::lock_guard lk(mutex_);
+            if (gen != generation_) continue;
+            if (!out) {
+                pcm_requested_[job.source] = true;
+                continue;
+            }
+            pcm_bytes_ += out->samples.size() * sizeof(int16_t);
+            pcm_[job.source] = std::move(out);
+            pcm_order_.push_back(job.source);
+            // Keep the decoded cache under ~192 MB (voices hold what they play).
+            while (pcm_bytes_ > (size_t(192) << 20) && pcm_order_.size() > 1) {
+                const uint32_t old = pcm_order_.front();
+                pcm_order_.pop_front();
+                if (const auto it = pcm_.find(old); it != pcm_.end()) {
+                    pcm_bytes_ -= it->second->samples.size() * sizeof(int16_t);
+                    pcm_.erase(it);
+                }
+                pcm_requested_.erase(old);
+            }
+        }
+    }
+}
+
+std::shared_ptr<const EntityAudioPlayer::Event> EntityAudioPlayer::event(TagHash t) {
+    std::lock_guard lk(mutex_);
+    if (const auto it = events_.find(t.value); it != events_.end()) return it->second;
+    if (!pm_ || event_requested_.contains(t.value)) return nullptr;
+    event_requested_[t.value] = false;
+    jobs_.push_back({t, nullptr, 0});
+    cv_.notify_one();
+    return nullptr;
+}
+
+bool EntityAudioPlayer::event_failed(TagHash t) const {
+    std::lock_guard lk(mutex_);
+    const auto it = event_requested_.find(t.value);
+    return !pm_ || (it != event_requested_.end() && it->second);
+}
+
+std::shared_ptr<const PcmAudio> EntityAudioPlayer::pcm(const std::shared_ptr<const WwiseEventData>& ev, uint32_t source) {
+    std::lock_guard lk(mutex_);
+    if (const auto it = pcm_.find(source); it != pcm_.end()) return it->second;
+    if (!pm_ || pcm_requested_.contains(source)) return nullptr;
+    pcm_requested_[source] = false;
+    jobs_.push_back({TagHash(), ev, source});
+    cv_.notify_one();
+    return nullptr;
+}
+
+bool EntityAudioPlayer::pcm_failed(uint32_t source) const {
+    std::lock_guard lk(mutex_);
+    const auto it = pcm_requested_.find(source);
+    return !pm_ || (it != pcm_requested_.end() && it->second);
+}
+
+float EntityAudioPlayer::gain(const Playing& p) const {
+    float g = std::pow(10.0f, p.v.volume_db / 20.0f) * std::max(p.stop_gain, 0.0f);
+    const auto at = where_.find(p.emitter);
+    if (at == where_.end()) return g;
+    const auto& w = at->second;
+    const float dist = std::hypot(w[0] - eye_[0], w[1] - eye_[1], w[2] - eye_[2]);
+    const auto& att = p.event->bank->attenuations;
+    if (const auto a = att.find(p.v.attenuation); p.v.attenuation && a != att.end()) g *= a->second.gain(dist);
+    else if (p.event->max_distance > 0)  // no curve: linear to the tag's reach (推定)
+        g *= std::clamp(1.0f - dist / p.event->max_distance, 0.0f, 1.0f);
+    return g;
+}
+
+void EntityAudioPlayer::add_voices(uint64_t emitter, uint64_t group, const std::shared_ptr<const WwiseEventData>& ev,
+                                   std::vector<WwiseVoice> voices, int after) {
+    int offset = 0;
+    for (const auto& p : playing_)
+        if (p.group == group) offset = std::max(offset, p.index + 1);
+    for (size_t i = 0; i < voices.size(); ++i) {
+        Playing p;
+        p.emitter = emitter;
+        p.group = group;
+        p.index = offset + int(i);
+        p.event = ev;
+        p.v = voices[i];
+        if (p.v.after >= 0) p.v.after += offset;
+        else if (after >= 0) p.v.after = after, p.v.overlap = 0;
+        p.start_at = p.v.after < 0 ? clock_ + p.v.delay : -1;
+        // One-shots out of reach are not played (their attenuation is silent at the emitter).
+        const bool endless = p.v.loops == 0 || p.v.repeat;
+        if (!endless && p.v.after < 0 && gain(p) < 1e-4f) continue;
+        pcm(ev, p.v.source);  // start decoding now
+        playing_.push_back(std::move(p));
+    }
+}
+
+void EntityAudioPlayer::instantiate(const Cue& cue, const Event& ev, float age) {
+    const auto& d = ev.data;
+    // The play event's own stop actions: this emitter's voices under their targets fade out.
+    for (const auto target : ev.stops)
+        for (auto& p : playing_)
+            if (p.emitter == cue.emitter && wwise_is_under(*p.event->bank, p.v.sound, target)) p.stopping = true;
+    auto voices = wwise_play_event(*d->bank, d->play_id, state_);
+    // A one-shot that waited too long for its bank is dropped; loops still start.
+    if (age > 0.75f && std::ranges::none_of(voices, [](const WwiseVoice& v) { return v.loops == 0 || v.repeat; })) return;
+    add_voices(cue.emitter, next_group_++, d, std::move(voices), -1);
+}
+
+void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64_t> stopped,
+                               std::span<const std::pair<uint64_t, std::array<float, 3>>> emitters, std::array<float, 3> eye,
+                               std::array<float, 3> right, float dt, float master_volume, bool enabled) {
+    if (!engine_.ok()) return;
+    dt = std::max(dt, 0.0f);
+    eye_ = eye;
+    clock_ += dt;
+    for (const auto& [e, at] : emitters) where_[e] = at;
+    for (const uint64_t e : stopped) {
+        for (auto& p : playing_)
+            if (p.emitter == e) p.stopping = true;
+        std::erase_if(pending_, [&](const Pending& q) { return q.cue.emitter == e; });
+    }
+    for (const auto& c : cues) pending_.push_back({c, 0});
+    for (size_t k = 0; k < pending_.size();) {
+        if (const auto ev = event(pending_[k].cue.event)) {
+            const Pending done = pending_[k];
+            pending_.erase(pending_.begin() + ptrdiff_t(k));
+            instantiate(done.cue, *ev, done.age);
+            continue;
+        }
+        pending_[k].age += dt;
+        if (event_failed(pending_[k].cue.event) || pending_[k].age > 10) pending_.erase(pending_.begin() + ptrdiff_t(k));
+        else ++k;
+    }
+    // Starts, chains, endless containers' next rounds, ends.
+    struct Repeat {
+        uint64_t emitter, group;
+        std::shared_ptr<const WwiseEventData> ev;
+        uint32_t node;
+        int after;
+    };
+    std::vector<Repeat> repeats;
+    std::vector<bool> drop(playing_.size(), false);
+    for (size_t i = 0; i < playing_.size(); ++i) {
+        auto& p = playing_[i];
+        if (p.stopping) {
+            p.stop_gain -= std::max(dt, 1e-3f) / 0.25f;  // 0.25 s fade (推定)
+            if (!p.started || p.stop_gain <= 0) {
+                drop[i] = true;
+                continue;
+            }
+        }
+        if (!p.started) {
+            if (p.start_at < 0 && p.v.after >= 0) {
+                const auto prev = std::ranges::find_if(playing_, [&](const Playing& q) { return q.group == p.group && q.index == p.v.after; });
+                if (prev == playing_.end()) {
+                    drop[i] = true;
+                    continue;
+                }
+                if (prev->started && prev->end_at >= 0) p.start_at = std::max(prev->start_at, prev->end_at - p.v.overlap);
+            }
+            if (p.start_at < 0 || clock_ < p.start_at) continue;
+            if (!p.pcm) p.pcm = pcm(p.event, p.v.source);
+            if (!p.pcm) {
+                const bool endless = p.v.loops == 0 || p.v.repeat;
+                if (pcm_failed(p.v.source) || (!endless && clock_ - p.start_at > 0.5)) drop[i] = true;
+                continue;
+            }
+            const auto& a = *p.pcm;
+            auto voice = std::make_unique<Voice>(engine_, a.sample_rate, a.channels);
+            const auto samples = std::shared_ptr<const std::vector<int16_t>>(p.pcm, &p.pcm->samples);
+            const uint32_t frames = uint32_t(a.frames());
+            const uint32_t begin = std::min<uint32_t>(uint32_t(p.v.seek * float(frames)), frames ? frames - 1 : 0);
+            const uint32_t repeats_left = p.v.loops == 0 ? ~0u : p.v.loops - 1;
+            if (!voice->ok() || !voice->submit_from(samples, begin, repeats_left)) {
+                drop[i] = true;
+                continue;
+            }
+            const float ratio = std::pow(2.0f, p.v.pitch_cents / 1200.0f);
+            voice->set_ratio(ratio);
+            voice->set_volume(0);
+            voice->start();
+            p.voice = std::move(voice);
+            p.started = true;
+            p.start_at = clock_;
+            if (p.v.loops != 0)
+                p.end_at = clock_ + (double(frames - begin) + double(frames) * double(p.v.loops - 1)) / (double(a.sample_rate) * ratio);
+        } else {
+            if (p.v.repeat && !p.repeated && p.end_at >= 0 && clock_ >= p.end_at - 1.0) {
+                p.repeated = true;
+                repeats.push_back({p.emitter, p.group, p.event, p.v.repeat, p.index});
+            }
+            if (p.end_at >= 0 && clock_ > p.end_at + 0.05 && p.voice->queued() == 0) drop[i] = true;
+        }
+    }
+    for (size_t i = playing_.size(); i-- > 0;)
+        if (drop[i]) playing_.erase(playing_.begin() + ptrdiff_t(i));
+    for (auto& r : repeats) {
+        if (std::ranges::none_of(playing_, [&](const Playing& q) { return q.group == r.group && !q.stopping; })) continue;
+        add_voices(r.emitter, r.group, r.ev, wwise_play_node(*r.ev->bank, r.node, state_), r.after);
+    }
+    // Levels and pans. Over 32 sounding voices the quietest one-shots are cut.
+    const float master = enabled ? std::max(master_volume, 0.0f) : 0.0f;
+    std::vector<std::pair<float, size_t>> levels;
+    for (size_t i = 0; i < playing_.size(); ++i) {
+        auto& p = playing_[i];
+        if (!p.started) continue;
+        float g = master * gain(p);
+        if (p.v.fade_in > 0) g *= std::clamp(float(clock_ - p.start_at) / p.v.fade_in, 0.0f, 1.0f);
+        float pan = 0;
+        if (const auto at = where_.find(p.emitter); p.v.spatial && at != where_.end()) {
+            const float dx = at->second[0] - eye[0], dy = at->second[1] - eye[1], dz = at->second[2] - eye[2];
+            const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (len > 1e-3f) pan = (dx * right[0] + dy * right[1] + dz * right[2]) / len;
+        }
+        p.voice->set_volume(std::min(g, 4.0f));
+        p.voice->set_pan(pan, engine_.master_channels());
+        levels.push_back({(p.v.loops == 0 || p.v.repeat) ? 1e9f : g, i});
+    }
+    active_ = levels.size();
+    if (levels.size() > 32) {
+        std::ranges::sort(levels);
+        std::vector<size_t> cut;
+        for (size_t k = 0; k + 32 < levels.size(); ++k) cut.push_back(levels[k].second);
+        std::ranges::sort(cut, std::greater<>());
+        for (const size_t i : cut) playing_.erase(playing_.begin() + ptrdiff_t(i));
+        active_ = 32;
+    }
 }
 
 } // namespace nim::media

@@ -28,6 +28,7 @@
 #include "nim/render/particles.hpp"
 #include "nim/render/ai_actors.hpp"
 #include "nim/sim/ai.hpp"
+#include "nim/content/wwise.hpp"
 
 #include <wincodec.h>
 
@@ -199,6 +200,7 @@ int run(int argc, char** argv) {
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
     bool ai_ground_audit = false;  // --ai-ground-audit: every drawable agent posed in turn, its sink and body overlap
+    float ai_sound_log = 0;  // --ai-sound-log S: the nearest dropship called, S s of actor sounds listed (3.90)
     std::optional<size_t> ai_subject;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -254,6 +256,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-subject" && i + 1 < args.size()) ai_subject_name = args[++i];
         else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--ai-ground-audit") ai_ground_audit = true;
+        else if (args[i] == "--ai-sound-log" && i + 1 < args.size()) ai_sound_log = std::stof(args[++i]);
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--shield-fx" && i + 1 < args.size()) shield_entity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
@@ -323,7 +326,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -639,7 +642,10 @@ int run(int argc, char** argv) {
             for (const auto& sq : ai_gameplay->squads)
                 if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
                     p != sq.positions.end()) {
-                    auto ship = prepare_actor_dropship(pm, sources, p->model);
+                    auto ship = prepare_actor_dropship(pm, sources, p->model, dropship_entities(*ai_gameplay));
+                    for (const auto& sp : ship.spawners)
+                        std::println("ai dropship spawner {}: {} named sounds, {} loops; arrival {}, departure {}", sp.entity.str(),
+                                     sp.sounds ? sp.sounds->by_name.size() : 0, sp.sounds ? sp.sounds->loops.size() : 0, sp.arrival, sp.departure);
                     std::println("ai dropship {}: {} arrivals, {} departures{}{}", p->model.str(), ship.arrivals.size(), ship.departures.size(),
                                  ship.error.empty() ? "" : ", ", ship.error);
                     ai_actors.build_dropships(gpu, scene, layouts, std::move(ship), 3);
@@ -691,6 +697,42 @@ int run(int argc, char** argv) {
                 }
             }
             for (const auto& n : ai_actors.notes()) std::println("  ai note: {}", n);
+            if (ai_sound_log > 0) {
+                // The sounds the actors start (3.90): the nearest waiting dropship called, then S s.
+                std::optional<size_t> called;
+                float best = 1e30f;
+                for (size_t i = 0; i < ai_sim->dropships().size(); ++i) {
+                    const auto& d = ai_sim->dropships()[i];
+                    const float dist = std::hypot(d.position[0] - player[0], d.position[1] - player[1]);
+                    if (ai_sim->dropship_state(i).phase == AiDropshipPhase::Waiting && dist < best) best = dist, called = i;
+                }
+                if (called) ai_sim->call_dropship(*called), std::println("ai sound log: dropship {} called ({:.0f} m)", *called, best);
+                std::map<uint32_t, size_t> events;
+                size_t agent_sounds = 0, ship_sounds = 0, stopped = 0;
+                for (float t = 0; t < ai_sound_log; t += 0.1f) {
+                    ai_sim->step(0.1f, player);
+                    ai_actors.update(scene, *ai_sim, player, 0.1f, ai_range);
+                    for (const auto& snd : ai_actors.sounds()) {
+                        const bool ship = (snd.emitter >> 32) == 2;
+                        (ship ? ship_sounds : agent_sounds)++;
+                        if (events[snd.event.value]++ < 3)
+                            std::println("  {:6.1f}s {} {} {}", t, ship ? "ship " : "agent", uint32_t(snd.emitter), snd.event.str());
+                    }
+                    stopped += ai_actors.stopped_emitters().size();
+                }
+                size_t playable = 0;
+                for (const auto& [e, n] : events) {
+                    try {
+                        const auto ev = load_wwise_event(pm, TagHash(e));
+                        WwisePlayState st;
+                        playable += !wwise_play_event(*ev.bank, ev.play_id, st).empty();
+                    } catch (const std::exception&) {
+                    }
+                }
+                for (const auto& [e, n] : events) std::println("  event {:08X}: {}", e, n);
+                std::println("ai sound log: {} agent sounds, {} ship sounds, {} distinct events ({} with voices), {} emitters stopped",
+                             agent_sounds, ship_sounds, events.size(), playable, stopped);
+            }
             if (ai_ground_audit) {
                 // Each drawable agent nearest the camera in turn (the camera at its head).
                 ai_actors.set_ground_checks(true);

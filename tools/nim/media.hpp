@@ -6,13 +6,17 @@
 #include "nim/content/movies.hpp"
 #include "nim/content/mpeg1.hpp"
 #include "nim/content/hca.hpp"
+#include "nim/content/wwise.hpp"
 #include "nim/core/package_manager.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <span>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +55,9 @@ public:
     bool ok() const { return voice_ != nullptr; }
     bool submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream = false);
     bool submit_looping(std::shared_ptr<const std::vector<int16_t>> samples);
+    // From frame `begin` to the end, then the whole buffer `repeats` more times (~0u: endlessly).
+    bool submit_from(std::shared_ptr<const std::vector<int16_t>> samples, uint32_t begin, uint32_t repeats);
+    void set_ratio(float r);  // playback rate (pitch), up to 4
     void start();
     void pause();
     void set_volume(float v);
@@ -206,6 +213,92 @@ private:
     std::vector<std::pair<uint32_t, std::shared_ptr<const PcmAudio>>> decoded_;
     std::vector<uint32_t> failed_;
     bool stop_ = false;
+    std::thread worker_;
+};
+
+// Sounds started at moving emitters (docs/PROGRESS.md 3.90): the audio events AiActors cues
+// (clip events, component loops), played as their Wwise banks lay out (wwise_play_event: delays,
+// containers, loops, seeks, fades, pitch, volume, attenuation curves), panned and attenuated by
+// each emitter's distance from the camera. Banks load and .wem streams decode on a worker thread.
+class EntityAudioPlayer {
+public:
+    struct Cue {
+        TagHash event;
+        uint64_t emitter = 0;
+    };
+    explicit EntityAudioPlayer(AudioEngine& engine);
+    ~EntityAudioPlayer();
+    EntityAudioPlayer(const EntityAudioPlayer&) = delete;
+    EntityAudioPlayer& operator=(const EntityAudioPlayer&) = delete;
+
+    void set_package(PackageManager& pm);
+    void clear();  // stops everything
+    // `cues` start this frame, `stopped` emitters fade out, `emitters` are where each one is now.
+    void update(std::span<const Cue> cues, std::span<const uint64_t> stopped,
+                std::span<const std::pair<uint64_t, std::array<float, 3>>> emitters, std::array<float, 3> eye,
+                std::array<float, 3> right, float dt, float master_volume, bool enabled);
+    size_t active_voices() const { return active_; }
+    size_t events_loaded() const;
+
+private:
+    struct Event {
+        std::shared_ptr<const WwiseEventData> data;
+        std::vector<uint32_t> stops;  // the nodes its own stop actions name
+    };
+    struct Playing {
+        uint64_t emitter = 0;
+        uint64_t group = 0;  // one play of an event (chained voices share it)
+        int index = 0;       // in its group
+        std::shared_ptr<const WwiseEventData> event;
+        WwiseVoice v;
+        std::shared_ptr<const PcmAudio> pcm;
+        std::unique_ptr<Voice> voice;
+        double start_at = -1;  // clock time it starts (< 0: waiting on the voice it follows)
+        double end_at = -1;    // clock time it ends (< 0: endless or not started)
+        bool started = false, repeated = false, stopping = false;
+        float stop_gain = 1;
+    };
+    void work();
+    std::shared_ptr<const Event> event(TagHash t);           // nullptr while loading
+    bool event_failed(TagHash t) const;
+    bool pcm_failed(uint32_t source) const;
+    std::shared_ptr<const PcmAudio> pcm(const std::shared_ptr<const WwiseEventData>& ev, uint32_t source);
+    void instantiate(const Cue& cue, const Event& ev, float age);
+    void add_voices(uint64_t emitter, uint64_t group, const std::shared_ptr<const WwiseEventData>& ev,
+                    std::vector<WwiseVoice> voices, int after);
+    float gain(const Playing& p) const;  // without the master volume
+    std::array<float, 3> eye_{};
+
+    AudioEngine& engine_;
+    std::vector<Playing> playing_;
+    struct Pending {
+        Cue cue;
+        float age = 0;
+    };
+    std::vector<Pending> pending_;
+    std::unordered_map<uint64_t, std::array<float, 3>> where_;
+    WwisePlayState state_;
+    double clock_ = 0;
+    uint64_t next_group_ = 1;
+    size_t active_ = 0;
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::unique_ptr<PackageManager> pm_;
+    struct Job {
+        TagHash event;
+        std::shared_ptr<const WwiseEventData> source_event;
+        uint32_t source = 0;
+    };
+    std::deque<Job> jobs_;
+    std::unordered_map<uint32_t, std::shared_ptr<const Event>> events_;
+    std::unordered_map<uint32_t, bool> event_requested_;  // true: failed
+    std::unordered_map<uint32_t, std::shared_ptr<const PcmAudio>> pcm_;
+    std::unordered_map<uint32_t, bool> pcm_requested_;  // true: failed
+    std::deque<uint32_t> pcm_order_;
+    size_t pcm_bytes_ = 0;
+    bool stop_ = false;
+    uint64_t generation_ = 0;
     std::thread worker_;
 };
 

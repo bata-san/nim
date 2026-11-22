@@ -123,7 +123,8 @@ template <typename Map> void add_borrowed_clips(PackageManager& pm, const std::v
     }
 }
 
-ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
+namespace {
+ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
     ActorCharacter c;
     c.entity = motion.entity;
     c.motion = motion;
@@ -218,8 +219,29 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
     }
     return c;
 }
+}  // namespace
 
-ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sources, TagHash model) {
+ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
+    ActorCharacter c = prepare_character_model(pm, sources, motion);
+    if (c.binding) {
+        try {
+            c.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&c.entity, 1)));
+        } catch (const std::exception&) {
+        }
+    }
+    return c;
+}
+
+std::vector<TagHash> dropship_entities(const MapGameplay& gameplay) {
+    std::vector<TagHash> out;
+    for (const auto& sq : gameplay.squads)
+        for (const auto& p : sq.positions)
+            if (p.model.value == 0x80ACA5E7u && p.entity.value && std::ranges::find(out, p.entity) == out.end()) out.push_back(p.entity);
+    return out;
+}
+
+ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sources, TagHash model,
+                                     std::span<const TagHash> entities) {
     ActorDropship d;
     d.model = model;
     try {
@@ -249,12 +271,68 @@ ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sou
         }
         if (d.arrivals.empty() || d.departures.empty() || !d.open) throw std::runtime_error(std::format(
             "clips: {} arrivals, {} departures, {} open poses", d.arrivals.size(), d.departures.size(), d.open ? 1 : 0));
+        // Each spawner entity's sounds, and the clips whose events its table names.
+        auto best = [](const std::vector<AnimationClip>& clips, const EntitySounds& sounds) {
+            int pick = -1;
+            size_t most = 0;
+            for (size_t k = 0; k < clips.size(); ++k) {
+                size_t n = 0;
+                for (const auto& e : clips[k].events) n += sounds.find(e.kind, e.name, e.value) != nullptr;
+                if (n > most) most = n, pick = int(k);
+            }
+            return pick;
+        };
+        for (const auto entity : entities) {
+            ActorDropship::Spawner sp;
+            sp.entity = entity;
+            try {
+                sp.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&entity, 1)));
+                sp.arrival = best(d.arrivals, *sp.sounds);
+                sp.departure = best(d.departures, *sp.sounds);
+            } catch (const std::exception&) {
+            }
+            d.spawners.push_back(std::move(sp));
+        }
         d.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
         d.binding = std::make_shared<const PreviewAnimation>(std::move(*anim));
     } catch (const std::exception& e) {
         d.error = e.what();
     }
     return d;
+}
+
+namespace {
+// The frame `actor_poses` shows of clip `tag` at motion time `time`.
+float actor_clip_frame(const ActorCharacter& c, TagHash tag, float time) {
+    const auto* info = clip_by_tag(c.motion, tag);
+    const auto& clip = c.clips.at(tag);
+    const float t = info ? motion_clip_time(*info, time) : std::fmod(time, std::max(clip.frame_count, 1u) / kClipFps);
+    return std::min(t * kClipFps, float(std::max(clip.frame_count, 1u) - 1));
+}
+constexpr uint64_t kAgentEmitter = 1ull << 32, kShipEmitter = 2ull << 32;
+}  // namespace
+
+void AiActors::emit_clip_sounds(const EntitySounds& sounds, const AnimationClip& clip, float from, float to, bool wrapped,
+                                uint64_t emitter) {
+    // Events on frames in (from, to]; a wrapped loop also takes (from, end] and [0, to].
+    for (const auto& e : clip.events) {
+        const float f = float(e.frame);
+        const bool passed = wrapped ? (f > from || f <= to) : (f > from && f <= to);
+        if (!passed) continue;
+        const auto* list = sounds.find(e.kind, e.name, e.value);
+        if (!list) continue;
+        size_t pick = 0;
+        if (e.kind == 4 && list->size() > 1) {  // a bark: any of its lines
+            sound_rng_ ^= sound_rng_ << 13, sound_rng_ ^= sound_rng_ >> 17, sound_rng_ ^= sound_rng_ << 5;
+            pick = sound_rng_ % list->size();
+        }
+        sounds_.push_back({(*list)[pick], emitter});
+    }
+}
+
+void AiActors::emit_loops(const EntitySounds& sounds, uint64_t emitter) {
+    if (shown_emitters_.contains(emitter)) return;
+    for (const auto t : sounds.loops) sounds_.push_back({t, emitter});
 }
 
 std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& agent, ActorAnimator& anim, float dt) {
@@ -322,6 +400,15 @@ void AiActors::build(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::ve
     clear();
     notes_.clear();
     by_character_.assign(gameplay.characters.size(), std::nullopt);
+    // Each dropship's spawner entity (its first squad's node with the dropship model).
+    dropship_entity_.clear();
+    for (const auto& d : sim.dropships()) {
+        uint32_t entity = 0;
+        if (d.squad < gameplay.squads.size())
+            for (const auto& p : gameplay.squads[d.squad].positions)
+                if (p.model.value == 0x80ACA5E7u && !entity) entity = p.entity.value;
+        dropship_entity_.push_back(entity);
+    }
     // One drawable character per entity: characters (squad slots) sharing an entity share it.
     std::unordered_map<uint32_t, size_t> by_entity;
     for (size_t i = 0; i < characters.size() && i < gameplay.characters.size(); ++i) {
@@ -391,6 +478,7 @@ void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim,
     if (ship_slots_.empty()) return;
     if (range < 0) {  // hidden
         for (const auto slot : ship_slots_) scene.set_actor(slot, std::nullopt);
+        ship_frames_.clear();
         return;
     }
     // Ships in flight or unloading, nearest first (they fly in from up to ~270 m away).
@@ -410,24 +498,58 @@ void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim,
         }
         const auto& d = sim.dropships()[list[k].second];
         const auto state = sim.dropship_state(list[k].second);
+        // The spawner entity's clips and sounds when known (3.90), else the variant's.
+        const ActorDropship::Spawner* spawner = nullptr;
+        if (list[k].second < dropship_entity_.size())
+            for (const auto& sp : ship_.spawners)
+                if (sp.entity.value == dropship_entity_[list[k].second]) spawner = &sp;
         const AnimationClip* clip = &*ship_.open;
         float seconds = state.seconds;
-        if (state.phase == AiDropshipPhase::Arriving) clip = &ship_.arrivals[d.variant % ship_.arrivals.size()];
+        if (state.phase == AiDropshipPhase::Arriving)
+            clip = &ship_.arrivals[spawner && spawner->arrival >= 0 ? size_t(spawner->arrival) : d.variant % ship_.arrivals.size()];
         float last = float(std::max(clip->frame_count, 1u) - 1);
         if (state.phase == AiDropshipPhase::Departing) {
-            const size_t v = (d.variant / 7) % ship_.departures.size();
+            const size_t v = spawner && spawner->departure >= 0 ? size_t(spawner->departure) : (d.variant / 7) % ship_.departures.size();
             clip = &ship_.departures[v];
             last = float(ship_.departure_frames[v]);
         }
         const float frame = std::clamp(seconds * kClipFps, 0.0f, last);
         const float c = std::cos(d.yaw), s = std::sin(d.yaw);
         const std::array<float, 12> rows{c, -s, 0, d.position[0], s, c, 0, d.position[1], 0, 0, 1, d.position[2]};
-        scene.set_actor(ship_slots_[k], rows, ship_.binding->poses(*clip, frame));
+        auto poses = ship_.binding->poses(*clip, frame);
+        // Sounds (3.90): the clip's events passed since the last frame (from its start when the
+        // clip just began), the component loops when the ship appears, at the flying root node.
+        const size_t index = list[k].second;
+        const uint64_t emitter = kShipEmitter | index;
+        std::array<float, 3> at = d.position;
+        const auto& bones = poses.front().bones;
+        if (bones.size() > 1 && ship_.binding->skeleton.bind.size() > 1) {
+            const auto r = transform_rows(bones[1] * ship_.binding->skeleton.bind[1]);
+            at = {d.position[0] + c * r[3] - s * r[7], d.position[1] + s * r[3] + c * r[7], d.position[2] + r[11]};
+        }
+        emitters_.push_back({emitter, at});
+        now_shown_.insert(emitter);
+        if (spawner && spawner->sounds) {
+            const auto& sounds = *spawner->sounds;
+            emit_loops(sounds, emitter);
+            const auto prev = ship_frames_.find(index);
+            if (prev != ship_frames_.end() && prev->second.first == clip) {
+                if (frame > prev->second.second) emit_clip_sounds(sounds, *clip, prev->second.second, frame, false, emitter);
+            } else if (frame < 15) {
+                emit_clip_sounds(sounds, *clip, -1, frame, false, emitter);
+            }
+            ship_frames_[index] = {clip, frame};
+        }
+        scene.set_actor(ship_slots_[k], rows, std::move(poses));
         ++ships_shown_;
     }
 }
 
 void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range) {
+    sounds_.clear();
+    stopped_.clear();
+    emitters_.clear();
+    now_shown_.clear();
     update_dropships(scene, sim, eye, range);
     const auto& agents = sim.agents();
     // Per character: its agents within range, nearest first.
@@ -471,6 +593,27 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         if (poses.empty()) {
             scene.set_actor(s.actor, std::nullopt);
             continue;
+        }
+        // Sounds (3.90): the clip events passed since the last frame, the component loops when
+        // the agent appears, at the agent (1 m up).
+        {
+            const auto& ch = characters_[s.character];
+            const uint64_t emitter = kAgentEmitter | *s.agent;
+            emitters_.push_back({emitter, {a.position[0], a.position[1], a.position[2] + 1}});
+            now_shown_.insert(emitter);
+            if (ch.sounds && dt > 0 && ch.clips.contains(s.anim.clip)) {
+                emit_loops(*ch.sounds, emitter);
+                const float frame = actor_clip_frame(ch, s.anim.clip, a.motion_time);
+                if (s.cue_agent == s.agent && s.cue_clip == s.anim.clip && s.cue_frame >= 0) {
+                    if (frame != s.cue_frame)
+                        emit_clip_sounds(*ch.sounds, ch.clips.at(s.anim.clip), s.cue_frame, frame, frame < s.cue_frame, emitter);
+                } else if (s.cue_agent == s.agent && frame < 10) {
+                    emit_clip_sounds(*ch.sounds, ch.clips.at(s.anim.clip), -1, frame, false, emitter);
+                }
+                s.cue_agent = s.agent;
+                s.cue_clip = s.anim.clip;
+                s.cue_frame = frame;
+            }
         }
         // Grounding (推定, in place of the engine's foot IK, not in game data): the lowest point
         // of the posed mesh is put on the floor surface under the agent, and no point of the feet
@@ -517,6 +660,9 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         scene.set_actor(s.actor, rows, std::move(poses));
         ++shown_;
     }
+    for (const auto e : shown_emitters_)
+        if (!now_shown_.contains(e)) stopped_.push_back(e);
+    shown_emitters_ = now_shown_;
 }
 
 // ---- walkable floor -----------------------------------------------------------------------------

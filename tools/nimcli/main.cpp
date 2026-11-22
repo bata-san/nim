@@ -29,6 +29,11 @@
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
 //   nimcli [--install DIR] components [CLASS]           component tags by resource class (or those holding CLASS)
+//   nimcli [--install DIR] tag-audio TAG [DEPTH]        audio events a tag names (through its references)
+//   nimcli [--install DIR] entity-sounds ENTITY...       sounds the entities' animations trigger (clip-event tables)
+//   nimcli [--install DIR] wwise-audit [LIMIT]          every audio event's Wwise bank through nim's reader
+//   nimcli [--install DIR] wwise-event EVENT [PLAYS]    an audio event's bank objects and the voices of a few plays
+//   nimcli [--install DIR] event-wav EVENT OUT.wav [S]  render one play of an audio event (no attenuation)
 //   nimcli [--install DIR] entity-fx ENTITY             an entity's components and the particle systems they name
 //   nimcli [--install DIR] entity-components ENTITY [-v]  an entity's component tags, their classes and referenced tag classes
 //   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
@@ -45,6 +50,8 @@
 //                                                       (also reports how many of those also hold string hashes)
 #include "nim/content/animation.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/content/wwise.hpp"
+#include "nim/content/entity_audio.hpp"
 #include "nim/content/codex.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/hca.hpp"
@@ -3069,6 +3076,227 @@ const char* kStageNames[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 // Tags of class `cls` (type 8) whose bytes hold `tag` at a 4-byte aligned offset.
 // entity-fx ENTITY: the entity's (8080BAAD) components and the particle systems each one names,
 // with the system's lifetime and rate (the map FX path, load_map_particles, reads the same).
+// The Wwise events (8080B128) a tag names, directly (u32 tag) or by 64-bit hash, searched
+// through the tags it references up to `depth` levels (entity -> components -> their data).
+// Every audio event's bank through the Wwise reader (docs/PROGRESS.md 3.90): load failures, and
+// voices whose source is neither a listed stream nor embedded in the bank.
+int cmd_wwise_audit(PackageManager& pm, size_t limit) {
+    size_t events = 0, failed = 0, voices = 0, missing = 0, embedded = 0, silent = 0;
+    std::map<std::string, size_t> why;
+    std::map<uint16_t, size_t> action_types;
+    WwisePlayState state;
+    const auto all_streams = index_wwise_streams(pm);
+    std::println("{} streams in the install", all_streams.size());
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != kClassAudioEvent) continue;
+            if (limit && events >= limit) break;
+            ++events;
+            const TagHash tag = TagHash::make(info.pkg_id, uint16_t(i));
+            try {
+                const auto ev = load_wwise_event(pm, tag, &all_streams);
+                for (const auto& [id, list] : ev.bank->events)
+                    for (auto a : list)
+                        if (const auto it = ev.bank->actions.find(a); it != ev.bank->actions.end()) ++action_types[it->second.type];
+                const auto vs = wwise_play_event(*ev.bank, ev.play_id, state);
+                silent += vs.empty();
+                for (const auto& v : vs) {
+                    ++voices;
+                    if (ev.streams.contains(v.source)) continue;
+                    if (ev.bank->media.contains(v.source)) ++embedded;
+                    else ++missing;
+                }
+            } catch (const std::exception& ex) {
+                if (failed++ < 12) std::println("  {}: {}", tag.str(), ex.what());
+                std::string w = ex.what();
+                if (const auto c = w.find(": "); c != std::string::npos) w = w.substr(c + 2);
+                ++why[w.substr(0, 60)];
+            }
+        }
+    }
+    std::println("{} events, {} failed; {} voices on first play: {} embedded in the bank, {} without media; {} events start nothing",
+                 events, failed, voices, embedded, missing, silent);
+    for (const auto& [w, n] : why) std::println("  {:>6}  {}", n, w);
+    for (const auto& [t, n] : action_types) std::println("  action {:04X} x{}", t, n);
+    return failed ? 1 : 0;
+}
+
+void print_wwise_voices(const WwiseEventData& ev, const std::vector<WwiseVoice>& vs) {
+    for (const auto& v : vs) {
+        const auto s = ev.streams.find(v.source);
+        const auto at = ev.bank->attenuations.find(v.attenuation);
+        const WwiseAttenuation* att = v.attenuation && at != ev.bank->attenuations.end() ? &at->second : nullptr;
+        const std::string media = s != ev.streams.end() ? s->second.str() : ev.bank->media.contains(v.source) ? "embedded" : "missing";
+        std::println("    sound {:08X} source {:08X} ({}) stream {} delay {:.3f}s vol {:+.1f} dB pitch {:+.0f} c loops {} fade {:.2f}s seek {:.2f}{}{}{}",
+                     v.sound, v.source, media, v.stream_type, v.delay, v.volume_db, v.pitch_cents, v.loops, v.fade_in, v.seek,
+                     v.spatial ? " 3D" : " 2D",
+                     att ? std::format(" att {:08X} max {:.0f} m (gain at 10 m {:.2f}, 30 m {:.2f})", v.attenuation, att->max_distance(),
+                                       att->gain(10), att->gain(30))
+                         : std::string(),
+                     v.after >= 0 ? std::format(" after #{} overlap {:.2f}s", v.after, v.overlap) : std::string());
+    }
+}
+
+// An audio event's bank: its objects and the voices of a few plays.
+int cmd_wwise_event(PackageManager& pm, TagHash tag, int plays) {
+    const auto ev = load_wwise_event(pm, tag);
+    const auto& b = *ev.bank;
+    std::println("{}: bank {:08X} v{}, play {:08X} stop {:08X}, max distance {:.0f} m, longest {:.2f} s, {} streams, {} nodes, "
+                 "{} actions, {} events, {} attenuations, {} embedded, {} other objects",
+                 tag.str(), b.id, b.version, ev.play_id, ev.stop_id, ev.max_distance, ev.longest, ev.streams.size(), b.nodes.size(),
+                 b.actions.size(), b.events.size(), b.attenuations.size(), b.media.size(), b.other_objects);
+    for (const auto& [id, list] : b.events) {
+        std::println("  event {:08X}{}", id, id == ev.play_id ? " (play)" : id == ev.stop_id ? " (stop)" : "");
+        for (auto a : list)
+            if (const auto it = b.actions.find(a); it != b.actions.end())
+                std::println("    action {:08X} type {:04X} target {:08X} delay {} ms transition {} ms", a, it->second.type,
+                             it->second.target, int32_t(it->second.props.u(wwise_prop::DelayTime)),
+                             int32_t(it->second.props.u(wwise_prop::TransitionTime)));
+    }
+    static const char* names[] = {"?", "?", "sound", "?", "?", "ranseq", "switch", "mixer", "?", "layer"};
+    for (const auto& [id, n] : b.nodes) {
+        std::string extra;
+        if (n.type == 5)
+            extra = std::format(" mode {} random {} loop {} continuous {} avoid {} transition {} {:.0f} ms", n.mode, n.random_mode,
+                                n.loop_count, n.continuous, n.avoid_repeat, n.transition_mode, n.transition_ms);
+        if (n.type == 2)
+            extra = std::format(" source {:08X} stream {} loop {}", n.source, n.stream_type,
+                                n.props.has(wwise_prop::Loop) ? int(n.props.u(wwise_prop::Loop)) : 1);
+        std::println("  {} {:08X} parent {:08X} children {} vol {:+.1f} pitch {:+.0f}{}", names[n.type < 10 ? n.type : 0], id, n.parent,
+                     n.children.size(), n.props.f(wwise_prop::Volume), n.props.f(wwise_prop::Pitch), extra);
+    }
+    WwisePlayState state;
+    for (int k = 0; k < plays; ++k) {
+        std::println("  play {}:", k + 1);
+        print_wwise_voices(ev, wwise_play_event(b, ev.play_id, state));
+    }
+    if (ev.stop_id)
+        for (auto t : wwise_stop_targets(b, ev.stop_id)) std::println("  stop event stops {:08X}", t);
+    return 0;
+}
+
+// Renders one play of an audio event to a WAV (no distance attenuation; loops play `seconds`).
+int cmd_event_wav(PackageManager& pm, TagHash tag, const char* out, float seconds) {
+    const auto ev = load_wwise_event(pm, tag);
+    WwisePlayState state;
+    const auto vs = wwise_play_event(*ev.bank, ev.play_id, state);
+    print_wwise_voices(ev, vs);
+    constexpr uint32_t rate = 48000;
+    std::vector<float> mix(size_t(seconds * rate) * 2, 0.0f);
+    std::vector<double> ends(vs.size(), 0);
+    for (size_t i = 0; i < vs.size(); ++i) {
+        const auto& v = vs[i];
+        const auto bytes = wwise_source_bytes(pm, ev, v.source);
+        if (bytes.empty()) continue;
+        const auto pcm = wwise_downmix(decode_wem(bytes));
+        if (!pcm.frames()) continue;
+        double start = v.delay;
+        if (v.after >= 0 && size_t(v.after) < i) start = std::max(start, ends[size_t(v.after)] - v.overlap);
+        const double ratio = std::pow(2.0, v.pitch_cents / 1200.0) * pcm.sample_rate / rate;
+        const float gain = std::pow(10.0f, v.volume_db / 20.0f);
+        const double begin = v.seek * double(pcm.frames());
+        double src = begin;
+        const double total = v.loops == 0 ? 1e18 : double(v.loops) * double(pcm.frames());
+        size_t o = size_t(start * rate);
+        for (; o < mix.size() / 2 && src - begin < total; ++o) {
+            const size_t f = size_t(src) % pcm.frames();
+            const float fade = v.fade_in > 0 ? std::min(1.0f, float(double(o) / rate - start) / v.fade_in) : 1.0f;
+            for (int c = 0; c < 2; ++c)
+                mix[o * 2 + c] += gain * fade * float(pcm.samples[f * pcm.channels + std::min<int>(c, pcm.channels - 1)]) / 32768.0f;
+            src += ratio;
+        }
+        ends[i] = double(o) / rate;
+    }
+    PcmAudio pcm;
+    pcm.sample_rate = rate;
+    pcm.channels = 2;
+    pcm.samples.resize(mix.size());
+    float peak = 0;
+    for (size_t k = 0; k < mix.size(); ++k) {
+        peak = std::max(peak, std::fabs(mix[k]));
+        pcm.samples[k] = int16_t(std::clamp(mix[k], -1.0f, 1.0f) * 32767);
+    }
+    std::println("{} voices, peak {:.3f}", vs.size(), peak);
+    return write_wav(out, pcm) ? 0 : 1;
+}
+
+// The sounds an entity's animations trigger: its clip-event sound tables and dialogue tables.
+int cmd_entity_sounds(PackageManager& pm, std::span<const TagHash> entities) {
+    pm.build_hash64_index();
+    const auto s = load_entity_sounds(pm, entities);
+    std::println("{} sound tables, {} dialogue tables, {} names, {} bark keys", s.tables, s.dialogue_tables, s.by_name.size(), s.barks.size());
+    std::vector<std::pair<uint32_t, const std::vector<TagHash>*>> names, barks;
+    for (const auto& [k, v] : s.by_name) names.push_back({k, &v});
+    for (const auto& [k, v] : s.barks) barks.push_back({k, &v});
+    std::ranges::sort(names);
+    std::ranges::sort(barks);
+    for (const auto& [k, v] : names) {
+        std::string list;
+        for (auto t : *v) list += " " + t.str();
+        std::println("  name {:08X}:{}", k, list);
+    }
+    for (const auto& [k, v] : barks) std::println("  bark {:08X}: {} events (first {})", k, v->size(), v->empty() ? "-" : v->front().str());
+    for (auto t : s.loops) std::println("  loop {}", t.str());
+    return 0;
+}
+
+int cmd_tag_audio(PackageManager& pm, TagHash root, int depth) {
+    pm.build_hash64_index();
+    std::set<uint32_t> seen;
+    std::function<void(TagHash, int, const std::string&)> walk = [&](TagHash t, int level, const std::string& path) {
+        if (!seen.insert(t.value).second) return;
+        std::vector<uint8_t> d;
+        try { d = pm.read(t); } catch (...) { return; }
+        auto report = [&](size_t o, TagHash ev, const char* how) {
+            size_t wems = 0;
+            uint32_t id = 0;
+            double shortest = 1e9, longest = 0;
+            try {
+                const auto eb = pm.read(ev);
+                TagReader er(eb);
+                id = er.u32_at(0x08);
+                const auto v = er.vec_at(0x20);
+                wems = size_t(v.count);
+                for (size_t k = 0; k < wems; ++k) {
+                    const auto wb = pm.read(er.tag_at(v.data + k * 4));
+                    if (const auto info = probe_wem(wb); info && info->sample_rate) {
+                        const double sec = double(info->sample_count) / info->sample_rate;
+                        shortest = std::min(shortest, sec), longest = std::max(longest, sec);
+                    }
+                }
+            } catch (...) {}
+            std::println("{} +0x{:X} event {} ({}) id {:08X} streams {} {:.2f}-{:.2f}s", path, o, ev.str(), how, id, wems,
+                         wems ? shortest : 0.0, longest);
+        };
+        std::vector<TagHash> children;
+        for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+            uint32_t v;
+            std::memcpy(&v, d.data() + o, 4);
+            if (v >= 0x80800000u && v != ~0u) {
+                if (const Entry* e = pm.entry(TagHash(v)); e && e->type == 8) {
+                    if (e->reference == kClassAudioEvent) report(o, TagHash(v), "tag");
+                    else children.push_back(TagHash(v));
+                }
+            }
+            if (o % 8 == 0 && o + 8 <= d.size()) {
+                uint64_t w;
+                std::memcpy(&w, d.data() + o, 8);
+                if (w && w != ~0ull && (w >> 32)) {
+                    if (const auto ev = pm.resolve64(w)) {
+                        if (const Entry* e = pm.entry(*ev); e && e->type == 8 && e->reference == kClassAudioEvent) report(o, *ev, "hash64");
+                    }
+                }
+            }
+        }
+        if (level < depth)
+            for (const auto c : children) walk(c, level + 1, path + "/" + c.str());
+    };
+    walk(root, 0, root.str());
+    return 0;
+}
+
 int cmd_entity_fx(PackageManager& pm, TagHash entity) {
     const auto ed = pm.read(entity);
     std::set<uint32_t> listed;
@@ -3612,6 +3840,18 @@ int main(int argc, char** argv) {
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
         if (cmd == "codex-art") return cmd_codex_art(pm);
         if (cmd == "codex-audit") return cmd_codex_audit(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
+        if (cmd == "wwise-audit") return cmd_wwise_audit(pm, args.size() >= 2 ? std::stoul(args[1]) : 0);
+        if (cmd == "wwise-event" && args.size() >= 2)
+            return cmd_wwise_event(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 3);
+        if (cmd == "event-wav" && args.size() >= 3)
+            return cmd_event_wav(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stof(args[3]) : 10.0f);
+        if (cmd == "entity-sounds" && args.size() >= 2) {
+            std::vector<TagHash> list;
+            for (size_t k = 1; k < args.size(); ++k) list.push_back(TagHash(parse_hex(args[k])));
+            return cmd_entity_sounds(pm, list);
+        }
+        if (cmd == "tag-audio" && args.size() >= 2)
+            return cmd_tag_audio(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 2);
         if (cmd == "entity-fx" && args.size() >= 2) return cmd_entity_fx(pm, TagHash(parse_hex(args[1])));
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);

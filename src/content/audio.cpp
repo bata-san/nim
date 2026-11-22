@@ -621,7 +621,7 @@ PcmAudio decode_vorbis(std::span<const uint8_t> bytes, size_t fmt, size_t fmt_si
     const uint32_t setup_offset = le32(vorb + 0x10), audio_offset = le32(vorb + 0x14);
     const size_t bs0 = size_t(1) << vorb[0x28], bs1 = size_t(1) << vorb[0x29];
     if (bs0 < 64 || bs1 < bs0 || bs1 > 8192) fail("bad block sizes");
-    if (channels == 0 || channels > 8) fail("bad channel count");
+    if (channels == 0 || channels > 32) fail("bad channel count");  // up to 16: ambisonic beds
 
     auto packet_at = [&](size_t off) -> std::optional<Packet> {
         if (off + 2 > data_size) return std::nullopt;

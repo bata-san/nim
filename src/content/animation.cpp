@@ -960,6 +960,23 @@ AnimationClip load_animation_clip(PackageManager& pm, TagHash tag) {
     } else if (acls != 0) {
         throw std::runtime_error(std::format("{}: unknown track block {:08X}", tag.str(), acls));
     }
+    try {
+        const auto events = r.vec_at(0x160);
+        for (uint64_t k = 0; k < events.count && k < 4096; ++k) {
+            // The pointer lands just past the event's class field.
+            const size_t body = r.pointer_at(events.data + k * 8);
+            if (body < 4 || body + 12 > bytes.size()) continue;
+            ClipEvent e;
+            e.cls = r.u32_at(body - 4);
+            e.frame = r.u16_at(body);
+            e.kind = r.u16_at(body + 2);
+            e.value = r.u32_at(body + 4);
+            e.name = r.u32_at(body + 8);
+            clip.events.push_back(e);
+        }
+    } catch (const std::exception&) {
+        clip.events.clear();
+    }
     return clip;
 }
 

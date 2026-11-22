@@ -1633,6 +1633,13 @@ public:
     std::unique_ptr<media::AmbientAudioPlayer> ambient_audio;
     bool ambient_audio_enabled = true;
     float ambient_audio_volume = 0.75f;
+    // Sounds of the AI actors and dropships (3.90): cues gathered by update_ai, played each frame.
+    std::unique_ptr<media::EntityAudioPlayer> entity_audio;
+    bool entity_audio_enabled = true;
+    float entity_audio_volume = 0.75f;
+    std::vector<media::EntityAudioPlayer::Cue> entity_cues;
+    std::vector<uint64_t> entity_stopped;
+    std::vector<std::pair<uint64_t, std::array<float, 3>>> entity_emitters;
     struct AudioRequest {
         uint64_t id = 0;
         std::future<std::shared_ptr<const PcmAudio>> result;
@@ -2109,13 +2116,10 @@ public:
                 out.motions.push_back(build_motion_set(pm, ch.entity, kClipFps));
                 out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back()));
             }
-            // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
-            for (const auto& sq : out.gameplay->squads)
-                if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
-                    p != sq.positions.end()) {
-                    out.ship = prepare_actor_dropship(pm, sources, p->model);
-                    break;
-                }
+            // The UESC dropship (3.71): the model of the dropship squads' spawner nodes; its sounds
+            // (3.90) from every such node's entity.
+            if (const auto ships = dropship_entities(*out.gameplay); !ships.empty())
+                out.ship = prepare_actor_dropship(pm, sources, TagHash(0x80ACA5E7u), ships);
         } catch (const std::exception& ex) {
             out.error = ex.what();
         }
@@ -2125,6 +2129,8 @@ public:
     void reset_ai() {
         if (ai.pending.valid()) ai_discarded.push_back(std::move(ai.pending));
         ai.actors.clear();  // the scene's actors go with the scene (begin / release)
+        if (entity_audio) entity_audio->clear();
+        entity_cues.clear(), entity_stopped.clear(), entity_emitters.clear();
         ai.sim.reset();
         ai.gameplay.reset();
         ai.activity = TagHash();
@@ -2171,6 +2177,10 @@ public:
                 ai.actors.build(g, scene, layouts, std::move(p.characters), *ai.gameplay, *ai.sim, 4);
                 ai.actors.apply_radii(*ai.sim);
                 if (!p.ship.model.is_none()) ai.actors.build_dropships(g, scene, layouts, std::move(p.ship), 3);
+                if (auto* eng = audio_engine()) {
+                    if (!entity_audio) entity_audio = std::make_unique<media::EntityAudioPlayer>(*eng);
+                    entity_audio->set_package(*pm);
+                }
                 for (const auto& n : ai.actors.notes()) ++map_add_failures["ai: " + n.substr(0, 110)];
                 info(ui::trf(ui::S::LogAiReady, ai.sim->agents().size(), ai.sim->drones().size(), ai.actors.slots(), p.seconds,
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()));
@@ -2187,12 +2197,19 @@ public:
         const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};
         if (!ai.enabled) {
             ai.actors.update(scene, *ai.sim, eye, 0, -1);  // hidden, simulation paused
+            take_actor_sounds();
             return;
         }
         const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
         ai.sim->set_player_invisible(!ai.visible);
         ai.sim->step(dt, eye);
         ai.actors.update(scene, *ai.sim, eye, dt, ai.range);
+        take_actor_sounds();
+    }
+    void take_actor_sounds() {
+        for (const auto& s : ai.actors.sounds()) entity_cues.push_back({s.event, s.emitter});
+        entity_stopped.insert(entity_stopped.end(), ai.actors.stopped_emitters().begin(), ai.actors.stopped_emitters().end());
+        entity_emitters = ai.actors.emitters();
     }
     void draw_ai_overlay(ImDrawList* dl, ImVec2 origin, ImVec2 size, float sc) {
         if (!ai.enabled || !ai.sim || !ai.gameplay || !map_scene) return;
@@ -2712,6 +2729,12 @@ public:
                                           light.frame_delta_time, ambient_audio_volume, ambient_audio_enabled);
                 else
                     ambient_audio->update({}, {}, light.frame_delta_time, 0.0f, false);
+            }
+            if (entity_audio) {
+                entity_audio->update(entity_cues, entity_stopped, entity_emitters, {vm.eye.x, vm.eye.y, vm.eye.z},
+                                     {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time, entity_audio_volume,
+                                     entity_audio_enabled && map_scene);
+                entity_cues.clear(), entity_stopped.clear();
             }
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
@@ -3581,6 +3604,15 @@ public:
                 ImGui::SliderFloat("環境音量", &ambient_audio_volume, 0.0f, 1.5f, "%.2f");
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("再生中: %zu ボイス / %zu 音源", ambient_audio->active_voices(), ambient_audio->emitter_count());
+            }
+            if (map_scene && entity_audio && ai.sim) {
+                ImGui::SeparatorText("敵・船の音");
+                ImGui::Checkbox("敵・船の音を再生", &entity_audio_enabled);
+                ImGui::SetItemTooltip("AI の兵士・メカ・降下船が鳴らす音 (アニメーションのイベントとコンポーネントのループ)");
+                ImGui::BeginDisabled(!entity_audio_enabled);
+                ImGui::SliderFloat("敵・船の音量", &entity_audio_volume, 0.0f, 1.5f, "%.2f");
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("再生中: %zu ボイス / %zu イベント読込済", entity_audio->active_voices(), entity_audio->events_loaded());
             }
             ImGui::SetItemTooltip(ui::tr(ui::S::ProbeFadeTip));
             {

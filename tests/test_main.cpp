@@ -7,6 +7,7 @@
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/content/weather.hpp"
+#include "nim/content/wwise.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/tag_hash.hpp"
 #include "nim/core/tag_reader.hpp"
@@ -591,6 +592,93 @@ int main() {
         glob.global = true;
         glob.position = {999, 999, 999};
         CHECK(glob.distance_to({0, 0, 0}) == 0.0f);
+    }
+
+    {
+        // A synthetic version 150 bank: event -> play action (250 ms delay) -> sequence container
+        // (pitch +100) -> sound (-6 dB, streamed source 0x5000).
+        std::vector<uint8_t> hirc;
+        auto put8 = [](std::vector<uint8_t>& v, uint8_t x) { v.push_back(x); };
+        auto put32 = [](std::vector<uint8_t>& v, uint32_t x) { for (int k = 0; k < 4; ++k) v.push_back(uint8_t(x >> (8 * k))); };
+        auto putf = [&](std::vector<uint8_t>& v, float f) { uint32_t x; std::memcpy(&x, &f, 4); put32(v, x); };
+        auto node_base = [&](std::vector<uint8_t>& v, uint32_t parent, uint8_t prop, float value) {
+            put8(v, 0), put8(v, 0), put8(v, 0), put8(v, 0);  // fx, metadata
+            put32(v, 0), put32(v, parent), put8(v, 0);       // bus, parent, bits
+            put8(v, 1), put8(v, prop), putf(v, value), put8(v, 0);  // props, no ranges
+            put8(v, 0);                                      // positioning
+            put8(v, 0), put32(v, 0);                         // aux, reflections bus
+            for (int k = 0; k < 6; ++k) put8(v, 0);          // advanced settings
+            put8(v, 0), put8(v, 0);                          // state chunk
+            put8(v, 0), put8(v, 0);                          // RTPCs
+        };
+        std::vector<std::pair<uint8_t, std::vector<uint8_t>>> objects;
+        std::vector<uint8_t> o;
+        put32(o, 0x100), put32(o, 0x00040001), put8(o, 2), put32(o, 0x5000), put32(o, 0), put8(o, 0);
+        node_base(o, 0x200, 0x00, -6.0f);
+        objects.push_back({2, o});
+        o.clear();
+        put32(o, 0x200);
+        node_base(o, 0, 0x01, 100.0f);
+        o.push_back(1), o.push_back(0), o.push_back(0), o.push_back(0), o.push_back(0), o.push_back(0);  // loop 1, modifiers
+        putf(o, 0), putf(o, 0), putf(o, 0);
+        o.push_back(0), o.push_back(0);  // avoid repeat
+        put8(o, 0), put8(o, 0), put8(o, 1), put8(o, 0);  // transition, random, sequence, bits
+        put32(o, 1), put32(o, 0x100);
+        o.push_back(1), o.push_back(0), put32(o, 0x100), put32(o, 50000);
+        objects.push_back({5, o});
+        o.clear();
+        put32(o, 0x300), o.push_back(0x03), o.push_back(0x04), put32(o, 0x200), put8(o, 0);
+        put8(o, 1), put8(o, 0x39), put32(o, 250), put8(o, 0);
+        put8(o, 4), put32(o, 0), put32(o, 0);
+        objects.push_back({3, o});
+        o.clear();
+        put32(o, 0x400), put8(o, 1), put32(o, 0x300);
+        objects.push_back({4, o});
+        put32(hirc, uint32_t(objects.size()));
+        for (const auto& [type, body] : objects) {
+            put8(hirc, type), put32(hirc, uint32_t(body.size()));
+            hirc.insert(hirc.end(), body.begin(), body.end());
+        }
+        std::vector<uint8_t> bank;
+        put32(bank, 0x44484B42), put32(bank, 8), put32(bank, 150), put32(bank, 0xABCD);
+        put32(bank, 0x43524948), put32(bank, uint32_t(hirc.size()));
+        bank.insert(bank.end(), hirc.begin(), hirc.end());
+        const auto b = parse_wwise_bank(bank);
+        CHECK(b.id == 0xABCD && b.nodes.size() == 2 && b.actions.size() == 1 && b.events.size() == 1);
+        WwisePlayState st;
+        const auto voices = wwise_play_event(b, 0x400, st);
+        CHECK(voices.size() == 1);
+        if (voices.size() == 1) {
+            CHECK(voices[0].sound == 0x100 && voices[0].source == 0x5000 && voices[0].stream_type == 2);
+            CHECK(std::abs(voices[0].delay - 0.25f) < 1e-4f);
+            CHECK(std::abs(voices[0].volume_db + 6.0f) < 1e-4f);
+            CHECK(std::abs(voices[0].pitch_cents - 100.0f) < 1e-4f);
+            CHECK(voices[0].loops == 1 && voices[0].after < 0);
+        }
+        CHECK(wwise_is_under(b, 0x100, 0x200) && !wwise_is_under(b, 0x200, 0x100));
+        bool threw = false;
+        try {
+            bank[8] = 140;  // another version
+            parse_wwise_bank(bank);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+
+        // Downmix: a first-order ambisonic frame (W, Y, Z, X) to L/R = (W +- Y) / 2.
+        PcmAudio amb;
+        amb.sample_rate = 48000, amb.channels = 4, amb.samples = {1000, 200, 7, 9};
+        const auto st2 = wwise_downmix(amb);
+        CHECK(st2.channels == 2 && st2.samples.size() == 2 && st2.samples[0] == 600 && st2.samples[1] == 400);
+        PcmAudio three;
+        three.sample_rate = 48000, three.channels = 3, three.samples = {30, 60, 90};
+        const auto mono = wwise_downmix(three);
+        CHECK(mono.channels == 1 && mono.samples.size() == 1 && mono.samples[0] == 60);
+
+        // A linear curve.
+        WwiseCurve c;
+        c.points = {{0, 1, 4}, {10, 0, 4}};
+        CHECK(std::abs(c.eval(5) - 0.5f) < 1e-4f && std::abs(c.eval(-1) - 1) < 1e-4f && std::abs(c.eval(20)) < 1e-4f);
     }
 
     if (g_failures) return 1;
