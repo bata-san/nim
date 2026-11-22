@@ -2327,6 +2327,7 @@ int cmd_find(PackageManager& pm, uint32_t cls) {
 // Component tags (8080BADB) by the classes of their two resources (0x10, 0x18).
 // An entity's components (tags of class 8080BADB it references) with their class pair (+0x10 / +0x18).
 int cmd_entity_components(PackageManager& pm, TagHash entity, bool verbose = false) {
+    if (verbose) pm.build_hash64_index();
     const auto data = pm.read(entity);
     std::set<uint32_t> seen;
     for (size_t o = 0; o + 4 <= data.size(); o += 4) {
@@ -2362,6 +2363,16 @@ int cmd_entity_components(PackageManager& pm, TagHash entity, bool verbose = fal
                         extra = std::format("  particles: life {:.2f}s rate {:.2f}/s state {} instance {}", ps.lifetime, ps.rate, ps.state_float4s, ps.instance_float4s);
                     } catch (...) {}
                     std::println("    +{:04X} {} class {:08X}{}", q, TagHash(t).str(), te->reference, extra);
+                }
+            }
+        if (verbose)  // 64-bit references (entities and other resources named by hash64)
+            for (size_t q = 0; q + 8 <= d.size(); q += 4) {
+                uint64_t h;
+                std::memcpy(&h, d.data() + q, 8);
+                if (!h || h == ~0ull || (h >> 32) == 0 || (uint32_t(h) == 0)) continue;
+                if (const auto t = pm.resolve64(h)) {
+                    const Entry* te = pm.entry(*t);
+                    std::println("    +{:04X} h64 {:016X} -> {} class {:08X}", q, h, t->str(), te ? te->reference : 0u);
                 }
             }
     }
