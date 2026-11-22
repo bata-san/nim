@@ -1270,9 +1270,14 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         if (rig.skeleton_bone[i] < sk.size()) rig_to_skeleton_parent_child[i] = rig.skeleton_bone[i];
     std::vector<uint8_t> offset_translation(rig.size(), 0), offset_rotation(rig.size(), 1);
     const bool additive = is_additive(rig, clip);
+    // Bind-relative nodes (local, identity rest) rotate from the skeleton's bind: without a track,
+    // or with keys nearer identity than the bind (offset_rotation), the identity rest is "no
+    // rotation from the bind". Read as an absolute local rotation, the recruit's back attachment
+    // (bone 14, rig node 57) took its parent's (the chest) orientation and tipped backwards
+    // (docs/PROGRESS.md 3.87).
     if (!additive) {
         for (const auto& t : clip.rotations) {
-            if (!mechanism_offsets || t.bone >= rig.size() || !identity_local(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
+            if (t.bone >= rig.size() || !identity_local(t.bone) || t.frames.empty() || rig_to_skeleton_parent_child[t.bone] < 0) continue;
             const Q& bind = sk.local_bind[size_t(rig_to_skeleton_parent_child[t.bone])].rotation;
             float to_bind = 1e30f, to_identity = 1e30f;
             for (const auto& q : t.frames) {
@@ -1368,7 +1373,9 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                     } else {
                         // The identity-rest digit channels bend about the finger's own bind axes.
                         // An identity key preserves the joint's bind orientation, including thumb opposition.
-                        local.rotation = bind_digit ? qnormalize(qmul(local.rotation, c.rotation)) : qnormalize(c.rotation);
+                        // Tracked ones are offsets too when their keys stay nearer identity than the bind.
+                        const bool bind_offset = identity_local(size_t(ri)) && offset_rotation[size_t(ri)];
+                        local.rotation = bind_digit || bind_offset ? qnormalize(qmul(local.rotation, c.rotation)) : qnormalize(c.rotation);
                         // A matching rest offset establishes that this track uses the local
                         // skeleton space and units. Variant rigs can have different proportions.
                         float rest_error = 0;
