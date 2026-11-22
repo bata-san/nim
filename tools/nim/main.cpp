@@ -4856,7 +4856,7 @@ public:
         if (two_col) ImGui::SameLine(0, col_gap);
         else ImGui::Dummy({0, 12 * sc});
 
-        // ---- Right column: CyberAcme terminal header + scrollable body + pinned footer ----
+        // ---- Right column: scrollable terminal body (game text carries its own header/footer) ----
         ImGui::BeginGroup();
         ImGui::PushFont(g_fonts.mono, term_font_px);
         const float cw = std::max(1.0f, ImGui::CalcTextSize("=").x);
@@ -4867,29 +4867,8 @@ public:
             ImGui::TextColored(col4(kCxGreen), "%s", s.c_str());
         };
 
-        // Header: collection name + version tag on line 1, entry title on line 2, === rule on line 3.
-        ImGui::PushFont(g_fonts.mono_med, term_font_px);
-        const std::string col_title = upper_ascii(text(c.title, lang));
-        const std::string ent_title = upper_ascii(text(e.title, lang));
-        const std::string ver = std::format("v.1.{:03d}.{:02d}.tciv", codex.collection + 1, codex.entry + 1);
-        const float right_x0 = ImGui::GetCursorPosX();
-        const float ver_w = ImGui::CalcTextSize(ver.c_str()).x;
-        ImGui::TextColored(col4(kCxGreen), "%s", col_title.c_str());
-        if (col_right_w > ver_w + 24 * sc) {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(right_x0 + col_right_w - ver_w - 14 * sc);
-            ImGui::TextColored(col4(kCxGreen), "%s", ver.c_str());
-        }
-        ImGui::PushTextWrapPos(right_x0 + col_right_w - 14 * sc);
-        ImGui::TextColored(col4(kCxGreen), "%s", ent_title.empty() ? std::format("{:08X}", e.hash).c_str() : ent_title.c_str());
-        ImGui::PopTextWrapPos();
-        eq_rule(col_right_w - 14 * sc);
-        ImGui::PopFont();
-        ImGui::Dummy({0, 4 * sc});
-
         // Scrollable body child with thin dark scrollbar on the far right edge.
-        const float footer_h = line_h * 2.4f + 10 * sc;
-        const float body_h = std::max(80 * sc, (win_p.y + win_s.y - bar_h - pad_y) - ImGui::GetCursorScreenPos().y - footer_h);
+        const float body_h = std::max(80 * sc, (win_p.y + win_s.y - bar_h - pad_y) - ImGui::GetCursorScreenPos().y);
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7 * sc);
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 2 * sc);
         ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(0, 0, 0, 0));
@@ -4968,19 +4947,6 @@ public:
         ImGui::EndChild();
         ImGui::PopStyleColor(4);
         ImGui::PopStyleVar(2);
-
-        // Pinned terminal footer: === rule + [RNNRqterm] || CyberAcme Systems, Inc. / ///REDACTED///
-        ImGui::Dummy({0, 4 * sc});
-        eq_rule(col_right_w - 14 * sc);
-        const char* foot_l = "[RNNRqterm] || CyberAcme Systems, Inc.";
-        const char* foot_r = "///REDACTED///";
-        const float fr_w = ImGui::CalcTextSize(foot_r).x;
-        ImGui::TextColored(col4(kCxBody), "%s", foot_l);
-        if (col_right_w > fr_w + 24 * sc) {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(right_x0 + col_right_w - fr_w - 14 * sc);
-            ImGui::TextColored(col4(kCxBody), "%s", foot_r);
-        }
         ImGui::PopFont();
         ImGui::EndGroup();
     }
