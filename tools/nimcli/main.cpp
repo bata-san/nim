@@ -13,7 +13,8 @@
 //   nimcli [--install DIR] movie-audio USM OUT.wav [CH]  decode a movie's audio track (ADX)
 //   nimcli [--install DIR] movie-frames USM OUT_DIR [START_S] [COUNT]  decode frames (BMP) and list subtitles
 //   nimcli [--install DIR] wem TAG|EVENT OUT.wav      decode a Wwise stream (or a dialogue audio event)
-//   nimcli [--install DIR] xref-strings                which tag classes reference string hashes
+//   nimcli [--install DIR] codex-audit [OUT.tsv]       per record: title, image name, recording label, body
+//   nimcli [--install DIR] xref-strings               which tag classes reference string hashes
 //   nimcli [--install DIR] xref-tags T/S|class:HASH    which tag classes reference tags of that kind
 //   nimcli [--install DIR] static TAG                  static mesh: groups, techniques, shaders, layouts
 //   nimcli [--install DIR] shader TAG [OUT.asm]         disassemble a shader header's DXBC
@@ -666,6 +667,58 @@ int cmd_codex_art(PackageManager& pm) {
     return 0;
 }
 
+// One row per codex record: title, image name, recording label and body opening side by side, to
+// check that the illustration and the audio log belong to the record.
+int cmd_codex_audit(PackageManager& pm, const char* out_path) {
+    StringTable table;
+    table.load_all(pm);
+    auto lines = load_all_dialogue(pm);
+    Codex codex = load_codex(pm, lines);
+    auto flat = [](std::string t) {
+        for (char& ch : t)
+            if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+        return t;
+    };
+    auto text = [&](uint32_t h, TagHash container = {}) -> std::string {
+        const LocalizedString* s = h ? table.find(h, container) : nullptr;
+        return s ? flat(s->text[0]) : std::string();
+    };
+    auto ctext = [&](const CodexString& s) { return s ? text(s.hash, s.container) : std::string(); };
+    // Counts: strings found in their own container, and how many a hash-only lookup gets wrong.
+    size_t n = 0, title_ok = 0, body_ok = 0, body_refs = 0, unlock_ok = 0, unlock_refs = 0, title_wrong_unscoped = 0,
+           body_wrong_unscoped = 0, coll_ok = 0, colls = 0;
+    const char* path = out_path ? out_path : "codex_audit.tsv";
+    std::ofstream f(path, std::ios::binary);
+    f << "collection\trecord\ttitle\ttitle_container\timage_index\ttexture\tasset\ttable\tconversation\tlabel\twem\tbody\n";
+    for (const auto& c : codex.collections) {
+        ++colls;
+        coll_ok += !ctext(c.title).empty();
+        for (const auto& e : c.entries) {
+            ++n;
+            const std::string title = ctext(e.title), body = ctext(e.body);
+            title_ok += !title.empty();
+            title_wrong_unscoped += e.title && text(e.title.hash) != title;
+            if (e.body) ++body_refs, body_ok += !body.empty(), body_wrong_unscoped += text(e.body.hash) != body;
+            if (e.unlock) ++unlock_refs, unlock_ok += !ctext(e.unlock).empty();
+            std::string label, wem;
+            for (size_t li : e.lines) {
+                label += text(lines[li].subtitle_hash, lines[li].subtitle_container) + " ";
+                if (!lines[li].wem.empty()) wem += lines[li].wem[0].str() + " ";
+            }
+            f << std::format("{}\t{:08X}\t{}\t{}\t{:X}\t{}\t{}\t{}\t{:08X}\t{}\t{}\t{}\n", ctext(c.title), e.hash, title,
+                             e.title.container.str(), e.image_index, e.illustration.str(), e.asset.str(), e.dialogue_table.str(),
+                             e.conversation, label, wem, body.substr(0, 160));
+        }
+    }
+    std::println("collections {} titled {}  records {} titled {}  bodies {}/{}  unlock hints {}/{}", colls, coll_ok, n,
+                 title_ok, body_ok, body_refs, unlock_ok, unlock_refs);
+    std::println("a hash-only lookup (ignoring the string container) would show a different title for {} records "
+                 "and a different body for {}", title_wrong_unscoped, body_wrong_unscoped);
+    std::println("recording assets {}  linked to spoken lines {}", codex.with_asset, codex.with_audio);
+    std::println("wrote {}", path);
+    return 0;
+}
+
 // The in-game codex: collections and their intel entries, with the recording lines of each entry.
 // With OUT, writes a Markdown dump (titles and bodies in LANG, default en).
 int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
@@ -679,15 +732,16 @@ int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
     if (lang_code)
         for (size_t l = 0; l < kTextLanguageCount; ++l)
             if (language_code(TextLanguage(l)) == lang_code) lang = l;
-    auto text = [&](uint32_t h, size_t lg) -> std::string {
-        const LocalizedString* s = h ? table.find(h) : nullptr;
+    auto text = [&](uint32_t h, size_t lg, TagHash container = {}) -> std::string {
+        const LocalizedString* s = h ? table.find(h, container) : nullptr;
         return s ? s->text[lg] : std::string();
     };
+    auto ctext = [&](const CodexString& s, size_t lg) { return s ? text(s.hash, lg, s.container) : std::string(); };
     size_t titled = 0, bodied = 0, line_total = 0, wem_lines = 0;
     for (const auto& c : codex.collections)
         for (const auto& e : c.entries) {
-            titled += !text(e.title, 0).empty();
-            bodied += !text(e.body, 0).empty();
+            titled += !ctext(e.title, 0).empty();
+            bodied += !ctext(e.body, 0).empty();
             line_total += e.lines.size();
             for (size_t li : e.lines) wem_lines += !lines[li].wem.empty();
         }
@@ -697,21 +751,21 @@ int cmd_codex(PackageManager& pm, const char* out_path, const char* lang_code) {
                  codex.with_audio, line_total, wem_lines);
     for (size_t i = 0; i < std::min<size_t>(codex.collections.size(), 12); ++i) {
         const auto& c = codex.collections[i];
-        std::println("  [{}] {} ({} entries)", text(c.title, lang), text(c.title, 1), c.entries.size());
+        std::println("  [{}] {} ({} entries)", ctext(c.title, lang), ctext(c.title, 1), c.entries.size());
     }
     if (out_path) {
         std::ofstream f(out_path, std::ios::binary);
         for (const auto& c : codex.collections) {
-            f << "# " << text(c.title, lang) << std::format("  ({:08X})\n\n", c.hash);
+            f << "# " << ctext(c.title, lang) << std::format("  ({:08X})\n\n", c.hash);
             for (const auto& e : c.entries) {
-                f << "## " << text(e.title, lang) << std::format("  ({:08X})\n\n", e.hash);
-                if (e.unlock) f << "> " << text(e.unlock, lang) << "\n\n";
-                f << text(e.body, lang) << "\n\n";
+                f << "## " << ctext(e.title, lang) << std::format("  ({:08X})\n\n", e.hash);
+                if (e.unlock) f << "> " << ctext(e.unlock, lang) << "\n\n";
+                f << ctext(e.body, lang) << "\n\n";
                 if (!e.lines.empty()) {
                     f << std::format("recording: asset {} table {} conversation {:08X}\n\n", e.asset.str(),
                                      e.dialogue_table.str(), e.conversation);
                     for (size_t li : e.lines)
-                        f << "- " << text(lines[li].speaker_hash, lang) << ": " << text(lines[li].subtitle_hash, lang)
+                        f << "- " << text(lines[li].speaker_hash, lang) << ": " << text(lines[li].subtitle_hash, lang, lines[li].subtitle_container)
                           << (lines[li].wem.empty() ? "" : "  [" + lines[li].wem[0].str() + "]") << "\n";
                     f << "\n";
                 }
@@ -3467,6 +3521,7 @@ int main(int argc, char** argv) {
         if (cmd == "wem" && args.size() >= 3) return cmd_wem(pm, TagHash(parse_hex(args[1])), args[2].c_str());
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
         if (cmd == "codex-art") return cmd_codex_art(pm);
+        if (cmd == "codex-audit") return cmd_codex_audit(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "dynamic" && args.size() >= 2) return cmd_dynamic(pm, TagHash(parse_hex(args[1])));

@@ -2,6 +2,7 @@
 #include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace nim {
@@ -26,20 +27,31 @@ std::vector<DialogueLine> load_all_dialogue(PackageManager& pm, DialogueStats* s
             bool is_table = false;
 
             // Array headers are {u64 count, u32 class, u32 0}, 16-byte aligned within the tag.
+            // Lines are reached from two arrays: the table's entries (8080AA3B, 0x28 bytes, line
+            // pointer at 0x20) and the choices of a single-recording container (8080AA35 Vec at
+            // 0x30 of 8080AA3A, 0x48 bytes, line pointer at 0x40). The table's conversation list
+            // (8080AA34 {u32 key, rel pointer}) points either at a conversation (8080AA38) or at such
+            // a container; codex audio logs such as General Reed's personal logs use the container.
+            std::vector<size_t> seen;  // line offsets already read from this tag
             for (size_t h = 0x10; h + 0x10 <= bytes.size(); h += 0x10) {
-                if (r.u32_at(h + 8) != kClassDialogueEntry || r.u32_at(h + 12) != 0) continue;
+                const uint32_t cls = r.u32_at(h + 8);
+                if ((cls != kClassDialogueEntry && cls != kClassDialogueChoice) || r.u32_at(h + 12) != 0) continue;
+                const size_t stride = cls == kClassDialogueEntry ? 0x28 : 0x48;
+                const size_t ptr = cls == kClassDialogueEntry ? 0x20 : 0x40;
                 uint64_t count = r.u64_at(h);
-                if (count == 0 || h + 0x10 + count * 0x28 > bytes.size()) continue;
+                if (count == 0 || h + 0x10 + count * stride > bytes.size()) continue;
                 is_table = true;
                 for (uint64_t k = 0; k < count; ++k) {
-                    size_t entry = h + 0x10 + size_t(k) * 0x28;
+                    size_t entry = h + 0x10 + size_t(k) * stride;
                     st.entries++;
-                    if (r.u64_at(entry + 0x20) == 0) { st.other_variants++; continue; }
-                    size_t target = r.pointer_at(entry + 0x20);
+                    if (r.u64_at(entry + ptr) == 0) { st.other_variants++; continue; }
+                    size_t target = r.pointer_at(entry + ptr);
                     if (target < 4 || target + 0xA0 > bytes.size() || r.u32_at(target - 4) != kClassDialogueLine) {
                         st.other_variants++;
                         continue;
                     }
+                    if (std::find(seen.begin(), seen.end(), target) != seen.end()) continue;
+                    seen.push_back(target);
                     DialogueLine line;
                     line.table = table;
                     line.line_id = r.u32_at(target + 0x00);

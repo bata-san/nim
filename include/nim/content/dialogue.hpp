@@ -16,8 +16,11 @@ namespace nim {
 //     0x48 f32   unknown (2.5 typical)
 //     0x68 Tag   string container (caption)       0x78 u32 string hash
 //     0x94 u32   speaker name string hash
+//   A single-recording container (8080AA35) holds Vec<8080AA3A> at 0x30 (0x48 bytes, line pointer
+//   at 0x40); the table's conversation list (8080AA34 {u32 key, rel pointer}) points at it directly.
 //   Audio event (class 8080B128): 0x08 u32 event id, 0x18 Tag sound bank, 0x20 Vec<Tag> WEM streams.
 constexpr uint32_t kClassDialogueEntry = 0x8080AA3B;
+constexpr uint32_t kClassDialogueChoice = 0x8080AA3A;
 constexpr uint32_t kClassDialogueLine = 0x8080AA3F;
 constexpr uint32_t kClassAudioEvent = 0x8080B128;
 

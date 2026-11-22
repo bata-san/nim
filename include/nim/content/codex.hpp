@@ -14,9 +14,15 @@ namespace nim {
 //   Definition table (class 808029D1, one tag): Vec<808029AA> at 0x08, elements 0x18 bytes
 //     0x00 u32 definition hash   0x04 u32 kind   0x08 Vec<pointer> components
 //   Each component pointer targets an object preceded by its u32 class id:
-//     808028E9  display      0x08 u32 title string hash
-//     808028E3  body         0x2C u32 body string hash
-//     808028E8  unlock       0x6C u32 unlock-hint string hash ("Complete objective to unlock.")
+//     808028E9  display      0x00 u32 image index, 0x04 u32 string list index, 0x08 u32 title hash
+//     808028E3  body         0x28 u32 string list index, 0x2C u32 body string hash
+//     808028E8  unlock       0x00 Vec<808023C7 {u32 string list index, u32 hint hash}>
+//                            ("Complete objective to unlock.")
+//   String hashes are only unique inside their string container: 911 hashes in the install name
+//   different texts in different containers (e.g. one hash is "Acceptance Notice" in 80A4111D and
+//   "Mentoring Intelligence" in 80A51DCA). Every string reference therefore carries an index into
+//   the investment string list (class 808071C8, one tag): Vec at 0x08 of 0x18-byte elements
+//   {u32 key, 0, -1, 0, u64 hash64 of the 8080B9B8 container}. 0xFFFF = no string.
 //   Kinds: 3049EB2C collection (a codex folder), 9F9F7DE7 entry (one intel record).
 //   The table is stored in codex order: a collection is followed by its entries.
 //
@@ -41,6 +47,7 @@ constexpr uint32_t kClassCodexDisplay = 0x808028E9;
 constexpr uint32_t kClassCodexBody = 0x808028E3;
 constexpr uint32_t kClassCodexUnlock = 0x808028E8;
 constexpr uint32_t kClassCodexImageList = 0x808071C0;
+constexpr uint32_t kClassInvestmentStrings = 0x808071C8;
 constexpr uint32_t kClassItemTable = 0x80806CAC;
 constexpr uint32_t kClassAssetIndex = 0x8080B61C;
 constexpr uint32_t kClassAssetRecord = 0x8080BAAD;
@@ -59,10 +66,18 @@ struct CodexDefinition {
 // Parses the definition table tag. Throws on a malformed table.
 std::vector<CodexDefinition> parse_codex_definitions(std::span<const uint8_t> tag);
 
+// A localized string reference: the hash is only meaningful inside its container.
+struct CodexString {
+    uint32_t hash = 0;  // 0 = none
+    TagHash container;  // the string container (8080B9B8); none when the list index did not resolve
+    explicit operator bool() const { return hash != 0; }
+};
+
 struct CodexEntry {
     uint32_t hash = 0;
-    uint32_t title = 0, body = 0, unlock = 0;  // string hashes (0 = none)
+    CodexString title, body, unlock;
     TagHash illustration;                      // texture header (type 32), none if the record has no image
+    uint32_t image_index = 0xFFFF;             // display component +0x00, index into the image list
     uint32_t asset_key = 0;                    // item table key, 0 = no recording asset
     TagHash asset;                             // 8080BAAD record, if any
     TagHash dialogue_table;
@@ -72,8 +87,9 @@ struct CodexEntry {
 
 struct CodexCollection {
     uint32_t hash = 0;
-    uint32_t title = 0, unlock = 0;
+    CodexString title, unlock;
     TagHash illustration;
+    uint32_t image_index = 0xFFFF;
     std::vector<CodexEntry> entries;
 };
 
@@ -82,8 +98,8 @@ struct Codex {
     std::vector<CodexCollection> collections;  // in codex order; [0] holds entries before any collection
     size_t entries = 0;
     size_t with_asset = 0;      // entries whose item resolves to a recording asset
-    size_t with_audio = 0;
-    size_t with_illustration = 0;  // entries whose display component resolves to a texture      // entries with at least one spoken line
+    size_t with_audio = 0;      // entries with at least one spoken line
+    size_t with_illustration = 0;  // entries whose display component resolves to a texture
 };
 
 // Builds the codex from the install. `dialogue` is the list from load_all_dialogue.

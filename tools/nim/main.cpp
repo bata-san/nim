@@ -3092,7 +3092,8 @@ public:
             auto& g = group(TabCodex);
             for (const auto& c : catalog->codex.collections)
                 for (const auto& e : c.entries)
-                    if (matches(e.title) || matches(e.body)) hit(g, text_of(c.title) + " / " + text_of(e.title));
+                    if (matches(e.title.hash, e.title.container) || matches(e.body.hash, e.body.container))
+                        hit(g, text_of(c.title.hash, c.title.container) + " / " + text_of(e.title.hash, e.title.container));
         }
         if (catalog->movies_ready) {
             auto& g = group(TabMovies);
@@ -3886,6 +3887,11 @@ public:
         const LocalizedString* s = catalog->strings.find(hash, container);
         return s ? s->text[lang] : empty;
     }
+    // Codex strings are looked up in their own container: hashes repeat across containers.
+    const std::string& text(const CodexString& s, size_t lang) {
+        static const std::string empty;
+        return s ? text(s.hash, lang, s.container) : empty;
+    }
 
     // -- DIALOGUE --
     // Text in any of the 13 languages, the line's audio in any installed voice language, lines
@@ -4529,7 +4535,7 @@ public:
 
         // The records in the game's codex order, as a grid of their illustrations.
         const std::string f = lower_ascii(codex.filter);
-        auto match = [&](uint32_t h) { return f.empty() || contains_ci(text(h, lang), f) || contains_ci(text(h, 0), f); };
+        auto match = [&](const CodexString& h) { return f.empty() || contains_ci(text(h, lang), f) || contains_ci(text(h, 0), f); };
         codex.view.clear();
         for (int ci = 0; ci < int(cx.collections.size()); ++ci) {
             const auto& c = cx.collections[size_t(ci)];
