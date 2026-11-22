@@ -17,6 +17,12 @@ namespace nim {
 namespace {
 constexpr float kClipFps = 30;     // clip rate (not decoded, 3.69)
 constexpr float kBlendSeconds = 0.25f;
+// The UESC robots' face indicator (material 80A4B5C4, docs/PROGRESS.md 3.77), unnamed object
+// channels read by its pixel TFX: the state (x 0.25 through a spline and a gradient: 0 white
+// ring, 1 yellow brackets, 2-3.5 red ring, 4 yellow) and a hide term (1 discards the panel; with
+// no authored default the generic unset value 1 hid it).
+constexpr uint32_t kIndicatorState = 0x319CE56E;
+constexpr uint32_t kIndicatorHidden = 0xBE78BFD7;
 
 BoneTransform blend_bone(const BoneTransform& a, const BoneTransform& b, float t) {
     BoneTransform r;
@@ -483,6 +489,12 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
                 checks_.push_back(g);
             }
         }
+        // The face indicator (UESC robots, material 80A4B5C4): its state follows the agent's alert.
+        if (const int state = int(indicator_state(a.alert)); state != s.indicator) {
+            const float v = float(state);
+            scene.set_actor_channels(s.actor, {{kIndicatorState, {v, v, v, v}}, {kIndicatorHidden, {0, 0, 0, 0}}});
+            s.indicator = state;
+        }
         scene.set_actor(s.actor, rows, std::move(poses));
         ++shown_;
     }
@@ -718,6 +730,19 @@ struct Projector {
 };
 
 float distance(const std::array<float, 3>& a, const std::array<float, 3>& b) { return std::hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
+
+}  // namespace
+
+float AiActors::indicator_state(AiAlert alert) {
+    switch (alert) {
+        case AiAlert::Unaware: return 0;
+        case AiAlert::Suspicious: return 1;
+        case AiAlert::Alerted: return 2;
+    }
+    return 0;
+}
+
+namespace {
 
 void meter(AiOverlay& o, std::array<float, 2> at, float awareness, AiAlert alert, bool sees, float scale) {
     const float w = 46 * scale, h = 6 * scale;

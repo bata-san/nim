@@ -36,6 +36,7 @@
 //   nimcli [--install DIR] clips [BONES]                decode every clip (or those with BONES bones)
 //   nimcli [--install DIR] animaudit                    skinned models without skeleton / rig / clips; rigs whose clips stretch bones
 //   nimcli [--install DIR] clipfit MODEL [-v]           pose the model's skeleton with every clip of its rig (-v: per clip)
+//   nimcli [--install DIR] parts MODEL                  each part: stage, technique, LOD, bind-pose bounds
 //   nimcli [--install DIR] skin MODEL                   skin weight summary of a dynamic model
 //   nimcli [--install DIR] survey-entities               prepare every ENTITIES entry and histogram outcomes
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
@@ -2529,6 +2530,43 @@ int cmd_skin(PackageManager& pm, TagHash tag) {
     return 0;
 }
 
+// Each part's bind-pose bounds (decoded positions over its index range), technique, stage, LOD.
+int cmd_parts(PackageManager& pm, TagHash tag) {
+    DynamicModel m = load_dynamic_model(pm, tag);
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const auto& d = m.meshes[i];
+        VertexBuffer vb0 = load_vertex_buffer(pm, d.vertex0);
+        IndexBuffer ib = load_index_buffer(pm, d.index);
+        const size_t nidx = ib.data.size() / (ib.is_32bit ? 4 : 2);
+        auto index = [&](size_t k) -> uint32_t {
+            if (ib.is_32bit) { uint32_t v; std::memcpy(&v, ib.data.data() + k * 4, 4); return v; }
+            uint16_t v; std::memcpy(&v, ib.data.data() + k * 2, 2); return v;
+        };
+        for (size_t pi = 0; pi < d.parts.size(); ++pi) {
+            const auto& part = d.parts[pi];
+            int stage = -1;
+            for (size_t st = 0; st < kRenderStageCount; ++st)
+                if (pi >= d.part_range[st] && pi < d.part_range[st + 1]) stage = int(st);
+            float lo[3]{1e9f, 1e9f, 1e9f}, hi[3]{-1e9f, -1e9f, -1e9f};
+            for (size_t k = part.index_start; k < size_t(part.index_start) + part.index_count && k < nidx; ++k) {
+                const uint32_t v = index(k);
+                if (v == 0xFFFF || v == 0xFFFFFFFF || (v + 1) * vb0.stride > vb0.data.size()) continue;
+                for (size_t a = 0; a < 3; ++a) {
+                    int16_t q;
+                    std::memcpy(&q, vb0.data.data() + v * vb0.stride + 2 * a, 2);
+                    const float p = q / 32767.0f * m.model_scale[a] + m.model_offset[a];
+                    lo[a] = std::min(lo[a], p);
+                    hi[a] = std::max(hi[a], p);
+                }
+            }
+            std::println(" mesh {} part {:3} stage {:2} tech {} var {:5} lod {:02X} role {} flags {:X} idx {}+{}  ({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})", i, pi,
+                         stage, part.technique.str(), part.variant_shader_index, part.lod_category, part.lod_role, part.flags, part.index_start, part.index_count,
+                         lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+        }
+    }
+    return 0;
+}
+
 int cmd_rig(PackageManager& pm, TagHash tag) {
     AnimationRig rig = load_animation_rig(pm, tag);
     std::println("rig {} bones {}", tag.str(), rig.size());
@@ -3329,6 +3367,7 @@ int main(int argc, char** argv) {
         if (cmd == "objaudit") return cmd_objaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
+        if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
         if (cmd == "entity-components" && args.size() >= 2)
             return cmd_entity_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");

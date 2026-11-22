@@ -100,6 +100,9 @@ public:
     size_t shown() const { return shown_; }
     const std::vector<ActorCharacter>& characters() const { return characters_; }
     const std::vector<std::string>& notes() const { return notes_; }
+    // The face indicator's object state per alert level (docs/PROGRESS.md 3.77): channel 319CE56E
+    // (0 white, 1 yellow, 2 red), and BE78BFD7 = 0 so the panel is shown. Both are estimates.
+    static float indicator_state(AiAlert alert);
 
 private:
     struct Slot {
@@ -108,6 +111,7 @@ private:
         std::optional<size_t> agent;
         ActorAnimator anim;
         float lift = std::numeric_limits<float>::quiet_NaN();  // grounding offset (m)
+        int indicator = -1;  // the face indicator state last given to the actor (-1: none yet)
     };
     std::vector<ActorCharacter> characters_;
     std::vector<std::optional<size_t>> by_character_;  // MapGameplay::characters -> characters_

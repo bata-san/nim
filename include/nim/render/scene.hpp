@@ -351,6 +351,10 @@ public:
     // or hides it when rows is empty.
     uint32_t add_actor(Gpu& gpu, const PreparedMesh& mesh, const std::vector<std::vector<InputElement>>& layouts);
     void set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses = {});
+    // Run-time object state of one actor (e.g. the face indicator's channels): over its models'
+    // authored channel defaults, under the scene's overrides. Its materials then evaluate apart
+    // from the other actors of the same model.
+    void set_actor_channels(uint32_t actor, const ChannelValues& values);
     size_t actor_count() const { return actors_.size(); }
     // The lowest z of the actor's skinned vertices (every 4th) in object space under `poses`.
     std::optional<float> actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const;
@@ -499,6 +503,7 @@ private:
         V3 model_center{};
         std::array<float4, 7> model_parameters{};
         std::shared_ptr<const ChannelValues> model_channels;
+        std::shared_ptr<const ChannelValues> actor_channels;  // set_actor_channels: model defaults + the actor's state
         bool exfil_device = false;
         std::vector<std::array<float, 12>> placements;
         std::vector<float> sky_order;

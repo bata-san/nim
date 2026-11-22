@@ -1030,7 +1030,17 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         bool used = false;
         // Some meshes also contain a complete auxiliary representation tagged (role 3, mask 0xF).
         // Its mask overlaps the regular detail levels, but drawing both overlays two models.
-        auto auxiliary = [](const DynamicMeshPart& part) { return part.lod_role == 3 && part.lod_category == 0xF; };
+        auto auxiliary_tagged = [](const DynamicMeshPart& part) { return part.lod_role == 3 && part.lod_category == 0xF; };
+        // Of the parts tagged like the auxiliary representation, the ones flagged 0x380 are the UESC
+        // robots' face indicator: the inner shapes of the panel in front of the face (80A4B5C4 /
+        // 80A968B3, docs/PROGRESS.md 3.77; 推定, what the flag bits mean is not decoded). They are
+        // drawn with the regular representation. The panel's square (flags 8) is not: in game only
+        // the inner shape is seen (user observation, 2026-11-22). The fragmented shell never counts.
+        auto indicator = [](const DynamicMeshPart& part) {
+            const bool shell = (part.flags & 8) && (part.technique.value == 0x80A4B903 || part.technique.value == 0x80A4B912);
+            return (part.flags & 0x380) && !shell;
+        };
+        auto auxiliary = [&](const DynamicMeshPart& part) { return auxiliary_tagged(part) && !indicator(part); };
         const size_t opaque_begin = std::min<size_t>(mesh.part_range[0], mesh.parts.size());
         const size_t opaque_end = std::max(opaque_begin, std::min<size_t>(mesh.part_range[1], mesh.parts.size()));
         const auto opaque = std::span(mesh.parts).subspan(opaque_begin, opaque_end - opaque_begin);
@@ -2681,6 +2691,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     auto channels_for = [&](const BufferSet& set) {
         ChannelContext result = cc;
         if (set.dynamic) result.defaults = set.model_channels.get(), result.exfil_device = set.exfil_device;
+        if (set.actor_channels) result.defaults = set.actor_channels.get();
         return result;
     };
     material_addresses_.clear();
@@ -2875,7 +2886,9 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             it.scope_addresses[k] = {it.scope_slots[k].first, shared_scope(it.scope_slots[k].second)};
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
             const bool model_inputs = assembled_ || (set.model_channels && !set.model_channels->empty());
-            const uint64_t object = model_inputs ? uint64_t(set.model.value - TagHash::kBase) + 1 : 0;
+            // An actor with its own object state evaluates apart from the other copies of its model.
+            const uint64_t object = set.actor_channels ? (uint64_t(1) << 30) | it.buffers
+                                    : model_inputs ? uint64_t(set.model.value - TagHash::kBase) + 1 : 0;
             const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
@@ -3454,6 +3467,15 @@ void StaticMeshScene::set_actor(uint32_t actor, const std::optional<std::array<f
         if (rows) set.placements.assign(1, *rows);
     }
     skin_dirty_ = skinned_;
+}
+
+void StaticMeshScene::set_actor_channels(uint32_t actor, const ChannelValues& values) {
+    for (const auto index : actors_.at(actor).sets) {
+        auto& set = sets_[index];
+        auto merged = std::make_shared<ChannelValues>(set.model_channels ? *set.model_channels : ChannelValues{});
+        for (const auto& [h, v] : values) (*merged)[h] = v;
+        set.actor_channels = std::move(merged);
+    }
 }
 
 // This frame's object constants of every visible actor: its model's own constants with the
