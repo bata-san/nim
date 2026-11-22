@@ -1657,6 +1657,7 @@ public:
         char filter[128] = "";
         int lang = -1;  // -1: the second-language setting
         bool audio_only = false;
+        bool crt_tint = true;  // phosphor green CRT filter on codex reader artwork
         int collection = -1, entry = -1;
         bool open_reader = false;
         std::vector<std::pair<int, int>> view;  // (collection, record) in grid order
@@ -4506,11 +4507,14 @@ public:
     // -- CODEX --
     // The in-game codex: collections in game order, each entry's title, unlock hint and body in any
     // of the 13 languages, and its audio log in any installed voice language.
-    // The codex terminal palette (the in-game intel reader): black, phosphor green, a dim rule.
-    static constexpr ImU32 kCxGreen = IM_COL32(64, 236, 104, 255);
-    static constexpr ImU32 kCxDim = IM_COL32(44, 132, 66, 255);
-    static constexpr ImU32 kCxRule = IM_COL32(26, 74, 40, 255);
-    static constexpr ImU32 kCxPanel = IM_COL32(5, 9, 6, 255);
+    // The codex terminal palette (CyberAcme 802.11 NEURO.FILTER intel reader): deep CRT black-green,
+    // phosphor green text, dark emerald ticker bars.
+    static constexpr ImU32 kCxGreen = IM_COL32(34, 214, 88, 255);
+    static constexpr ImU32 kCxBody = IM_COL32(28, 186, 76, 255);
+    static constexpr ImU32 kCxDim = IM_COL32(34, 122, 58, 255);
+    static constexpr ImU32 kCxRule = IM_COL32(22, 68, 36, 255);
+    static constexpr ImU32 kCxPanel = IM_COL32(11, 15, 12, 255);
+    static constexpr ImU32 kCxBarBg = IM_COL32(10, 29, 16, 255);
 
     // The codex illustration texture, uploaded the first time it is shown.
     const CodexUi::Art& codex_art(TagHash tag) {
@@ -4709,116 +4713,174 @@ public:
         ImGui::PopStyleVar(2);
     }
 
-    // One record as the game's intel reader shows it (inside the reader popup). Sets close on x.
+    // One record as the game's CyberAcme 802.11 (NEURO.FILTER) intel reader shows it.
     void codex_reader(const Codex& cx, size_t lang, bool& close) {
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, col4(kCxPanel));
-        ImGui::PushStyleColor(ImGuiCol_Border, col4(kCxRule));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {28 * sc, 22 * sc});
-        ImGui::BeginChild("cxentry", {0, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
-        ImGui::PopStyleVar();
-        {  // close, top right
-            const ImVec2 keep = ImGui::GetCursorPos();
-            const float bs = 30 * sc;
-            ImGui::SetCursorPos({ImGui::GetWindowWidth() - bs - 10 * sc, 10 * sc});
+        const ImVec2 win_p = ImGui::GetWindowPos();
+        const ImVec2 win_s = ImGui::GetWindowSize();
+        auto* root_dl = ImGui::GetWindowDrawList();
+        const float bar_h = 30 * sc;
+
+        // Full terminal background + subtle horizontal CRT scanlines.
+        root_dl->AddRectFilled(win_p, {win_p.x + win_s.x, win_p.y + win_s.y}, kCxPanel);
+        for (float y = win_p.y + bar_h; y < win_p.y + win_s.y - bar_h; y += std::max(2.0f, 3.0f * sc))
+            root_dl->AddLine({win_p.x, y}, {win_p.x + win_s.x, y}, IM_COL32(0, 0, 0, 34), 1.0f);
+
+        // Top & bottom repeating CyberAcme 802.11 (NEURO.FILTER) ticker bars.
+        auto draw_ticker_bar = [&](float y0, const char* sep, bool with_close) {
+            const ImVec2 b0{win_p.x, y0}, b1{win_p.x + win_s.x, y0 + bar_h};
+            root_dl->AddRectFilled(b0, b1, kCxBarBg);
+            root_dl->AddLine({b0.x, b0.y}, {b1.x, b0.y}, kCxRule, 1.0f);
+            root_dl->AddLine({b0.x, b1.y - 1.0f}, {b1.x, b1.y - 1.0f}, kCxRule, 1.0f);
+            const std::string unit = std::format("CYBERACME 802.11 (NEURO.FILTER)   {}   ", sep);
+            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.92f / sc);
+            const ImVec2 us = ImGui::CalcTextSize(unit.c_str());
+            const float clip_r = with_close ? (b1.x - bar_h - 6 * sc) : b1.x;
+            root_dl->PushClipRect(b0, {clip_r, b1.y}, true);
+            const float ty = y0 + (bar_h - us.y) * 0.5f;
+            for (float x = b0.x + 6 * sc; x < clip_r; x += std::max(us.x, 40.0f * sc))
+                root_dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {x, ty}, kCxGreen, unit.c_str());
+            root_dl->PopClipRect();
+            ImGui::PopFont();
+        };
+        draw_ticker_bar(win_p.y, "+", true);
+        draw_ticker_bar(win_p.y + win_s.y - bar_h, "-", false);
+
+        // Close button [x] on the right side of the top ticker bar.
+        {
+            const float bs = bar_h - 4 * sc;
+            ImGui::SetCursorScreenPos({win_p.x + win_s.x - bs - 4 * sc, win_p.y + 2 * sc});
             if (ImGui::InvisibleButton("##cxclose", {bs, bs})) close = true;
             const bool hov = ImGui::IsItemHovered();
             const ImVec2 a = ImGui::GetItemRectMin();
-            auto* cdl = ImGui::GetWindowDrawList();
-            if (hov) cdl->AddRectFilled(a, {a.x + bs, a.y + bs}, IM_COL32(26, 74, 40, 160), 4 * sc);
+            if (hov) root_dl->AddRectFilled(a, {a.x + bs, a.y + bs}, IM_COL32(26, 74, 40, 200), 2 * sc);
             const std::string g = icon(0xE711);
             const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-            cdl->AddText({a.x + (bs - gs.x) * 0.5f, a.y + (bs - gs.y) * 0.5f}, hov ? kCxGreen : kCxDim, g.c_str());
-            ImGui::SetCursorPos(keep);
+            root_dl->AddText({a.x + (bs - gs.x) * 0.5f, a.y + (bs - gs.y) * 0.5f}, hov ? kCxGreen : kCxDim, g.c_str());
         }
+
+        // Main interior area between the two ticker bars.
+        const float pad_x = 30 * sc, pad_y = 24 * sc;
+        const float inner_w = std::max(100.0f, win_s.x - 2 * pad_x);
+        const float inner_h = std::max(100.0f, win_s.y - 2 * bar_h - 2 * pad_y);
+        ImGui::SetCursorScreenPos({win_p.x + pad_x, win_p.y + bar_h + pad_y});
+
         if (codex.collection < 0 || size_t(codex.collection) >= cx.collections.size() || codex.entry < 0 ||
             size_t(codex.entry) >= cx.collections[size_t(codex.collection)].entries.size()) {
             ImGui::PushFont(g_fonts.mono, 0);
             ImGui::TextColored(col4(kCxDim), "> %s", ui::tr(ui::S::CodexPick));
             ImGui::PopFont();
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
             return;
         }
         const auto& c = cx.collections[size_t(codex.collection)];
         const auto& e = c.entries[size_t(codex.entry)];
-        auto* dl = ImGui::GetWindowDrawList();
-        const float avail = ImGui::GetContentRegionAvail().x;
-        const bool two_col = avail > 760 * sc;
-        const float meta_w = two_col ? std::min(300 * sc, avail * 0.32f) : avail;
+        const bool two_col = inner_w > 700 * sc;
+        const float col_gap = 32 * sc;
+        const float left_w = two_col ? std::min(inner_w * 0.37f, inner_h - 32 * sc) : std::min(inner_w, 260 * sc);
+        const float col_right_w = two_col ? std::max(260 * sc, inner_w - left_w - col_gap) : inner_w;
 
-        // meta column: the record's illustration (the collection's when the record has none) and its facts
-        auto rule = [&](float w) {
-            const ImVec2 p = ImGui::GetCursorScreenPos();
-            dl->AddLine({p.x, p.y + 4 * sc}, {p.x + w, p.y + 4 * sc}, kCxRule);
-            ImGui::Dummy({w, 9 * sc});
-        };
+        // ---- Left column: large square CRT phosphor-tinted illustration ----
         ImGui::BeginGroup();
         {
             const ImVec2 p = ImGui::GetCursorScreenPos();
-            const float box = two_col ? meta_w : std::min(meta_w, 220 * sc);
+            const float box = std::max(120 * sc, left_w);
             const TagHash art_tag = e.illustration.is_none() ? c.illustration : e.illustration;
             const CodexUi::Art* art = art_tag.is_none() ? nullptr : &codex_art(art_tag);
-            float box_h = box;
+            const float box_h = box;
+            root_dl->AddRectFilled(p, {p.x + box, p.y + box_h}, IM_COL32(6, 14, 8, 255));
             if (art && art->srv != UINT32_MAX) {
-                // Fit the image to the frame width; the frame grows to the image's aspect.
-                const float pad = 8 * sc, iw = box - 2 * pad;
-                const float ih = iw * float(art->h) / float(std::max(art->w, 1));
-                box_h = ih + 2 * pad;
-                dl->AddImage(ImTextureID(gpu.srv().gpu(art->srv).ptr), {p.x + pad, p.y + pad}, {p.x + pad + iw, p.y + pad + ih});
+                const float aspect = float(std::max(art->w, 1)) / float(std::max(art->h, 1));
+                float iw = box, ih = box;
+                if (aspect > 1.0f) ih = box / aspect;
+                else iw = box * aspect;
+                const ImVec2 ia{p.x + (box - iw) * 0.5f, p.y + (box_h - ih) * 0.5f};
+                const ImVec2 ib{ia.x + iw, ia.y + ih};
+                const ImU32 tint = codex.crt_tint ? IM_COL32(48, 240, 108, 255) : IM_COL32(255, 255, 255, 255);
+                root_dl->AddImage(ImTextureID(gpu.srv().gpu(art->srv).ptr), ia, ib, {0, 0}, {1, 1}, tint);
+                if (codex.crt_tint) {
+                    for (float y = ia.y; y < ib.y; y += std::max(2.0f, 3.0f * sc))
+                        root_dl->AddLine({ia.x, y}, {ib.x, y}, IM_COL32(0, 18, 6, 64), 1.0f);
+                }
             } else {
                 ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
                 const char* none = art ? art->error.c_str() : ui::tr(ui::S::CodexNoIllustration);
-                const float wrap = box - 32 * sc;
+                const float wrap = box - 24 * sc;
                 const ImVec2 ts = ImGui::CalcTextSize(none, nullptr, false, wrap);
-                dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {p.x + 16 * sc, p.y + (box - ts.y) * 0.5f}, kCxDim, none, nullptr, wrap);
+                root_dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {p.x + 12 * sc, p.y + (box_h - ts.y) * 0.5f}, kCxDim, none, nullptr, wrap);
                 ImGui::PopFont();
             }
-            dl->AddRect(p, {p.x + box, p.y + box_h}, kCxRule, 0, 0, 1 * sc);
-            const float t = 10 * sc;  // corner ticks
-            for (int k = 0; k < 4; ++k) {
-                const float x = k & 1 ? p.x + box : p.x, y = k & 2 ? p.y + box_h : p.y;
-                const float sx = k & 1 ? -t : t, sy = k & 2 ? -t : t;
-                dl->AddLine({x, y}, {x + sx, y}, kCxGreen, 2 * sc);
-                dl->AddLine({x, y}, {x, y + sy}, kCxGreen, 2 * sc);
-            }
+            root_dl->AddRect(p, {p.x + box, p.y + box_h}, kCxRule, 0, 0, 1.0f);
             ImGui::Dummy({box, box_h});
+
+            // Subtle 1-line metadata + CRT tint toggle below the artwork.
             ImGui::Dummy({0, 6 * sc});
-            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + meta_w);
-            auto fact = [&](const char* k, const std::string& v) {
-                ImGui::TextColored(col4(kCxDim), "%s", k);
-                ImGui::TextColored(col4(kCxGreen), "%s", v.c_str());
-            };
-            fact("COLLECTION", upper_ascii(text(c.title, lang)));
-            fact("RECORD", std::format("{:08X}", e.hash));
-            if (e.unlock && !text(e.unlock, lang).empty()) fact(upper_ascii(ui::tr(ui::S::CodexUnlock)).c_str(), text(e.unlock, lang));
-            if (!art_tag.is_none()) fact("IMAGE", art_tag.str());
-            if (!e.asset.is_none()) fact("ASSET", e.asset.str());
-            ImGui::PopTextWrapPos();
+            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.78f / sc);
+            ImGui::PushStyleColor(ImGuiCol_Button, col4(kCxBarBg));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col4(kCxRule));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, col4(kCxRule));
+            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxGreen));
+            if (ImGui::SmallButton(codex.crt_tint ? "[CRT: ON]" : "[CRT: OFF]")) codex.crt_tint = !codex.crt_tint;
+            ImGui::PopStyleColor(4);
+            ImGui::SameLine(0, 10 * sc);
+            ImGui::TextColored(col4(kCxDim), "ID %08X", e.hash);
+            if (e.unlock && !text(e.unlock, lang).empty()) {
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + box);
+                ImGui::TextColored(col4(kCxDim), "%s: %s", upper_ascii(ui::tr(ui::S::CodexUnlock)).c_str(), text(e.unlock, lang).c_str());
+                ImGui::PopTextWrapPos();
+            }
             ImGui::PopFont();
         }
         ImGui::EndGroup();
-        if (two_col) ImGui::SameLine(0, 32 * sc);
+
+        if (two_col) ImGui::SameLine(0, col_gap);
         else ImGui::Dummy({0, 12 * sc});
 
-        // reader column
+        // ---- Right column: CyberAcme terminal header + scrollable body + pinned footer ----
         ImGui::BeginGroup();
-        const float rw = two_col ? std::min(avail - meta_w - 32 * sc, 820 * sc) : avail;
-        ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.8f / sc);
-        ImGui::TextColored(col4(kCxDim), "/  %s  /  %s", upper_ascii(text(c.title, lang)).c_str(), upper_ascii(text(e.title, lang)).c_str());
-        ImGui::PopFont();
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
-        heading(upper_ascii(text(e.title, lang)).c_str(), 30);
-        ImGui::PopTextWrapPos();
-        rule(rw);
+        ImGui::PushFont(g_fonts.mono, 0);
+        const float cw = std::max(1.0f, ImGui::CalcTextSize("=").x);
+        const float line_h = ImGui::GetTextLineHeight();
+        auto eq_rule = [&](float w) {
+            const size_t n = std::max<size_t>(4, size_t(w / cw));
+            const std::string s(n, '=');
+            ImGui::TextColored(col4(kCxGreen), "%s", s.c_str());
+        };
 
-        // audio log
+        // Header: collection name + version tag on line 1, entry title on line 2, === rule on line 3.
+        const std::string col_title = upper_ascii(text(c.title, lang));
+        const std::string ent_title = upper_ascii(text(e.title, lang));
+        const std::string ver = std::format("v.1.{:03d}.{:02d}.tciv", codex.collection + 1, codex.entry + 1);
+        const float right_x0 = ImGui::GetCursorPosX();
+        const float ver_w = ImGui::CalcTextSize(ver.c_str()).x;
+        ImGui::TextColored(col4(kCxGreen), "%s", col_title.c_str());
+        if (col_right_w > ver_w + 24 * sc) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(right_x0 + col_right_w - ver_w - 14 * sc);
+            ImGui::TextColored(col4(kCxGreen), "%s", ver.c_str());
+        }
+        ImGui::PushTextWrapPos(right_x0 + col_right_w - 14 * sc);
+        ImGui::TextColored(col4(kCxGreen), "%s", ent_title.empty() ? std::format("{:08X}", e.hash).c_str() : ent_title.c_str());
+        ImGui::PopTextWrapPos();
+        eq_rule(col_right_w - 14 * sc);
+        ImGui::Dummy({0, 4 * sc});
+
+        // Scrollable body child with thin dark scrollbar on the far right edge.
+        const float footer_h = line_h * 2.4f + 10 * sc;
+        const float body_h = std::max(80 * sc, (win_p.y + win_s.y - bar_h - pad_y) - ImGui::GetCursorScreenPos().y - footer_h);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7 * sc);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 2 * sc);
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, IM_COL32(52, 64, 56, 210));
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, IM_COL32(40, 140, 72, 230));
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, kCxGreen);
+        ImGui::BeginChild("cxbody", {col_right_w, body_h}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        auto* bdl = ImGui::GetWindowDrawList();
+        const float text_w = std::max(100.0f, ImGui::GetContentRegionAvail().x - 10 * sc);
+
+        // Audio log controls (when entry has voice recordings).
         if (!e.lines.empty()) {
             const uint16_t voice = audio_langs.empty() ? 0 : audio_langs[voice_index(lang)].first;
-            ImGui::PushFont(g_fonts.mono, 0);
             ImGui::TextColored(col4(kCxDim), "%s", upper_ascii(ui::tr(ui::S::CodexPlayLog)).c_str());
-            ImGui::PopFont();
             if (!audio_langs.empty()) {
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(140 * sc);
@@ -4830,34 +4892,31 @@ public:
                 play_button(uint32_t(li), 0, voice);
                 ImGui::SameLine();
                 const uint64_t id = clip_id(uint32_t(li), 0, voice);
-                const float bar_w = std::min(260 * sc, std::max(80 * sc, rw - 260 * sc));
+                const float bar_w = std::min(240 * sc, std::max(80 * sc, text_w - 240 * sc));
                 const ImVec2 p = ImGui::GetCursorScreenPos();
                 const float bh = ImGui::GetFrameHeight();
                 const float t = clip && clip->id() == id && clip->length() > 0 ? float(clip->position() / clip->length()) : 0.0f;
-                dl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w, p.y + bh * 0.5f + 1 * sc}, kCxRule);
-                dl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w * t, p.y + bh * 0.5f + 1 * sc}, kCxGreen);
+                bdl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w, p.y + bh * 0.5f + 1 * sc}, kCxRule);
+                bdl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w * t, p.y + bh * 0.5f + 1 * sc}, kCxGreen);
                 ImGui::Dummy({bar_w, bh});
                 ImGui::SameLine();
                 ImGui::AlignTextToFramePadding();
-                ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
                 text_line_fit(clip && clip->id() == id ? (clock_text(clip->position()) + " / " + clock_text(clip->length())).c_str() : l.wem[0].str().c_str(), kCxDim);
                 const auto& audio_label = text(l.subtitle_hash, lang, l.subtitle_container);
                 if (!audio_label.empty()) ImGui::SetItemTooltip("%s", audio_label.c_str());
-                ImGui::PopFont();
             }
-            rule(rw);
+            eq_rule(text_w);
+            ImGui::Dummy({0, 4 * sc});
         }
 
-        // body
+        // Body paragraphs in phosphor green monospace.
         const std::string& body = text(e.body, lang);
-        ImGui::PushFont(g_fonts.mono, 0);
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 6 * sc});
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
-        if (body.empty()) ImGui::TextColored(col4(kCxDim), "%s", ui::tr(ui::S::CodexNoBody));
-        else {
-            // Line by line: the record's ===== / ----- rules are cut to the column instead of wrapping.
-            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxGreen));
-            const float cw = std::max(1.0f, ImGui::CalcTextSize("=").x);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 5 * sc});
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_w);
+        if (body.empty()) {
+            ImGui::TextColored(col4(kCxDim), "%s", ui::tr(ui::S::CodexNoBody));
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxBody));
             size_t pos = 0;
             while (pos <= body.size()) {
                 size_t end = body.find('\n', pos);
@@ -4866,10 +4925,10 @@ public:
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 const bool is_rule = line.size() > 8 && line.find_first_not_of("=-_~ ") == std::string::npos;
                 if (is_rule) {
-                    line.resize(std::min(line.size(), size_t(rw / cw)));
-                    ImGui::TextColored(col4(kCxDim), "%s", line.c_str());
+                    line.resize(std::min(line.size(), size_t(text_w / cw)));
+                    ImGui::TextColored(col4(kCxGreen), "%s", line.c_str());
                 } else if (line.empty()) {
-                    ImGui::Dummy({0, ImGui::GetTextLineHeight() * 0.5f});
+                    ImGui::Dummy({0, line_h * 0.55f});
                 } else {
                     ImGui::TextUnformatted(line.c_str());
                 }
@@ -4877,20 +4936,30 @@ public:
             }
             ImGui::PopStyleColor();
         }
+        if (e.lines.empty() && !e.asset.is_none()) {
+            ImGui::Dummy({0, 6 * sc});
+            ImGui::TextColored(col4(kCxDim), "%s", ui::trf(ui::S::CodexAssetNoAudio, e.asset.str()).c_str());
+        }
         ImGui::PopTextWrapPos();
         ImGui::PopStyleVar();
-        ImGui::PopFont();
-        if (e.lines.empty() && !e.asset.is_none()) {
-            rule(rw);
-            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.85f / sc);
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + rw);
-            ImGui::TextColored(col4(kCxDim), "%s", ui::trf(ui::S::CodexAssetNoAudio, e.asset.str()).c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::PopFont();
-        }
-        ImGui::EndGroup();
         ImGui::EndChild();
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(4);
+        ImGui::PopStyleVar(2);
+
+        // Pinned terminal footer: === rule + [RNNRqterm] || CyberAcme Systems, Inc. / ///REDACTED///
+        ImGui::Dummy({0, 4 * sc});
+        eq_rule(col_right_w - 14 * sc);
+        const char* foot_l = "[RNNRqterm] || CyberAcme Systems, Inc.";
+        const char* foot_r = "///REDACTED///";
+        const float fr_w = ImGui::CalcTextSize(foot_r).x;
+        ImGui::TextColored(col4(kCxBody), "%s", foot_l);
+        if (col_right_w > fr_w + 24 * sc) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(right_x0 + col_right_w - fr_w - 14 * sc);
+            ImGui::TextColored(col4(kCxBody), "%s", foot_r);
+        }
+        ImGui::PopFont();
+        ImGui::EndGroup();
     }
 
     void movies_tab() {
