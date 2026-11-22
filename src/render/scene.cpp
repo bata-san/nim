@@ -1775,6 +1775,58 @@ PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const s
     return out;
 }
 
+PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
+                               const std::vector<std::vector<InputElement>>& layouts, PrepareCache* cache) {
+    PreparedMesh out;
+    if (cache) {
+        std::lock_guard lk(*cache->mutex);
+        if (!cache->ready) {
+            prepare_material_inputs(pm, out, nullptr);
+            cache->global_channels = out.global_channels;
+            cache->scopes = out.scopes;
+            cache->ready = true;
+        }
+        out.global_channels = cache->global_channels;
+        out.scopes = cache->scopes;
+    } else {
+        prepare_material_inputs(pm, out, nullptr);
+    }
+    out.tag = decal.collection;
+    out.dynamic = true;  // authored rigid_model transform and position decode
+    auto& buffers = out.buffers.emplace_back();
+    buffers.ib = load_index_buffer(pm, decal.index);
+    buffers.vb0 = load_vertex_buffer(pm, decal.vertex);
+    const uint32_t index_stride = buffers.ib.is_32bit ? 4 : 2;
+    if (!decal.triangle_count || buffers.ib.data.size() != uint64_t(decal.triangle_count) * 3 * index_stride ||
+        buffers.vb0.stride != 32 || buffers.vb0.data.empty() || buffers.vb0.data.size() % 32)
+        throw std::runtime_error("Invalid map decal geometry: " + decal.vertex.str());
+
+    constexpr std::array semantics{"POSITION", "TEXCOORD", "NORMAL", "TANGENT", "COLOR"};
+    constexpr std::array formats{13u, 37u, 13u, 13u, 28u};
+    const auto layout = std::ranges::find_if(layouts, [&](const auto& elements) {
+        if (elements.size() != semantics.size()) return false;
+        for (size_t i = 0; i < semantics.size(); ++i) {
+            const auto& e = elements[i];
+            if (e.buffer || e.instanced || e.semantic_index || e.dxgi_format != formats[i] ||
+                std::string_view(e.semantic) != semantics[i]) return false;
+        }
+        return true;
+    });
+    if (layout == layouts.end()) throw std::runtime_error("Missing original map decal vertex layout");
+    const auto technique = load_technique(pm, decal.technique);
+    TextureCache textures;
+    textures.shared = cache;
+    out.groups.push_back(build_group(pm, technique, {0, decal.triangle_count * 3, 0, 1, 3},
+                                     uint16_t(decal.ordinal), uint8_t(layout - layouts.begin()), textures, out.scopes));
+    out.groups.back().stage = kStageDecal;
+    out.model_cb[4] = decal.scale;
+    out.model_cb[5] = decal.offset;
+    out.model_cb[6] = decal.uv;
+    out.center = {decal.offset[0], decal.offset[1], decal.offset[2]};
+    out.radius = std::hypot(decal.scale[0], decal.scale[1], decal.scale[2]);
+    return out;
+}
+
 void StaticMeshScene::upload(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts) {
     begin(gpu);
     dynamic_ = mesh.dynamic;

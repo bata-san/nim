@@ -73,6 +73,13 @@ struct MapStatic {
     std::vector<float> sky_order;  // one authored sort key per row for sky collections
 };
 inline constexpr uint32_t kBubbleOutpost = 0x80AF9550;  // exp_outpost
+inline constexpr uint32_t kClassMapDecals = 0x808081B2;
+struct MapDecal {
+    TagHash collection, technique, index, vertex;
+    uint32_t ordinal = 0, triangle_count = 0;
+    std::array<float, 12> rows{};
+    std::array<float, 4> scale{}, offset{}, uv{};
+};
 
 struct MapLayout {
     TagHash bubble;
@@ -81,10 +88,12 @@ struct MapLayout {
     std::vector<MapStatic> statics;      // one per distinct mesh
     std::vector<Terrain> terrains;       // terrain patches
     std::vector<TagHash> decorator_groups; // placement streams referenced by the map nodes
+    std::vector<TagHash> decal_collections;
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
+std::vector<MapDecal> load_map_decals(PackageManager& pm, const MapLayout& map);
 
 // Where the geometry is: the per-axis median of the instance origins (bounds are stretched by
 // far-off outliers such as skyboxes).

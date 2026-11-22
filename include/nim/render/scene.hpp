@@ -265,10 +265,13 @@ struct PrepareCache {
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr,
                                  PrepareCache* cache = nullptr);
 struct Terrain;
+struct MapDecal;
 // A map's terrain patch (high detail parts) with its own techniques, dyemaps and VS constants;
 // `layouts` picks the game input layout matching its vertex streams. Throws on failure.
 PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
                              PrepareCache* cache = nullptr);
+PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
+                               const std::vector<std::vector<InputElement>>& layouts, PrepareCache* cache = nullptr);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
 // material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_poses.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their

@@ -171,6 +171,7 @@ int run(int argc, char** argv) {
     bool dump_lighting = false;
     bool no_froxels = false;
     bool no_froxel_noise = false;
+    bool no_map_decals = false;
     bool no_froxel_history = false;
     bool verify_static_motion = false;
     bool probe_distance_fade = false;
@@ -211,6 +212,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--dump-lighting") dump_lighting = true;
         else if (args[i] == "--no-froxels") no_froxels = true;
         else if (args[i] == "--no-froxel-noise") no_froxel_noise = true;
+        else if (args[i] == "--no-map-decals") no_map_decals = true;
         else if (args[i] == "--no-froxel-history") no_froxel_history = true;
         else if (args[i] == "--verify-static-motion") verify_static_motion = true;
         else if (args[i] == "--probe-distance-fade") probe_distance_fade = true;
@@ -543,6 +545,19 @@ int run(int argc, char** argv) {
                 if (++failures[std::string(ex.what()).substr(0, 100)] == 1 || std::getenv("NIM_LIST_SKIPPED"))
                     std::println("  {}{}: {}", is_terrain ? "terrain " : "", what, ex.what());
             }
+        }
+        if (!no_map_decals) {
+            const auto decals = load_map_decals(pm, map);
+            size_t ready = 0;
+            for (const auto& d : decals) {
+                try {
+                    scene.add_mesh(gpu, prepare_map_decal(pm, d, layouts, &cache), layouts, std::span(&d.rows, 1));
+                    ++ready;
+                } catch (const std::exception& ex) {
+                    ++failures[ex.what()];
+                }
+            }
+            std::println("map decals: {} of {} prepared", ready, decals.size());
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
         if (load_sampler) load_sampler->stop_and_print();

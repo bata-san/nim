@@ -38,7 +38,8 @@ bool structural(uint32_t cls) {
 
 std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr,
                                         std::vector<TagHash>* node_tables = nullptr,
-                                        std::vector<TagHash>* decorator_groups = nullptr) {
+                                        std::vector<TagHash>* decorator_groups = nullptr,
+                                        std::vector<TagHash>* decal_collections = nullptr) {
     pm.build_hash64_index();
     std::vector<TagHash> queue{bubble}, found;
     std::set<uint32_t> seen{bubble.value};
@@ -69,6 +70,11 @@ std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std:
             if (ce->reference == kClassDecoratorGroup) {
                 seen.insert(c.value);
                 if (decorator_groups) decorator_groups->push_back(c);
+                return;
+            }
+            if (ce->reference == kClassMapDecals) {
+                seen.insert(c.value);
+                if (decal_collections) decal_collections->push_back(c);
                 return;
             }
             if (!structural(ce->reference)) return;
@@ -742,9 +748,11 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     MapLayout out;
     out.bubble = bubble;
     std::vector<TagHash> terrain_tags;
-    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables, &out.decorator_groups);
+    out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables, &out.decorator_groups,
+                                           &out.decal_collections);
     for (const auto table : additional_tables) {
-        const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables, &out.decorator_groups);
+        const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables, &out.decorator_groups,
+                                             &out.decal_collections);
         out.instance_tags.insert(out.instance_tags.end(), tags.begin(), tags.end());
     }
     auto unique = [](auto& tags) { std::sort(tags.begin(), tags.end()); tags.erase(std::unique(tags.begin(), tags.end()), tags.end()); };
@@ -753,6 +761,7 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     deduplicate(out.instance_tags);
     deduplicate(out.node_tables);
     deduplicate(out.decorator_groups);
+    deduplicate(out.decal_collections);
     unique(terrain_tags);
     for (TagHash t : terrain_tags) {
         try {
@@ -971,6 +980,36 @@ std::array<float, 12> quat_rows(const TagReader& r, size_t te) {
             2 * (xz - wy) * s, 2 * (yz + wx) * s, (1 - 2 * (xx + yy)) * s, tz};
 }
 }  // namespace
+
+std::vector<MapDecal> load_map_decals(PackageManager& pm, const MapLayout& map) {
+    constexpr size_t stride = 0x60;
+    std::vector<MapDecal> result;
+    for (const auto tag : map.decal_collections) {
+        const auto bytes = pm.read(tag);
+        const TagReader r(bytes);
+        const auto records = r.vec_at(0x08);
+        if (records.element_class != 0x808081AB || records.data > bytes.size() ||
+            records.count > (bytes.size() - records.data) / stride)
+            throw std::runtime_error("Invalid decal collection: " + tag.str());
+        for (size_t i = 0; i < records.count; ++i) {
+            const size_t at = records.data + i * stride;
+            MapDecal decal;
+            decal.collection = tag;
+            decal.ordinal = uint32_t(i);
+            decal.technique = r.tag_at(at);
+            decal.index = r.tag_at(at + 4);
+            decal.vertex = r.tag_at(at + 8);
+            decal.triangle_count = r.u32_at(at + 0x0C);
+            decal.rows = quat_rows(r, at + 0x10);
+            r.copy_at(at + 0x30, decal.scale);
+            r.copy_at(at + 0x40, decal.offset);
+            const auto uv = r.read_at<std::array<float, 4>>(at + 0x50);
+            decal.uv = {uv[0], uv[2], uv[1], uv[3]};
+            result.push_back(decal);
+        }
+    }
+    return result;
+}
 
 MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                               const std::unordered_map<uint32_t, DynamicModelMaterials>& materials) {

@@ -1167,13 +1167,16 @@ private:
                 // the user's initial camera.
                 const size_t first_sky = region.size();
                 for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
+                const auto decals = load_map_decals(*pm, *layout);
+                const size_t decal_start = terrain.size() + region.size();
                 std::sort(world_jobs.begin(), world_jobs.end());
                 std::vector<size_t> jobs;
-                jobs.reserve(terrain.size() + region.size());
+                jobs.reserve(decal_start + decals.size());
                 // The skyline must be visible while the thousands of world meshes are loading.
                 for (size_t i = first_sky; i < region.size(); ++i) jobs.push_back(terrain.size() + i);
                 for (size_t i = 0; i < terrain.size(); ++i) jobs.push_back(i);
                 for (const auto& [distance, index] : world_jobs) jobs.push_back(index);
+                for (size_t i = 0; i < decals.size(); ++i) jobs.push_back(decal_start + i);
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
                     const auto all = load_map_lights(*pm, *layout);
@@ -1212,7 +1215,7 @@ private:
                     if (generation_ != req.generation) continue;
                     progress_.weather = weather;
                     progress_.atmosphere = atmosphere;
-                    progress_.total = region.size() + terrain.size();
+                    progress_.total = jobs.size();
                     progress_.center = center;
                     progress_.extent = extent;
                     progress_.typical = typical;
@@ -1236,7 +1239,11 @@ private:
                         Piece piece{req.generation};
                         std::string failure;
                         try {
-                            if (j < terrain.size()) {
+                            if (j >= decal_start) {
+                                const auto& decal = decals[j - decal_start];
+                                piece.mesh = prepare_map_decal(wpm, decal, layouts, &*cache);
+                                piece.rows = {decal.rows};
+                            } else if (j < terrain.size()) {
                                 piece.mesh = prepare_terrain(wpm, *terrain[j], layouts, &*cache);
                                 piece.rows = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}};
                             } else if (j - terrain.size() < static_count) {
@@ -1254,7 +1261,8 @@ private:
                                 piece.sky_order = std::move(model.sky_order);
                             }
                         } catch (const std::exception& ex) {
-                            failure = (j < terrain.size() ? "terrain: " : j - terrain.size() >= static_count ? "entity: " : "")
+                            failure = (j >= decal_start ? "decal: " : j < terrain.size() ? "terrain: " :
+                                       j - terrain.size() >= static_count ? "entity: " : "")
                                     + std::string(ex.what()).substr(0, 110);
                         }
                         std::unique_lock lk(m_);

@@ -1,5 +1,6 @@
 // CPU regression tests for render-input handoff; no GPU or game install needed.
 #include "nim/render/game_lighting.hpp"
+#include "nim/render/ai_actors.hpp"
 #include <cstdio>
 #include <cmath>
 #include <stdexcept>
@@ -183,5 +184,47 @@ int main() {
               "the co-authored part's pose survived switching to an unrelated clip");
     }
     std::printf("render input tests: %d failures\n", failures);
+    {
+        // A half-turn of the root sweeps the child along an arc. Blending the skin transforms
+        // directly collapsed its one-metre joint offset to zero at the midpoint.
+        ActorCharacter actor;
+        auto binding = std::make_shared<PreviewAnimation>();
+        actor.binding = binding;
+        binding->model = TagHash(1);
+        auto& sk = binding->skeleton;
+        sk.parents = {-1, 0};
+        sk.hashes = {0, 0};
+        sk.bind.resize(2);
+        sk.bind[1].translation[0] = 1;
+        sk.local_bind = sk.bind;
+        sk.inverse_bind = {inverse(sk.bind[0]), inverse(sk.bind[1])};
+        binding->rig.skeleton_bone = {0, 1};
+        binding->rig.object_space = {0, 0};
+        binding->rig.bind_relative = {0, 0};
+        binding->rig.default_pose = sk.local_bind;
+        binding->followers.push_back({TagHash(2), {1}});
+        const TagHash idle(3), walk(4);
+        actor.motion.idle = MotionClip{idle, 1};
+        actor.motion.locomotion.push_back({walk, 1, 1, {1, 0}});
+        for (auto clip : {idle, walk}) {
+            AnimationClip pose;
+            pose.tag = clip;
+            pose.bone_count = 2;
+            if (clip == walk) pose.rotations.push_back({0, {{0, 0, 1, 0}}});
+            actor.clips.emplace(clip, std::move(pose));
+        }
+        ActorAnimator animator;
+        AiAgent agent;
+        actor_poses(actor, agent, animator, 0);
+        agent.motion.locomotion = 0;
+        const auto result = actor_poses(actor, agent, animator, 0.125f);
+        check(result.size() == 2 && result[1].bones.front() == result[0].bones[1], "AI follower split from crossfaded parent");
+        if (!result.empty()) {
+            const auto root = result[0].bones[0] * sk.bind[0];
+            const auto child = result[0].bones[1] * sk.bind[1];
+            const auto offset = (inverse(root) * child).translation;
+            check(std::abs(offset[0] - 1) < 1e-5f && std::abs(offset[1]) < 1e-5f, "AI crossfade collapsed the child joint offset");
+        }
+    }
     return failures ? 1 : 0;
 }

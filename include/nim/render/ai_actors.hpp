@@ -64,6 +64,7 @@ ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sou
 struct ActorAnimator {
     TagHash clip, previous;
     float time = 0, previous_time = 0, blend = 1;  // blend 0 -> 1: previous -> clip
+    float rate = 1, previous_rate = 1;
 };
 // The poses for `agent` (its motion choice and clock), blending out of the previous clip over
 // 0.25 s (推定). Empty when the character has no clip for the choice.

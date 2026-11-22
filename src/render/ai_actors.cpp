@@ -35,6 +35,36 @@ BoneTransform blend_bone(const BoneTransform& a, const BoneTransform& b, float t
     return r;
 }
 
+// A skin transform is posed object space times inverse bind. Interpolating those transforms
+// directly moves two connected joints along unrelated chords. Blend the posed local transforms
+// and compose the result down the skeleton before putting it back in skinning space.
+void blend_skin_pose(const Skeleton& skeleton, std::span<const BoneTransform> from,
+                     std::span<BoneTransform> to, float weight) {
+    std::vector<BoneTransform> a, b;
+    a.reserve(to.size());
+    b.reserve(to.size());
+    for (size_t i = 0; i < to.size(); ++i) {
+        a.push_back(from[i] * skeleton.bind[i]);
+        b.push_back(to[i] * skeleton.bind[i]);
+    }
+    for (size_t i = 0; i < to.size(); ++i) {
+        const int parent = skeleton.parents[i];
+        to[i] = parent < 0 ? blend_bone(a[i], b[i], weight)
+            : blend_bone(inverse(a[parent]) * a[i], inverse(b[parent]) * b[i], weight);
+    }
+    std::vector<uint8_t> done(to.size());
+    auto compose = [&](auto&& self, size_t i) -> const BoneTransform& {
+        if (!done[i]) {
+            const int parent = skeleton.parents[i];
+            a[i] = parent < 0 ? to[i] : self(self, size_t(parent)) * to[i];
+            done[i] = 1;
+        }
+        return a[i];
+    };
+    for (size_t i = 0; i < to.size(); ++i) compose(compose, i);
+    for (size_t i = 0; i < to.size(); ++i) to[i] = a[i] * skeleton.inverse_bind[i];
+}
+
 const MotionClip* chosen_clip(const MotionSet& m, const MotionChoice& choice) {
     if (choice.locomotion && *choice.locomotion < m.locomotion.size()) return &m.locomotion[*choice.locomotion];
     return m.idle ? &*m.idle : nullptr;
@@ -213,6 +243,7 @@ std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& a
         if (!anim.clip.is_none()) {
             anim.previous = anim.clip;
             anim.previous_time = anim.time;  // where the old clip was
+            anim.previous_rate = anim.rate;
             anim.blend = 0;
         }
         anim.clip = now->clip;
@@ -225,15 +256,29 @@ std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& a
         return c.binding->poses(clip, frame);
     };
     anim.time = agent.motion_time;
+    anim.rate = agent.motion.locomotion && now == chosen_clip(c.motion, agent.motion) ? agent.motion.rate : 1;
     auto poses = pose_at(now->clip, agent.motion_time);
     if (anim.blend < 1 && c.clips.contains(anim.previous)) {
-        anim.previous_time += dt;
+        anim.previous_time += dt * anim.previous_rate;
         anim.blend = std::min(1.0f, anim.blend + dt / kBlendSeconds);
         const auto before = pose_at(anim.previous, anim.previous_time);
         for (auto& p : poses) {
             const auto other = std::ranges::find(before, p.model, &ModelSkinPose::model);
             if (other == before.end() || other->bones.size() != p.bones.size()) continue;
-            for (size_t b = 0; b < p.bones.size(); ++b) p.bones[b] = blend_bone(other->bones[b], p.bones[b], anim.blend);
+            const auto part = std::ranges::find(c.binding->animated_parts, p.model, &PreviewAnimation::AnimatedPart::model);
+            const Skeleton* skeleton = p.model == c.binding->model ? &c.binding->skeleton
+                : part == c.binding->animated_parts.end() ? nullptr : &part->skeleton;
+            if (skeleton && skeleton->size() == p.bones.size())
+                blend_skin_pose(*skeleton, other->bones, p.bones, anim.blend);
+        }
+        const auto& source = poses.front().bones;
+        for (const auto& follower : c.binding->followers) {
+            auto p = std::ranges::find(poses, follower.model, &ModelSkinPose::model);
+            if (p == poses.end() || p == poses.begin() || p->bones.size() != follower.bone_map.size()) continue;
+            for (size_t i = 0; i < follower.bone_map.size(); ++i) {
+                const auto b = follower.bone_map[i];
+                if (b >= 0 && size_t(b) < source.size()) p->bones[i] = source[b];
+            }
         }
     } else {
         anim.blend = 1;
