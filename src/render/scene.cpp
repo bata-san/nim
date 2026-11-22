@@ -1040,55 +1040,82 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         }
         const uint32_t set = uint32_t(out.buffers.size());
         bool used = false;
-        // Some meshes also contain a complete auxiliary representation tagged (role 3, mask 0xF).
-        // Its mask overlaps the regular detail levels, but drawing both overlays two models.
-        auto auxiliary_tagged = [](const DynamicMeshPart& part) { return part.lod_role == 3 && part.lod_category == 0xF; };
-        // Of the parts tagged like the auxiliary representation, the ones flagged 0x380 are the UESC
-        // robots' face indicator: the inner shapes of the panel in front of the face (80A4B5C4 /
-        // 80A968B3, docs/PROGRESS.md 3.77; 推定, what the flag bits mean is not decoded). They are
-        // drawn with the regular representation. The panel's square (flags 8) is not: in game only
-        // the inner shape is seen (user observation, 2026-11-22). The fragmented shell never counts.
-        auto indicator = [](const DynamicMeshPart& part) {
-            const bool shell = (part.flags & 8) && (part.technique.value == 0x80A4B903 || part.technique.value == 0x80A4B912);
-            return (part.flags & 0x380) && !shell;
-        };
-        auto auxiliary = [&](const DynamicMeshPart& part) { return auxiliary_tagged(part) && !indicator(part); };
-        const size_t opaque_begin = std::min<size_t>(mesh.part_range[0], mesh.parts.size());
-        const size_t opaque_end = std::max(opaque_begin, std::min<size_t>(mesh.part_range[1], mesh.parts.size()));
-        const auto opaque = std::span(mesh.parts).subspan(opaque_begin, opaque_end - opaque_begin);
-        const bool has_regular = std::ranges::any_of(opaque, [](const auto& part) {
-            return part.lod_role == 1 && (part.lod_category & 1);
-        });
-        // These two techniques draw the fragmented shell of the same body. In an
-        // intact preview their flagged sections overlap the unflagged intact shell.
-        auto fractured_shell = [](const DynamicMeshPart& part) {
-            return (part.flags & 8) && (part.technique.value == 0x80A4B903 || part.technique.value == 0x80A4B912);
-        };
-        const bool has_intact_shell = materials && std::ranges::any_of(opaque, [&](const DynamicMeshPart& part) {
-            return part.lod_role == 1 && (part.lod_category & 1) && part.flags == 0 &&
-                   !materials->technique(part.variant_shader_index, perm).is_none();
-        });
+        // Which parts of the mesh make the intact model (docs/PROGRESS.md 3.80; 推定):
+        // - Role 3 with mask 0xF: detail parts every LOD shares (the UESC robots' sensor module,
+        //   heels, face indicator), drawn with the highest regular LOD. They were once taken for a
+        //   separate auxiliary representation.
+        // - Flags 8: decals laid on the body (lettering and numbers, 80A4B903 / 80A4B912 / 80A4B64E),
+        //   drawn. They were once taken for a fragmented shell.
+        // - The face indicator (80A4B5C4 / 80A968B3, 3.77): of a technique with parts flagged 0x380
+        //   (the inner shapes), the parts without the flag (the panel's square) are not drawn. In game
+        //   only the inner shape is seen (user observation, 2026-11-22).
+        // - Alternates: parts of one stage with the same material, the same bind-pose bounds and
+        //   nearly the same index count are one piece's alternates (colour variants such as the
+        //   recruit's blue / red neck, or the same triangles under another external identifier).
+        //   Only the lowest external identifier is drawn; how the game picks one is not decoded.
+        std::vector<char> hidden(mesh.parts.size(), 0);
+        {
+            auto bounds = [&](const DynamicMeshPart& part) {
+                std::array<float, 6> bb{1e9f, 1e9f, 1e9f, -1e9f, -1e9f, -1e9f};
+                const size_t nidx = bufs.ib.data.size() / (bufs.ib.is_32bit ? 4 : 2);
+                for (size_t k = part.index_start; k < size_t(part.index_start) + part.index_count && k < nidx; ++k) {
+                    uint32_t v = 0;
+                    if (bufs.ib.is_32bit) std::memcpy(&v, bufs.ib.data.data() + k * 4, 4);
+                    else { uint16_t v16; std::memcpy(&v16, bufs.ib.data.data() + k * 2, 2); v = v16 == 0xFFFF ? 0xFFFFFFFFu : v16; }
+                    if (v == 0xFFFFFFFFu || size_t(v + 1) * bufs.vb0.stride > bufs.vb0.data.size()) continue;
+                    for (size_t c = 0; c < 3; ++c) {
+                        int16_t q;
+                        std::memcpy(&q, bufs.vb0.data.data() + size_t(v) * bufs.vb0.stride + 2 * c, 2);
+                        bb[c] = std::min(bb[c], float(q));
+                        bb[c + 3] = std::max(bb[c + 3], float(q));
+                    }
+                }
+                return bb;
+            };
+            for (uint8_t stage : kDrawnStages) {
+                const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
+                std::set<uint32_t> glyph_techniques;
+                for (size_t k = first; k < last; ++k)
+                    if (mesh.parts[k].flags & 0x380) glyph_techniques.insert(mesh.parts[k].technique.value);
+                std::vector<std::pair<size_t, std::array<float, 6>>> seen;
+                for (size_t k = first; k < last; ++k) {
+                    const auto& part = mesh.parts[k];
+                    if (glyph_techniques.contains(part.technique.value) && !(part.flags & 0x380)) {
+                        hidden[k] = 1;
+                        continue;
+                    }
+                    const auto bb = bounds(part);
+                    for (auto& [j, other_bb] : seen) {
+                        const auto& other = mesh.parts[j];
+                        if (other.technique != part.technique || other.variant_shader_index != part.variant_shader_index ||
+                            (other.lod_category & part.lod_category) == 0)
+                            continue;
+                        const uint32_t n = std::max(part.index_count, other.index_count);
+                        if (std::max(part.index_count, other.index_count) - std::min(part.index_count, other.index_count) > n / 20 + 2) continue;
+                        bool same = true;
+                        for (size_t c = 0; c < 6; ++c) same = same && std::abs(bb[c] - other_bb[c]) <= 64.0f;  // a few mm in quantized units
+                        if (!same) continue;
+                        // Keep the lowest external identifier (the regular role first).
+                        const bool part_first = std::pair(part.lod_role != 1, part.external_identifier) < std::pair(other.lod_role != 1, other.external_identifier);
+                        hidden[part_first ? j : k] = 1;
+                        if (part_first) j = k, other_bb = bb;
+                        out.inferred_dynamic_lod = true;
+                        break;
+                    }
+                    if (!hidden[k] && std::ranges::none_of(seen, [&](const auto& e) { return e.first == k; })) seen.push_back({k, bb});
+                }
+            }
+        }
         for (uint8_t stage : kDrawnStages) {
             const size_t first = mesh.part_range[stage], last = std::min<size_t>(mesh.part_range[stage + 1], mesh.parts.size());
-            const bool has_auxiliary = first < last && std::ranges::any_of(
-                std::span(mesh.parts).subspan(first, last - first), auxiliary);
-            const bool choose_representation = has_regular && has_auxiliary;
-            out.inferred_dynamic_lod |= choose_representation;
-            const auto before = out.groups.size();
-            // A second pass is only needed when no regular part can be loaded.
-            for (unsigned attempt = 0; attempt < (choose_representation ? 2u : 1u) && out.groups.size() == before; ++attempt) {
+            {
                 uint8_t authored_lods = 0;
-                for (size_t k = first; k < last; ++k)
-                    if (!choose_representation || auxiliary(mesh.parts[k]) == (attempt == 1)) authored_lods |= mesh.parts[k].lod_category;
+                for (size_t k = first; k < last; ++k) authored_lods |= mesh.parts[k].lod_category;
                 const uint8_t highest = uint8_t(authored_lods & -int(authored_lods));
                 for (size_t k = first; k < last; ++k) {
                     const DynamicMeshPart& dp = mesh.parts[k];
-                    if (choose_representation && auxiliary(dp) != (attempt == 1)) continue;
                     if (highest && !(dp.lod_category & highest)) continue;
-                    if (stage == 0 && has_intact_shell && fractured_shell(dp)) {
-                        out.intact_preview = true;
-                        continue;
-                    }
+                    if (hidden[k]) continue;
                     // The entity's material variant wins over the part's own technique (goriath binds both,
                     // the variant last).
                     TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
@@ -1969,15 +1996,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     }
 
     if (mesh.inferred_dynamic_lod)
-        material_externs_->note_estimate("dynamic LOD: regular parts take precedence over the auxiliary representation",
-                                         "role 3 with mask 0x0F overlaps the regular LODs");
+        material_externs_->note_estimate("dynamic model alternates: only the lowest external identifier is drawn",
+                                         "parts with the same material, bind-pose bounds and index count are one piece's variants");
 
     if (mesh.distance_field_preview)
         material_externs_->note_estimate("distance-field preview: bounds from the initial spheres; default dissolve 0 if unset",
                                          "native vertex material evaluated at time zero; activation and later bounds depend on runtime channels");
-    if (mesh.intact_preview)
-        material_externs_->note_estimate("intact entity: fragmented shell groups disabled",
-                                         "the flagged shell techniques overlap the intact skinned mesh");
     if (mesh.inferred_transparent_stage)
         material_externs_->note_estimate("HDR colour and motion material drawn in the transparent pass",
                                          "the shader writes colour at target 0 and motion at target 4");
