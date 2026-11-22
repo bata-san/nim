@@ -362,7 +362,28 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             set.error = "no ankle pair in the skeleton";
             return set;
         }
-        std::optional<MotionClip> still;  // non-cyclic idle candidate
+        // The height the clip's foot IK targets stand at (rig nodes whose chain ends at a bone at
+        // ground level): the 10th percentile over both feet and all frames, the planted foot;
+        // none without foot targets.
+        auto foot_floor = [&](const AnimationClip& clip) -> std::optional<float> {
+            std::vector<float> zs;
+            for (const auto& t : clip.translations) {
+                if (t.bone >= rig.size() || rig.ik_root.size() != rig.size() || rig.ik_root[t.bone] < 0) continue;
+                const size_t end = rig.skeleton_bone[t.bone];
+                if (end >= skeleton.size() || std::fabs(rig.default_pose[t.bone].translation[2] - skeleton.bind[end].translation[2]) > 0.05f)
+                    continue;
+                for (const auto& f : t.frames) zs.push_back(f[2]);
+            }
+            if (zs.empty()) return std::nullopt;
+            std::ranges::nth_element(zs, zs.begin() + zs.size() / 10);
+            return zs[zs.size() / 10];
+        };
+        float ankle = 0;
+        for (const int b : *feet) ankle += skeleton.bind[size_t(b)].translation[2] * 0.5f;
+        struct Found {
+            std::vector<MotionClip> locomotion, turns;
+            std::optional<MotionClip> idle, still;
+        } own, borrowed;
         for (const auto tag : entity_motion_clips(pm, entity)) {
             AnimationClip clip;
             try {
@@ -370,28 +391,45 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             } catch (...) {
                 continue;
             }
-            if (clip.bone_count != rig.size()) continue;
+            Found* into = &own;
+            if (clip.bone_count != rig.size()) {
+                // Another robot's clip of the shared bank, rebound by bone group. Only clips whose
+                // planted feet stand at this skeleton's ankle height (within 5 mm: a body of the same
+                // size; the assault, 1.1 times the others, plants at 0.135 m against 0.126) are taken.
+                auto mapped = map_clip_groups(clip, rig);
+                if (!mapped) continue;
+                const auto floor = foot_floor(*mapped);
+                if (!floor || std::fabs(*floor - ankle) > 0.005f) continue;
+                clip = std::move(*mapped);
+                into = &borrowed;
+            }
             const auto gait = measure_clip_gait(skeleton, rig, clip, *feet, fps);
             const float travel = std::hypot(clip.root_motion.translation[0], clip.root_motion.translation[1]);
             if (std::fabs(gait.yaw) >= 0.35f && travel < 0.04f && gait.seconds >= 0.3f) {
                 MotionClip t{tag, gait.seconds, 0, {}, false};
                 t.yaw = gait.yaw;
-                set.turns.push_back(t);
+                into->turns.push_back(t);
                 continue;
             }
             if (!gait.cyclic) {
-                if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!still || gait.seconds > still->seconds))
-                    still = MotionClip{tag, gait.seconds, 0, {}, false};
+                if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!into->still || gait.seconds > into->still->seconds))
+                    into->still = MotionClip{tag, gait.seconds, 0, {}, false};
                 continue;
             }
             MotionClip m{tag, gait.seconds, gait.speed, gait.direction};
             m.authored = gait.authored;
             // A stride (root travel over one cycle) beyond 4 m is a dash or a multi-cycle move, not a gait (推定).
-            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f && travel <= 4.0f) set.locomotion.push_back(m);
-            else if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!set.idle || gait.seconds > set.idle->seconds))
-                set.idle = MotionClip{tag, gait.seconds, 0, {}};
+            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f && travel <= 4.0f) into->locomotion.push_back(m);
+            else if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!into->idle || gait.seconds > into->idle->seconds))
+                into->idle = MotionClip{tag, gait.seconds, 0, {}};
         }
-        if (!set.idle) set.idle = still;
+        // The character's own clips first; what it lacks comes from the shared family (推定: the
+        // motion graph's choice is not decoded).
+        set.locomotion = !own.locomotion.empty() ? own.locomotion : borrowed.locomotion;
+        set.turns = !own.turns.empty() ? own.turns : borrowed.turns;
+        set.idle = own.idle ? own.idle : own.still ? own.still : borrowed.idle ? borrowed.idle : borrowed.still;
+        set.borrowed = (own.locomotion.empty() && !borrowed.locomotion.empty() ? 1 : 0) +
+                       (own.turns.empty() && !borrowed.turns.empty() ? 2 : 0) + (!own.idle && !own.still && set.idle ? 4 : 0);
         for (const auto& m : set.locomotion) {
             if (!m.authored || m.direction[0] < 0.9f) continue;
             set.walk_speed = set.walk_speed > 0 ? std::min(set.walk_speed, m.speed) : m.speed;
@@ -461,7 +499,8 @@ std::vector<AiEstimate> ai_estimates(const AiParams& p) {
         {"dropship_linger", p.dropship_linger, "s the bay stays open after the last member"},
         {"path_search", 8, "path searches per second over all agents: Dijkstra over a 0.5 m lattice of floor-following walks (steps up to 0.45 m), 1500 lattice points, within 40 m; the goal is a random reached point of the squad's areas; paths string-pulled (the engine's navigation is not in game data)"},
         {"walk_grid", 0, "patrol points and straight paths only over open floor: a top-down depth render of the map's geometry between the floor and 2 m above it, eroded by 0.3 m (no navmesh found)"},
-        {"stationary", 0, "characters whose motion bank has no locomotion clip (sniper, ghost) hold their position"},
+        {"stationary", 0, "characters without a locomotion clip of their own or of the shared bank (rebound by bone group) hold their position"},
+        {"shared_clips", 0, "a robot without its own locomotion, turn or idle clips takes those of the shared bank whose planted feet stand at its ankle height (within 5 mm); the motion graph's own choice is not decoded"},
         {"motion_fps", 30, "clip rate used to measure gaits (not decoded)"},
     };
 }

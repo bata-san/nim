@@ -176,6 +176,15 @@ void pose_skeleton(const Skeleton& skeleton, const AnimationRig& rig, const Anim
 // 80803BE9 at resource +0xE8; bank order is the animation graph's clip index). In bank order,
 // duplicates dropped.
 std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity);
+// The clips of one motion bank (80803BE9; rows of 8080AE00 wide hashes), none for unresolved rows.
+std::vector<TagHash> motion_bank_clips(PackageManager& pm, TagHash bank);
+// Rebinds a clip authored for another rig of the same family by bone group: each clip group
+// (AnimationClip::bone_groups, hash and node count, in track order) whose hash and count a group of
+// `rig` has moves onto that group's nodes; tracks of groups the rig lacks are dropped and those rig
+// nodes keep the default pose. The UESC robots' rigs all start with group 522AAFD7 (62 nodes:
+// body, limbs, IK targets), so the shared bank's clips of one robot play on the others. None when
+// the clip's first group is not in the rig.
+std::optional<AnimationClip> map_clip_groups(const AnimationClip& clip, const AnimationRig& rig);
 // Root travel of a clip: the animated translation track of the lowest-numbered bone that has one,
 // first to last frame. speed is horizontal metres per second at `fps` (推定: the clip rate is not
 // decoded; callers pass their estimate).

@@ -227,7 +227,7 @@ int main() {
     }
 
     {
-        // A ground-level IK target (the robots' feet, 3.80): thigh and knee turn so the ankle reaches
+        // A ground-level IK target (the robots' feet, 3.82): thigh and knee turn so the ankle reaches
         // the target node's translation; the limb keeps its lengths and the knee its bend side.
         Skeleton leg;
         leg.parents = {-1, 0, 1, 2, 3};
@@ -263,6 +263,27 @@ int main() {
         clip.translations = {{3, {{0.6f, 0.1f, 0.1f}}}};  // far from the FK ankle: not a target
         pose_skeleton(leg, rig, clip, 0, posed);
         CHECK(dist(posed[4].translation, leg.bind[4].translation) < 1e-4f);
+    }
+
+    {
+        // Clips of a rig family rebind by bone group (3.83): the shared first group keeps its nodes,
+        // a group the target rig also has moves to its position there, others are dropped.
+        AnimationRig rig;
+        rig.skeleton_bone = {0, 1, 2, 3, 4};
+        rig.bone_groups = {{0xA, 2}, {0xD, 1}, {0xB, 2}};
+        AnimationClip clip;
+        clip.bone_count = 5;
+        clip.bone_groups = {{0xA, 2}, {0xC, 1}, {0xB, 2}};
+        clip.rotations = {{0, {{0, 0, 0, 1}}}, {1, {{0, 0, 0, 1}}}, {2, {{0, 0, 0, 1}}}, {3, {{0, 0, 0, 1}}}, {4, {{0, 0, 0, 1}}}};
+        clip.translations = {{2, {{1, 2, 3}}}, {4, {{4, 5, 6}}}};
+        const auto mapped = map_clip_groups(clip, rig);
+        CHECK(mapped && mapped->bone_count == 5 && mapped->rotations.size() == 4);
+        CHECK(mapped->rotations[0].bone == 0 && mapped->rotations[1].bone == 1 && mapped->rotations[2].bone == 3 && mapped->rotations[3].bone == 4);
+        CHECK(mapped->translations.size() == 1 && mapped->translations[0].bone == 4 && mapped->translations[0].frames[0][0] == 4);
+        clip.bone_groups = {{0xE, 2}, {0xC, 1}, {0xB, 2}};  // the first group is not the rig's
+        CHECK(!map_clip_groups(clip, rig));
+        clip.bone_groups = {{0xA, 2}};  // groups that do not cover the tracks
+        CHECK(!map_clip_groups(clip, rig));
     }
 
     {

@@ -1329,7 +1329,7 @@ int cmd_h64_graph(PackageManager& pm, const std::string& prefix) {
 }
 
 // An entity's motion-bank clips and the gait read from their feet (fps 30, 推定).
-int cmd_motion_probe(PackageManager& pm, TagHash entity) {
+int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
     pm.build_hash64_index();
     const auto bytes = pm.read(entity);
     TagReader r(bytes);
@@ -1346,10 +1346,39 @@ int cmd_motion_probe(PackageManager& pm, TagHash entity) {
     const auto feet = find_feet(skeleton);
     if (!feet) throw std::runtime_error("no ankle pair");
     std::println("skeleton {} rig {} feet {} {}", sk.str(), rg.str(), (*feet)[0], (*feet)[1]);
+    if (all) {
+        std::print("rig groups");
+        for (const auto& g : rig.bone_groups) std::print(" {:08X}:{}", g.hash, g.bones);
+        std::println("");
+    }
     for (const auto clip : entity_motion_clips(pm, entity)) {
         try {
             const auto c = load_animation_clip(pm, clip);
-            if (c.bone_count != rig.size()) continue;
+            if (c.bone_count != rig.size()) {
+                if (!all) continue;
+                std::print("{} {:4} frames, {} tracks (rig has {}), groups", clip.str(), c.frame_count, c.bone_count, rig.size());
+                for (const auto& g : c.bone_groups) std::print(" {:08X}:{}", g.hash, g.bones);
+                const auto mapped = map_clip_groups(c, rig);
+                if (!mapped) {
+                    std::println(": does not map");
+                    continue;
+                }
+                // Foot IK targets (ground-level chains), 10th percentile, against the ankles' bind height.
+                std::vector<float> zs;
+                for (const auto& t : mapped->translations) {
+                    if (t.bone >= rig.size() || rig.ik_root[t.bone] < 0) continue;
+                    const size_t end = rig.skeleton_bone[t.bone];
+                    if (std::fabs(rig.default_pose[t.bone].translation[2] - skeleton.bind[end].translation[2]) > 0.05f) continue;
+                    for (const auto& f : t.frames) zs.push_back(f[2]);
+                }
+                std::ranges::sort(zs);
+                const float low = zs.empty() ? 0 : zs[zs.size() / 10];  // as build_motion_set: the planted foot
+                const auto g = measure_clip_gait(skeleton, rig, *mapped, *feet, 30.0f);
+                std::println(": mapped, foot floor {:.4f} (ankle {:.4f}) cyclic {} lift {:.2f} speed {:5.2f}{} yaw {:6.1f}", low,
+                             skeleton.bind[size_t((*feet)[0])].translation[2], g.cyclic ? 1 : 0, g.lift, g.speed, g.authored ? "*" : " ",
+                             g.yaw * 57.2957795f);
+                continue;
+            }
             const auto g = measure_clip_gait(skeleton, rig, c, *feet, 30.0f);
             std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f}{} dir ({:5.2f} {:5.2f}) root ({:6.3f} {:6.3f} {:6.3f}) yaw {:6.1f}",
                          clip.str(), c.frame_count, g.seconds, g.cyclic ? 1 : 0, g.lift, g.speed, g.authored ? "*" : " ", g.direction[0],
@@ -1381,9 +1410,13 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
     }
     for (size_t c = 0; c < g.characters.size(); ++c) {
         const auto& m = motions[c];
-        std::println("  motion {} {:<28} {} locomotion clips, {} turns, walk {:.2f} run {:.2f} m/s, idle {}{}", g.characters[c].entity.str(),
+        std::println("  motion {} {:<28} {} locomotion clips, {} turns, walk {:.2f} run {:.2f} m/s, idle {}{}{}", g.characters[c].entity.str(),
                      g.characters[c].name_estimate, m.locomotion.size(), m.turns.size(), m.walk_speed, m.run_speed,
-                     m.idle ? m.idle->clip.str() : "-", m.error.empty() ? "" : "  (" + m.error + ")");
+                     m.idle ? m.idle->clip.str() : "-",
+                     m.borrowed ? std::format("  shared:{}{}{}", m.borrowed & 1 ? " locomotion" : "", m.borrowed & 2 ? " turns" : "",
+                                              m.borrowed & 4 ? " idle" : "")
+                                : "",
+                     m.error.empty() ? "" : "  (" + m.error + ")");
     }
     AiParams params;
     params.player_invisible = !visible;
@@ -2511,6 +2544,34 @@ int cmd_clip_tracks(PackageManager& pm, TagHash tag, const std::string& list) {
     return 0;
 }
 
+// Every motion bank (80803BE9) with its clip count per track count; with BONES only the banks
+// that hold clips of that many tracks.
+int cmd_motion_banks(PackageManager& pm, uint32_t bones) {
+    pm.build_hash64_index();
+    std::unordered_map<uint32_t, uint16_t> tracks;
+    for (const auto& info : index_animation_clips(pm)) tracks[info.tag.value] = info.bones;
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != 0x80803BE9) continue;
+            const TagHash t = TagHash::make(info.pkg_id, uint16_t(i));
+            std::map<uint16_t, size_t> by;
+            size_t unresolved = 0;
+            for (const auto c : motion_bank_clips(pm, t)) {
+                if (c.is_none()) { ++unresolved; continue; }
+                const auto it = tracks.find(c.value);
+                ++by[it == tracks.end() ? 0 : it->second];
+            }
+            if (bones && !by.count(uint16_t(bones))) continue;
+            std::print("{} pkg {:04X}", t.str(), info.pkg_id);
+            for (const auto& [b, n] : by) std::print("  {}x{}", n, b);
+            std::println("{}", unresolved ? std::format("  unresolved {}", unresolved) : "");
+        }
+    }
+    return 0;
+}
+
 // Decodes every clip; codec histogram and failures.
 int cmd_clips(PackageManager& pm, uint32_t bones) {
     std::map<std::string, size_t> codecs;
@@ -3428,6 +3489,7 @@ int main(int argc, char** argv) {
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clip-tracks" && args.size() >= 3) return cmd_clip_tracks(pm, TagHash(parse_hex(args[1])), args[2]);
         if (cmd == "tag-class-refs" && args.size() >= 2) return cmd_tag_class_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
+        if (cmd == "motion-banks") return cmd_motion_banks(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
@@ -3467,7 +3529,7 @@ int main(int argc, char** argv) {
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "h64-graph" && args.size() >= 2) return cmd_h64_graph(pm, args[1]);
-        if (cmd == "motion-probe" && args.size() >= 2) return cmd_motion_probe(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "motion-probe" && args.size() >= 2) return cmd_motion_probe(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-a");
         if (cmd == "bs-modules") return cmd_bs_modules(pm, args.size() >= 2 ? args[1] : std::string());
         if (cmd == "ai-sim" && args.size() >= 2) {
             float seconds = 60, dt = 0.1f;

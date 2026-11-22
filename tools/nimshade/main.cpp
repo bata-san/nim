@@ -194,6 +194,7 @@ int run(int argc, char** argv) {
     float ai_time = 20, ai_range = 60, ai_frame_distance = 6, ai_frame_height = 1.7f;
     size_t ai_per_character = 4;
     uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
+    std::string ai_subject_name;  // --ai-subject TEXT: --ai-frame / --ai-strip only consider characters whose name contains it
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
     bool ai_ground_audit = false;  // --ai-ground-audit: every drawable agent posed in turn, its sink and body overlap
@@ -249,6 +250,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-range" && i + 1 < args.size()) ai_range = std::stof(args[++i]);
         else if (args[i] == "--ai-actors" && i + 1 < args.size()) ai_per_character = std::stoull(args[++i]);
         else if (args[i] == "--ai-strip" && i + 1 < args.size()) ai_strip = uint32_t(std::stoul(args[++i])), ai_frame = true;
+        else if (args[i] == "--ai-subject" && i + 1 < args.size()) ai_subject_name = args[++i];
         else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--ai-ground-audit") ai_ground_audit = true;
         else if (args[i] == "--no-fx") no_fx = true;
@@ -318,7 +320,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-dropship-strip N] [--ai-ground-audit]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit]");
         return 2;
     }
     if (install.empty()) {
@@ -737,6 +739,7 @@ int run(int argc, char** argv) {
                         const bool walking = std::hypot(a.velocity[0], a.velocity[1]) > 0.5f &&
                                              std::hypot(a.goal[0] - a.position[0], a.goal[1] - a.position[1]) > 4.0f;
                         if (ai_strip && !walking) continue;
+                        if (!ai_subject_name.empty() && !ai_gameplay->characters[a.character].name_estimate.contains(ai_subject_name)) continue;
                         order.push_back({d, k});
                     }
                 }

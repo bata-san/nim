@@ -1464,6 +1464,42 @@ std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity) {
     return out;
 }
 
+std::vector<TagHash> motion_bank_clips(PackageManager& pm, TagHash bank) { return read_motion_bank(pm, bank); }
+
+std::optional<AnimationClip> map_clip_groups(const AnimationClip& clip, const AnimationRig& rig) {
+    if (clip.bone_groups.empty() || rig.bone_groups.empty()) return std::nullopt;
+    std::vector<int32_t> to(clip.bone_count, -1);
+    size_t from_at = 0, matched = 0;
+    for (size_t g = 0; g < clip.bone_groups.size(); ++g) {
+        const auto& cg = clip.bone_groups[g];
+        size_t rig_at = 0;
+        for (const auto& rg : rig.bone_groups) {
+            if (rg.hash == cg.hash && rg.bones == cg.bones) {
+                for (uint32_t k = 0; k < cg.bones && from_at + k < to.size() && rig_at + k < rig.size(); ++k)
+                    to[from_at + k] = int32_t(rig_at + k);
+                matched += cg.bones;
+                break;
+            }
+            rig_at += rg.bones;
+        }
+        // The first group is the body every clip of the family shares; without it nothing fits.
+        if (g == 0 && !matched) return std::nullopt;
+        from_at += cg.bones;
+    }
+    if (from_at != clip.bone_count) return std::nullopt;
+    AnimationClip out = clip;
+    out.bone_count = uint32_t(rig.size());
+    auto remap = [&](auto& tracks) {
+        std::erase_if(tracks, [&](const auto& t) { return t.bone >= to.size() || to[t.bone] < 0; });
+        for (auto& t : tracks) t.bone = decltype(t.bone)(to[t.bone]);
+    };
+    remap(out.rotations);
+    remap(out.translations);
+    remap(out.scales);
+    out.bone_groups = rig.bone_groups;
+    return out;
+}
+
 ClipRootMotion measure_clip_root_motion(const AnimationClip& clip, float fps) {
     ClipRootMotion m;
     m.clip = clip.tag;

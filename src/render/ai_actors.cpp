@@ -111,6 +111,18 @@ std::vector<TagHash> entity_dynamic_models(PackageManager& pm, TagHash entity, c
     return out;
 }
 
+// The motion set's clips authored for another robot of the shared bank (MotionSet::borrowed),
+// rebound onto this rig by bone group.
+template <typename Map> void add_borrowed_clips(PackageManager& pm, const std::vector<ClipInfo>& wanted, const AnimationRig& rig, Map& clips) {
+    for (const auto& info : wanted) {
+        if (info.bones == rig.size() || clips.contains(info.tag)) continue;
+        try {
+            if (auto mapped = map_clip_groups(load_animation_clip(pm, info.tag), rig)) clips.emplace(info.tag, std::move(*mapped));
+        } catch (const std::exception&) {
+        }
+    }
+}
+
 ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
     ActorCharacter c;
     c.entity = motion.entity;
@@ -153,6 +165,7 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
                 restrict_preview_clip(clip, info);
                 c.clips.emplace(info.tag, std::move(clip));
             }
+            add_borrowed_clips(pm, wanted, anim->rig, c.clips);
             c.model = model;
             c.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
             c.binding = std::make_shared<const PreviewAnimation>(std::move(*anim));
@@ -189,6 +202,7 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
                     if (info.bones != rig.size()) continue;
                     c.clips.emplace(info.tag, load_animation_clip(pm, info.tag));
                 }
+                add_borrowed_clips(pm, wanted, rig, c.clips);
                 if (c.clips.empty()) break;
                 c.model = model;
                 c.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));

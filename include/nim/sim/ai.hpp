@@ -47,6 +47,9 @@ struct MotionSet {
     // The character's own forward locomotion speeds (slowest and fastest forward clip with root
     // motion); 0 when it has none. The simulation patrols and runs at these instead of AiParams.
     float walk_speed = 0, run_speed = 0;
+    // Parts taken from other robots' clips of the shared bank (map_clip_groups) because the
+    // character has none of its own: 1 locomotion, 2 turns, 4 idle.
+    int borrowed = 0;
     std::string error;                   // why the set is empty, if it is
 };
 // Reads the entity's skeleton, rig and motion-bank clips and measures each clip's gait at `fps`
