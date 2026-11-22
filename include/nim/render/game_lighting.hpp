@@ -432,6 +432,7 @@ public:
     TagHash shading_technique() const { return shading_.tag(); }
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
     ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
+    ID3D12Resource* material_occlusion() const { return material_ao_.Get(); }  // R8, copied from G-buffer
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
     ID3D12Resource* distortion_view_depth() const { return distortion_view_depth_.Get(); }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
@@ -459,10 +460,11 @@ private:
     int time_of_day_slot_ = -1;
     GamePipeline shading_, final_combine_;
     // SSAO: the engine's hdao pass over the depth buffer, read by the shading pass (extern 93).
-    GamePipeline hdao_, apply_ssao_;
+    GamePipeline hdao_, apply_ssao_, copy_material_ao_;
     ExternStore hdao_ext_;
     ExternStore atmo_lut_;  // the atmosphere density pass's inputs
-    ComPtr<ID3D12Resource> ao_, linear_depth_;
+    static constexpr UINT kMaterialAoRtv = 13;
+    ComPtr<ID3D12Resource> ao_, material_ao_, linear_depth_;
     ComPtr<ID3D12PipelineState> linear_depth_pso_;
     void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     void render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
@@ -624,6 +626,7 @@ private:
     void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p,
                      const ScopeBufferFn& scopes, bool distorted);
     GamePipeline post_tonemap_, post_tonemap_luma_, post_pack_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_down_finite_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
+    GamePipeline bloom_line_down_, bloom_line_blur_, bloom_line_combine_;
     GamePipeline grading_fill_, grading_convert_;
     static constexpr int kBloomLevels = 4;  // 1/3, 1/6, 1/12, 1/24
     struct BloomLevel {
@@ -631,6 +634,7 @@ private:
         uint32_t w = 0, h = 0;
     };
     std::array<BloomLevel, kBloomLevels> bloom_;
+    std::array<ComPtr<ID3D12Resource>, 3> bloom_line_;  // half width, quarter width, filter scratch
     ComPtr<ID3D12Resource> post_ldr_;  // the tonemapped colour with its luma in alpha (the fxaa input)
     ComPtr<ID3D12Resource> ae_columns_rt_, grading_strip_, grading_lut_, black_, lens_blur_;
     ComPtr<ID3D12DescriptorHeap> post_rtv_heap_;

@@ -53,9 +53,8 @@ void GameLighting::load_sky_ambient(PackageManager& pm, Gpu& gpu, std::span<cons
     load(hemi_down_, "sky_hemisphere_downsample_filter_ggx", {kF16, false});
     load(hemi_tint_, "sky_hemisphere_copy_and_tint", {kF16, false});
     {
-        // SV_Target0 diffuse, 1 specular, 2 the G-buffer AO (for passes nim does not run).
-        GamePipeline::Options opt{kF16, false, {kF16}};
-        opt.drop_extra_targets = true;
+        // SV_Target0 diffuse, 1 specular, 2 baked material AO for local cubemap passes.
+        const GamePipeline::Options opt{kF16, false, {kF16, DXGI_FORMAT_R8_UNORM}};
         load(sky_apply_, "cubemap_apply_sky_copy_ao", opt);
         load(sky_apply_overhead_, "cubemap_apply_sky_copy_ao_with_overhead_occlusion", opt);
     }

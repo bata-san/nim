@@ -1155,6 +1155,7 @@ void GameLighting::release(Gpu& gpu) {
     shading_.release(gpu);
     hdao_.release(gpu);
     apply_ssao_.release(gpu);
+    copy_material_ao_.release(gpu);
     sky_near_.release(gpu);
     sky_far_.release(gpu);
     sky_.release(gpu);
@@ -1176,6 +1177,7 @@ void GameLighting::release(Gpu& gpu) {
     atm_ = {};
     atm_notes_.clear();
     ao_.Reset();
+    material_ao_.Reset();
     linear_depth_.Reset();
     final_combine_.release(gpu);
     release_post(gpu);
@@ -1249,6 +1251,13 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
             apply_ssao_.load(pm, gpu, apply, scopes, opt);
         } catch (const std::exception& ex) {
             shading_.notes.push_back(std::format("apply_ssao_to_light_buffers not loaded: {}", ex.what()));
+        }
+    }
+    if (const auto copy = globals_.pipeline("copy_third_gbuffer_ao_to_temp_ao"); !copy.is_none()) {
+        try {
+            copy_material_ao_.load(pm, gpu, copy, scopes, {DXGI_FORMAT_R8_UNORM, false});
+        } catch (const std::exception& ex) {
+            shading_.notes.push_back(std::format("copy_third_gbuffer_ao_to_temp_ao not loaded: {}", ex.what()));
         }
     }
     // Atmosphere: the sky lookups (one full-screen pass each, into RGBA16F) and the sky background,
@@ -1372,7 +1381,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 13};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kMaterialAoRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
@@ -1392,6 +1401,7 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     clear_owned(ext::Deferred, 0xC0, light_diffuse_.Get());
     clear_owned(ext::Deferred, 0xC8, light_specular_.Get());
     clear_owned(ext::Deferred, 0xD0, env_.Get());
+    clear_owned(0x5D, 0x00, material_ao_.Get());
     for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
     distortion_.Reset();
     distortion_depth_.Reset();
@@ -1420,6 +1430,10 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     D3D12_CLEAR_VALUE ov{DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 1, 1, 1}};
     ao_ = gpu.texture2d(w, h, ov.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &ov);
     gpu.device()->CreateRenderTargetView(ao_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 5 * inc});
+    material_ao_ = gpu.texture2d(w, h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+    gpu.device()->CreateRenderTargetView(material_ao_.Get(), nullptr,
+        {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + kMaterialAoRtv * inc});
     D3D12_CLEAR_VALUE lv{DXGI_FORMAT_R32G32_FLOAT, {0, 0, 0, 0}};
     linear_depth_ = gpu.texture2d(w, h, lv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lv);
     gpu.device()->CreateRenderTargetView(linear_depth_.Get(), nullptr, {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 6 * inc});
@@ -1632,9 +1646,7 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
         ext_.note_estimate("extern 43 +0x30 = 1, +0x34 = 0 (shadow strength / filter)", unshadowed);
     }
     if (!ext_.zero_policy(ext::ShadowMask)) ext_.zero_when_missing(ext::ShadowMask, "no shadow pass yet (sun shadow mask not rendered): zero");
-    // Extern 93 +0x00: the ambient occlusion every cubemap_apply pipeline reads (hdao output).
-    if (p.ssao && hdao_.loaded()) ext_.set_texture(93, 0x00, ao_.Get());
-    else ext_.estimate_texture(93, 0x00, unshadowed_.Get(), p.ssao ? "SSAO pipeline not loaded: unoccluded (white)" : "SSAO off: unoccluded (white)");
+    ext_.set_texture(0x5D, 0x00, nullptr);  // produced this frame by the native material AO copy
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "no volumetric fog pass yet: zero");
     // Marathon's original consumers differ from the reference game's frame layout:
     // uber light C0 is Texture3D; shading D0 is the thin-film/iridescence table;
@@ -1952,19 +1964,34 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         const float zero[4]{};
         cl->ClearRenderTargetView({hdr.ptr + 3 * inc}, zero, 0, nullptr);
         cl->ClearRenderTargetView({hdr.ptr + 4 * inc}, zero, 0, nullptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE material_ao_rtv{hdr.ptr + kMaterialAoRtv * inc};
+        const bool copy_material_ao = !sky_ambient && own_env && !cubemaps_.empty() && copy_material_ao_.loaded();
+        if (sky_ambient || copy_material_ao)
+            Gpu::barrier(cl, material_ao_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (sky_ambient) {
             // The sky everywhere first (diffuse light buffer, specular IBL); the cubemap volumes
             // then replace it where they are.
             const bool overhead = overhead_occlusion_on(p);
             if (overhead) prepare_overhead_occlusion(gpu, cl);
-            const D3D12_CPU_DESCRIPTOR_HANDLE bufs[] = {{hdr.ptr + 3 * inc}, env_rtv};
-            cl->OMSetRenderTargets(2, bufs, FALSE, nullptr);
+            const D3D12_CPU_DESCRIPTOR_HANDLE bufs[] = {{hdr.ptr + 3 * inc}, env_rtv, material_ao_rtv};
+            cl->OMSetRenderTargets(3, bufs, FALSE, nullptr);
             (overhead ? sky_apply_overhead_ : sky_apply_).draw(gpu, cl, ext_, scopes);
+        } else if (copy_material_ao) {
+            hdao_ext_.set_texture(ext::Deferred, 0xB8, gb.rt[2].Get());
+            hdao_ext_.set(0x26, 0x50, float4{float(w_), float(h_), 1 / float(w_), 1 / float(h_)});
+            cl->OMSetRenderTargets(1, &material_ao_rtv, FALSE, nullptr);
+            copy_material_ao_.draw(gpu, cl, hdao_ext_, scopes);
+        }
+        if (sky_ambient || copy_material_ao) {
+            Gpu::barrier(cl, material_ao_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ext_.set_texture(0x5D, 0x00, material_ao_.Get());
         }
         if (!cubemaps_.empty() && own_env) {
+            if (!ext_.texture(0x5D, 0x00).resource)
+                ext_.estimate_texture(0x5D, 0x00, unshadowed_.Get(), "material AO copy unavailable: unoccluded (white)");
             { ProfileScope ps_("frame.light.cubemaps"); draw_cubemaps(gpu, cl, gb, vm, scopes, p.probe_distance_fade); }
-            ext_.note_estimate("light buffers: cubemap volumes, then local lights, then the SSAO multiply (the probes also read the AO)",
-                               "engine pass order not in game data; the cubemap alpha replaces what is under it");
+            ext_.note_estimate("light buffers: cubemap volumes read material AO, then local lights, then the SSAO multiply",
+                               "material AO copy matches the cubemap AO input; engine pass order not in game data");
         }
         if (!lights_.empty()) { ProfileScope ps_("frame.light.draw_lights"); draw_lights(gpu, cl, gb, vm, scopes); }
         if (p.ssao && hdao_.loaded() && apply_ssao_.loaded()) {

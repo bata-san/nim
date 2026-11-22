@@ -89,6 +89,9 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     load(bloom_blur_h_, "gaussian_10_horz", {f16, false});
     load(bloom_blur_v_, "gaussian_10_vert", {f16, false});
     load(bloom_add_, "weighted_add", {f16, false});
+    load(bloom_line_down_, "downsample_gaussian_8x1", {f16, false});
+    load(bloom_line_blur_, "downsample_gaussian_16x1", {f16, false});
+    load(bloom_line_combine_, "combined_bloom_line_blur", {f16, false});
     load(ae_columns_, "autoexposure_sample_columns", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
 
     load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
@@ -99,7 +102,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 6};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 9};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -111,6 +114,8 @@ void GameLighting::release_post(Gpu& gpu) {
     for (auto& t : taa_history_) t.Reset();
     taa_valid_ = taa_prev_valid_ = false;
     for (auto& l : bloom_) l = {};
+    for (GamePipeline* gp : {&bloom_line_down_, &bloom_line_blur_, &bloom_line_combine_}) gp->release(gpu);
+    for (auto& r : bloom_line_) r.Reset();
     ae_columns_rt_.Reset();
     grading_strip_.Reset();
     grading_lut_.Reset();
@@ -202,6 +207,13 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < 2; ++i) taa_history_[i] = target(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 2 + i);
     // The authored upsample copies HDR bloom values for the lens texture multiply.
     lens_blur_ = target((w + 3) / 4, (h + 3) / 4, DXGI_FORMAT_R16G16B16A16_FLOAT, 3 * kBloomLevels + 4);
+    if (bloom_line_down_.loaded() && bloom_line_blur_.loaded() && bloom_line_combine_.loaded()) {
+        const auto& l = bloom_[kBloomLevels - 2];
+        const uint32_t half = (l.w + 1) / 2, quarter = (half + 1) / 2;
+        bloom_line_[0] = target(half, l.h, cv.Format, 3 * kBloomLevels + 6);
+        bloom_line_[1] = target(quarter, l.h, cv.Format, 3 * kBloomLevels + 7);
+        bloom_line_[2] = target(quarter, l.h, cv.Format, 3 * kBloomLevels + 8);
+    }
     taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -438,37 +450,66 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         // Up the pyramid: blur the smallest level, then at each finer level weighted_add the
         // blurred coarser result to it and blur again (gaussian_10 with the engine's cb11 kernel).
         constexpr float strength = 0.06f;
+        auto filter = [&](GamePipeline& pipeline, ID3D12Resource* src, ID3D12Resource* dst, uint32_t slot,
+                          const std::array<float4, 12>& cb) {
+            const auto a = gpu.dynamic(cb.size() * sizeof(float4));
+            std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
+            const ScopeBufferFn filter_scopes = [&, va = a.gpu](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+                return reg == 11 ? va : scopes(stage, reg);
+            };
+            const auto desc = dst->GetDesc();
+            const std::pair<uint32_t, ID3D12Resource*> tex[] = {{0, src}};
+            begin(dst, slot, uint32_t(desc.Width), desc.Height);
+            pipeline.draw(gpu, cl, e, filter_scopes, std::span(tex));
+            end(dst);
+        };
         auto blur = [&](uint32_t level, ID3D12Resource* horizontal_source) {
             const auto& l = bloom_[level];
-            for (bool vertical : {false, true}) {
-                auto cb = blur_scope(l.w, l.h, vertical, 2.0f);
-                if (vertical && level == 0) cb[6] = {strength, strength, strength, strength};
-                auto a = gpu.dynamic(cb.size() * sizeof(float4));
-                std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
-                const ScopeBufferFn blur_scopes = [&, va = a.gpu](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
-                    return reg == 11 ? va : scopes(stage, reg);
-                };
-                ID3D12Resource* src = vertical ? l.blur.Get() : horizontal_source;
-                ID3D12Resource* dst = vertical ? l.sum.Get() : l.blur.Get();
-                const std::pair<uint32_t, ID3D12Resource*> tex[] = {{0, src}};
-                begin(dst, 3 * level + (vertical ? 2 : 1), l.w, l.h);
-                (vertical ? bloom_blur_v_ : bloom_blur_h_).draw(gpu, cl, e, blur_scopes, std::span(tex));
-                end(dst);
-            }
+            filter(bloom_blur_h_, horizontal_source, l.blur.Get(), 3 * level + 1, blur_scope(l.w, l.h, false, 2.0f));
+            auto cb = blur_scope(l.w, l.h, true, 2.0f);
+            if (level == 0) cb[6] = {strength, strength, strength, strength};
+            filter(bloom_blur_v_, l.blur.Get(), l.sum.Get(), 3 * level + 2, cb);
         };
+        if (bloom_line_[0]) {
+            auto line = [&](GamePipeline& pipeline, ID3D12Resource* src, uint32_t dst, float4 weights, float4 offsets) {
+                const auto desc = bloom_line_[dst]->GetDesc();
+                const float texel = 1.0f / float(src->GetDesc().Width);
+                std::array<float4, 12> cb{};
+                cb[0] = size4(uint32_t(desc.Width), desc.Height);
+                cb[3] = weights;
+                cb[4] = {offsets[0] * texel, offsets[1] * texel, 0, 0};
+                cb[5] = {offsets[2] * texel, offsets[3] * texel, 0, 0};
+                cb[6] = {1, 1, 1, 1};
+                filter(pipeline, src, bloom_line_[dst].Get(), 3 * kBloomLevels + 6 + dst, cb);
+            };
+            constexpr float4 reduce_weights{0.12667f, 0.37333f, 0, 0}, reduce_offsets{2.87f, 0.875f, 0, 0};
+            constexpr float4 wide_weights{0.04734f, 0.0858f, 0.14793f, 0.21893f}, wide_offsets{6.94f, 4.91f, 2.94f, 0.91f};
+            line(bloom_line_down_, bloom_[kBloomLevels - 2].down.Get(), 0, reduce_weights, reduce_offsets);
+            line(bloom_line_down_, bloom_line_[0].Get(), 1, reduce_weights, reduce_offsets);
+            line(bloom_line_blur_, bloom_line_[1].Get(), 2, wide_weights, wide_offsets);
+            line(bloom_line_blur_, bloom_line_[2].Get(), 1, wide_weights, wide_offsets);
+        }
         blur(kBloomLevels - 1, bloom_.back().down.Get());
         for (int i = kBloomLevels - 2; i >= 0; --i) {
             const auto& l = bloom_[size_t(i)];
             e.set_texture(pp, 0x00, bloom_[size_t(i + 1)].sum.Get());
             e.set_texture(pp, 0x08, l.down.Get());
-            e.set(pp, 0xC0, float4{0.5f, 0.5f, 0.5f, 0.5f});
-            e.set(pp, 0xD0, float4{0.5f, 0.5f, 0.5f, 0.5f});
-            e.set(pp, 0xE0, float4{1, 1, 0, 0});
+            const bool add_line = i == 0 && bloom_line_[1];
+            const float mix = add_line ? 0.44f : 0.5f;
+            e.set(pp, 0xC0, float4{mix, mix, mix, mix});
+            e.set(pp, 0xD0, float4{mix, mix, mix, mix});
+            e.set(pp, 0xE0, add_line ? float4{0.12f, 0.12f, 0.12f, 0.12f} : float4{1, 1, 0, 0});
             e.set(pp, 0xF0, float4{1, 1, 0, 0});
             e.set(pp, 0x50, size4(l.w, l.h));
+            if (add_line) e.set_texture(pp, 0x10, bloom_line_[1].Get());
             begin(l.sum.Get(), uint32_t(3 * i + 2), l.w, l.h);
-            bloom_add_.draw(gpu, cl, e, scopes);
+            (add_line ? bloom_line_combine_ : bloom_add_).draw(gpu, cl, e, scopes);
             end(l.sum.Get());
+            if (add_line) {
+                e.set_texture(pp, 0x10, nullptr);
+                ext_.note_estimate("bloom: two width reductions and two horizontal filters, final line mix 0.44 / 0.44 / 0.12",
+                                   "native line shaders and same-engine reference topology; neutral normalized mix, Marathon runtime weights unknown");
+            }
             blur(uint32_t(i), l.sum.Get());
         }
         bloom_tex = bloom_.front().sum.Get();
@@ -495,7 +536,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             ext_.note_estimate("lens glare: coarsest blurred bloom level, quarter-resolution upsample, Frame +0x24 = 1",
                                "map-authored optics techniques and texture; original broad filter and brightness are unknown");
         }
-        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, weighted_add 0.5 / 0.5, strength 0.06",
+        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, strength 0.06",
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 

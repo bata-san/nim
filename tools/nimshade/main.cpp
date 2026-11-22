@@ -1326,6 +1326,8 @@ int run(int argc, char** argv) {
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-ibl.bin", gpu.read_texture(gl.specular_ibl(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        if (gl.externs().texture(0x5D, 0x00).resource == gl.material_occlusion())
+            save("lighting-material-ao.bin", gpu.read_texture(gl.material_occlusion(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1));
         if (gl.ssr_drawn()) {
             save("lighting-ssr-radiance.bin", gpu.read_texture(gl.ssr_radiance(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 8));
             save("lighting-ssr-distance.bin", gpu.read_texture(gl.ssr_hit_distance(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 4));
@@ -1452,6 +1454,19 @@ int run(int argc, char** argv) {
             if (gl.cubemap_count() != gl.cubemaps_requested()) throw std::runtime_error("Original cubemap preparation omitted volumes");
             if (gl.cubemaps_failed()) throw std::runtime_error("Original cubemap volume draw failed");
             const auto& ext = gl.externs();
+            if (lp.sky_ambient || gl.cubemaps_drawn()) {
+                const auto* packed_ao = gl.material_occlusion();
+                if (!packed_ao || ext.texture(0x5D, 0x00).resource != packed_ao || packed_ao == gl.ambient_occlusion())
+                    throw std::runtime_error("Cubemaps are not reading the current material AO");
+                const auto source = gpu.read_texture(gb.rt[2].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 4);
+                const auto material = gpu.read_texture(gl.material_occlusion(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1);
+                if (material.size() * 4 != source.size()) throw std::runtime_error("Stale material AO dimensions");
+                int max_delta = 0;
+                for (size_t i = 0; i < material.size(); ++i)
+                    max_delta = std::max(max_delta, std::abs(int(material[i]) - std::min(255, 2 * int(source[i * 4 + 1]))));
+                if (max_delta > 1) throw std::runtime_error(std::format("Material AO disagrees with G-buffer max error {}", max_delta));
+                std::println("verified material AO: {} pixels match G-buffer decode (max UNORM8 delta {})", material.size(), max_delta);
+            }
             if (lp.sky_ambient && gl.has_atmosphere()) {
                 auto* hemisphere = ext.texture(ext::Deferred, 0xF8).resource;
                 if (!hemisphere) throw std::runtime_error("Original sky environment was not produced");
