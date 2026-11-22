@@ -157,6 +157,9 @@ struct PreparedMesh {
         std::vector<uint32_t> skin_pos, skin_normal;
         std::vector<uint8_t> color;  // dynamic models: per-vertex RGBA8 the VS reads as t0
         SkinWeights skin;            // skinned meshes: per-vertex bones and weights (CPU skinning)
+        // vb0 holds 48-byte float vertices (position, normal, tangent; input layout 13), already
+        // unpacked to model space. Their vertex shader reads vb0 directly, so posing rewrites vb0.
+        bool float_positions = false;
     };
     struct Group {
         StaticMeshPart part;
@@ -502,6 +505,7 @@ private:
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
         bool skin_posed = false;
+        bool float_vertices = false;  // PreparedMesh::Buffers::float_positions: posed into vb0 itself
         // Dynamic models: the object constants (rigid_model / skinning scope, local_to_world in
         // rows 0-3) and the placements; this frame's constants per placement.
         bool dynamic = false;

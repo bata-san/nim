@@ -884,7 +884,7 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
 
 // Grows [lo, hi] by the snorm16 positions (x scale + offset) the part's indices reach.
 void grow_bounds(const IndexBuffer& ib, const VertexBuffer& vb0, const StaticMeshPart& part, V3 scale, V3 offset,
-                 V3& lo, V3& hi) {
+                 V3& lo, V3& hi, bool float_positions = false) {
     for (uint32_t i = 0; i < part.index_count; ++i) {
         size_t ii = part.index_start + i;
         if ((ii + 1) * (ib.is_32bit ? 4 : 2) > ib.data.size()) break;
@@ -894,6 +894,7 @@ void grow_bounds(const IndexBuffer& ib, const VertexBuffer& vb0, const StaticMes
         if ((size_t(v) + 1) * vb0.stride > vb0.data.size()) continue;
         const uint8_t* p = vb0.data.data() + size_t(v) * vb0.stride;
         V3 q{snorm16(p) * scale.x + offset.x, snorm16(p + 2) * scale.y + offset.y, snorm16(p + 4) * scale.z + offset.z};
+        if (float_positions) std::memcpy(&q, p, 12);  // already unpacked
         lo = {std::min(lo.x, q.x), std::min(lo.y, q.y), std::min(lo.z, q.z)};
         hi = {std::max(hi.x, q.x), std::max(hi.y, q.y), std::max(hi.z, q.z)};
     }
@@ -1028,8 +1029,44 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
             out.notes.push_back(std::format("mesh {}: buffers: {}", mi, ex.what()));
             continue;
         }
+        // Float-position meshes (input layout 13, 48-byte vertices: position, normal, tangent as
+        // float4; the UESC ghost's cape 80A4A8A6, docs/PROGRESS.md 3.85): the floats are in the
+        // model's packed space like snorm16 positions (the model header's bounds are float * scale
+        // + offset), but their vertex shader (80A4B8A0) applies only the object matrix, so they are
+        // unpacked here. Weights (+0x08) are four UNORM8 weights then four skeleton bone indices.
+        bufs.float_positions = bufs.vb0.stride == 48 &&
+            std::ranges::any_of(kDrawnStages, [&](uint8_t st) { return mesh.input_layout[st] == 13; });
+        if (bufs.float_positions) {
+            const size_t count = bufs.vb0.data.size() / 48;
+            for (size_t v = 0; v < count; ++v) {
+                float p[3];
+                std::memcpy(p, bufs.vb0.data.data() + v * 48, 12);
+                p[0] = p[0] * scale.x + offset.x, p[1] = p[1] * scale.y + offset.y, p[2] = p[2] * scale.z + offset.z;
+                std::memcpy(bufs.vb0.data.data() + v * 48, p, 12);
+            }
+            bufs.vb0.data_tag = TagHash();  // no longer the package bytes
+            if (!mesh.weights.is_none()) {
+                try {
+                    const VertexBuffer w = load_vertex_buffer(pm, mesh.weights);
+                    if (w.stride != 8 || w.data.size() < count * 8) throw std::runtime_error(std::format("stride {}, {} bytes", w.stride, w.data.size()));
+                    bufs.skin.bones.resize(count);
+                    bufs.skin.weights.resize(count);
+                    for (size_t v = 0; v < count; ++v) {
+                        for (int k = 0; k < 4; ++k) {
+                            const uint8_t weight = w.data[v * 8 + k], bone = w.data[v * 8 + 4 + k];
+                            bufs.skin.weights[v][k] = weight / 255.0f;
+                            bufs.skin.bones[v][k] = weight ? bone : 0;
+                            if (weight) bufs.skin.max_bone = std::max<uint32_t>(bufs.skin.max_bone, bone);
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    out.notes.push_back(std::format("mesh {}: float vertex weights: {}", mi, ex.what()));
+                    bufs.skin = {};
+                }
+            }
+        }
         const float s1 = std::max({std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z)});
-        const bool packed =
+        const bool packed = !bufs.float_positions &&
             !mesh.skinning.is_none() && pack_skin_streams(bufs.vb0, scale, skin_pack_range(s1), bufs.skin_pos, bufs.skin_normal);
         if (packed) {
             try {
@@ -1064,8 +1101,16 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                     else { uint16_t v16; std::memcpy(&v16, bufs.ib.data.data() + k * 2, 2); v = v16 == 0xFFFF ? 0xFFFFFFFFu : v16; }
                     if (v == 0xFFFFFFFFu || size_t(v + 1) * bufs.vb0.stride > bufs.vb0.data.size()) continue;
                     for (size_t c = 0; c < 3; ++c) {
-                        int16_t q;
-                        std::memcpy(&q, bufs.vb0.data.data() + size_t(v) * bufs.vb0.stride + 2 * c, 2);
+                        float q;
+                        if (bufs.float_positions) {  // back to packed units
+                            std::memcpy(&q, bufs.vb0.data.data() + size_t(v) * 48 + 4 * c, 4);
+                            const float o3[3]{offset.x, offset.y, offset.z}, s3[3]{scale.x, scale.y, scale.z};
+                            q = (q - o3[c]) / s3[c] * 32767.0f;
+                        } else {
+                            int16_t s;
+                            std::memcpy(&s, bufs.vb0.data.data() + size_t(v) * bufs.vb0.stride + 2 * c, 2);
+                            q = s;
+                        }
                         bb[c] = std::min(bb[c], float(q));
                         bb[c + 3] = std::max(bb[c + 3], float(q));
                     }
@@ -1150,7 +1195,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                             continue;
                         }
                         g.buffers = set;
-                        grow_bounds(bufs.ib, bufs.vb0, part, scale, offset, lo, hi);
+                        grow_bounds(bufs.ib, bufs.vb0, part, scale, offset, lo, hi, bufs.float_positions);
                         const auto detail = dp.lod_category ? uint8_t(std::countr_zero(dp.lod_category)) : uint8_t(0);
                         lod = std::min(lod, detail);
                         out.groups.push_back(std::move(g));
@@ -1398,6 +1443,12 @@ std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, co
             if (b.skin.bones.empty() || b.vb0.stride < 6 || b.skin.bones.size() * b.vb0.stride > b.vb0.data.size()) continue;
             for (size_t v = 0; v < b.skin.bones.size(); ++v) {
                 const uint8_t* p = b.vb0.data.data() + v * b.vb0.stride;
+                if (b.float_positions) {
+                    std::array<float, 3> q;
+                    std::memcpy(q.data(), p, 12);
+                    positions.push_back(q);
+                    continue;
+                }
                 positions.push_back({s16(p) * cb[4][0] + cb[5][0], s16(p + 2) * cb[4][1] + cb[5][1], s16(p + 4) * cb[4][2] + cb[5][2]});
             }
             bones.insert(bones.end(), b.skin.bones.begin(), b.skin.bones.end());
@@ -1999,6 +2050,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         material_externs_->note_estimate("dynamic model alternates: only the lowest external identifier is drawn",
                                          "parts with the same material, bind-pose bounds and index count are one piece's variants");
 
+    if (std::ranges::any_of(mesh.buffers, [](const auto& b) { return b.float_positions && !b.skin.bones.empty(); }))
+        material_externs_->note_estimate("cloth mesh: posed by its skin weights only",
+                                         "the game's cloth simulation (sway, collision) is not decoded");
+
     if (mesh.distance_field_preview)
         material_externs_->note_estimate("distance-field preview: bounds from the initial spheres; default dissolve 0 if unset",
                                          "native vertex material evaluated at time zero; activation and later bounds depend on runtime channels");
@@ -2122,6 +2177,19 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 set.skin_offset = {mesh.model_cb[5][0], mesh.model_cb[5][1], mesh.model_cb[5][2]};
                 set.skin_pack_offset = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
                 set.skin_range = mesh.model_cb[13][3];
+                skinned_ = skin_dirty_ = true;
+            } else if ((dynamic_ || adding_actor_ >= 0) && b.float_positions && !b.skin.bones.empty() &&
+                       b.skin.bones.size() * 48 <= b.vb0.data.size()) {
+                // Float vertices (cloth): posed on the CPU into vb0 itself; the first render uploads
+                // the bind pose.
+                const size_t bytes = b.skin.bones.size() * 48;
+                set.vb0 = {gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST), 0, bytes, 0};
+                set.vb0.gpu = set.vb0.resource->GetGPUVirtualAddress();
+                set.vbv[0] = {set.vb0.gpu, UINT(bytes), 48};
+                for (auto& u : set.skin_upload) u = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                set.vb0_cpu = b.vb0.data;
+                set.skin = b.skin;
+                set.float_vertices = true;
                 skinned_ = skin_dirty_ = true;
             } else {
                 set.skin_pos = up(b.skin_pos);
@@ -3400,6 +3468,38 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         uint32_t* dst = jobs[j].dst;
         const size_t n = set.skin.bones.size();
         const float inv_range = 1.0f / set.skin_range;
+        if (set.float_vertices) {  // 48-byte float vertices, rewritten whole (position, normal, tangent)
+            float* out = reinterpret_cast<float*>(dst);
+            for (size_t i = 0; i < n; ++i) {
+                float f[12];
+                std::memcpy(f, set.vb0_cpu.data() + i * 48, sizeof(f));
+                if (mats) {
+                    float m[12]{};
+                    float total = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        const float wk = set.skin.weights[i][k];
+                        const uint16_t bk = set.skin.bones[i][k];
+                        if (wk <= 0 || bk >= mats->size()) continue;
+                        for (int c = 0; c < 12; ++c) m[c] += (*mats)[bk].m[c] * wk;
+                        total += wk;
+                    }
+                    if (total > 0) {
+                        for (int base : {0, 4, 8}) {
+                            const float w1 = base == 0 ? 1.0f : 0.0f, a = f[base], b = f[base + 1], c = f[base + 2];
+                            f[base] = m[0] * a + m[1] * b + m[2] * c + m[3] * w1;
+                            f[base + 1] = m[4] * a + m[5] * b + m[6] * c + m[7] * w1;
+                            f[base + 2] = m[8] * a + m[9] * b + m[10] * c + m[11] * w1;
+                        }
+                        for (int base : {4, 8}) {
+                            const float len = std::sqrt(f[base] * f[base] + f[base + 1] * f[base + 1] + f[base + 2] * f[base + 2]);
+                            if (len > 0) f[base] /= len, f[base + 1] /= len, f[base + 2] /= len;
+                        }
+                    }
+                }
+                std::memcpy(out + i * 12, f, sizeof(f));
+            }
+            return;
+        }
         for (size_t i = 0; i < n; ++i) {
             const uint8_t* v = set.vb0_cpu.data() + i * 24;
             V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
@@ -3435,6 +3535,15 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         const size_t n = set.skin.bones.size();
         ID3D12Resource* upload = set.skin_upload[slot].Get();
         upload->Unmap(0, nullptr);
+        if (set.float_vertices) {
+            constexpr auto kVertex = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            ID3D12Resource* vb = set.vb0.resource.Get();
+            if (set.skin_readable) Gpu::barrier(cl, vb, kVertex, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyBufferRegion(vb, 0, upload, 0, n * 48);
+            Gpu::barrier(cl, vb, D3D12_RESOURCE_STATE_COPY_DEST, kVertex);
+            set.skin_readable = true;
+            continue;
+        }
         if (set.skin_readable) {
             Gpu::barrier(cl, set.skin_pos.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
             Gpu::barrier(cl, set.skin_normal.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -3485,7 +3594,7 @@ std::vector<V3> StaticMeshScene::actor_points(uint32_t actor, const std::vector<
     std::vector<V3> out;
     for (const auto index : actors_.at(actor).sets) {
         const auto& set = sets_[index];
-        if (set.skin.bones.empty() || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
+        if (set.skin.bones.empty() || set.float_vertices || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
         const auto pose = std::ranges::find(poses, set.model, &ModelSkinPose::model);
         if (pose == poses.end()) continue;
         const auto& bones = pose->bones;
@@ -3520,7 +3629,7 @@ std::optional<float> StaticMeshScene::actor_lowest(uint32_t actor, const std::ve
     std::optional<float> lowest;
     for (const auto index : actors_.at(actor).sets) {
         const auto& set = sets_[index];
-        if (set.skin.bones.empty() || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
+        if (set.skin.bones.empty() || set.float_vertices || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
         const auto pose = std::ranges::find(poses, set.model, &ModelSkinPose::model);
         if (pose == poses.end()) continue;
         const auto& bones = pose->bones;

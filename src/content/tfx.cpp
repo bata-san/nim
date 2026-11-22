@@ -178,6 +178,7 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
         DynamicMesh dm;
         dm.vertex0 = r.tag_at(o + 0x00);
         dm.vertex1 = r.tag_at(o + 0x04);
+        dm.weights = r.tag_at(o + 0x08);
         dm.index = r.tag_at(o + 0x10);
         dm.color = r.tag_at(o + 0x14);
         dm.skinning = r.tag_at(o + 0x18);

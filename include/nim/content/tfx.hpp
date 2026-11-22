@@ -112,6 +112,9 @@ struct DynamicMeshPart {
 };
 struct DynamicMesh {
     TagHash vertex0, vertex1, index, color, skinning;
+    // +0x08: float-position meshes (input layout 13, cloth such as the UESC ghost's cape): per
+    // vertex four UNORM8 weights, then four skeleton bone indices.
+    TagHash weights;
     std::vector<DynamicMeshPart> parts;
     std::array<uint16_t, kRenderStageCount + 1> part_range{};  // stage s: [range[s], range[s+1])
     std::array<uint8_t, kRenderStageCount> input_layout{};

@@ -38,7 +38,7 @@
 //   nimcli [--install DIR] animaudit                    skinned models without skeleton / rig / clips; rigs whose clips stretch bones
 //   nimcli [--install DIR] clipfit MODEL [-v]           pose the model's skeleton with every clip of its rig (-v: per clip)
 //   nimcli [--install DIR] parts MODEL [-v]             each part: stage, technique, LOD, bind-pose bounds (-v: raw record)
-//   nimcli [--install DIR] skin MODEL                   skin weight summary of a dynamic model
+//   nimcli [--install DIR] skin MODEL [PART]            skin weight summary of a dynamic model (or of one part)
 //   nimcli [--install DIR] survey-entities               prepare every ENTITIES entry and histogram outcomes
 //   nimcli [--install DIR] xref-values CLASS OFFSET     which classes contain the u32 found at OFFSET of CLASS tags
 //                                                       (also reports how many of those also hold string hashes)
@@ -2648,7 +2648,7 @@ int cmd_clips(PackageManager& pm, uint32_t bones) {
 }
 
 // Skin weights of a dynamic model's meshes.
-int cmd_skin(PackageManager& pm, TagHash tag) {
+int cmd_skin(PackageManager& pm, TagHash tag, int only_part) {
     DynamicModel m = load_dynamic_model(pm, tag);
     for (size_t i = 0; i < m.meshes.size(); ++i) {
         const auto& d = m.meshes[i];
@@ -2669,7 +2669,20 @@ int cmd_skin(PackageManager& pm, TagHash tag) {
         // Per bone: vertices whose largest weight is that bone, and their bind-pose bounds.
         struct Stat { size_t n = 0; float lo[3]{1e9f, 1e9f, 1e9f}, hi[3]{-1e9f, -1e9f, -1e9f}; };
         std::map<uint16_t, Stat> stats;
+        std::vector<char> in_part;  // skin PART: only the vertices that part's indices use
+        if (only_part >= 0 && size_t(only_part) < d.parts.size()) {
+            const IndexBuffer ib = load_index_buffer(pm, d.index);
+            in_part.assign(w.bones.size(), 0);
+            const auto& part = d.parts[size_t(only_part)];
+            for (size_t k = part.index_start; k < size_t(part.index_start) + part.index_count; ++k) {
+                uint32_t v = 0;
+                if (ib.is_32bit) std::memcpy(&v, ib.data.data() + k * 4, 4);
+                else { uint16_t v16; std::memcpy(&v16, ib.data.data() + k * 2, 2); v = v16 == 0xFFFF ? 0xFFFFFFFFu : v16; }
+                if (v < in_part.size()) in_part[v] = 1;
+            }
+        }
         for (size_t v = 0; v < w.bones.size(); ++v) {
+            if (!in_part.empty() && !in_part[v]) continue;
             size_t best = 0;
             for (size_t k = 1; k < 4; ++k)
                 if (w.weights[v][k] > w.weights[v][best]) best = k;
@@ -2736,6 +2749,16 @@ int cmd_parts(PackageManager& pm, TagHash tag, bool raw) {
                     for (size_t b = 0; b < vb0.stride && (v + 1) * vb0.stride <= vb0.data.size(); ++b) verts += std::format("{:02X}", vb0.data[v * vb0.stride + b]);
                 }
                 std::println("    {}", verts);
+                if (vb0.stride == 48) {  // float3 positions (cloth meshes, layout 13)
+                    float flo[3]{1e9f, 1e9f, 1e9f}, fhi[3]{-1e9f, -1e9f, -1e9f};
+                    for (size_t k = part.index_start; k < size_t(part.index_start) + part.index_count && k < nidx; ++k) {
+                        const uint32_t v = index(k);
+                        if ((v + 1) * vb0.stride > vb0.data.size()) continue;
+                        float p[3];
+                        std::memcpy(p, vb0.data.data() + v * vb0.stride, 12);
+                        for (size_t a = 0; a < 3; ++a) flo[a] = std::min(flo[a], p[a]), fhi[a] = std::max(fhi[a], p[a]);
+                    }
+                    std::println("     float positions ({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})", flo[0], flo[1], flo[2], fhi[0], fhi[1], fhi[2]);                }
             }
         }
     }
@@ -3547,7 +3570,7 @@ int main(int argc, char** argv) {
         if (cmd == "motion-banks") return cmd_motion_banks(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
-        if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])), args.size() > 2 ? std::stoi(args[2]) : -1);
         if (cmd == "entity-components" && args.size() >= 2)
             return cmd_entity_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");
         if (cmd == "components") return cmd_components(pm, args.size() >= 2 ? parse_hex(args[1]) : 0);
