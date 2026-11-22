@@ -138,6 +138,7 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
             };
             return rank(a) > rank(b);
         });
+        c.models = models;
         std::vector<ClipInfo> wanted;
         auto want = [&](const MotionClip& m) {
             const auto it = std::ranges::find(sources.clips, m.clip, &ClipInfo::tag);

@@ -42,6 +42,7 @@ struct ActorCharacter {
     std::unordered_map<TagHash, AnimationClip> clips;  // the motion set's clips the binding plays
     MotionSet motion;
     bool entity_binding = false;  // bound with the entity's own skeleton and rig (推定)
+    std::vector<TagHash> models;  // every dynamic model the entity names, the drawn one first
     std::string error;  // why it cannot be drawn, if it cannot
 };
 ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion);

@@ -590,8 +590,10 @@ int run(int argc, char** argv) {
                 motions.push_back(build_motion_set(pm, ch.entity, 30.0f));
                 characters.push_back(prepare_actor_character(pm, sources, motions.back()));
                 const auto& c = characters.back();
-                std::println("ai character {} {}: model {} clips {} {}", ch.entity.str(), ch.name_estimate, c.model.is_none() ? "-" : c.model.str(),
-                             c.clips.size(), c.error);
+                std::string models;
+                for (const auto m : c.models) models += " " + m.str();
+                std::println("ai character {} {}: model {} clips {} (entity models{}) {}", ch.entity.str(), ch.name_estimate,
+                             c.model.is_none() ? "-" : c.model.str(), c.clips.size(), models, c.error);
             }
             AiParams params;
             params.player_invisible = !ai_visible;
