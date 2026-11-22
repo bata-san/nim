@@ -2033,6 +2033,7 @@ public:
         std::shared_ptr<MapGameplay> gameplay;
         std::vector<MotionSet> motions;
         std::vector<ActorCharacter> characters;
+        ActorDropship ship;  // the dropship squads' ship (3.71); no model = none on this map
         std::string error;
         double seconds = 0;
     };
@@ -2068,6 +2069,13 @@ public:
                 out.motions.push_back(build_motion_set(pm, ch.entity, kClipFps));
                 out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back()));
             }
+            // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
+            for (const auto& sq : out.gameplay->squads)
+                if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
+                    p != sq.positions.end()) {
+                    out.ship = prepare_actor_dropship(pm, sources, p->model);
+                    break;
+                }
         } catch (const std::exception& ex) {
             out.error = ex.what();
         }
@@ -2118,6 +2126,7 @@ public:
                 SunShadow walk_view;
                 for (const auto fa : areas) ai.sim->set_walk_grid(fa, build_walk_grid(g, scene, ai.gameplay->firing_areas[fa], walk_view));
                 ai.actors.build(g, scene, layouts, std::move(p.characters), *ai.gameplay, *ai.sim, 4);
+                if (!p.ship.model.is_none()) ai.actors.build_dropships(g, scene, layouts, std::move(p.ship), 3);
                 for (const auto& n : ai.actors.notes()) ++map_add_failures["ai: " + n.substr(0, 110)];
                 info(ui::trf(ui::S::LogAiReady, ai.sim->agents().size(), ai.sim->drones().size(), ai.actors.slots(), p.seconds,
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()));

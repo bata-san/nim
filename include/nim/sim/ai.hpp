@@ -85,6 +85,17 @@ struct AiParams {  // every value here is an estimate (推定)
     float drone_speed = 5.0f;       // m/s along its spline
     float drone_scan_range = 15.0f; // m, all around
     bool player_invisible = true;   // enemies compute awareness but never act on it
+    // Dropship squads (spawned at a uesc_dropship_spawner, 3.71): called when the player comes
+    // within range, then the ship's own clips (arrival, open hold, departure) and the members
+    // dropping from its open rear bay to the floor one after another.
+    float dropship_call_range = 60.0f;   // m from the player
+    float dropship_call_delay = 2.0f;    // s, uniform 0..this after the call
+    float dropship_arrive = 129.0f / 30; // s: the arrival clips' length (129 frames at 30 fps)
+    float dropship_depart = 153.0f / 30; // s: the departure clips' length
+    float dropship_first_exit = 0.6f;    // s after landing
+    float dropship_exit_interval = 0.8f; // s between members
+    float dropship_exit_walk = 2.0f;     // s walking away from the drop point (3 m)
+    float dropship_linger = 1.5f;        // s open after the last member is out
 };
 struct AiEstimate {
     std::string name;
@@ -109,6 +120,24 @@ struct AiAgent {
     bool sees_player = false;
     MotionChoice motion;
     float motion_time = 0;             // s into the current clip
+    bool active = true;                // false until spawned (dropship squads wait for their ship)
+    std::optional<size_t> dropship;    // AiSimulation::dropships
+    float exit = -1;                   // s into the drop from the ship's bay (>= 0 while leaving it)
+    float exit_floor = 0;              // z of the floor it drops to
+};
+// A squad's dropship (3.71).
+struct AiDropship {
+    size_t squad = 0;
+    std::array<float, 3> position{};   // the spawner node: where the ship lands
+    float yaw = 0;
+    float start = -1;                  // simulation time the arrival begins; < 0 until called
+    uint32_t variant = 0;              // picks one of the arrival / departure clips
+    std::vector<size_t> members;       // agents, in exit order
+};
+enum class AiDropshipPhase : uint8_t { Waiting, Arriving, Unloading, Departing, Gone };
+struct AiDropshipState {
+    AiDropshipPhase phase = AiDropshipPhase::Waiting;
+    float seconds = 0;                 // into the phase
 };
 struct AiDrone {
     size_t group = 0;                  // MapGameplay::point_groups
@@ -128,6 +157,11 @@ public:
     void step(float dt, const std::array<float, 3>& player);
     const std::vector<AiAgent>& agents() const { return agents_; }
     const std::vector<AiDrone>& drones() const { return drones_; }
+    const std::vector<AiDropship>& dropships() const { return dropships_; }
+    AiDropshipState dropship_state(size_t dropship) const;
+    // Calls every waiting dropship now (all squads present from the start, as before 3.71).
+    void call_all_dropships();
+    void call_dropship(size_t dropship);
     const AiParams& params() const { return params_; }
     void set_player_invisible(bool invisible) { params_.player_invisible = invisible; }
     const std::vector<MotionSet>& motions() const { return motions_; }
@@ -158,6 +192,11 @@ private:
     std::vector<std::vector<size_t>> squad_areas_;  // per squad: firing areas of its objective
     std::vector<AiAgent> agents_;
     std::vector<AiDrone> drones_;
+    std::vector<AiDropship> dropships_;
+    void step_dropships(float dt, const std::array<float, 3>& player);
+    float unload_seconds(const AiDropship& d) const;
+    float floor_below(size_t squad, float x, float y, float z) const;
+    float exit_seconds(const AiDropship& d) const;
     std::vector<float> drone_length_;
     float time_ = 0;
 };

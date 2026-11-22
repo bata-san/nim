@@ -45,6 +45,20 @@ struct ActorCharacter {
 };
 ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion);
 
+// The UESC dropship (3.71): its model and its own animation bank, sorted by the root track
+// (the ship's flight is root motion): arrivals start far away and end at the origin with the rear
+// bay open, departures start there and fly off, `open` is the static open-bay pose.
+struct ActorDropship {
+    TagHash model;
+    std::shared_ptr<const PreparedMesh> mesh;
+    std::shared_ptr<const PreviewAnimation> binding;
+    std::vector<AnimationClip> arrivals, departures;
+    std::vector<uint32_t> departure_frames;  // per departure: its last frame away from the origin
+    std::optional<AnimationClip> open;
+    std::string error;
+};
+ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sources, TagHash model);
+
 // Crossfades between the clips an agent plays.
 struct ActorAnimator {
     TagHash clip, previous;
@@ -66,7 +80,11 @@ public:
     // Places the nearest agents of each character (within `range` m of `eye`), poses them and
     // hides the rest.
     void update(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range);
-    void clear() { slots_.clear(), characters_.clear(), by_character_.clear(); }
+    // Adds `slots` hidden dropships (drawn while arriving, unloading or departing, nearest first).
+    void build_dropships(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
+                         ActorDropship ship, size_t slots);
+    void clear() { slots_.clear(), characters_.clear(), by_character_.clear(), ship_slots_.clear(), ship_ = {}; }
+    size_t ships_shown() const { return ships_shown_; }
     size_t slots() const { return slots_.size(); }
     size_t shown() const { return shown_; }
     const std::vector<ActorCharacter>& characters() const { return characters_; }
@@ -85,6 +103,10 @@ private:
     std::vector<Slot> slots_;
     std::vector<std::string> notes_;
     size_t shown_ = 0;
+    ActorDropship ship_;
+    std::vector<uint32_t> ship_slots_;  // scene actors
+    size_t ships_shown_ = 0;
+    void update_dropships(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float range);
 };
 
 // Open floor of a firing area: the scene drawn straight down into `view` (resized as needed;

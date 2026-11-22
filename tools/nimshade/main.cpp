@@ -192,6 +192,8 @@ int run(int argc, char** argv) {
     float ai_time = 20, ai_range = 60, ai_frame_distance = 6, ai_frame_height = 1.7f;
     size_t ai_per_character = 4;
     uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
+    uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
+    std::optional<size_t> ai_ship;
     std::optional<size_t> ai_subject;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -243,6 +245,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-range" && i + 1 < args.size()) ai_range = std::stof(args[++i]);
         else if (args[i] == "--ai-actors" && i + 1 < args.size()) ai_per_character = std::stoull(args[++i]);
         else if (args[i] == "--ai-strip" && i + 1 < args.size()) ai_strip = uint32_t(std::stoul(args[++i])), ai_frame = true;
+        else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
@@ -309,7 +312,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-dropship-strip N]");
         return 2;
     }
     if (install.empty()) {
@@ -596,6 +599,36 @@ int run(int argc, char** argv) {
             std::vector<bool> characters_drawable;
             for (const auto& c : characters) characters_drawable.push_back(c.mesh != nullptr);
             ai_actors.build(gpu, scene, layouts, std::move(characters), *ai_gameplay, *ai_sim, ai_per_character);
+            // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
+            for (const auto& sq : ai_gameplay->squads)
+                if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
+                    p != sq.positions.end()) {
+                    auto ship = prepare_actor_dropship(pm, sources, p->model);
+                    std::println("ai dropship {}: {} arrivals, {} departures{}{}", p->model.str(), ship.arrivals.size(), ship.departures.size(),
+                                 ship.error.empty() ? "" : ", ", ship.error);
+                    ai_actors.build_dropships(gpu, scene, layouts, std::move(ship), 3);
+                    break;
+                }
+            std::println("ai dropships: {} squads arrive by ship", ai_sim->dropships().size());
+            if (ai_ship_strip) {
+                std::vector<std::pair<float, size_t>> order;
+                for (size_t i = 0; i < ai_sim->dropships().size(); ++i)
+                    if (ai_sim->dropship_state(i).phase == AiDropshipPhase::Waiting && ai_sim->dropships()[i].members.size() >= 3) {
+                        const auto& d = ai_sim->dropships()[i];
+                        order.push_back({std::hypot(d.position[0] - eye.x, d.position[1] - eye.y), i});
+                    }
+                if (order.empty()) throw std::runtime_error("--ai-dropship-strip: no waiting dropship");
+                ai_ship = std::ranges::min(order).second;
+                const auto& d = ai_sim->dropships()[*ai_ship];
+                // Behind the ship's rear bay and to its side, looking at the exit.
+                const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+                auto at = [&](float x, float y, float z) { return V3{d.position[0] + c * x - s * y, d.position[1] + s * x + c * y, d.position[2] + z}; };
+                eye_arg = at(-24, 12, 5);
+                look_arg = at(-5, 0, 2);
+                ai_sim->call_dropship(*ai_ship);
+                std::println("ai dropship strip: ship {} at ({:.1f} {:.1f} {:.1f}) yaw {:.2f}, {} members", *ai_ship, d.position[0], d.position[1],
+                             d.position[2], d.yaw, d.members.size());
+            }
             // Run the clips' crossfades to rest over the last half second.
             for (int k = 0; k < 5; ++k) {
                 ai_sim->step(0.1f, player);
@@ -625,7 +658,7 @@ int run(int argc, char** argv) {
                 std::vector<std::pair<float, size_t>> order;
                 for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
                     const auto& a = ai_sim->agents()[k];
-                    if (a.character < characters_drawable.size() && characters_drawable[a.character]) {
+                    if (a.active && a.character < characters_drawable.size() && characters_drawable[a.character]) {
                         const float d = std::hypot(a.position[0] - eye.x, a.position[1] - eye.y);
                         const bool walking = std::hypot(a.velocity[0], a.velocity[1]) > 0.5f &&
                                              std::hypot(a.goal[0] - a.position[0], a.goal[1] - a.position[1]) > 4.0f;
@@ -1060,6 +1093,27 @@ int run(int argc, char** argv) {
             draw_overlay(composite, width, height, overlay);
             write_png(out_dir / "composite_ai.png", width, height, composite);
             std::println("ai overlay: {} lines, {} rects, {} labels", overlay.lines.size(), overlay.rects.size(), overlay.texts.size());
+        }
+        // --ai-dropship-strip: the called ship from behind its bay, one frame per 0.5 s.
+        for (uint32_t k = 0; ai_sim && ai_ship && k < ai_ship_strip; ++k) {
+            const std::array<float, 3> player{view.eye.x, view.eye.y, view.eye.z};
+            for (int sub = 0; sub < 5; ++sub) {
+                ai_sim->step(0.1f, player);
+                ai_actors.update(scene, *ai_sim, player, 0.1f, ai_range);
+            }
+            vm = make_view(view);
+            gpu.begin_frame(k % 2);
+            prepare_game_frame();
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            render_game(gpu.immediate());
+            gpu.flush();
+            write_png(out_dir / std::format("ship_{:02}.png", k), width, height,
+                      gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+            const auto state = ai_sim->dropship_state(*ai_ship);
+            size_t out = 0;
+            for (const auto m : ai_sim->dropships()[*ai_ship].members) out += ai_sim->agents()[m].active;
+            std::println("ship {}: phase {} {:.2f}s, {} of {} members out, {} ships drawn, {} actors", k, int(state.phase), state.seconds, out,
+                         ai_sim->dropships()[*ai_ship].members.size(), ai_actors.ships_shown(), ai_actors.shown());
         }
         // --ai-strip: the camera follows the agent from its side, one frame per 0.1 s.
         for (uint32_t k = 0; ai_sim && ai_subject && k < ai_strip; ++k) {

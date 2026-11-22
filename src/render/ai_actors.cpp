@@ -164,6 +164,44 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
     return c;
 }
 
+ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sources, TagHash model) {
+    ActorDropship d;
+    d.model = model;
+    try {
+        auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies);
+        if (mesh.no_drawable) throw std::runtime_error("nothing drawable");
+        auto anim = prepare_preview_animation(pm, mesh, sources.rigs, sources.clips, {}, {}, &sources.motions);
+        if (!anim || anim->clips.empty()) throw std::runtime_error("no clips fit its rig");
+        // The root track: the rig node carrying the flight (the first with translation keys away
+        // from the origin in any clip).
+        for (const auto& info : anim->clips) {
+            AnimationClip clip = load_animation_clip(pm, info.tag);
+            const auto track = std::ranges::find_if(clip.translations, [](const auto& t) { return t.bone == 1 && !t.frames.empty(); });
+            if (track == clip.translations.end() || clip.translations.size() < 2) continue;
+            auto length = [](const std::array<float, 3>& v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+            const float first = length(track->frames.front()), last = length(track->frames.back());
+            float farthest = 0;
+            uint32_t away = 0;  // the last frame still away (departures snap back to the origin on their final key)
+            for (size_t f = 0; f < track->frames.size(); ++f) farthest = std::max(farthest, length(track->frames[f]));
+            for (size_t f = 0; f < track->frames.size(); ++f)
+                if (length(track->frames[f]) >= 0.9f * farthest) away = uint32_t(f);
+            if (first > 50 && first < 1000 && last < 1) d.arrivals.push_back(std::move(clip));
+            else if (first < 1 && farthest > 50 && farthest < 1000) {
+                d.departure_frames.push_back(away);
+                d.departures.push_back(std::move(clip));
+            }
+            else if (first < 1 && last < 1 && clip.frame_count < 100 && !d.open) d.open = std::move(clip);
+        }
+        if (d.arrivals.empty() || d.departures.empty() || !d.open) throw std::runtime_error(std::format(
+            "clips: {} arrivals, {} departures, {} open poses", d.arrivals.size(), d.departures.size(), d.open ? 1 : 0));
+        d.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
+        d.binding = std::make_shared<const PreviewAnimation>(std::move(*anim));
+    } catch (const std::exception& e) {
+        d.error = e.what();
+    }
+    return d;
+}
+
 std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& agent, ActorAnimator& anim, float dt) {
     if (!c.binding) return {};
     const MotionClip* now = chosen_clip(c.motion, agent.motion);
@@ -243,13 +281,73 @@ void AiActors::build(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::ve
     }
 }
 
+void AiActors::build_dropships(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
+                               ActorDropship ship, size_t slots) {
+    ship_slots_.clear();
+    ship_ = std::move(ship);
+    if (!ship_.mesh) {
+        if (!ship_.error.empty()) notes_.push_back(std::format("dropship {}: {}", ship_.model.str(), ship_.error));
+        return;
+    }
+    for (size_t k = 0; k < slots; ++k) {
+        try {
+            ship_slots_.push_back(scene.add_actor(gpu, *ship_.mesh, layouts));
+        } catch (const std::exception& e) {
+            notes_.push_back(std::format("dropship {}: {}", ship_.model.str(), e.what()));
+            break;
+        }
+    }
+}
+
+void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float range) {
+    ships_shown_ = 0;
+    if (ship_slots_.empty()) return;
+    if (range < 0) {  // hidden
+        for (const auto slot : ship_slots_) scene.set_actor(slot, std::nullopt);
+        return;
+    }
+    // Ships in flight or unloading, nearest first (they fly in from up to ~270 m away).
+    std::vector<std::pair<float, size_t>> list;
+    for (size_t i = 0; i < sim.dropships().size(); ++i) {
+        const auto state = sim.dropship_state(i);
+        if (state.phase == AiDropshipPhase::Waiting || state.phase == AiDropshipPhase::Gone) continue;
+        const auto& d = sim.dropships()[i];
+        const float dist = std::hypot(d.position[0] - eye[0], d.position[1] - eye[1], d.position[2] - eye[2]);
+        if (dist <= range + 300) list.push_back({dist, i});
+    }
+    std::ranges::sort(list);
+    for (size_t k = 0; k < ship_slots_.size(); ++k) {
+        if (k >= list.size()) {
+            scene.set_actor(ship_slots_[k], std::nullopt);
+            continue;
+        }
+        const auto& d = sim.dropships()[list[k].second];
+        const auto state = sim.dropship_state(list[k].second);
+        const AnimationClip* clip = &*ship_.open;
+        float seconds = state.seconds;
+        if (state.phase == AiDropshipPhase::Arriving) clip = &ship_.arrivals[d.variant % ship_.arrivals.size()];
+        float last = float(std::max(clip->frame_count, 1u) - 1);
+        if (state.phase == AiDropshipPhase::Departing) {
+            const size_t v = (d.variant / 7) % ship_.departures.size();
+            clip = &ship_.departures[v];
+            last = float(ship_.departure_frames[v]);
+        }
+        const float frame = std::clamp(seconds * kClipFps, 0.0f, last);
+        const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+        const std::array<float, 12> rows{c, -s, 0, d.position[0], s, c, 0, d.position[1], 0, 0, 1, d.position[2]};
+        scene.set_actor(ship_slots_[k], rows, ship_.binding->poses(*clip, frame));
+        ++ships_shown_;
+    }
+}
+
 void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range) {
+    update_dropships(scene, sim, eye, range);
     const auto& agents = sim.agents();
     // Per character: its agents within range, nearest first.
     std::vector<std::vector<std::pair<float, size_t>>> nearby(characters_.size());
     for (size_t i = 0; i < agents.size(); ++i) {
         const auto& a = agents[i];
-        if (a.character >= by_character_.size() || !by_character_[a.character]) continue;
+        if (!a.active || a.character >= by_character_.size() || !by_character_[a.character]) continue;
         const float d = std::hypot(a.position[0] - eye[0], a.position[1] - eye[1], a.position[2] - eye[2]);
         if (d <= range) nearby[*by_character_[a.character]].push_back({d, i});
     }
@@ -290,7 +388,8 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         // of the posed mesh is put on the floor surface under the agent, eased at 12/s.
         auto rows = actor_rows(a);
         if (const auto lowest = scene.actor_lowest(s.actor, poses)) {
-            const float floor = sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
+            // Leaving a dropship: the path's own height (falling from the ship, then the floor).
+            const float floor = a.exit >= 0 ? a.position[2] : sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
             const float target = floor - *lowest - a.position[2];
             s.lift = std::isnan(s.lift) || dt <= 0 ? target : s.lift + (target - s.lift) * std::min(1.0f, dt * 12);
             rows[11] += s.lift;
@@ -458,7 +557,7 @@ AiOverlay build_ai_overlay(const AiSimulation& sim, const MapGameplay& g, const 
     // Firing areas the nearby squads use.
     std::set<size_t> areas;
     for (const auto& a : sim.agents()) {
-        if (distance(a.position, eye) > opt.range) continue;
+        if (!a.active || distance(a.position, eye) > opt.range) continue;
         if (const auto ob = g.squads[a.squad].objective)
             for (const auto fa : g.objectives[*ob].firing_areas) areas.insert(fa);
     }
@@ -484,7 +583,7 @@ AiOverlay build_ai_overlay(const AiSimulation& sim, const MapGameplay& g, const 
         std::set<size_t> marked;
         std::set<size_t> objectives;
         for (const auto& a : sim.agents())
-            if (distance(a.position, eye) <= opt.range)
+            if (a.active && distance(a.position, eye) <= opt.range)
                 if (const auto ob = g.squads[a.squad].objective) objectives.insert(*ob);
         for (const auto ob : objectives) {
             std::optional<size_t> best;
@@ -533,7 +632,7 @@ AiOverlay build_ai_overlay(const AiSimulation& sim, const MapGameplay& g, const 
     const float half_fov = p.fov_degrees * 0.5f * std::numbers::pi_v<float> / 180;
     for (const auto& a : sim.agents()) {
         const float d = distance(a.position, eye);
-        if (d > opt.range) continue;
+        if (!a.active || d > opt.range) continue;
         const float scale = std::clamp(18.0f / std::max(d, 1.0f), 0.6f, 1.2f);
         if (opt.debug) {
             const std::array<float, 3> feet{a.position[0], a.position[1], a.position[2] + 0.05f};
