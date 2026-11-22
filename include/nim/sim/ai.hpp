@@ -5,9 +5,12 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nim {
@@ -129,6 +132,8 @@ struct AiAgent {
     std::optional<size_t> dropship;    // AiSimulation::dropships
     float exit = -1;                   // s into the drop from the ship's bay (>= 0 while leaving it)
     float exit_floor = 0;              // z of the floor it drops to
+    std::vector<std::array<float, 3>> path;  // waypoints to the goal (A*, 3.73); empty: straight
+    size_t path_next = 0;
 };
 // A squad's dropship (3.71).
 struct AiDropship {
@@ -195,10 +200,27 @@ public:
     float room_at(float x, float y, float z) const;
     // A straight walk from a to b following the floor (steps up to 0.45 m) over open cells.
     bool path_clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const;
+    // A* over a 0.5 m lattice of such walks (3.73): the waypoints after `a` up to b (string-pulled),
+    // none when b is not reached within `max_nodes` lattice points.
+    std::optional<std::vector<std::array<float, 3>>> find_path(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius,
+                                                               size_t max_nodes = 3000) const;
+    struct PathStats { size_t straight = 0, found = 0, failed = 0, deferred = 0; };
+    const PathStats& path_stats() const { return path_stats_; }
 
 private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
-    std::array<float, 3> sample_objective(size_t squad, const std::array<float, 3>& from, float radius);
+    void choose_goal(AiAgent& a);
+    bool in_area(size_t firing_area, float x, float y, float z, float radius) const;
+    std::optional<std::vector<std::array<float, 3>>> route(const std::array<float, 3>& a, const std::array<float, 3>* b, float radius,
+                                                           size_t max_nodes, const std::function<bool(float, float, float)>& accept,
+                                                           float pick) const;
+    std::optional<float> follow(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius, float relaxed, float spacing = 0.125f,
+                                bool skip_start = false) const;
+    template <class F> void each_grid(float x, float y, F&& f) const;
+    mutable std::unordered_map<int64_t, std::vector<std::pair<uint8_t, uint32_t>>> grid_index_;  // 16 m buckets -> (list, index)
+    mutable bool grid_index_dirty_ = true;
+    PathStats path_stats_;
+    float search_budget_ = 0;  // A* searches available now
     std::array<float, 3> sample_area(size_t firing_area);
     void separate();
     std::array<float, 3> nearest_objective_point(size_t squad, const std::array<float, 3>& to) const;

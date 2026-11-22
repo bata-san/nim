@@ -606,7 +606,11 @@ int run(int argc, char** argv) {
             ai_actors.apply_radii(*ai_sim);
             std::vector<std::array<float, 3>> ai_start;
             for (const auto& a : ai_sim->agents()) ai_start.push_back(a.position);
+            const auto ts = std::chrono::steady_clock::now();
             for (float t = 0; t < ai_time; t += 0.1f) ai_sim->step(0.1f, player);
+            const auto& ps = ai_sim->path_stats();
+            std::println("ai steps: {:.0f}s simulated in {:.2f}s; goals: {} straight, {} by path search, {} without a path, {} deferred", ai_time,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), ps.straight, ps.found, ps.failed, ps.deferred);
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
             for (const auto& sq : ai_gameplay->squads)
                 if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });

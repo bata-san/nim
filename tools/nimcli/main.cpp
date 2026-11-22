@@ -28,6 +28,7 @@
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
 //   nimcli [--install DIR] components [CLASS]           component tags by resource class (or those holding CLASS)
+//   nimcli [--install DIR] entity-components ENTITY [-v]  an entity's component tags, their classes and referenced tag classes
 //   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
 //   nimcli [--install DIR] skeletons                    skinned models -> their entity's skeleton and rig, clip counts
 //   nimcli [--install DIR] rig COMPONENT                animation rig (8080AD7E): rig -> skeleton bones, spaces
@@ -2324,6 +2325,49 @@ int cmd_find(PackageManager& pm, uint32_t cls) {
 }
 
 // Component tags (8080BADB) by the classes of their two resources (0x10, 0x18).
+// An entity's components (tags of class 8080BADB it references) with their class pair (+0x10 / +0x18).
+int cmd_entity_components(PackageManager& pm, TagHash entity, bool verbose = false) {
+    const auto data = pm.read(entity);
+    std::set<uint32_t> seen;
+    for (size_t o = 0; o + 4 <= data.size(); o += 4) {
+        uint32_t v;
+        std::memcpy(&v, data.data() + o, 4);
+        const Entry* e = pm.entry(TagHash(v));
+        if (!e || e->type != 8 || e->reference != kClassComponent || !seen.insert(v).second) continue;
+        std::vector<uint8_t> d;
+        try { d = pm.read(TagHash(v)); } catch (...) { continue; }
+        BinaryReader r(d);
+        auto cls = [&](size_t at) -> uint32_t {
+            const uint64_t q = at + 8 <= d.size() ? r.u64_at(at) : 0;
+            return q && at + q >= 4 && at + q < d.size() ? r.u32_at(at + size_t(q) - 4) : 0;
+        };
+        std::map<uint32_t, size_t> refs;  // referenced tags' classes
+        for (size_t q = 0; q + 4 <= d.size(); q += 4) {
+            uint32_t t;
+            std::memcpy(&t, d.data() + q, 4);
+            if (const Entry* te = t >= 0x80800000u && t != ~0u ? pm.entry(TagHash(t)) : nullptr; te && (te->type == 8 || te->type == 16)) ++refs[te->reference];
+        }
+        std::string list;
+        for (const auto& [c, n] : refs) list += std::format(" {:08X}x{}", c, n);
+        std::println("+{:05X} {}  {:08X} {:08X}  size {} refs{}", o, TagHash(v).str(), cls(0x10), cls(0x18), d.size(), list);
+        if (verbose)
+            for (size_t q = 0; q + 4 <= d.size(); q += 4) {
+                uint32_t t;
+                std::memcpy(&t, d.data() + q, 4);
+                if (const Entry* te = t >= 0x80800000u && t != ~0u ? pm.entry(TagHash(t)) : nullptr; te && (te->type == 8 || te->type == 16))
+                {
+                    std::string extra;
+                    if (te->reference == kClassParticleSystem) try {
+                        const auto ps = load_particle_system(pm, TagHash(t));
+                        extra = std::format("  particles: life {:.2f}s rate {:.2f}/s state {} instance {}", ps.lifetime, ps.rate, ps.state_float4s, ps.instance_float4s);
+                    } catch (...) {}
+                    std::println("    +{:04X} {} class {:08X}{}", q, TagHash(t).str(), te->reference, extra);
+                }
+            }
+    }
+    return 0;
+}
+
 int cmd_components(PackageManager& pm, uint32_t want) {
     std::map<std::pair<uint32_t, uint32_t>, size_t> hist;
     for (const auto& info : pm.packages()) {
@@ -3275,6 +3319,8 @@ int main(int argc, char** argv) {
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "entity-components" && args.size() >= 2)
+            return cmd_entity_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");
         if (cmd == "components") return cmd_components(pm, args.size() >= 2 ? parse_hex(args[1]) : 0);
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);

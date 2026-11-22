@@ -488,6 +488,28 @@ int main() {
         for (int i = 0; i < 20; ++i) ws.step(0.1f, {1000, 0, 0});
         const auto& sa = ws.agents();
         CHECK(std::hypot(sa[0].position[0] - sa[1].position[0], sa[0].position[1] - sa[1].position[1]) > 1.1f);
+
+        // Path search (3.73): around a wall from y = 0 to 7.5 m at x = 5 m.
+        nim::AiSimulation ps(g, nim::AiParams{}, 7);
+        auto walled = wg;
+        std::vector<uint8_t> open_floor(1600, 1);
+        for (uint32_t r = 0; r < 30; ++r) open_floor[r * 40 + 20] = 0;
+        walled.set_free(open_floor);
+        ps.set_walk_grid(0, walled);
+        CHECK(!ps.path_clear({2, 2, 0}, {8, 2, 0}, 0.3f));
+        const auto route = ps.find_path({2, 2, 0}, {8, 2, 0}, 0.3f);
+        CHECK(route && !route->empty() && route->back() == (std::array<float, 3>{8, 2, 0}));
+        if (route) {
+            std::array<float, 3> from{2, 2, 0};
+            bool walkable = true, around = false;
+            for (const auto& w : *route) {
+                walkable = walkable && ps.path_clear(from, w, 0.3f);
+                around = around || w[1] > 7.5f;
+                from = w;
+            }
+            CHECK(walkable && around);
+        }
+        CHECK(!ps.find_path({2, 2, 0}, {8, 2, 3}, 0.3f));  // no floor at that height
     }
 
     if (g_failures) return 1;
