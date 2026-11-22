@@ -4686,8 +4686,16 @@ public:
             codex.open_reader = false;
         }
         const ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float max_w = std::min(vp->WorkSize.x - 80 * sc, 1380 * sc);
+        const float max_h = vp->WorkSize.y - 100 * sc;
+        constexpr float kTermAspect = 1.90f;  // CyberAcme 802.11 widescreen terminal proportion
+        float pop_w = max_w, pop_h = pop_w / kTermAspect;
+        if (pop_h > max_h) {
+            pop_h = max_h;
+            pop_w = std::min(max_w, pop_h * kTermAspect);
+        }
         ImGui::SetNextWindowPos({vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
-        ImGui::SetNextWindowSize({std::min(vp->WorkSize.x - 80 * sc, 1400 * sc), vp->WorkSize.y - 110 * sc}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize({pop_w, pop_h}, ImGuiCond_Always);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
         ImGui::PushStyleColor(ImGuiCol_PopupBg, col4(kCxPanel));
@@ -4727,7 +4735,9 @@ public:
         const ImVec2 win_p = ImGui::GetWindowPos();
         const ImVec2 win_s = ImGui::GetWindowSize();
         auto* root_dl = ImGui::GetWindowDrawList();
-        const float bar_h = 30 * sc;
+        const float bar_h = std::clamp(win_s.y * 0.056f, 32 * sc, 42 * sc);
+        const float ticker_font_px = std::clamp(bar_h * 0.54f / sc, 15.0f, 21.0f);
+        const float term_font_px = std::clamp(win_s.x * 0.0132f / sc, 15.0f, 19.0f);
 
         // Full terminal background + subtle horizontal CRT scanlines.
         root_dl->AddRectFilled(win_p, {win_p.x + win_s.x, win_p.y + win_s.y}, kCxPanel);
@@ -4741,7 +4751,7 @@ public:
             root_dl->AddLine({b0.x, b0.y}, {b1.x, b0.y}, kCxRule, 1.0f);
             root_dl->AddLine({b0.x, b1.y - 1.0f}, {b1.x, b1.y - 1.0f}, kCxRule, 1.0f);
             const std::string unit = std::format("CYBERACME 802.11 (NEURO.FILTER)   {}   ", sep);
-            ImGui::PushFont(g_fonts.wide, ImGui::GetFontSize() * 0.90f / sc);
+            ImGui::PushFont(g_fonts.wide, ticker_font_px);
             const ImVec2 us = ImGui::CalcTextSize(unit.c_str());
             const float step = std::max(us.x, 40.0f * sc);
             const float clip_r = with_close ? (b1.x - bar_h - 6 * sc) : b1.x;
@@ -4759,8 +4769,8 @@ public:
 
         // Close button [x] on the right side of the top ticker bar.
         {
-            const float bs = bar_h - 4 * sc;
-            ImGui::SetCursorScreenPos({win_p.x + win_s.x - bs - 4 * sc, win_p.y + 2 * sc});
+            const float bs = bar_h - 6 * sc;
+            ImGui::SetCursorScreenPos({win_p.x + win_s.x - bs - 5 * sc, win_p.y + 3 * sc});
             if (ImGui::InvisibleButton("##cxclose", {bs, bs})) close = true;
             const bool hov = ImGui::IsItemHovered();
             const ImVec2 a = ImGui::GetItemRectMin();
@@ -4771,23 +4781,23 @@ public:
         }
 
         // Main interior area between the two ticker bars.
-        const float pad_x = 30 * sc, pad_y = 24 * sc;
+        const float pad_x = win_s.x * 0.025f, pad_y = win_s.y * 0.042f;
         const float inner_w = std::max(100.0f, win_s.x - 2 * pad_x);
         const float inner_h = std::max(100.0f, win_s.y - 2 * bar_h - 2 * pad_y);
         ImGui::SetCursorScreenPos({win_p.x + pad_x, win_p.y + bar_h + pad_y});
 
         if (codex.collection < 0 || size_t(codex.collection) >= cx.collections.size() || codex.entry < 0 ||
             size_t(codex.entry) >= cx.collections[size_t(codex.collection)].entries.size()) {
-            ImGui::PushFont(g_fonts.mono, 0);
+            ImGui::PushFont(g_fonts.mono, term_font_px);
             ImGui::TextColored(col4(kCxDim), "> %s", ui::tr(ui::S::CodexPick));
             ImGui::PopFont();
             return;
         }
         const auto& c = cx.collections[size_t(codex.collection)];
         const auto& e = c.entries[size_t(codex.entry)];
-        const bool two_col = inner_w > 700 * sc;
-        const float col_gap = 32 * sc;
-        const float left_w = two_col ? std::min(inner_w * 0.37f, inner_h - 32 * sc) : std::min(inner_w, 260 * sc);
+        const bool two_col = inner_w > 640 * sc;
+        const float col_gap = win_s.x * 0.024f;
+        const float left_w = two_col ? std::min(inner_w * 0.345f, inner_h * 0.78f) : std::min(inner_w, 240 * sc);
         const float col_right_w = two_col ? std::max(260 * sc, inner_w - left_w - col_gap) : inner_w;
 
         // ---- Left column: large square CRT phosphor-tinted illustration ----
@@ -4848,7 +4858,7 @@ public:
 
         // ---- Right column: CyberAcme terminal header + scrollable body + pinned footer ----
         ImGui::BeginGroup();
-        ImGui::PushFont(g_fonts.mono, 0);
+        ImGui::PushFont(g_fonts.mono, term_font_px);
         const float cw = std::max(1.0f, ImGui::CalcTextSize("=").x);
         const float line_h = ImGui::GetTextLineHeight();
         auto eq_rule = [&](float w) {
@@ -4858,7 +4868,7 @@ public:
         };
 
         // Header: collection name + version tag on line 1, entry title on line 2, === rule on line 3.
-        ImGui::PushFont(g_fonts.mono_med, 0);
+        ImGui::PushFont(g_fonts.mono_med, term_font_px);
         const std::string col_title = upper_ascii(text(c.title, lang));
         const std::string ent_title = upper_ascii(text(e.title, lang));
         const std::string ver = std::format("v.1.{:03d}.{:02d}.tciv", codex.collection + 1, codex.entry + 1);
