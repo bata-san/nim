@@ -4726,8 +4726,8 @@ public:
         for (float y = win_p.y + bar_h; y < win_p.y + win_s.y - bar_h; y += std::max(2.0f, 3.0f * sc))
             root_dl->AddLine({win_p.x, y}, {win_p.x + win_s.x, y}, IM_COL32(0, 0, 0, 34), 1.0f);
 
-        // Top & bottom repeating CyberAcme 802.11 (NEURO.FILTER) ticker bars.
-        auto draw_ticker_bar = [&](float y0, const char* sep, bool with_close) {
+        // Top & bottom continuously scrolling CyberAcme 802.11 (NEURO.FILTER) ticker bars.
+        auto draw_ticker_bar = [&](float y0, const char* sep, bool with_close, float dir) {
             const ImVec2 b0{win_p.x, y0}, b1{win_p.x + win_s.x, y0 + bar_h};
             root_dl->AddRectFilled(b0, b1, kCxBarBg);
             root_dl->AddLine({b0.x, b0.y}, {b1.x, b0.y}, kCxRule, 1.0f);
@@ -4735,16 +4735,19 @@ public:
             const std::string unit = std::format("CYBERACME 802.11 (NEURO.FILTER)   {}   ", sep);
             ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.92f / sc);
             const ImVec2 us = ImGui::CalcTextSize(unit.c_str());
+            const float step = std::max(us.x, 40.0f * sc);
             const float clip_r = with_close ? (b1.x - bar_h - 6 * sc) : b1.x;
+            const float phase = std::fmod(float(ImGui::GetTime()) * 36.0f * sc, step);
+            const float start_x = dir < 0.0f ? (b0.x - phase) : (b0.x - step + phase);
             root_dl->PushClipRect(b0, {clip_r, b1.y}, true);
             const float ty = y0 + (bar_h - us.y) * 0.5f;
-            for (float x = b0.x + 6 * sc; x < clip_r; x += std::max(us.x, 40.0f * sc))
+            for (float x = start_x; x < clip_r; x += step)
                 root_dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {x, ty}, kCxGreen, unit.c_str());
             root_dl->PopClipRect();
             ImGui::PopFont();
         };
-        draw_ticker_bar(win_p.y, "+", true);
-        draw_ticker_bar(win_p.y + win_s.y - bar_h, "-", false);
+        draw_ticker_bar(win_p.y, "+", true, -1.0f);
+        draw_ticker_bar(win_p.y + win_s.y - bar_h, "-", false, 1.0f);
 
         // Close button [x] on the right side of the top ticker bar.
         {
