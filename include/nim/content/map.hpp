@@ -361,6 +361,9 @@ struct ParticleSystem {
     float lifetime = 0;  // definition +0x128: the longest particle life (seconds), estimate
     float rate = 0;      // definition +0x134: particles per second, estimate
     uint16_t state_float4s = 0, instance_float4s = 0;  // definition +0x48 / +0x4C
+    // Mesh particles: +0x20 a 64-bit hash naming a mesh record (808081F1) that holds a dynamic
+    // model (8080881C); its first mesh is drawn per particle (the UESC assault's shield: a unit cube).
+    TagHash mesh;
 };
 ParticleSystem load_particle_system(PackageManager& pm, TagHash tag);
 // The particle systems a map places: nodes -> entity (8080BAAD) -> components (8080BADB) that
@@ -375,5 +378,11 @@ struct MapParticle {
 };
 inline constexpr uint32_t kChannelExfilActivationProgress = 0x4AE64998;  // fnv1("exfil_activation_progress")
 std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map);
+// The particle systems of an entity's shield component (docs/PROGRESS.md 3.88, 推定): the
+// components (8080BADB) whose sequence reads an object channel named *shield* (the UESC assault's
+// assault_shield_recent_damage) and names particle systems. The assault's are cube mesh
+// particles with the shield's light: its damage FX (nimshade --shield-fx plays them at b_shield).
+std::vector<TagHash> entity_shield_systems(PackageManager& pm, TagHash entity);
+inline constexpr uint32_t kBoneShield = 0x6981AD2B;  // fnv1("b_shield")
 
 }  // namespace nim

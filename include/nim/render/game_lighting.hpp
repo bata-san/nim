@@ -219,6 +219,10 @@ public:
         // Instanced quads: a per-instance stream of this many float4s (TEXCOORD0..n-1), each
         // instance drawn as a 4-vertex strip (draw_instances). 0 = none.
         uint32_t instance_float4s = 0;
+        // Mesh particles: with instance_float4s, the VS's per-vertex POSITION0..n come from a model's
+        // vertex stream (slot 0: DXGI format, byte offset), the instances from slot 1, and each
+        // instance is the model's indexed triangle list (draw_mesh_instances).
+        std::vector<std::pair<uint32_t, uint32_t>> mesh_elements;
         bool depth_write = false;
         // A graphics technique that also carries a compute stage: load that stage instead.
         bool compute_stage = false;
@@ -254,6 +258,11 @@ public:
     // The per-stage resources must stay identical within a particle batch.
     void draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                         const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances, VolumeBatch& batch);
+    // Mesh particles: `instances` copies of the indexed triangle list `mesh` / `ibv` (`indices`),
+    // the per-instance stream `vbv` in slot 1.
+    void draw_mesh_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                             const D3D12_VERTEX_BUFFER_VIEW& mesh, const D3D12_INDEX_BUFFER_VIEW& ibv, uint32_t indices,
+                             const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances, VolumeBatch& batch);
     void dispatch_batch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                         uint32_t groups_x, VolumeBatch& batch);
     // Each stage's evaluated cbuffer, in stage order (evaluate_stages).
@@ -307,6 +316,7 @@ private:
         VolumeBatch* batch = nullptr;
         const StageConstants* constants = nullptr;
         uint32_t instances = 0;  // instanced 4-vertex strips over vbv
+        const D3D12_VERTEX_BUFFER_VIEW* mesh = nullptr;  // mesh particles: per-vertex slot 0 (vbv: slot 1, ibv: the mesh's)
         bool stable_views = false;
     };
     void execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,

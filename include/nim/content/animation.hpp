@@ -31,6 +31,8 @@ BoneTransform operator*(const BoneTransform& parent, const BoneTransform& child)
 BoneTransform inverse(const BoneTransform& t);
 std::array<float, 3> transform_point(const BoneTransform& t, const std::array<float, 3>& p);
 std::array<float, 3> rotate(const std::array<float, 4>& q, const std::array<float, 3>& v);
+// 3x4 rows (rotation * scale | translation), as map placements.
+std::array<float, 12> transform_rows(const BoneTransform& t);
 
 // ---- Skeleton ------------------------------------------------------------------------------------
 // S80809FB7 (inside a component tag): 0xB0 nodes (16 B: hash, parent, first child, next sibling),

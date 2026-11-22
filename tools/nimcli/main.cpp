@@ -29,6 +29,7 @@
 //   nimcli [--install DIR] fonts [OUT_DIR]               the game's UI fonts (names; optionally write the files)
 //   nimcli [--install DIR] h64 [HEX64...]               hash64 table summary by target class, or resolve values
 //   nimcli [--install DIR] components [CLASS]           component tags by resource class (or those holding CLASS)
+//   nimcli [--install DIR] entity-fx ENTITY             an entity's components and the particle systems they name
 //   nimcli [--install DIR] entity-components ENTITY [-v]  an entity's component tags, their classes and referenced tag classes
 //   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
 //   nimcli [--install DIR] skeletons                    skinned models -> their entity's skeleton and rig, clip counts
@@ -52,6 +53,7 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
+#include "nim/content/object_channels.hpp"
 #include "nim/content/weather.hpp"
 #include "nim/content/strings.hpp"
 #include "nim/content/tfx.hpp"
@@ -3036,6 +3038,41 @@ int cmd_clipfit(PackageManager& pm, TagHash model, bool verbose) {
 const char* kStageNames[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
 
 // Tags of class `cls` (type 8) whose bytes hold `tag` at a 4-byte aligned offset.
+// entity-fx ENTITY: the entity's (8080BAAD) components and the particle systems each one names,
+// with the system's lifetime and rate (the map FX path, load_map_particles, reads the same).
+int cmd_entity_fx(PackageManager& pm, TagHash entity) {
+    const auto ed = pm.read(entity);
+    std::set<uint32_t> listed;
+    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+        uint32_t c;
+        std::memcpy(&c, ed.data() + o, 4);
+        if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+        const Entry* ce = pm.entry(TagHash(c));
+        if (!ce || ce->type != 8) continue;
+        const auto cd = pm.read(TagHash(c));
+        std::string systems;
+        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+            uint32_t v;
+            std::memcpy(&v, cd.data() + q, 4);
+            if (const char* name = object_channel_name(v)) {
+                systems += std::format("\n    +0x{:X} channel {}", q, name);
+                continue;
+            }
+            if (v < 0x80800000u || v == ~0u) continue;
+            const Entry* pe = pm.entry(TagHash(v));
+            if (!pe || pe->type != 8 || pe->reference != kClassParticleSystem) continue;
+            std::string extra;
+            try {
+                const auto s = load_particle_system(pm, TagHash(v));
+                extra = std::format(" life {:.2f} rate {:.1f} state {} inst {}", s.lifetime, s.rate, s.state_float4s, s.instance_float4s);
+            } catch (const std::exception& ex) { extra = std::string(" ") + ex.what(); }
+            systems += std::format("\n    +0x{:X} system {:08X}{}", q, v, extra);
+        }
+        std::println("  +0x{:X} {:08X} class {:08X} size {}{}", o, c, ce->reference, cd.size(), systems);
+    }
+    return 0;
+}
+
 int cmd_refs(PackageManager& pm, TagHash tag, uint32_t cls) {
     size_t n = 0;
     for (const auto& info : pm.packages()) {
@@ -3546,6 +3583,7 @@ int main(int argc, char** argv) {
         if (cmd == "xref-strings") return cmd_xref_strings(pm);
         if (cmd == "codex-art") return cmd_codex_art(pm);
         if (cmd == "codex-audit") return cmd_codex_audit(pm, args.size() >= 2 ? args[1].c_str() : nullptr);
+        if (cmd == "entity-fx" && args.size() >= 2) return cmd_entity_fx(pm, TagHash(parse_hex(args[1])));
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "dynamic" && args.size() >= 2) return cmd_dynamic(pm, TagHash(parse_hex(args[1])));

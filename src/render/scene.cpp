@@ -679,6 +679,8 @@ struct ChannelContext {
 // vertices about it; unset, the pivot is somewhere else and the object swings around it.
 constexpr uint32_t kInterpolatedWorldPosition = 0xA7A7FE43;
 constexpr uint32_t kExfilActivationProgress = 0x4AE64998;
+constexpr uint32_t kShieldDeployChannel = 0x1B151BAB;         // unnamed; the assault shield parts' VS reads it
+constexpr uint32_t kAssaultShieldRecentDamage = 0xEB766AE0;   // fnv1("assault_shield_recent_damage")
 bool reads_object_position(const TechniqueStage& stage) {
     return disassemble_tfx(stage.bytecode).find("push_object_channel A7 A7 FE 43") != std::string::npos;
 }
@@ -688,6 +690,18 @@ TfxEnvironment with_channels(const TfxEnvironment& base, const ChannelContext& c
         const float4* value = nullptr;
         if (cc.defaults)
             if (auto it = cc.defaults->find(h); it != cc.defaults->end()) value = &it->second;
+        // The UESC assault's shield (docs/PROGRESS.md 3.88): its parts' VS collapses every vertex
+        // while channel 1B151BAB is 0 (the authored default, the stowed shield); the shield
+        // component's sequence raises it at run time. Shown deployed, without recent damage.
+        static const float4 shield_deployed{1, 1, 1, 1}, shield_undamaged{};
+        if (h == kShieldDeployChannel || h == kAssaultShieldRecentDamage) {
+            const bool deploy = h == kShieldDeployChannel;
+            value = deploy ? &shield_deployed : &shield_undamaged;
+            if (cc.estimates && cc.estimates->first_note(uint64_t(1) << 60 | h))
+                cc.estimates->note_estimate(deploy ? "object channel 1B151BAB (shield deployed) = 1" : "object channel assault_shield_recent_damage = 0",
+                                            deploy ? "run-time state the assault's shield component raises (authored default 0 hides the shield)"
+                                                   : "no damage is simulated");
+        }
         if (cc.overrides)
             if (auto it = cc.overrides->find(h); it != cc.overrides->end()) value = &it->second;
         static const float4 unset{1, 1, 1, 1};

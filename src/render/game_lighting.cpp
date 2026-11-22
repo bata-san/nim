@@ -655,8 +655,12 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
         if (std::getenv("NIM_LIGHT_NOCULL")) pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     std::vector<D3D12_INPUT_ELEMENT_DESC> instance_layout;
+    const UINT instance_slot = opt.mesh_elements.empty() ? 0 : 1;
     for (uint32_t i = 0; i < opt.instance_float4s; ++i)
-        instance_layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16 * i, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1});
+        instance_layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, instance_slot, 16 * i, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1});
+    for (size_t i = 0; opt.instance_float4s && i < opt.mesh_elements.size(); ++i)
+        instance_layout.push_back({"POSITION", UINT(i), DXGI_FORMAT(opt.mesh_elements[i].first), 0, opt.mesh_elements[i].second,
+                                   D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
     if (!instance_layout.empty()) {
         pd.InputLayout = {instance_layout.data(), UINT(instance_layout.size())};
         pd.RasterizerState.DepthClipEnable = TRUE;
@@ -719,6 +723,18 @@ void GamePipeline::draw_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     if (compute_) throw std::runtime_error("Compute pipeline cannot draw instances");
     Geometry g{nullptr, &vbv, nullptr, 4};
     g.instances = instances;
+    g.batch = &batch;
+    g.stable_views = true;
+    execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
+}
+
+void GamePipeline::draw_mesh_instances(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
+                                       const D3D12_VERTEX_BUFFER_VIEW& mesh, const D3D12_INDEX_BUFFER_VIEW& ibv, uint32_t indices,
+                                       const D3D12_VERTEX_BUFFER_VIEW& vbv, uint32_t instances, VolumeBatch& batch) {
+    if (compute_) throw std::runtime_error("Compute pipeline cannot draw instances");
+    Geometry g{nullptr, &vbv, &ibv, indices};
+    g.instances = instances;
+    g.mesh = &mesh;
     g.batch = &batch;
     g.stable_views = true;
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
@@ -802,7 +818,13 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
             batch->root_bindings.fill(UINT64_MAX);
         }
     }
-    if (geometry && geometry->instances) {
+    if (geometry && geometry->instances && geometry->mesh) {
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VERTEX_BUFFER_VIEW views[] = {*geometry->mesh, *geometry->vbv};
+        cl->IASetVertexBuffers(0, 2, views);
+        cl->IASetIndexBuffer(geometry->ibv);
+        if (batch) batch->vertices = nullptr, batch->indices = nullptr;
+    } else if (geometry && geometry->instances) {
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         cl->IASetVertexBuffers(0, 1, geometry->vbv);
     } else if (geometry && geometry->vbv) {
@@ -944,6 +966,7 @@ void GamePipeline::execute(Gpu& gpu, ID3D12GraphicsCommandList* cl, const Extern
     }
     if (compute_ && indirect_args_) cl->ExecuteIndirect(indirect_signature_, 1, indirect_args_, 0, nullptr, 0);
     else if (compute_) cl->Dispatch(x, y, z);
+    else if (geometry && geometry->instances && geometry->mesh) cl->DrawIndexedInstanced(geometry->indices, geometry->instances, 0, 0, 0);
     else if (geometry && geometry->instances) cl->DrawInstanced(4, geometry->instances, 0, 0);
     else if (geometry && geometry->vbv && geometry->ibv && geometry->ibv->BufferLocation) cl->DrawIndexedInstanced(geometry->indices, 1, 0, 0, 0);
     else if (geometry && geometry->vbv) cl->DrawInstanced(geometry->indices, 1, 0, 0);
@@ -2206,6 +2229,13 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         // compare cb2[0].y * t10.x + cb2[0].x directly with distance in metres.
         ext_.set(ext::Deferred, 0x00, float4{0, 1, 0, 0});
         ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
+        // Transparent +0x68: a screen image the shield's mesh particles blur behind themselves
+        // (3x3 taps at the pixel, tinted, scaled by exposure). Its engine producer is not
+        // identified; the previous frame's lit image is the closest nim has.
+        if (ssr_history_valid_)
+            ext_.estimate_texture(ext::Transparent, 0x68, ssr_history_.Get(),
+                                  "transparent +0x68 (screen image behind refractive particles) = the previous frame's lit image");
+        else ext_.set_texture(ext::Transparent, 0x68, nullptr);
         { ProfileScope ps_("frame.light.transparents"); transparents(cl, hdr); }
         ext_.set(ext::Deferred, 0x00, depth_decode);
         ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);

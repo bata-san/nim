@@ -1,4 +1,5 @@
 #include "nim/content/map.hpp"
+#include "nim/content/object_channels.hpp"
 
 #include "nim/content/tfx.hpp"
 #include "nim/content/weather.hpp"
@@ -1491,6 +1492,21 @@ ParticleSystem load_particle_system(PackageManager& pm, TagHash tag) {
     s.rate = dr.f32_at(0x134);
     s.state_float4s = dr.u16_at(0x48);
     s.instance_float4s = dr.u16_at(0x4C);
+    if (d.size() >= 0x28) {
+        const uint64_t h = r.u64_at(0x20);
+        if (h && h != ~0ull) {
+            pm.build_hash64_index();
+            if (const auto m = pm.resolve64(h); m && pm.entry(*m) && pm.entry(*m)->reference == 0x808081F1) {
+                const auto md = pm.read(*m);
+                for (size_t o = 0; o + 4 <= md.size() && s.mesh.is_none(); o += 4) {
+                    uint32_t v;
+                    std::memcpy(&v, md.data() + o, 4);
+                    if (v < 0x80800000u || v == ~0u) continue;
+                    if (const Entry* me = pm.entry(TagHash(v)); me && me->type == 8 && me->reference == kClassDynamicModel) s.mesh = TagHash(v);
+                }
+            }
+        }
+    }
     return s;
 }
 
@@ -1556,6 +1572,35 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             const auto rows = quat_rows(r, e);
             for (const auto& [s, gate] : it->second) out.push_back({TagHash(s), rows, gate});
         }
+    }
+    return out;
+}
+
+std::vector<TagHash> entity_shield_systems(PackageManager& pm, TagHash entity) {
+    std::vector<TagHash> out;
+    const auto ed = pm.read(entity);
+    std::set<uint32_t> listed;
+    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+        uint32_t c;
+        std::memcpy(&c, ed.data() + o, 4);
+        if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+        const Entry* ce = pm.entry(TagHash(c));
+        if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
+        const auto cd = pm.read(TagHash(c));
+        bool shield = false;
+        std::vector<TagHash> systems;
+        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+            uint32_t v;
+            std::memcpy(&v, cd.data() + q, 4);
+            if (const char* name = object_channel_name(v); name && std::strstr(name, "shield")) shield = true;
+            if (v < 0x80800000u || v == ~0u) continue;
+            const Entry* pe = pm.entry(TagHash(v));
+            if (pe && pe->type == 8 && pe->reference == kClassParticleSystem && std::ranges::find(systems, TagHash(v)) == systems.end())
+                systems.push_back(TagHash(v));
+        }
+        if (shield)
+            for (const auto s : systems)
+                if (std::ranges::find(out, s) == out.end()) out.push_back(s);
     }
     return out;
 }

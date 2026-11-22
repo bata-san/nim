@@ -128,6 +128,7 @@ std::vector<uint8_t> PackageManager::read_range(TagHash h, uint64_t offset, size
 }
 
 void PackageManager::build_hash64_index() {
+    if (!h64_.empty()) return;  // built once (the packages do not change)
     for (const auto& i : infos_)
         for (const auto& e : open(i).hash64s()) h64_.emplace(e.hash64, e.hash32);
 }

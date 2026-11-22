@@ -53,6 +53,11 @@ BoneTransform operator*(const BoneTransform& parent, const BoneTransform& child)
     return r;
 }
 
+std::array<float, 12> transform_rows(const BoneTransform& t) {
+    const V x = rotate(t.rotation, {t.scale, 0, 0}), y = rotate(t.rotation, {0, t.scale, 0}), z = rotate(t.rotation, {0, 0, t.scale});
+    return {x[0], y[0], z[0], t.translation[0], x[1], y[1], z[1], t.translation[1], x[2], y[2], z[2], t.translation[2]};
+}
+
 BoneTransform inverse(const BoneTransform& t) {
     BoneTransform r;
     r.rotation = {-t.rotation[0], -t.rotation[1], -t.rotation[2], t.rotation[3]};

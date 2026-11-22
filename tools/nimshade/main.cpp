@@ -166,6 +166,7 @@ int run(int argc, char** argv) {
     uint32_t map_texture_cap = 0;  // full resolution
     bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false, no_fx = false;
     float fx_radius = -1;
+    TagHash shield_entity;  // --shield-fx ENTITY: its shield component's particle systems at the posed b_shield bone (needs --clip)
     std::optional<size_t> probe_index;
     bool dump_probe_mask = false;
     bool dump_lighting = false;
@@ -254,6 +255,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--ai-ground-audit") ai_ground_audit = true;
         else if (args[i] == "--no-fx") no_fx = true;
+        else if (args[i] == "--shield-fx" && i + 1 < args.size()) shield_entity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
@@ -833,6 +835,17 @@ int run(int argc, char** argv) {
             prepare_preview_equipment(pm, mesh, *anim, rigs, all, mats);
             for (const auto& option : anim->equipment) std::println("equipment candidate {}", option.model.str());
             poses = anim->poses(clip, clip_frame, equipment_model);
+            if (!shield_entity.is_none()) {
+                const auto& sk = anim->skeleton;
+                const auto bone = std::ranges::find(sk.hashes, kBoneShield);
+                if (bone == sk.hashes.end()) throw std::runtime_error("--shield-fx: the skeleton has no b_shield bone");
+                const size_t b = size_t(bone - sk.hashes.begin());
+                const auto rows = transform_rows(poses.front().bones[b] * sk.bind[b]);
+                for (const auto system : entity_shield_systems(pm, shield_entity)) {
+                    particle_placements.push_back({system, rows, 0});
+                    std::println("shield fx {} at b_shield (bone {}) ({:.3f}, {:.3f}, {:.3f})", system.str(), b, rows[3], rows[7], rows[11]);
+                }
+            }
             if (!equipment_model.is_none() && std::ranges::none_of(poses, [](const auto& pose) { return bool(pose.placement); }))
                 throw std::runtime_error(std::format("equipment {} is incompatible with this preview clip", equipment_model.str()));
             for (const auto& pose : poses)

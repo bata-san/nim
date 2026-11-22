@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <unordered_map>
 
 namespace nim {
@@ -37,6 +38,13 @@ struct ParticleScene::System {
     GamePipeline init, update, instance, draw;
     uint32_t instance_float4s = 0;  // the draw VS's per-instance TEXCOORD inputs
     bool screen_collision = false;
+    // Mesh particles: the dynamic model drawn per particle and its rigid_model decode (c4 position
+    // scale, c5 offset, c6 texcoord scale / offset).
+    ComPtr<ID3D12Resource> mesh_vb, mesh_ib;
+    D3D12_VERTEX_BUFFER_VIEW mesh_vbv{};
+    D3D12_INDEX_BUFFER_VIEW mesh_ibv{};
+    uint32_t mesh_indices = 0;
+    std::array<float4, 3> mesh_decode{};
     bool failed = false;  // an original program could not be evaluated: left out from then on
 };
 
@@ -92,6 +100,7 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     grid_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("player_centered_cascaded_grid")));
     std::unordered_map<uint32_t, int> index;  // system tag -> systems_ index, -1 = failed
     gated_ = 0;
+    std::optional<std::vector<std::vector<InputElement>>> layouts;  // read on the first mesh particle
     for (const auto& p : placements) {
         // The exfil device's FX component plays on exfil_activation_progress. With no activation
         // state supplied the device is inactive (as its materials, scene.cpp), so they do not run.
@@ -128,11 +137,53 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
                 if (d.blend_state < 0) throw std::runtime_error(std::format("{}: draw has no blend state", s->def.draw.str()));
                 d.depth_func = D3D12_COMPARISON_FUNC_GREATER_EQUAL;  // reversed depth, read only
                 d.additional_rtv_formats = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, GBuffer::kFormats[3]};
+                uint32_t mesh_inputs = 0;
                 for (const auto& in : shader_inputs(load_shader_bytecode(pm, draw.stage(ShaderStage::Vertex).shader))) {
                     if (_stricmp(in.semantic.c_str(), "TEXCOORD") == 0) s->instance_float4s = std::max(s->instance_float4s, in.index + 1);
-                    else  // POSITION etc.: a model drawn per particle; its geometry reference is not decoded
-                        throw std::runtime_error(std::format("{}: mesh particles (draw VS reads per-vertex {}{}), model not decoded",
-                                                             s->def.draw.str(), in.semantic, in.index));
+                    else if (_stricmp(in.semantic.c_str(), "POSITION") == 0) mesh_inputs = std::max(mesh_inputs, in.index + 1);
+                    else
+                        throw std::runtime_error(std::format("{}: draw VS reads per-vertex {}{}", s->def.draw.str(), in.semantic, in.index));
+                }
+                if (mesh_inputs) {
+                    // A model drawn per particle: the VS's POSITION0..n are the model's vertex
+                    // stream 0 elements in order (the shield cube: position, texcoord, normal).
+                    if (s->def.mesh.is_none())
+                        throw std::runtime_error(std::format("{}: mesh particles without a mesh record", s->def.draw.str()));
+                    const DynamicModel model = load_dynamic_model(pm, s->def.mesh);
+                    if (model.meshes.empty()) throw std::runtime_error(std::format("{}: mesh {} has no meshes", p.system.str(), s->def.mesh.str()));
+                    const DynamicMesh& m = model.meshes.front();
+                    if (m.parts.empty() || m.vertex0.is_none() || m.index.is_none())
+                        throw std::runtime_error(std::format("{}: mesh {} has no drawable part", p.system.str(), s->def.mesh.str()));
+                    if (!layouts) layouts = load_input_layouts(pm);
+                    size_t stage = 0;
+                    while (stage < kRenderStageCount && m.part_range[stage] == m.part_range[stage + 1]) ++stage;
+                    const uint8_t li = stage < kRenderStageCount ? m.input_layout[stage] : 0xFF;
+                    if (li >= layouts->size()) throw std::runtime_error(std::format("mesh {}: unknown input layout {}", s->def.mesh.str(), li));
+                    uint32_t offset = 0;
+                    for (const auto& el : (*layouts)[li]) {
+                        if (el.buffer != 0 || el.instanced) continue;
+                        if (d.mesh_elements.size() < mesh_inputs) d.mesh_elements.push_back({el.dxgi_format, offset});
+                        offset += el.size;
+                    }
+                    if (d.mesh_elements.size() < mesh_inputs)
+                        throw std::runtime_error(std::format("mesh {}: layout {} has {} vertex elements, the draw VS reads {}", s->def.mesh.str(), li,
+                                                             d.mesh_elements.size(), mesh_inputs));
+                    const VertexBuffer vb = load_vertex_buffer(pm, m.vertex0);
+                    const IndexBuffer ib = load_index_buffer(pm, m.index);
+                    if (vb.data.empty() || ib.data.empty() || vb.stride != offset)
+                        throw std::runtime_error(std::format("mesh {}: vertex stride {} vs layout {}", s->def.mesh.str(), vb.stride, offset));
+                    const DynamicMeshPart& part = m.parts[m.part_range[stage]];
+                    if (part.primitive_type != 3) throw std::runtime_error(std::format("mesh {}: not a triangle list", s->def.mesh.str()));
+                    s->mesh_vb = gpu.upload(vb.data.data(), vb.data.size());
+                    s->mesh_ib = gpu.upload(ib.data.data(), ib.data.size());
+                    s->mesh_vbv = {s->mesh_vb->GetGPUVirtualAddress(), UINT(vb.data.size()), vb.stride};
+                    const uint32_t index_bytes = ib.is_32bit ? 4 : 2;
+                    s->mesh_ibv = {s->mesh_ib->GetGPUVirtualAddress() + uint64_t(part.index_start) * index_bytes,
+                                   UINT(uint64_t(part.index_count) * index_bytes), ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+                    s->mesh_indices = part.index_count;
+                    s->mesh_decode = {float4{model.model_scale[0], model.model_scale[1], model.model_scale[2], model.model_scale[3]},
+                                      float4{model.model_offset[0], model.model_offset[1], model.model_offset[2], model.model_offset[3]},
+                                      float4{model.texcoord_scale[0], model.texcoord_scale[1], model.texcoord_offset[0], model.texcoord_offset[1]}};
                 }
                 if (!s->instance_float4s || s->instance_float4s > s->def.instance_float4s)
                     throw std::runtime_error(std::format("{}: draw VS inputs exceed the authored instance record", s->def.draw.str()));
@@ -171,6 +222,7 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
         object[2] = {p[2], p[6], p[10], 0};
         object[3] = {p[3], p[7], p[11], 1};
         std::copy_n(object.begin(), 4, object.begin() + 8);
+        std::copy_n(systems_[emitters_[i].system]->mesh_decode.begin(), 3, object.begin() + 4);
     }
     object_constants_ = gpu.upload(objects.data(), objects.size() * sizeof(ParticleObjectConstants));
     const uint64_t n = total_;
@@ -488,13 +540,15 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         const Emitter& e = emitters_[i];
         const uint32_t used = uint32_t(std::min<uint64_t>(e.spawned, e.capacity));
         if (!used) continue;
-        object_cb = object_constants_->GetGPUVirtualAddress() + uint64_t(i) * sizeof(ParticleObjectConstants);
         System& s = *systems_[e.system];
+        object_cb = object_constants_->GetGPUVirtualAddress() + uint64_t(i) * sizeof(ParticleObjectConstants);
         ext.set(kParticle, 0x178, float(e.offset * kHistoryFloat4s));
         ext.set(kParticle, 0x17C, float(e.offset * kHistoryFloat4s));
         const D3D12_VERTEX_BUFFER_VIEW vbv{instances_->GetGPUVirtualAddress() + uint64_t(e.instance_base) * 16,
                                            used * s.instance_float4s * 16, s.instance_float4s * 16};
-        guard(s, [&] { s.draw.draw_instances(gpu, cl, ext, scopes, vbv, used, draw_batch); });
+        if (s.mesh_indices)
+            guard(s, [&] { s.draw.draw_mesh_instances(gpu, cl, ext, scopes, s.mesh_vbv, s.mesh_ibv, s.mesh_indices, vbv, used, draw_batch); });
+        else guard(s, [&] { s.draw.draw_instances(gpu, cl, ext, scopes, vbv, used, draw_batch); });
     }
     Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Gpu::barrier(cl, instances_.Get(), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
