@@ -49,6 +49,7 @@
 #include "nim/content/hca.hpp"
 #include "media.hpp"
 #include "nim/content/audio.hpp"
+#include "nim/content/map_audio.hpp"
 #include "nim/content/fonts.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/weather.hpp"
@@ -3582,6 +3583,29 @@ int main(int argc, char** argv) {
         if (cmd == "map-sky" && args.size() >= 2) return cmd_map_sky(pm, TagHash(parse_hex(args[1])));
         if (cmd == "stage-survey" && args.size() >= 2) return cmd_stage_survey(pm, std::stoul(args[1]));
         if (cmd == "scope-survey" && args.size() >= 2) return cmd_scope_survey(pm, unsigned(std::stoul(args[1])));
+        if (cmd == "map-audio" && args.size() >= 2) {
+            const TagHash bubble(parse_hex(args[1]));
+            std::vector<TagHash> extra;
+            if (args.size() >= 3) {
+                const TagHash act(parse_hex(args[2]));
+                for (const auto& m : list_activity_maps(pm))
+                    if (m.activity == act && m.bubble == bubble) extra = load_activity_node_tables(pm, act, m.bubble_name, m.activity_map);
+            }
+            const MapLayout layout = load_map_layout(pm, bubble, extra);
+            const MapAudio audio = load_map_audio(pm, layout);
+            std::println("map {}: {} emitters ({} point, {} polyline, {} global), {} unique events ({} with WEM, {} without), {} unique WEMs",
+                         bubble.str(), audio.emitters.size(), audio.point_emitters, audio.polyline_emitters, audio.global_emitters,
+                         audio.unique_events, audio.events_with_wems, audio.events_without_wems, audio.unique_wems);
+            size_t shown = 0;
+            for (const auto& em : audio.emitters) {
+                if (em.wems.empty() || shown >= 12) continue;
+                std::println("  {} event {} ({:08X}) pos ({:.1f} {:.1f} {:.1f}) r={:.1f} gain={:.2f} wems={} first={}",
+                             em.polyline ? "poly" : em.global ? "glob" : "pt  ", em.event.str(), em.event_id,
+                             em.position[0], em.position[1], em.position[2], em.radius, em.gain, em.wems.size(), em.wems[0].str());
+                ++shown;
+            }
+            return 0;
+        }
         if (cmd == "map-fx" && args.size() >= 2)
             return cmd_map_fx(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? TagHash(parse_hex(args[2])) : TagHash{});
         if (cmd == "class-refs" && args.size() >= 2) return cmd_class_refs(pm, parse_hex(args[1]));

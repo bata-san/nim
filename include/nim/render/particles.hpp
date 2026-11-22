@@ -67,6 +67,7 @@ private:
     std::vector<std::unique_ptr<System>> systems_;
     std::vector<Emitter> emitters_;
     std::unique_ptr<ExternStore> ext_;
+    bool ext_initialized_ = false;
     ComPtr<ID3D12Resource> state_[2], history_, instances_, object_constants_;
     uint32_t parity_ = 0;  // state_[parity_] holds the current particles
     uint32_t total_ = 0, state_total_ = 0, instance_total_ = 0;  // slots / pool float4s

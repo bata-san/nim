@@ -59,6 +59,11 @@ public:
         sorted_ = true;
         if (++epoch_ == 0) std::fill(stamps_.begin(), stamps_.end(), 0), epoch_ = 1;
     }
+    const float* find(uint8_t id, uint32_t byte_offset) const {
+        if (values_.empty() || byte_offset >= kBlockBytes) return nullptr;
+        const uint32_t i = uint32_t(id) * kWords + (byte_offset >> 2);
+        return stamps_[i] == epoch_ ? &values_[i] : nullptr;
+    }
     static uint32_t key(uint8_t id, uint32_t byte_offset) { return uint32_t(id) << 16 | (byte_offset >> 2); }
 
 private:
@@ -96,8 +101,9 @@ public:
     std::map<uint32_t, float> world_channels; // script registry slots, never render-globals indices
     void set_channel(std::string_view name, float4 v);
     TfxEnvironment environment() const;
-    // The same environment with `overlay` (sorted ExternOverlay words) over this store's values.
+    // The same environment with `overlay` (sorted ExternOverlay words or live ExternOverlay) over this store's values.
     TfxEnvironment environment(const std::vector<std::pair<uint32_t, float>>* overlay) const;
+    TfxEnvironment environment(const ExternOverlay* overlay) const;
     // Engine-produced cb13, including its temporal seeds and exposure state.
     void set_frame_constants(const std::array<float4, 16>& constants) { frame_ = constants; has_frame_ = true; frame_estimated_ = false; }
     bool has_frame_constants() const { return has_frame_; }
@@ -255,7 +261,7 @@ public:
     void draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                      const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
                      uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures = {}, VolumeBatch* batch = nullptr,
-                     const StageConstants* constants = nullptr);
+                     const StageConstants* constants = nullptr, bool stable_views = false);
     // The TFX of each stage (with `materials`' programs when given) against `env`: what draw_volume
     // would evaluate. Thread-safe; draw_volume then takes the result instead of evaluating again.
     void evaluate_stages(const TfxEnvironment& env, const Technique* materials, StageConstants& out) const;
@@ -441,6 +447,7 @@ public:
     };
     // Probe index zero means sky. Other indices belong to the current map or preview.
     size_t transparent_probe_at(V3 position) const;
+    uint64_t cubemap_generation() const { return cubemap_generation_; }
     TransparentReflection transparent_reflection(size_t probe) const;
     ID3D12Resource* distortion_view_depth() const { return distortion_view_depth_.Get(); }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
@@ -570,7 +577,7 @@ private:
         std::shared_ptr<const Technique> shadow_technique;
         std::unique_ptr<SunShadow> shadow;
         bool shadow_readable = false;  // depth map in PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
-        M4 world_volume, world_to_box;
+        M4 world_volume, world_box, world_to_box;
         bool mirrored = false;
         // Registers of the light PS read for the transparent light grid (-1: not found):
         // falloff (a, b) of saturate(a * d + b)^2, the colour at falloff - 1, the spot cone
@@ -627,6 +634,7 @@ private:
     size_t cubemaps_drawn_ = 0;
     size_t cubemaps_failed_ = 0;
     size_t cubemaps_requested_ = 0;
+    uint64_t cubemap_generation_ = 0;
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_textures_;  // current selection's resources only
     std::unordered_map<uint32_t, ComPtr<ID3D12Resource>> probe_shapes_;    // keep in-flight boundary buffers alive across map changes
 

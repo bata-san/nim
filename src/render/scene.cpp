@@ -638,6 +638,8 @@ void StaticMeshScene::release(Gpu& gpu) {
     world_transparent_draws_ = 0;
     sky_transparent_draws_ = 0;
     transparent_local_reflections_ = transparent_sky_reflections_ = transparent_local_probes_ = 0;
+    transparent_probe_cache_.clear();
+    transparent_probe_gen_ = UINT64_MAX;
     channels_.clear();
     channel_overrides_.clear();
     channel_defaults_.clear();
@@ -2733,7 +2735,7 @@ StaticMeshScene::StaticMeshScene() = default;
 StaticMeshScene::~StaticMeshScene() = default;
 
 void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage,
-                                       const ExternStore* frame_inputs) {
+                                       const ExternStore* frame_inputs, bool shadow) {
     if (!material_externs_) return;
     auto& ext = *material_externs_;
     if (assembled_) for (auto& set : sets_) {
@@ -2913,7 +2915,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // Shared scopes are produced at most once per call, by whichever item needs them first.
     std::mutex scope_mutex;
     auto& scope_ready = material_scratch_->scope_ready;
-    scope_ready = std::vector<std::atomic<uint64_t>>(scope_defs_.size());
+    if (scope_ready.size() != scope_defs_.size()) scope_ready = std::vector<std::atomic<uint64_t>>(scope_defs_.size());
+    else for (auto& slot : scope_ready) slot.store(0, std::memory_order_relaxed);
     auto shared_scope = [&](uint32_t slot) -> D3D12_GPU_VIRTUAL_ADDRESS {
         if (const auto a = scope_ready[slot].load(std::memory_order_acquire)) return a;
         std::lock_guard lock(scope_mutex);
@@ -2991,7 +2994,6 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         if (!item_instances(it)) return;  // culled this frame: not drawn, nothing to evaluate
       try {
         const auto& set = sets_[it.buffers];
-        const ChannelContext model_cc = channels_for(set);
         if (assembled_) {
             for (uint32_t row = 0; row < set.model_parameters.size(); ++row)
                 ext.set(ext::RigidModel, row * 16, set.model_parameters[row]);
@@ -3000,21 +3002,21 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         for (size_t k = 0; k < it.scope_slots.size(); ++k)
             it.scope_addresses[k] = {it.scope_slots[k].first, shared_scope(it.scope_slots[k].second)};
         auto evaluate = [&](const TechniqueStage& material, std::vector<float4>& cb, const GpuBuffer& fixed, bool vs) {
+            if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
             const bool model_inputs = assembled_ || (set.model_channels && !set.model_channels->empty());
             // An actor with its own object state evaluates apart from the other copies of its model.
             const uint64_t object = set.actor_channels ? (uint64_t(1) << 30) | it.buffers
                                     : model_inputs ? uint64_t(set.model.value - TagHash::kBase) + 1 : 0;
             const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
-            if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
-            if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
             if (deferred_evaluation) {
                 const bool origin = (vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic);
                 chunk.requests.emplace_back(index, vs, key, origin);
                 return D3D12_GPU_VIRTUAL_ADDRESS(0);
             }
+            if (auto shared = material_addresses_.find(key); shared != material_addresses_.end()) return shared->second;
             // A placed object's position is filled in per placement below: not reported as unset here.
             static const float4 origin{0, 0, 0, 1};
-            ChannelContext ec = model_cc;
+            ChannelContext ec = channels_for(set);
             if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic)) ec.world_position = &origin;
             evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs));
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
@@ -3053,21 +3055,21 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         };
         try {
             bind_shared(it.vs_sources, it.vs_kinds, true);
-            bind_shared(it.ps_sources, it.ps_kinds, false);
+            if (!shadow) bind_shared(it.ps_sources, it.ps_kinds, false);
         } catch (const std::exception& ex) {
             chunk.table_errors.emplace_back(table, ex.what());
             throw;
         }
         if (it.vs_reads_position < 0) it.vs_reads_position = reads_object_position(it.vs_material);
-        if (it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
+        if (!shadow && it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
         it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0, true);
-        it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
+        if (!shadow) it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
         if (deferred_evaluation) {
             it.vs_placement_addresses.clear();
             it.ps_placement_addresses.clear();
-            if (it.vs_reads_position || it.ps_reads_position) chunk.placements.push_back(index);
+            if (it.vs_reads_position || (!shadow && it.ps_reads_position)) chunk.placements.push_back(index);
         } else {
-            placement_constants(index, model_cc);
+            placement_constants(index, channels_for(set));
         }
       } catch (const std::exception& ex) {
         // One part without its game inputs is left out (never drawn with invented values);
@@ -3280,15 +3282,18 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         // Preserve the authored part order for equal depths, including parts of one placement.
         std::stable_sort(ordered.begin(), ordered.end(), [](const Draw& a, const Draw& b) {
             if (a.sky != b.sky) return a.sky;
-            // Both back to front. Sky records hold an authored distance at +0x64 (Outpost: stars
-            // -105, clouds 48400, the planet 1e6; Cryo Archive: its fog shell 80000 drawn first).
-            // Ascending order let the far shells cover the whole sky (estimate of the engine rule).
-            return a.depth > b.depth;
+            // Sky records hold an ascending layer order at +0x64 (stars/dome -110..-90 first,
+            // distant planets/clouds/horizon layers in ascending order); world transparents draw
+            // back to front by camera view depth.
+            return a.sky ? a.depth < b.depth : a.depth > b.depth;
         });
         world_transparent_draws_ = 0;
         sky_transparent_draws_ = 0;
         transparent_local_reflections_ = transparent_sky_reflections_ = transparent_local_probes_ = 0;
-        std::unordered_map<uint64_t, size_t> placement_probes;
+        if (lighting && lighting->cubemap_generation() != transparent_probe_gen_) {
+            transparent_probe_cache_.clear();
+            transparent_probe_gen_ = lighting->cubemap_generation();
+        }
         std::unordered_map<size_t, ReflectionBinding> reflection_bindings;
         DrawState state;
         for (const auto& entry : ordered) {
@@ -3299,7 +3304,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
                 if (!entry.sky) {
                     const uint32_t group = it.dynamic ? it.buffers : sets_[it.buffers].cull;
                     const uint64_t key = (uint64_t(it.dynamic) << 63) | (uint64_t(group) << 32) | entry.instance;
-                    const auto [slot, first] = placement_probes.try_emplace(key, 0);
+                    const auto [slot, first] = transparent_probe_cache_.try_emplace(key, 0);
                     if (first) slot->second = lighting->transparent_probe_at(entry.centre);
                     probe = slot->second;
                 }
@@ -3387,7 +3392,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         record(cl, opaque, false);
     }
     // Blended G-buffer items (decals) go over opaque surfaces.
-    if (!shadow) record(cl, opaque, true);
+    if (!shadow) {
+        if (stage == kStageDecal) record(cl, opaque, true);
+        else if (!visible_blended_.empty()) record(cl, visible_blended_, true);
+    }
 }
 
 void StaticMeshScene::load_animation_equipment(Gpu& gpu, const std::vector<std::vector<InputElement>>& layouts,
@@ -3758,6 +3766,7 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
                y * vm.fy > std::max(0.0f, z) * (1 + margin_y) + r * ky;
     };
     visible_opaque_.clear();
+    visible_blended_.clear();
     visible_static_indices_.clear();
     visible_static_groups_.clear();
     // Each group is tested on the worker pool into its own lists; the streams are then gathered
@@ -3782,8 +3791,10 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
             const float r = sp[3];
             const float projected = vm.ortho > 0 ? r / vm.ortho : r * vm.fy / std::max(z - r, 1e-4f);
             const auto delta = V3{sp[0], sp[1], sp[2]} - vm.eye;
-            const bool near_camera = vm.ortho == 0 && dot(delta, delta) <= (25 + r) * (25 + r);
-            if (!near_camera && projected * half_h < 0.5f) continue;
+            const float d2 = dot(delta, delta);
+            const bool near_camera = vm.ortho == 0 && d2 <= (25 + r) * (25 + r);
+            const float min_px = (vm.ortho == 0 && d2 > (40 + r) * (40 + r)) ? 1.8f : 1.25f;
+            if (!near_camera && projected * half_h < min_px) continue;
             ++group.visible;
             if (group.dynamic) {
                 group.visible_placements.push_back(i);
@@ -3828,10 +3839,15 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
         // static groups with none (hanging cables, foliage, trim) do not cast (3.70, 推定).
         if (shadow && !group.dynamic && !group.authored_shadow) continue;
         for (size_t index = group.first_item; index < group.end_item; ++index)
-            if (items_[index].stage == stage && (group.dynamic || (items_[index].lod_mask & lods))) visible_opaque_.push_back(index);
+            if (items_[index].stage == stage && (group.dynamic || (items_[index].lod_mask & lods))) {
+                visible_opaque_.push_back(index);
+                if (items_[index].blended) visible_blended_.push_back(index);
+            }
     }
     const size_t first_uncullable = visible_opaque_.size();
     visible_opaque_.insert(visible_opaque_.end(), uncullable_opaque_.begin(), uncullable_opaque_.end());
+    for (size_t index : uncullable_opaque_)
+        if (items_[index].blended) visible_blended_.push_back(index);
     if (first_uncullable && !uncullable_opaque_.empty() &&
         visible_opaque_[first_uncullable - 1] > uncullable_opaque_.front())
         std::inplace_merge(visible_opaque_.begin(), visible_opaque_.begin() + first_uncullable, visible_opaque_.end());
@@ -3845,6 +3861,7 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
     if (visibility_shadow_ != shadow) {
         std::swap(visibility_key_, visibility_key_other_);
         std::swap(visible_opaque_, visible_opaque_other_);
+        std::swap(visible_blended_, visible_blended_other_);
         std::swap(visible_static_indices_, visible_static_indices_other_);
         std::swap(visible_static_groups_, visible_static_groups_other_);
         for (auto& group : cull_groups_) group.swap_view();
@@ -3915,7 +3932,7 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
     cull(gpu, shadow.vm, shadow.size, true);
     ps_cull.stop();
     ProfileScope ps_mat("frame.shadow.materials");
-    update_materials(gpu, shadow.size, shadow.size, shadow.vm);
+    update_materials(gpu, shadow.size, shadow.size, shadow.vm, 0, nullptr, true);
     ps_mat.stop();
     ProfileScope ps_draw("frame.shadow.draw");
     cl->ClearDepthStencilView(shadow.dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
@@ -3926,11 +3943,11 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
 
 void StaticMeshScene::render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map) {
     if (map && material_externs_)
-        material_externs_->note_estimate("sun shadow: map origin snapped to 4 m, depth refreshed at 20 Hz in a stable view",
+        material_externs_->note_estimate("sun shadow: map origin snapped to 4 m, depth refreshed at 4 Hz in a stable view",
                                         "single viewer shadow map; engine cascade update schedule unknown");
     if (map && shadow.valid && shadow.cached_sun_generation == shadow_generation_ &&
         std::equal(std::begin(shadow.cached_sun_view.c), std::end(shadow.cached_sun_view.c), std::begin(shadow.vm.vp_abs.c)) &&
-        material_time_ >= shadow.cached_sun_time && material_time_ - shadow.cached_sun_time < 0.049f)
+        material_time_ >= shadow.cached_sun_time && material_time_ - shadow.cached_sun_time < 0.249f)
         return;
     render_shadow(gpu, cl, shadow);
     shadow.cached_sun_view = shadow.vm.vp_abs;

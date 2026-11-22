@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,10 @@ AudioEngine::AudioEngine() {
     if (FAILED(hr)) {
         error_ = std::format("音声出力デバイスを開けません ({:08X})", uint32_t(hr));
         master_ = nullptr;
+    } else {
+        XAUDIO2_VOICE_DETAILS details{};
+        master_->GetVoiceDetails(&details);
+        if (details.InputChannels > 0) master_channels_ = details.InputChannels;
     }
 }
 
@@ -89,6 +94,20 @@ bool Voice::submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end
     return false;
 }
 
+bool Voice::submit_looping(std::shared_ptr<const std::vector<int16_t>> samples) {
+    if (!voice_ || !samples || samples->empty()) return false;
+    std::lock_guard lock(mutex_);
+    release_finished();
+    XAUDIO2_BUFFER b{};
+    b.AudioBytes = UINT32(samples->size() * sizeof(int16_t));
+    b.pAudioData = reinterpret_cast<const BYTE*>(samples->data());
+    b.LoopCount = XAUDIO2_LOOP_INFINITE;
+    buffers_.push_back(std::move(samples));
+    if (SUCCEEDED(voice_->SubmitSourceBuffer(&b))) return true;
+    buffers_.pop_back();
+    return false;
+}
+
 void Voice::start() {
     if (voice_) voice_->Start();
 }
@@ -97,6 +116,29 @@ void Voice::pause() {
 }
 void Voice::set_volume(float v) {
     if (voice_) voice_->SetVolume(v);
+}
+void Voice::set_pan(float pan, uint32_t master_channels) {
+    if (!voice_ || master_channels < 2 || channels_ == 0 || channels_ > 8 || master_channels > 8) return;
+    const float clamped = std::clamp(pan, -1.0f, 1.0f);
+    const float angle = (clamped * 0.5f + 0.5f) * 1.57079632679f;
+    const float l = std::cos(angle), r = std::sin(angle);
+    float matrix[64]{};
+    if (channels_ == 1) {
+        matrix[0] = l;
+        matrix[1] = r;
+    } else if (channels_ == 2) {
+        // Preserve stereo width while shifting balance toward the emitter's side.
+        matrix[0 * channels_ + 0] = l * 1.15f;
+        matrix[0 * channels_ + 1] = l * 0.35f;
+        matrix[1 * channels_ + 0] = r * 0.35f;
+        matrix[1 * channels_ + 1] = r * 1.15f;
+    } else {
+        for (uint32_t c = 0; c < channels_; ++c) {
+            matrix[0 * channels_ + c] = l / float(channels_);
+            matrix[1 * channels_ + c] = r / float(channels_);
+        }
+    }
+    voice_->SetOutputMatrix(nullptr, channels_, master_channels, matrix);
 }
 
 uint64_t Voice::frames_played() const {
@@ -433,6 +475,221 @@ void MoviePlayer::run() {
     }
     finished_ = true;
     if (SUCCEEDED(co)) CoUninitialize();
+}
+
+// ---- Spatialized map ambient audio ----------------------------------------------------------------
+AmbientAudioPlayer::AmbientAudioPlayer(AudioEngine& engine) : engine_(engine) {
+    worker_ = std::thread([this] { decode_loop(); });
+}
+
+AmbientAudioPlayer::~AmbientAudioPlayer() {
+    clear();
+    {
+        std::lock_guard lk(mutex_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void AmbientAudioPlayer::set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio) {
+    voices_.clear();
+    active_voices_ = 0;
+    audio_ = std::move(audio);
+    {
+        std::lock_guard lk(mutex_);
+        pm_ = pm.fork();
+        decode_queue_.clear();
+        decode_pending_.clear();
+        decoded_.clear();
+        failed_.clear();
+    }
+}
+
+void AmbientAudioPlayer::clear() {
+    voices_.clear();
+    active_voices_ = 0;
+    audio_.reset();
+    {
+        std::lock_guard lk(mutex_);
+        decode_queue_.clear();
+        decode_pending_.clear();
+        decoded_.clear();
+        failed_.clear();
+    }
+}
+
+size_t AmbientAudioPlayer::decoded_count() const {
+    std::lock_guard lk(mutex_);
+    return decoded_.size();
+}
+
+void AmbientAudioPlayer::request_decode(TagHash wem) {
+    if (wem.is_none()) return;
+    std::lock_guard lk(mutex_);
+    if (!pm_) return;
+    for (const auto& [k, _] : decoded_) if (k == wem.value) return;
+    for (uint32_t f : failed_) if (f == wem.value) return;
+    for (uint32_t p : decode_pending_) if (p == wem.value) return;
+    decode_pending_.push_back(wem.value);
+    decode_queue_.push_back(wem);
+    cv_.notify_one();
+}
+
+void AmbientAudioPlayer::decode_loop() {
+    for (;;) {
+        TagHash wem;
+        PackageManager* pm = nullptr;
+        {
+            std::unique_lock lk(mutex_);
+            cv_.wait(lk, [&] { return stop_ || !decode_queue_.empty(); });
+            if (stop_) return;
+            wem = decode_queue_.front();
+            decode_queue_.pop_front();
+            pm = pm_.get();
+        }
+        std::shared_ptr<const PcmAudio> pcm;
+        if (pm) {
+            try {
+                auto raw = pm->read(wem);
+                auto dec = decode_wem(raw);
+                if (!dec.samples.empty() && dec.sample_rate > 0 && dec.channels > 0)
+                    pcm = std::make_shared<const PcmAudio>(std::move(dec));
+            } catch (...) {
+            }
+        }
+        std::lock_guard lk(mutex_);
+        std::erase(decode_pending_, wem.value);
+        if (pcm) {
+            // Bound decoded cache to ~48 entries (~40-60 MB) so memory stays lean on huge maps.
+            if (decoded_.size() >= 48) decoded_.erase(decoded_.begin());
+            decoded_.emplace_back(wem.value, std::move(pcm));
+        } else {
+            failed_.push_back(wem.value);
+        }
+    }
+}
+
+void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> right, float dt,
+                                float master_volume, bool enabled) {
+    if (!engine_.ok() || !audio_ || !enabled || master_volume <= 1e-4f) {
+        for (auto& v : voices_)
+            if (v.voice) v.voice->set_volume(0.0f);
+        active_voices_ = 0;
+        return;
+    }
+    constexpr size_t kMaxVoices = 12;
+    struct Candidate {
+        uint32_t event_tag = 0;
+        TagHash wem;
+        float weight = 0.0f;
+        float pan = 0.0f;
+    };
+    // Deduplicate by event tag: keep the loudest/closest emitter for each distinct AudioEvent.
+    std::vector<Candidate> best;
+    best.reserve(64);
+    for (const auto& em : audio_->emitters) {
+        if (em.wems.empty()) continue;
+        const auto pt = em.closest_point(eye);
+        const float dx = pt[0] - eye[0], dy = pt[1] - eye[1], dz = pt[2] - eye[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        const float max_dist = em.global ? 1e9f : std::max(52.0f, em.radius + 40.0f);
+        if (!em.global && d2 > max_dist * max_dist) continue;
+        const float d = std::sqrt(d2);
+        const float ref_dist = std::max(7.0f, em.radius + 5.0f);
+        const float edge_fade = em.global ? 1.0f : std::clamp(1.0f - (d / max_dist) * (d / max_dist), 0.0f, 1.0f);
+        const float att = em.global ? 0.55f : (edge_fade / (1.0f + (d / ref_dist) * (d / ref_dist)));
+        const float w = std::clamp(em.gain, 0.1f, 3.0f) * att;
+        if (w < 0.015f) continue;
+        float pan = 0.0f;
+        if (!em.global && d > 0.25f) {
+            pan = std::clamp((dx * right[0] + dy * right[1] + dz * right[2]) / d, -1.0f, 1.0f);
+        }
+        bool merged = false;
+        for (auto& c : best) {
+            if (c.event_tag == em.event.value) {
+                if (w > c.weight) {
+                    c.weight = w;
+                    c.pan = pan;
+                }
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            // Deterministically pick one WEM stream from the event's variations.
+            const TagHash wem = em.wems[em.event_id % em.wems.size()];
+            best.push_back({em.event.value, wem, w, pan});
+        }
+    }
+    if (best.size() > kMaxVoices) {
+        std::partial_sort(best.begin(), best.begin() + kMaxVoices, best.end(),
+                          [](const Candidate& a, const Candidate& b) { return a.weight > b.weight; });
+        best.resize(kMaxVoices);
+    }
+
+    // Lookup decoded PCMs under lock.
+    auto find_pcm = [&](TagHash wem) -> std::shared_ptr<const PcmAudio> {
+        std::lock_guard lk(mutex_);
+        for (const auto& [k, p] : decoded_)
+            if (k == wem.value) return p;
+        return nullptr;
+    };
+
+    const float smooth = 1.0f - std::exp(-std::clamp(dt, 0.001f, 0.1f) * 5.0f);
+    // Fade out voices no longer in `best`.
+    for (auto& v : voices_) {
+        const auto it = std::find_if(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
+        if (it == best.end()) {
+            v.volume += (0.0f - v.volume) * smooth;
+            if (v.voice) v.voice->set_volume(v.volume);
+        }
+    }
+    std::erase_if(voices_, [&](const ActiveVoice& v) {
+        const bool wanted = std::any_of(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
+        return !wanted && v.volume < 0.004f;
+    });
+
+    // Update or start wanted voices.
+    const float mix_scale = 0.28f * master_volume;  // keep 12 concurrent ambient beds balanced without clipping
+    size_t playing = 0;
+    for (const auto& c : best) {
+        const float target_vol = std::min(c.weight * mix_scale, 0.85f * master_volume);
+        auto it = std::find_if(voices_.begin(), voices_.end(), [&](const ActiveVoice& v) { return v.event_tag == c.event_tag; });
+        if (it != voices_.end()) {
+            it->volume += (target_vol - it->volume) * smooth;
+            it->pan += (c.pan - it->pan) * smooth;
+            if (it->voice) {
+                it->voice->set_volume(it->volume);
+                it->voice->set_pan(it->pan, engine_.master_channels());
+                if (it->volume > 0.005f) ++playing;
+            }
+            continue;
+        }
+        auto pcm = find_pcm(c.wem);
+        if (!pcm) {
+            request_decode(c.wem);
+            continue;
+        }
+        if (voices_.size() >= kMaxVoices + 4) continue;
+        ActiveVoice av;
+        av.event_tag = c.event_tag;
+        av.wem = c.wem;
+        av.pcm = std::move(pcm);
+        av.voice = std::make_unique<Voice>(engine_, av.pcm->sample_rate, av.pcm->channels);
+        if (av.voice->ok()) {
+            av.volume = target_vol * smooth;
+            av.pan = c.pan;
+            av.voice->set_volume(av.volume);
+            av.voice->set_pan(av.pan, engine_.master_channels());
+            auto alias = std::shared_ptr<const std::vector<int16_t>>(av.pcm, &av.pcm->samples);
+            av.voice->submit_looping(alias);
+            av.voice->start();
+            voices_.push_back(std::move(av));
+            ++playing;
+        }
+    }
+    active_voices_ = playing;
 }
 
 } // namespace nim::media

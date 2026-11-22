@@ -182,7 +182,7 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_distortion = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
-    bool no_shaft_fog_density = false;
+    bool shaft_fog_density = false;
     float exposure_arg = 1;
     bool assume_lights_on = true;
     std::optional<V3> eye_arg, look_arg;
@@ -259,7 +259,8 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
-        else if (args[i] == "--no-shaft-fog-density") no_shaft_fog_density = true;
+        else if (args[i] == "--shaft-fog-density") shaft_fog_density = true;
+        else if (args[i] == "--no-shaft-fog-density") shaft_fog_density = false;
         else if (args[i] == "--no-ssr") no_ssr = true;
         else if (args[i] == "--no-distortion") no_distortion = true;
         else if (args[i] == "--no-post") no_post = true;
@@ -891,7 +892,7 @@ int run(int argc, char** argv) {
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
     lp.volumetrics = !no_volumetrics;
-    lp.shaft_fog_density = !no_shaft_fog_density;
+    lp.shaft_fog_density = shaft_fog_density;
     lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;

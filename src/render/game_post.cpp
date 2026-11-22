@@ -350,7 +350,11 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
             };
             const float min_stops = ch(0x05, -3), max_stops = ch(0x06, 3);
             const float lo = std::exp2(std::min(min_stops, max_stops)), hi = std::exp2(std::max(min_stops, max_stops));
-            constexpr float key = 0.18f;
+            // ch(0x00) is autoexposure_zero_bias (0.25 across maps); squaring converts it to a
+            // linear middle-grey key (0.0625), which sits in the middle of authored scene
+            // luminances (0.048..0.062) instead of pegging exposure at +1 stop (2x).
+            const float zero_bias = ch(0x00, 0.25f);
+            const float key = zero_bias > 0.0f ? zero_bias * zero_bias : 0.0625f;
             const float target = std::clamp(key * std::exp2(ch(0x01, 0)) / std::max(ae_luminance_, 1e-6f), lo, hi);
             if (!ae_valid_) ae_auto_ = target;
             else {
@@ -401,8 +405,11 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(pp, 0x00, hdr_.Get());
         e.set(pp, 0x50, size4(l0.w, l0.h));
         e.set(pp, 0x60, size4(w_, h_));
-        e.set(pp, 0xC0, float4{0, 0, 1, 0});
-        ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1 (no threshold)", engine);
+        // Highlight-weighted luminance curve (1.5*L): suppresses grey fog washout on
+        // low-luminance surfaces while giving bright emissives a rich colored atmospheric halo.
+        // Note: o0.w stores unscaled luminance L, so autoexposure_sample_columns is unaffected.
+        e.set(pp, 0xC0, float4{0.0f, 1.5f, 0.0f, 0.0f});
+        ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1.5*L (highlight-weighted)", engine);
         begin(l0.down.Get(), 0, l0.w, l0.h);
         bloom_initial_.draw(gpu, cl, e, scopes);
         e.set_texture(kBloomDistortion, 0x00, nullptr);
@@ -445,14 +452,15 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         Gpu::barrier(cl, ae_columns_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         ae_fence_[slot] = gpu.pending_fence();
         ++ae_frame_;
-        ext_.note_estimate("auto exposure: key 0.18, autoexposure_bias as stops, bounds ch05..ch06, adapting 3 / 1.5 per s",
-                           "engine reduction and adaptation are estimated; authored bias and the original columns shader are used");
+        ext_.note_estimate("auto exposure: key = ch00^2 (0.0625), autoexposure_bias as stops, bounds ch05..ch06, adapting 3 / 1.5 per s",
+                           "engine reduction and adaptation are estimated; authored zero_bias/bias and the original columns shader are used");
     }
     ID3D12Resource* bloom_tex = black_.Get();
     if (bloom) {
         // Up the pyramid: blur the smallest level, then at each finer level weighted_add the
         // blurred coarser result to it and blur again (gaussian_10 with the engine's cb11 kernel).
-        constexpr float strength = 0.06f;
+        // Weight coarser levels higher so emissive lights cast a soft, colored atmospheric halo.
+        constexpr float strength = 0.28f;
         auto filter = [&](GamePipeline& pipeline, ID3D12Resource* src, ID3D12Resource* dst, uint32_t slot,
                           const std::array<float4, 12>& cb) {
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
@@ -498,10 +506,11 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             e.set_texture(pp, 0x00, bloom_[size_t(i + 1)].sum.Get());
             e.set_texture(pp, 0x08, l.down.Get());
             const bool add_line = i == 0 && bloom_line_[1];
-            const float mix = add_line ? 0.44f : 0.5f;
-            e.set(pp, 0xC0, float4{mix, mix, mix, mix});
-            e.set(pp, 0xD0, float4{mix, mix, mix, mix});
-            e.set(pp, 0xE0, add_line ? float4{0.12f, 0.12f, 0.12f, 0.12f} : float4{1, 1, 0, 0});
+            const float coarse_w = add_line ? 0.56f : 0.65f;
+            const float fine_w = add_line ? 0.30f : 0.35f;
+            e.set(pp, 0xC0, float4{coarse_w, coarse_w, coarse_w, coarse_w});
+            e.set(pp, 0xD0, float4{fine_w, fine_w, fine_w, fine_w});
+            e.set(pp, 0xE0, add_line ? float4{0.14f, 0.14f, 0.14f, 0.14f} : float4{1, 1, 0, 0});
             e.set(pp, 0xF0, float4{1, 1, 0, 0});
             e.set(pp, 0x50, size4(l.w, l.h));
             if (add_line) e.set_texture(pp, 0x10, bloom_line_[1].Get());
@@ -510,8 +519,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             end(l.sum.Get());
             if (add_line) {
                 e.set_texture(pp, 0x10, nullptr);
-                ext_.note_estimate("bloom: two width reductions and two horizontal filters, final line mix 0.44 / 0.44 / 0.12",
-                                   "native line shaders and same-engine reference topology; neutral normalized mix, Marathon runtime weights unknown");
+                ext_.note_estimate("bloom: two width reductions and two horizontal filters, final line mix 0.56 / 0.30 / 0.14",
+                                   "native line shaders and same-engine reference topology; coarse-weighted mix, Marathon runtime weights unknown");
             }
             blur(uint32_t(i), l.sum.Get());
         }
@@ -539,7 +548,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             ext_.note_estimate("lens glare: coarsest blurred bloom level, quarter-resolution upsample, Frame +0x24 = 1",
                                "map-authored optics techniques and texture; original broad filter and brightness are unknown");
         }
-        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, strength 0.06",
+        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, coarse-weighted upsample, strength 0.28",
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 

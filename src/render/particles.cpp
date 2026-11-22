@@ -85,6 +85,7 @@ void ParticleScene::release(Gpu&) {
 void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapParticle> placements) {
     release(gpu);
     ext_ = std::make_unique<ExternStore>();
+    ext_initialized_ = false;
     const RenderGlobals globals = load_render_globals(pm);
     view_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("view")));
     transparent_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("transparent")));
@@ -269,27 +270,39 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
                            const ViewMatrices& vm, const ExternStore& inputs, float dt) {
     if (emitters_.empty()) return;
     ExternStore& ext = *ext_;
-    ext = inputs;
+    // Copy only the blocks particle shaders read (10 KB vs copying the full 1 MB ExternStore).
+    for (uint8_t block : {ext::Frame, ext::View, ext::Deferred, ext::Atmosphere, ext::Transparent, ext::GlobalLighting,
+                          ext::ShadowMask, uint8_t(80), uint8_t(81), uint8_t(82)})
+        ext.copy_block_from(block, inputs);
+    ext.channels = inputs.channels;
+    ext.channel_ids = inputs.channel_ids;
+    ext.world_channels = inputs.world_channels;
+    if (inputs.has_frame_constants()) ext.set_frame_constants(inputs.frame_constants());
     dt = std::clamp(std::isfinite(dt) ? dt : 0.0f, 0.0f, 0.1f);
 
-    // Engine values of the particle blocks that no file holds.
-    ext.zero_when_missing(kParticle, "particle block values with no producer found (emitter parameters): zero");
-    ext.zero_when_missing(kParticleCompute, "particle compute values with no producer found: zero");
-    ext.zero_when_missing(kGeneric, "generic block values with no producer found: zero");
-    for (uint32_t o = 0; o < 0x100; o += 16)
-        ext.estimate(kGeneric, o, float4{1, 1, 1, 1},
-                     "per-instance effect parameters (tint / alpha) the pattern sequencer writes; not decoded: 1");
-    ext.set(kParticle, 0x144, 1.0f);
-    ext.note_estimate("extern 27 +0x144 = 1", "particle draw fade (cb0[186] of the draw VS), producer not found");
-    if (gated_)
-        ext.note_estimate(std::format("{} particle placements of exfil devices not run: exfil_activation_progress = 0", gated_),
-                          "their component's sequence reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
-    ext.note_estimate("particle spawn rate = definition +0x134 per second, life = definition +0x128",
-                      "the FX expression program of the definition (808081EF) is not decoded");
-    ext.note_estimate("particle_transforms / particle_location_metadata: identity emitter frame",
-                      "engine-filled scopes; the emitter's placement goes through rigid_model instead");
-    ext.note_estimate(std::format("particles within {:.0f} m of the eye warm over one life, at most {} steps per frame", radius, kWarmStepsPerFrame),
-                      "viewer choice: the engine's FX culling is not decoded");
+    // Engine values of the particle blocks that no file holds (initialized once per load).
+    if (!ext_initialized_) {
+        ext_initialized_ = true;
+        ext.zero_when_missing(kParticle, "particle block values with no producer found (emitter parameters): zero");
+        ext.zero_when_missing(kParticleCompute, "particle compute values with no producer found: zero");
+        ext.zero_when_missing(kGeneric, "generic block values with no producer found: zero");
+        for (uint32_t o = 0; o < 0x100; o += 16)
+            ext.estimate(kGeneric, o, float4{1, 1, 1, 1},
+                         "per-instance effect parameters (tint / alpha) the pattern sequencer writes; not decoded: 1");
+        ext.set(kParticle, 0x144, 1.0f);
+        ext.note_estimate("extern 27 +0x144 = 1", "particle draw fade (cb0[186] of the draw VS), producer not found");
+        if (gated_)
+            ext.note_estimate(std::format("{} particle placements of exfil devices not run: exfil_activation_progress = 0", gated_),
+                              "their component's sequence reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
+        ext.note_estimate("particle spawn rate = definition +0x134 per second, life = definition +0x128",
+                          "the FX expression program of the definition (808081EF) is not decoded");
+        ext.note_estimate("particle_transforms / particle_location_metadata: identity emitter frame",
+                          "engine-filled scopes; the emitter's placement goes through rigid_model instead");
+        ext.note_estimate(std::format("particles within {:.0f} m of the eye warm over one life, at most {} steps per frame", radius, kWarmStepsPerFrame),
+                          "viewer choice: the engine's FX culling is not decoded");
+        ext.note_estimate("particle transparent_advanced cb8: zero, [7].w = 1",
+                          "engine-filled per-object scope; as for the light shafts");
+    }
 
     // Shared cbuffers. Per-emitter: rigid_model (b1, the placement). Engine-filled scopes get
     // explicit values; the rest are the original scopes evaluated against this frame.
@@ -305,8 +318,6 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     const auto location_cb = upload(location);
     std::array<float4, 37> advanced{};
     advanced[7][3] = 1;
-    ext.note_estimate("particle transparent_advanced cb8: zero, [7].w = 1",
-                      "engine-filled per-object scope; as for the light shafts");
     std::map<std::pair<ShaderStage, uint32_t>, D3D12_GPU_VIRTUAL_ADDRESS> cache;
     D3D12_GPU_VIRTUAL_ADDRESS object_cb = 0;
     auto scope_of = [&](const Scope& scope, ShaderStage stage) {
@@ -336,17 +347,44 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         return cache[key] = a;
     };
 
-    // Which emitters run this frame; the ones coming into range are warmed up first.
-    std::vector<uint32_t> live, warm;
+    // Which emitters run this frame; frustum-cull emitters (generous 18 m radius) so off-screen
+    // emitters beyond 24 m skip simulation, instancing, and draw calls.
+    std::array<float4, 6> planes{};
+    {
+        auto row = [&](int r) {
+            return float4{vm.vp_abs.c[0][r], vm.vp_abs.c[1][r], vm.vp_abs.c[2][r], vm.vp_abs.c[3][r]};
+        };
+        auto norm = [](float4 p) {
+            const float l = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            return l > 1e-8f ? float4{p[0] / l, p[1] / l, p[2] / l, p[3] / l} : float4{};
+        };
+        const float4 r0 = row(0), r1 = row(1), r2 = row(2), r3 = row(3);
+        planes[0] = norm({r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]});
+        planes[1] = norm({r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]});
+        planes[2] = norm({r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]});
+        planes[3] = norm({r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]});
+        planes[4] = norm({r2[0], r2[1], r2[2], r2[3]});
+        planes[5] = norm({r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]});
+    }
+    auto in_frustum = [&](const V3& p, float r) {
+        if (vm.ortho) return true;
+        for (const auto& pl : planes)
+            if (pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3] < -r) return false;
+        return true;
+    };
+    std::vector<uint32_t> live, warm, visible;
     for (uint32_t i = 0; i < emitters_.size(); ++i) {
         Emitter& e = emitters_[i];
         if (systems_[e.system]->failed) continue;
         const V3 d{e.position.x - vm.eye.x, e.position.y - vm.eye.y, e.position.z - vm.eye.z};
-        const bool in_range = d.x * d.x + d.y * d.y + d.z * d.z <= radius * radius;
+        const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+        const bool in_range = d2 <= radius * radius;
         if (!in_range) {
             e.active = false;
             continue;
         }
+        const bool vis = in_frustum(e.position, 18.0f);
+        if (!vis && d2 > 24.0f * 24.0f) continue;
         if (!e.active) {
             e.active = true;
             e.head = 0;
@@ -356,12 +394,14 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         }
         if (e.warm_steps) warm.push_back(i);
         live.push_back(i);
+        if (vis) visible.push_back(i);
     }
     active_ = live.size();
     if (live.empty()) return;
     const auto system_of = [&](uint32_t i) { return emitters_[i].system; };
     std::ranges::sort(live, {}, system_of);
     std::ranges::sort(warm, {}, system_of);
+    std::ranges::sort(visible, {}, system_of);
     // Collision CS projects its stored emitter-local positions directly with b12[0..3].
     // Draw VS has a separate rigid_model stage and continues to receive the normal view.
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> collision_views(emitters_.size());
@@ -405,13 +445,14 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     }
     if (dt > 0) step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes, collision_views);
 
-    // Expand each emitter's particles into draw instances.
+    if (visible.empty()) return;
+    // Expand each visible emitter's particles into draw instances.
     ID3D12Resource* cur = state_[parity_].Get();
     Gpu::barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ext.set_texture(kParticleCompute, 0x00, cur, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, state_total_);
     ext.set_texture(kParticleCompute, 0xC8, instances_.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, 0, instance_total_);
     GamePipeline::VolumeBatch instance_batch;
-    for (uint32_t i : live) {
+    for (uint32_t i : visible) {
         const Emitter& e = emitters_[i];
         const uint32_t used = uint32_t(std::min<uint64_t>(e.spawned, e.capacity));
         if (!used) continue;
@@ -426,7 +467,8 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
 
     // Draw, farthest emitter first (each emitter's quads in slot order).
     std::vector<std::pair<float, uint32_t>> order;
-    for (uint32_t i : live) {
+    order.reserve(visible.size());
+    for (uint32_t i : visible) {
         const Emitter& e = emitters_[i];
         const V3 d{e.position.x - vm.eye.x, e.position.y - vm.eye.y, e.position.z - vm.eye.z};
         order.push_back({-(d.x * d.x + d.y * d.y + d.z * d.z), i});

@@ -1,6 +1,7 @@
 // Unit tests that do not need a game install.
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
+#include "nim/content/map_audio.hpp"
 #include "nim/content/codex.hpp"
 #include "nim/content/usm.hpp"
 #include "nim/content/map.hpp"
@@ -570,6 +571,26 @@ int main() {
             CHECK(walkable && around);
         }
         CHECK(!ps.find_path({2, 2, 0}, {8, 2, 3}, 0.3f));  // no floor at that height
+    }
+
+    // Map ambient audio emitter geometry (point, polyline segment, global).
+    {
+        MapAudioEmitter pt;
+        pt.position = {10, 0, 0};
+        CHECK(std::abs(pt.distance_to({13, 4, 0}) - 5.0f) < 1e-4f);
+
+        MapAudioEmitter poly;
+        poly.polyline = true;
+        poly.points = {{0, 0, 0}, {10, 0, 0}, {10, 10, 0}};
+        const auto cp = poly.closest_point({5, 3, 0});
+        CHECK(std::abs(cp[0] - 5.0f) < 1e-4f && std::abs(cp[1]) < 1e-4f && std::abs(cp[2]) < 1e-4f);
+        CHECK(std::abs(poly.distance_to({5, 3, 0}) - 3.0f) < 1e-4f);
+        CHECK(std::abs(poly.distance_to({14, 5, 0}) - 4.0f) < 1e-4f);
+
+        MapAudioEmitter glob;
+        glob.global = true;
+        glob.position = {999, 999, 999};
+        CHECK(glob.distance_to({0, 0, 0}) == 0.0f);
     }
 
     if (g_failures) return 1;

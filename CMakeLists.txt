@@ -33,6 +33,7 @@ add_library(nim_core STATIC
   src/content/animation.cpp
   src/content/weather.cpp
   src/content/audio.cpp
+  src/content/map_audio.cpp
   src/content/usm.cpp
   src/content/mpeg1.cpp
   src/content/hca.cpp

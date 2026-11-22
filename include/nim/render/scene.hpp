@@ -447,7 +447,7 @@ private:
     void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                     bool shadow = false, const GameLighting* lighting = nullptr);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage = 0,
-                          const ExternStore* frame_inputs = nullptr);
+                          const ExternStore* frame_inputs = nullptr, bool shadow = false);
     std::unique_ptr<ExternStore> material_externs_;
     std::vector<float4> global_base_;               // the materials' global channels before overrides
     std::map<uint32_t, float> global_overrides_;
@@ -466,6 +466,8 @@ private:
     size_t world_transparent_draws_ = 0;
     size_t sky_transparent_draws_ = 0;
     size_t transparent_local_reflections_ = 0, transparent_sky_reflections_ = 0, transparent_local_probes_ = 0;
+    std::unordered_map<uint64_t, size_t> transparent_probe_cache_;
+    uint64_t transparent_probe_gen_ = UINT64_MAX;
     uint64_t shadow_generation_ = 0;
     struct VisibilityKey {
         std::array<float, 16> view;
@@ -580,16 +582,16 @@ private:
     std::array<std::vector<uint32_t>, 8> cull_scratch_;
     std::vector<uint32_t> visible_static_indices_, visible_static_groups_;
     std::vector<CullGroup> cull_groups_;
-    std::vector<size_t> uncullable_opaque_, visible_opaque_;
+    std::vector<size_t> uncullable_opaque_, visible_opaque_, visible_blended_;
     std::vector<uint32_t> visible_static_indices_other_, visible_static_groups_other_;
-    std::vector<size_t> visible_opaque_other_;
+    std::vector<size_t> visible_opaque_other_, visible_blended_other_;
     struct DrawBundle {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         uint64_t fence = 0;
     };
     // Opaque draws are recorded into kDrawBundles bundles in parallel (a few draw calls per frame).
-    static constexpr size_t kDrawBundles = 6;
+    static constexpr size_t kDrawBundles = 8;
     std::array<DrawBundle, kDrawBundles * 4 * Gpu::kFramesInFlight> draw_bundles_;
     void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow = false);
     uint32_t item_instances(const Item& it) const;  // this frame's, after cull()
@@ -668,7 +670,10 @@ struct LightingParams {
     bool ssao = true;
     // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.
     bool volumetrics = true;
-    bool shaft_fog_density = true;  // estimate the native shaft density input from the current froxels
+    // Reconstructed radial density from the froxels (extern 0x58). Off by default: differentiating
+    // the 3D noise-modulated interior froxel transmittance multiplies 5 m noise blobs by ~15x over
+    // the authored base shaft density (cb0[30].x), producing blotchy clouds in interior maps.
+    bool shaft_fog_density = false;
     // Screen-space reflections: the engine's hi_z_generate_* / ssr_* compute passes (PROGRESS 3.12).
     bool ssr = true;
     // Post-processing (game lighting only): bloom, auto exposure and the engine's tonemap /

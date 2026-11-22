@@ -2,6 +2,7 @@
 // Audio output (XAudio2) and movie playback (USM demux, Media Foundation MPEG-1 decoding, ADX audio)
 // for the nim GUI. Nothing here touches the GPU: the player hands out RGBA frames to upload.
 #include "nim/content/audio.hpp"
+#include "nim/content/map_audio.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/mpeg1.hpp"
 #include "nim/content/hca.hpp"
@@ -31,10 +32,12 @@ public:
     bool ok() const { return master_ != nullptr; }
     const std::string& error() const { return error_; }
     IXAudio2* xaudio() const { return xaudio_; }
+    uint32_t master_channels() const { return master_channels_; }
 
 private:
     IXAudio2* xaudio_ = nullptr;
     IXAudio2MasteringVoice* master_ = nullptr;
+    uint32_t master_channels_ = 2;
     std::string error_;
 };
 
@@ -47,9 +50,11 @@ public:
     Voice& operator=(const Voice&) = delete;
     bool ok() const { return voice_ != nullptr; }
     bool submit(std::shared_ptr<const std::vector<int16_t>> samples, bool end_of_stream = false);
+    bool submit_looping(std::shared_ptr<const std::vector<int16_t>> samples);
     void start();
     void pause();
     void set_volume(float v);
+    void set_pan(float pan, uint32_t master_channels);  // pan in [-1, 1] (-1 = left, +1 = right)
     uint64_t frames_played() const;  // since the voice was created
     uint32_t queued() const;         // buffers not yet finished
     uint32_t sample_rate() const { return rate_; }
@@ -151,6 +156,52 @@ private:
     std::vector<MovieSubtitle> subtitles_;
     std::string error_;
     std::thread thread_;
+};
+
+// Spatialized multi-voice ambient sound player for maps (XAudio2).
+// Selects the loudest distinct AudioEvents around the camera, decodes their .wem streams
+// asynchronously on a worker thread, and loops them with smooth distance attenuation & stereo pan.
+class AmbientAudioPlayer {
+public:
+    explicit AmbientAudioPlayer(AudioEngine& engine);
+    ~AmbientAudioPlayer();
+    AmbientAudioPlayer(const AmbientAudioPlayer&) = delete;
+    AmbientAudioPlayer& operator=(const AmbientAudioPlayer&) = delete;
+
+    void set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio);
+    void clear();
+    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float master_volume, bool enabled);
+
+    size_t emitter_count() const { return audio_ ? audio_->emitters.size() : 0; }
+    size_t active_voices() const { return active_voices_; }
+    size_t decoded_count() const;
+
+private:
+    struct ActiveVoice {
+        uint32_t event_tag = 0;
+        TagHash wem;
+        std::shared_ptr<const PcmAudio> pcm;
+        std::unique_ptr<Voice> voice;
+        float volume = 0.0f;
+        float pan = 0.0f;
+    };
+    void decode_loop();
+    void request_decode(TagHash wem);
+
+    AudioEngine& engine_;
+    std::shared_ptr<const MapAudio> audio_;
+    std::vector<ActiveVoice> voices_;
+    size_t active_voices_ = 0;
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::unique_ptr<PackageManager> pm_;
+    std::deque<TagHash> decode_queue_;
+    std::vector<uint32_t> decode_pending_;
+    std::vector<std::pair<uint32_t, std::shared_ptr<const PcmAudio>>> decoded_;
+    std::vector<uint32_t> failed_;
+    bool stop_ = false;
+    std::thread worker_;
 };
 
 } // namespace nim::media

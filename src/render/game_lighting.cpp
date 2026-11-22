@@ -411,6 +411,32 @@ void ExternOverlay::set(uint8_t id, uint32_t off, const M4& m) {
     for (int c = 0; c < 4; ++c) set(id, off + uint32_t(c) * 16, m.c[c]);
 }
 
+TfxEnvironment ExternStore::environment(const ExternOverlay* overlay) const {
+    TfxEnvironment env = environment();
+    if (!overlay) return env;
+    env.extern_float = [this, overlay](uint8_t id, uint8_t off) {
+        if (const float* v = overlay->find(id, uint32_t(off) * 4)) return *v;
+        return get_f(id, uint32_t(off) * 4);
+    };
+    env.extern_vec4 = [this, overlay](uint8_t id, uint8_t off16) {
+        const uint32_t off = uint32_t(off16) * 16;
+        float4 r{};
+        uint32_t mask = 0;
+        for (uint32_t w = 0; w < 4; ++w)
+            if (const float* v = overlay->find(id, off + w * 4)) r[w] = *v, mask |= 1u << w;
+        if (mask == 0) return get_v(id, off);
+        if (mask == 0xF) return r;
+        bool present = true;
+        for (uint32_t w = 0; w < 4; ++w)
+            if (!(mask >> w & 1) && !has(id, off + w * 4, 4)) present = false;
+        if (!present) require(id, off, 16);
+        for (uint32_t w = 0; w < 4; ++w)
+            if (!(mask >> w & 1)) std::memcpy(&r[w], data_.data() + size_t(id) * kBlockSize + off + w * 4, 4);
+        return r;
+    };
+    return env;
+}
+
 TfxEnvironment ExternStore::environment(const std::vector<std::pair<uint32_t, float>>* overlay) const {
     TfxEnvironment env = environment();
     if (!overlay || overlay->empty()) return env;
@@ -709,8 +735,9 @@ void GamePipeline::dispatch_batch(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
 void GamePipeline::draw_volume(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
                                const Technique* materials, const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW& ibv,
                                uint32_t indices, std::span<const std::pair<uint32_t, ID3D12Resource*>> ps_textures, VolumeBatch* batch,
-                               const StageConstants* constants) {
-    const Geometry g{materials, &vbv, &ibv, indices, ps_textures, batch, constants};
+                               const StageConstants* constants, bool stable_views) {
+    Geometry g{materials, &vbv, &ibv, indices, ps_textures, batch, constants};
+    g.stable_views = stable_views;
     execute(gpu, cl, ext, scopes, true, 0, 0, 0, &g);
 }
 
@@ -1336,7 +1363,10 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     constexpr auto rgb = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
     GamePipeline::Options shaft_blur{shaft_rgba, false, {shaft_rgba}};
     shaft_blur.write_masks = {rgb, rgb};
-    load_sky(vol_blur_, "volumetrics_blur_results", shaft_blur);
+    if (!globals_.pipeline("volumetrics_blur_results_4x4").is_none())
+        load_sky(vol_blur_, "volumetrics_blur_results_4x4", shaft_blur);
+    else
+        load_sky(vol_blur_, "volumetrics_blur_results", shaft_blur);
     GamePipeline::Options shaft_upres{shaft_rgba, true};
     shaft_upres.write_masks = {rgb};
     load_sky(vol_upres_, "volumetrics_upres_1", shaft_upres);
@@ -2309,9 +2339,18 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
                   "single estimated froxel depth mapping; analytic fog starts beyond volume (engine cascades unknown)");
     ext_.set(A, 0x150, ch(0x0A));  // sun_glow_color
     ext_.note_estimate("extern 7 +0x150 = sun_glow_color", copied);
-    auto glow_g = [](float shape) { return shape > 1 ? 1 - 1 / shape : 0.0f; };
-    est(0x160, glow_g(ch(0x0D)[0]), "sky_sun_glow_shape as g = 1 - 1/shape");
-    est(0x164, ch(0x0E)[0], copied);
+    constexpr float kInvFourPi = 1.0f / (4.0f * 3.14159265358979323846f);
+    // Exact shape -> g mapping from Bungie's cascade_raymarch_atmosphere_volume_inscatter CS (80A742F0):
+    //   r = sqrt(|shape|) + 1; g = shape / (r * r).
+    auto glow_g = [](float shape) {
+        if (shape <= 0.0f) return 0.0f;
+        const float r = std::sqrt(shape) + 1.0f;
+        return shape / (r * r);
+    };
+    const float sky_g = glow_g(ch(0x0D)[0]);
+    est(0x160, sky_g, "sky_sun_glow_shape as g = shape / (sqrt(shape) + 1)^2 (from CS 80A742F0)");
+    est(0x164, ch(0x0E)[0] * (1.0f - sky_g * sky_g) * kInvFourPi,
+        "sky_sun_glow_intensity * (1 - g^2) / (4*pi) (Henyey-Greenstein phase normalization)");
     // +0x170 scales the in-scatter and the sky (cb0[8] / cb0[9] of the shading and sky PS):
     // inscatter_intensity (ch 0x1C, name by FNV-1), which the map environments drive.
     est(0x170, ch(0x1C)[0], "inscatter_intensity: the only in-scatter scale among the channels (extern slot by shader use)");
@@ -2351,8 +2390,10 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
     est(0x1D0, 1.0f, chosen);  // sky: weight of the froxel in-scatter
     ext_.set(A, 0x1E0, ch(0x2C));  // sky_color_override (w = weight)
     ext_.note_estimate("extern 7 +0x1E0 = sky_color_override", copied);
-    est(0x1F0, glow_g(ch(0x0B)[0]), "sun_glow_shape as g = 1 - 1/shape");
-    est(0x1F4, ch(0x0C)[0], copied);  // sun_glow_intensity
+    const float sun_g = glow_g(ch(0x0B)[0]);
+    est(0x1F0, sun_g, "sun_glow_shape as g = shape / (sqrt(shape) + 1)^2 (from CS 80A742F0)");
+    est(0x1F4, ch(0x0C)[0] * (1.0f - sun_g * sun_g) * kInvFourPi,
+        "sun_glow_intensity * (1 - g^2) / (4*pi) (Henyey-Greenstein phase normalization)");
     est(0x1F8, 0.0f, chosen);  // paraboloid map weight
 }
 
@@ -2528,7 +2569,8 @@ M4 inverse(const M4& m) {
 }
 // The supporting corner gives the maximum signed distance of an AABB to each clip plane.
 struct LightFrustum {
-    explicit LightFrustum(const ViewMatrices& vm) : eye{vm.eye.x, vm.eye.y, vm.eye.z} {
+    explicit LightFrustum(const ViewMatrices& vm)
+        : eye{vm.eye.x, vm.eye.y, vm.eye.z}, fwd{vm.fwd.x, vm.fwd.y, vm.fwd.z}, max_f(std::max(vm.fx, vm.fy)), ortho(vm.ortho) {
         for (size_t c = 0; c < 4; ++c) {
             const auto& col = vm.vp_rel.c[c];
             planes[0][c] = col[3] + col[0];
@@ -2546,7 +2588,20 @@ struct LightFrustum {
         }
         return false;
     }
-    std::array<float, 3> eye;
+    // True when the volume's bounding sphere projects smaller than `min_ndc` in NDC (and is farther than `min_dist`).
+    bool tiny(const std::array<float, 3>& lo, const std::array<float, 3>& hi, float min_ndc, float max_dist = 1e30f) const {
+        if (ortho > 0) return false;
+        const float cx = 0.5f * (lo[0] + hi[0]), cy = 0.5f * (lo[1] + hi[1]), cz = 0.5f * (lo[2] + hi[2]);
+        const float hx = 0.5f * (hi[0] - lo[0]), hy = 0.5f * (hi[1] - lo[1]), hz = 0.5f * (hi[2] - lo[2]);
+        const float r = std::sqrt(hx * hx + hy * hy + hz * hz);
+        const float z = (cx - eye[0]) * fwd[0] + (cy - eye[1]) * fwd[1] + (cz - eye[2]) * fwd[2];
+        const float near_d = z - r;
+        if (near_d <= 2.0f) return false;
+        if (near_d > max_dist) return true;
+        return min_ndc > 0 && r * max_f < min_ndc * near_d;
+    }
+    std::array<float, 3> eye, fwd;
+    float max_f = 1, ortho = 0;
     std::array<float4, 5> planes;
 };
 
@@ -2718,7 +2773,8 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
             }
             const M4 node = m4(l->node), light_space = m4(l->light_space);
             local.world_volume = mul(node, light_space);
-            local.world_to_box = inverse(light_box_to_world(node, light_space));
+            local.world_box = light_box_to_world(node, light_space);
+            local.world_to_box = inverse(local.world_box);
             local.mirrored = det4(local.world_volume) > 0;
             if (l->shadowing && !l->shadow_technique.is_none() && light_shadow_view(*l)) {
                 // The +0xD8 technique: its own shaders, the same pipeline sharing.
@@ -2990,11 +3046,11 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
     GamePipeline::VolumeBatch batch;
     const bool light_debug = std::getenv("NIM_LIGHT_DEBUG") != nullptr;
     light_shadows_used_ = 0;
+    const float min_ndc = 6.0f / float(std::max(1u, h_));
     size_t draws = 0;
-    volume_overlay_.clear();  // this pass's writes only, over the store as it is now
     for (size_t index = 0; index < lights_.size(); ++index) {
         auto& ll = lights_[index];
-        if (frustum.outside(ll.light.lo, ll.light.hi)) continue;
+        if (frustum.outside(ll.light.lo, ll.light.hi) || frustum.tiny(ll.light.lo, ll.light.hi, min_ndc)) continue;
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && ll.shadow_technique;
         if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
         if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
@@ -3005,15 +3061,29 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
         // winding on screen flips with the handedness of its transform.
         d.pipeline = light_pipelines_[(shadowed ? ll.shadow_pipeline : ll.pipeline) + (ll.mirrored ? 1 : 0)].get();
         d.technique = shadowed ? ll.shadow_technique.get() : ll.technique.get();
-        write_light(volume_overlay_, ll, vm, shadowed);
-        volume_overlay_.snapshot(d.overlay);
     }
-    evaluate_volume_draws(draws);
+    // Additive blending is commutative: grouping by (shadowed, pipeline) minimizes PSO/table switches.
+    std::sort(volume_draws_.begin(), volume_draws_.begin() + ptrdiff_t(draws), [](const VolumeDraw& a, const VolumeDraw& b) {
+        if (a.shadowed != b.shadowed) return !a.shadowed;
+        return a.pipeline < b.pipeline;
+    });
+    WorkerPool::instance().parallel_for(draws, [&](size_t k) {
+        thread_local ExternOverlay overlay;
+        overlay.clear();
+        auto& d = volume_draws_[k];
+        d.error.clear();
+        write_light(overlay, lights_[d.light], vm, d.shadowed);
+        const auto env = ext_.environment(&overlay);
+        try {
+            d.pipeline->evaluate_stages(env, d.technique, d.constants);
+        } catch (const std::exception& ex) {
+            d.error = ex.what();
+        }
+    }, 8);
     for (size_t k = 0; k < draws; ++k) {
         const auto& d = volume_draws_[k];
         auto& ll = lights_[d.light];
         const bool shadowed = d.shadowed;
-        write_light(ext_, ll, vm, shadowed);
         if (shadowed) {
             bind_light_shadow(cl, ll, vm);
             ++light_shadows_used_;
@@ -3021,7 +3091,7 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
         GamePipeline& gp = *d.pipeline;
         try {
             if (!d.error.empty()) throw std::runtime_error(d.error);
-            gp.draw_volume(gpu, cl, ext_, scopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
+            gp.draw_volume(gpu, cl, ext_, scopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants, !shadowed);
             if (light_debug && lights_drawn_ < 2) {
                 const auto& vs = d.constants[0];  // evaluated ahead (draw_volume does not copy them)
                 const auto& ps = d.constants[1];
@@ -3233,36 +3303,6 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     for (uint32_t i = 0; i < 4; ++i) pixel_to_rel.c[i] = ext_.get_v(ext::View, 0x2E0 + 16 * i);
     const auto q12v = upload(evaluate_scope(view_scope_, ScopeStage::Vertex, ext_));
     const auto q12p = upload(evaluate_scope(view_scope_, ScopeStage::Pixel, ext_));
-    const Scope* extra_scopes[] = {&rigid_scope_, &transparent_scope_, &transparent_adv_scope_};
-    const VolumeDraw* current_draw = nullptr;  // its object scopes were evaluated ahead
-    // transparent_advanced (cb8) has no bytecode: the engine fills it per object. The light
-    // shaft PS reads only cb8[7].w, the weight of the froxel transmittance t25.x * t25.y in
-    // lerp(fog colour (global channel 0x16), 1, weight * transmittance), the shaft's
-    // attenuation by the atmosphere. Zero turned every shaft into the fog colour (about
-    // 0.002, i.e. invisible); one leaves the attenuation to the froxels.
-    std::array<float4, 37> shaft_advanced{};
-    shaft_advanced[7][3] = 1;
-    ext_.note_estimate("light shaft transparent_advanced cb8[7].w = 1 (froxel transmittance weight)",
-                       "engine-filled per-object value; read as the weight of the froxel transmittance in the shaft PS");
-    const auto shaft_advanced_cb = upload({shaft_advanced.begin(), shaft_advanced.end()});
-    ScopeBufferFn qscopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
-        if (reg == 12) return stage == ShaderStage::Vertex ? q12v : q12p;
-        if (reg == 13) return full_scopes(stage, 13);
-        const ScopeStage ss = scope_stage(stage);
-        for (size_t i = 0; i < std::size(extra_scopes); ++i) {
-            const Scope* s = extra_scopes[i];
-            const auto& st = s->stages[size_t(ss)];
-            if (st.cbuffer_slot != int32_t(reg) || st.cbuffer_init.empty()) continue;
-            if (s == &transparent_adv_scope_) return shaft_advanced_cb;
-            if (current_draw && (ss == ScopeStage::Vertex || ss == ScopeStage::Pixel)) {
-                const size_t slot = i * 2 + (ss == ScopeStage::Pixel ? 1 : 0);
-                if (!current_draw->scope_errors[slot].empty()) throw std::runtime_error(current_draw->scope_errors[slot]);
-                if (!current_draw->scopes[slot].empty()) return upload(current_draw->scopes[slot]);
-            }
-            return upload(evaluate_scope(*s, ss, ext_));
-        }
-        return 0;
-    };
     ext_.set_texture(ext::Deferred, 0x98, vol_minmax_.Get());  // t10 of the transparent scope
     const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
     ext_.set(ext::Deferred, 0x00, shaft_depth_decode);  // the light march converts the depths back to device depth
@@ -3280,6 +3320,38 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     ext_.set(ext::VolumeFog, 0xB0, 1.0f);  // cb0[39]: shaft intensity scale
     ext_.set(ext::VolumeFog, 0xB4, 1.0f);  // cb0[40]: march direction (+1: from the far face toward the eye)
     ext_.note_estimate("extern 50 +0xB0 = 1 (shaft intensity), +0xB4 = 1 (march direction)", chosen);
+    // transparent scope (cb2) depends only on Deferred +0x00 and Transparent +0x80..+0xE0, not per-light state.
+    const auto q2v = upload(evaluate_scope(transparent_scope_, ScopeStage::Vertex, ext_));
+    const auto q2p = upload(evaluate_scope(transparent_scope_, ScopeStage::Pixel, ext_));
+    const Scope* extra_scopes[] = {&rigid_scope_};
+    const VolumeDraw* current_draw = nullptr;  // its object scopes were evaluated ahead
+    // transparent_advanced (cb8) has no bytecode: the engine fills it per object. The light
+    // shaft PS reads only cb8[7].w, the weight of the froxel transmittance t25.x * t25.y in
+    // lerp(fog colour (global channel 0x16), 1, weight * transmittance), the shaft's
+    // attenuation by the atmosphere. Zero turned every shaft into the fog colour (about
+    // 0.002, i.e. invisible); one leaves the attenuation to the froxels.
+    std::array<float4, 37> shaft_advanced{};
+    shaft_advanced[7][3] = 1;
+    ext_.note_estimate("light shaft transparent_advanced cb8[7].w = 1 (froxel transmittance weight)",
+                       "engine-filled per-object value; read as the weight of the froxel transmittance in the shaft PS");
+    const auto shaft_advanced_cb = upload({shaft_advanced.begin(), shaft_advanced.end()});
+    ScopeBufferFn qscopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        if (reg == 12) return stage == ShaderStage::Vertex ? q12v : q12p;
+        if (reg == 13) return full_scopes(stage, 13);
+        if (reg == 2) return stage == ShaderStage::Vertex ? q2v : q2p;
+        if (reg == 8) return shaft_advanced_cb;
+        const ScopeStage ss = scope_stage(stage);
+        const auto& st = rigid_scope_.stages[size_t(ss)];
+        if (st.cbuffer_slot == int32_t(reg) && !st.cbuffer_init.empty()) {
+            if (current_draw && (ss == ScopeStage::Vertex || ss == ScopeStage::Pixel)) {
+                const size_t slot = ss == ScopeStage::Pixel ? 1 : 0;
+                if (!current_draw->scope_errors[slot].empty()) throw std::runtime_error(current_draw->scope_errors[slot]);
+                if (!current_draw->scopes[slot].empty()) return upload(current_draw->scopes[slot]);
+            }
+            return upload(evaluate_scope(rigid_scope_, ss, ext_));
+        }
+        return 0;
+    };
     for (auto& r : vol_layer_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE layers[4] = {rtv(1), rtv(2), rtv(3), rtv(4)};
     const float zero[4]{};
@@ -3294,19 +3366,24 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     M4 from_rel;  // camera-relative world -> world (bind_light_shadow's +0xC0)
     from_rel.c[0] = {1, 0, 0, 0}; from_rel.c[1] = {0, 1, 0, 0}; from_rel.c[2] = {0, 0, 1, 0};
     from_rel.c[3] = {vm.eye.x, vm.eye.y, vm.eye.z, 1};
-    // The extern writes of one shaft, to the store (when drawing) or to the overlay (ahead).
+    // The extern writes of one shaft, to the overlay ahead of parallel TFX evaluation.
     auto write_shaft = [&](auto& sink, const LocalLight& ll, bool shadowed) {
         const MapLight& l = ll.light;
         // +0xE0: each march sample is looked up in the light's depth map (t2) through the light
         // box, weighted by +0x154 (cb0[41]).
-        const M4 node = m4(l.node), space = m4(l.light_space);
-        const M4 node_rel = mul(to_rel, node);
-        const M4 volume = mul(node_rel, space);
-        const M4 box = light_box_to_world(node, space);  // light box [0,1]^3 -> world
-        const M4 rel_to_box = inverse(mul(to_rel, box));
+        const M4 node_rel = mul(to_rel, m4(l.node));
+        const M4 volume = mul(to_rel, ll.world_volume);
+        const M4 box_to_rel = mul(to_rel, ll.world_box);
+        M4 rel_to_box = ll.world_to_box;
+        for (size_t i = 0; i < 4; ++i)
+            rel_to_box.c[3][i] += vm.eye.x * rel_to_box.c[0][i] + vm.eye.y * rel_to_box.c[1][i] +
+                                  vm.eye.z * rel_to_box.c[2][i];
+        auto col_len = [](const float4& c) { return std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]); };
+        const float4 box_size{col_len(ll.world_box.c[0]), col_len(ll.world_box.c[1]), col_len(ll.world_box.c[2]), 0};
         sink.set(15, 0x00, mul(vm.vp_rel, volume));
         sink.set(ext::DeferredLight, 0x00, 0.0f);
         sink.set(ext::DeferredLight, 0x40, rel_to_box);
+        sink.set(ext::DeferredLight, 0x80, box_to_rel);
         sink.set(ext::DeferredLight, 0xC0, node_rel);
         for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
         sink.set(ext::DeferredLight, 0x150, 1.0f);
@@ -3320,36 +3397,61 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
             sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
             sink.set(6, 0x180, 2.0f);
         }
-        sink.set(ext::RigidModel, 0x00, box);                           // cb0[42..45]: box -> world
+        sink.set(ext::RigidModel, 0x00, ll.world_box);                  // cb0[42..45]: box -> world
         sink.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
         sink.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
-        return det4(volume) > 0;  // mirrored
+        sink.set(ext::VolumeFog, 0xA0, box_size);                       // cb0[39]: box world-space extents (point light radial falloff)
+        return ll.mirrored;
     };
-    std::vector<const VolumetricLight*> shafts;
+    const float min_ndc = 12.0f / float(std::max(1u, h_));
     size_t draws = 0;
-    volume_overlay_.clear();  // this pass's writes only, over the store as it is now
     for (const auto& vl : vol_lights_) {
         LocalLight& ll = lights_[vl.light];
-        if (frustum.outside(ll.light.lo, ll.light.hi)) continue;
+        if (frustum.outside(ll.light.lo, ll.light.hi) || frustum.tiny(ll.light.lo, ll.light.hi, min_ndc, 140.0f)) continue;
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
         if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
         if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
         auto& d = volume_draws_[draws++];
         d.light = vl.light;
         d.shadowed = shadowed;
-        const bool mirrored = write_shaft(volume_overlay_, ll, shadowed);
-        d.pipeline = vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (mirrored ? 1 : 0)].get();
+        d.pipeline = vol_pipelines_[(shadowed ? vl.shadow_pipeline : vl.pipeline) + (ll.mirrored ? 1 : 0)].get();
         d.technique = shadowed ? vl.shadow_technique.get() : vl.technique.get();
-        volume_overlay_.snapshot(d.overlay);
-        shafts.push_back(&vl);
     }
-    evaluate_volume_draws(draws, extra_scopes);
+    std::sort(volume_draws_.begin(), volume_draws_.begin() + ptrdiff_t(draws), [](const VolumeDraw& a, const VolumeDraw& b) {
+        if (a.shadowed != b.shadowed) return !a.shadowed;
+        return a.pipeline < b.pipeline;
+    });
+    WorkerPool::instance().parallel_for(draws, [&](size_t k) {
+        thread_local ExternOverlay overlay;
+        overlay.clear();
+        auto& d = volume_draws_[k];
+        d.error.clear();
+        write_shaft(overlay, lights_[d.light], d.shadowed);
+        const auto env = ext_.environment(&overlay);
+        try {
+            d.pipeline->evaluate_stages(env, d.technique, d.constants);
+        } catch (const std::exception& ex) {
+            d.error = ex.what();
+        }
+        for (const ScopeStage ss : {ScopeStage::Vertex, ScopeStage::Pixel}) {
+            const size_t slot = ss == ScopeStage::Pixel ? 1 : 0;
+            d.scopes[slot].clear();
+            d.scope_errors[slot].clear();
+            const auto& scope_stage_data = rigid_scope_.stages[size_t(ss)];
+            if (scope_stage_data.cbuffer_init.empty() || scope_stage_data.cbuffer_slot < 0) continue;
+            if (!d.pipeline->binds_shared_cbuffer(ss == ScopeStage::Vertex ? ShaderStage::Vertex : ShaderStage::Pixel,
+                                                  uint32_t(scope_stage_data.cbuffer_slot))) continue;
+            try {
+                d.scopes[slot] = evaluate_scope(rigid_scope_, ss, env);
+            } catch (const std::exception& ex) {
+                d.scope_errors[slot] = ex.what();
+            }
+        }
+    }, 8);
     for (size_t k = 0; k < draws; ++k) {
         const auto& d = volume_draws_[k];
-        const VolumetricLight& vl = *shafts[k];
-        LocalLight& ll = lights_[vl.light];
+        LocalLight& ll = lights_[d.light];
         const bool shadowed = d.shadowed;
-        write_shaft(ext_, ll, shadowed);
         if (shadowed) {
             bind_light_shadow(cl, ll, vm);
             ++vol_shadows_used_;
@@ -3357,12 +3459,12 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         try {
             if (!d.error.empty()) throw std::runtime_error(d.error);
             current_draw = &d;
-            d.pipeline->draw_volume(gpu, cl, ext_, qscopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants);
+            d.pipeline->draw_volume(gpu, cl, ext_, qscopes, d.technique, cube_vbv_, cube_ibv_, 36, {}, &batch, &d.constants, !shadowed);
             current_draw = nullptr;
             ++vol_drawn_;
         } catch (const std::exception& ex) {
             current_draw = nullptr;
-            if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", vl.technique->tag.str(), ex.what()));
+            if (light_notes_.size() < 32) light_notes_.push_back(std::format("volumetrics {}: {}", d.technique->tag.str(), ex.what()));
         }
     }
     for (auto& r : vol_layer_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3447,6 +3549,7 @@ void GameLighting::clear_cubemaps(Gpu& gpu) {
     // cache, instead of retaining every previously visited map for the process lifetime.
     if (!probe_textures_.empty() || !filtered_cubes_.empty() || !probe_shapes_.empty()) gpu.wait_idle();
     cubemaps_.clear();
+    ++cubemap_generation_;
     probe_textures_.clear();
     filtered_cubes_.clear();
     probe_shapes_.clear();
@@ -3476,6 +3579,7 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
         std::ranges::any_of(probe_shapes_, [&](const auto& x) { return !required_shapes.contains(x.first); });
     if (retire) gpu.wait_idle();
     cubemaps_.clear();
+    ++cubemap_generation_;
     std::erase_if(probe_textures_, [&](const auto& x) { return !required_textures.contains(x.first); });
     std::erase_if(filtered_cubes_, [&](const auto& x) { return !required_cubes.contains(x.first); });
     std::erase_if(probe_shapes_, [&](const auto& x) { return !required_shapes.contains(x.first); });

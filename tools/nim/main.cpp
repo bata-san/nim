@@ -8,6 +8,7 @@
 #include "ui_text.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
+#include "nim/content/map_audio.hpp"
 #include "nim/content/movies.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/core/parallel.hpp"
@@ -969,6 +970,7 @@ public:
         std::shared_ptr<const std::vector<MapParticle>> particles;  // the region's particle systems (FX)
         std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
         std::shared_ptr<const MapAtmosphere> atmosphere;  // the map's sky lookups and sun path
+        std::shared_ptr<const MapAudio> audio;  // the map's ambient sound emitters
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -1079,6 +1081,7 @@ private:
         std::vector<std::unique_ptr<PackageManager>> helpers;
         std::shared_ptr<const MapWeather> weather;
         std::shared_ptr<const MapAtmosphere> atmosphere;
+        std::shared_ptr<const MapAudio> audio;
         std::optional<std::unordered_map<uint32_t, DynamicModelMaterials>> entity_materials;
         std::optional<MapEntities> entities;
         TagHash entities_bubble;
@@ -1208,6 +1211,11 @@ private:
                     } catch (const std::exception&) {
                         atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
                     }
+                    try {
+                        audio = std::make_shared<const MapAudio>(load_map_audio(*pm, *layout));
+                    } catch (const std::exception&) {
+                        audio = std::make_shared<const MapAudio>();
+                    }
                     weather_bubble_ = req.bubble;
                 }
                 {
@@ -1215,6 +1223,7 @@ private:
                     if (generation_ != req.generation) continue;
                     progress_.weather = weather;
                     progress_.atmosphere = atmosphere;
+                    progress_.audio = audio;
                     progress_.total = jobs.size();
                     progress_.center = center;
                     progress_.extent = extent;
@@ -1499,7 +1508,7 @@ public:
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
         float radius = kUnlimited;  // default to the user's whole-world workflow
-        bool lights_set = false, particles_set = false;
+        bool lights_set = false, particles_set = false, audio_set = false;
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
         bool streaming = false, framed = false;
@@ -1609,9 +1618,12 @@ public:
     std::vector<std::string> audio_suffixes;                    // their package suffixes (names follow the UI language)
     int audio_lang = -1;          // -1 follows this screen's text language
 
-    // audio playback (dialogue) and WAV export
+    // audio playback (dialogue, map ambient) and WAV export
     std::unique_ptr<media::AudioEngine> audio_engine_;
     std::unique_ptr<media::ClipPlayer> clip;
+    std::unique_ptr<media::AmbientAudioPlayer> ambient_audio;
+    bool ambient_audio_enabled = true;
+    float ambient_audio_volume = 0.75f;
     struct AudioRequest {
         uint64_t id = 0;
         std::future<std::shared_ptr<const PcmAudio>> result;
@@ -1697,6 +1709,7 @@ public:
             map_worker.start(dir);
             map = MapView{};
             map_scene = false;
+            if (ambient_audio) ambient_audio->clear();
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
@@ -1947,6 +1960,8 @@ public:
         apply_weather();
         map.lights_set = false;
         map.particles_set = false;
+        map.audio_set = false;
+        if (ambient_audio) ambient_audio->clear();
         particles.release(gpu);
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
@@ -2015,6 +2030,13 @@ public:
                 ++map_add_failures[std::string("fx: ") + std::string(ex.what()).substr(0, 100)];
             }
             for (const auto& n : particles.notes()) ++map_add_failures[n.substr(0, 120)];
+        }
+        if (pr.audio && !map.audio_set) {
+            map.audio_set = true;
+            if (auto* eng = audio_engine()) {
+                if (!ambient_audio) ambient_audio = std::make_unique<media::AmbientAudioPlayer>(*eng);
+                ambient_audio->set_map(*pm, pr.audio);
+            }
         }
         if (added) {
             scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
@@ -2674,6 +2696,13 @@ public:
                 scene.set_material_time_of_day(game_lighting.time_of_day(light));
             }
             ViewMatrices vm = game_view ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
+            if (ambient_audio) {
+                if (map_scene)
+                    ambient_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
+                                          light.frame_delta_time, ambient_audio_volume, ambient_audio_enabled);
+                else
+                    ambient_audio->update({}, {}, light.frame_delta_time, 0.0f, false);
+            }
             SunShadow* shadow = nullptr;
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
@@ -3534,6 +3563,14 @@ public:
             ImGui::Checkbox(ui::tr(ui::S::OverheadOcclusion), &light.overhead_occlusion);
             ImGui::SetItemTooltip(ui::tr(ui::S::OverheadOcclusionTip));
             ImGui::Checkbox(ui::tr(ui::S::ProbeFade), &light.probe_distance_fade);
+            if (map_scene && ambient_audio && ambient_audio->emitter_count() > 0) {
+                ImGui::SeparatorText("環境音");
+                ImGui::Checkbox("環境音を再生", &ambient_audio_enabled);
+                ImGui::BeginDisabled(!ambient_audio_enabled);
+                ImGui::SliderFloat("環境音量", &ambient_audio_volume, 0.0f, 1.5f, "%.2f");
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("再生中: %zu ボイス / %zu 音源", ambient_audio->active_voices(), ambient_audio->emitter_count());
+            }
             ImGui::SetItemTooltip(ui::tr(ui::S::ProbeFadeTip));
             {
                 bool own = light.time_of_day < 0;
