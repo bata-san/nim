@@ -152,7 +152,12 @@ void GameLighting::resize_ssr(Gpu& gpu) {
 }
 
 void GameLighting::keep_ssr_history(ID3D12GraphicsCommandList* cl, const ViewMatrices& vm) {
-    if (!ssr_history_ || ssr_w_ != w_ || ssr_h_ != h_) return;
+    // A tiny viewport skips SSR allocation; the previous history may still have the old size.
+    // Orthographic frames cannot produce history for the perspective trace either.
+    if (vm.ortho > 0 || !hiz_mips_ || !ssr_history_ || ssr_w_ != w_ || ssr_h_ != h_) {
+        ssr_history_valid_ = false;
+        return;
+    }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Gpu::barrier(cl, ssr_history_.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyResource(ssr_history_.Get(), hdr_.Get());

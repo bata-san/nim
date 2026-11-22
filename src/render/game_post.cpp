@@ -305,6 +305,9 @@ void GameLighting::render_distortions(Gpu& gpu, ID3D12GraphicsCommandList* cl, c
 // them on the CPU. The columns were sampled with 1 / exposure (extern 38 +0xC0.z), so the average
 // is the scene's luminance before exposure. Use the newest finished measurement from a previous frame.
 void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
+    // prepare_frame also runs with post disabled, when render_post never gets to invalidate
+    // history. The next TAA frame must seed from its own tonemap, even at unchanged exposure.
+    if (!p.post) taa_valid_ = taa_prev_valid_ = false;
     const bool automatic = p.post && p.auto_exposure && ae_columns_.loaded() && bloom_initial_.loaded() && bloom_down_.loaded();
     if (!automatic) {
         ae_valid_ = false;

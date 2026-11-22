@@ -182,6 +182,7 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_distortion = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
+    bool no_shaft_fog_density = false;
     float exposure_arg = 1;
     bool assume_lights_on = true;
     std::optional<V3> eye_arg, look_arg;
@@ -256,6 +257,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
+        else if (args[i] == "--no-shaft-fog-density") no_shaft_fog_density = true;
         else if (args[i] == "--no-ssr") no_ssr = true;
         else if (args[i] == "--no-distortion") no_distortion = true;
         else if (args[i] == "--no-post") no_post = true;
@@ -884,6 +886,7 @@ int run(int argc, char** argv) {
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
     lp.volumetrics = !no_volumetrics;
+    lp.shaft_fog_density = !no_shaft_fog_density;
     lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;
     lp.environment = !no_environment;
@@ -1337,6 +1340,10 @@ int run(int argc, char** argv) {
         }
         for (int k = 0; k < 2 && gl.volumetric_layer(k); ++k)
             save(k ? "lighting-shafts-near.bin" : "lighting-shafts-far.bin", gpu.read_texture(gl.volumetric_layer(k), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        for (uint32_t bank = 0; bank < 2; ++bank)
+            if (auto* density = gl.externs().texture(0x58, bank * 8).resource)
+                save(bank ? "lighting-shaft-density-far.bin" : "lighting-shaft-density-near.bin",
+                     gpu.read_texture(density, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         if (auto* slices = gl.externs().texture(ext::Transparent, 0x50).resource)
             save("lighting-shafts-cdf.bin", gpu.read_texture(slices, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 2));
         std::ofstream f(out_dir / "lighting.json");
@@ -1568,6 +1575,29 @@ int run(int argc, char** argv) {
                 std::println("verified distortion view depth: {}x{}, finite ordered min/max", reduced_desc.Width, reduced_desc.Height);
             }
             if (gl.volumetrics_drawn()) {
+                const bool expect_shaft_density = lp.shaft_fog_density && lp.froxel_fog && !camera.ortho;
+                for (uint32_t bank = 0; bank < 2; ++bank) {
+                    const auto view = ext.texture(0x58, bank * 8);
+                    if (bool(view.resource) != expect_shaft_density)
+                        throw std::runtime_error("Shaft density did not follow the froxel setting");
+                    if (!view.resource) continue;
+                    const auto desc = view.resource->GetDesc();
+                    auto* froxels = ext.texture(ext::Atmosphere, 0x108).resource;
+                    if (!froxels || desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                        desc.Width != froxels->GetDesc().Width || desc.Height != froxels->GetDesc().Height)
+                        throw std::runtime_error("Shaft density and froxel view dimensions differ");
+                    const auto bytes = gpu.read_texture(view.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8);
+                    const auto* values = reinterpret_cast<const uint16_t*>(bytes.data());
+                    float maximum = 0;
+                    for (size_t n = 0; n < bytes.size() / sizeof(uint16_t); ++n) {
+                        const float density = half(values[n]);
+                        if (!std::isfinite(density) || density < 0)
+                            throw std::runtime_error("Shaft density contains invalid extinction");
+                        maximum = std::max(maximum, density);
+                    }
+                    std::println("verified shaft fog density bank {}: {}x{}, maximum {} per km",
+                                 bank, desc.Width, desc.Height, maximum);
+                }
                 const auto depths = gpu.read_texture(gl.volumetric_depth(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 16);
                 const auto* values = reinterpret_cast<const float*>(depths.data());
                 for (size_t i = 0; i < depths.size() / sizeof(float); i += 4) {
@@ -1682,6 +1712,7 @@ int run(int argc, char** argv) {
             vm = gl.temporal_view(view, lp);
         }
         lp.froxel_temporal = false;  // exposure tests isolate post-processing from temporal density
+        fx_delta = 0;                // hold particle simulation fixed while comparing exposures
         if (gl.temporal_aa_on(lp)) {
             const bool ssr = lp.ssr;
             lp.auto_exposure = false;
@@ -1713,11 +1744,25 @@ int run(int argc, char** argv) {
             if (std::abs(remaining_weight - 0.46f) > 0.0001f)
                 throw std::runtime_error("Half-stop exposure change did not reduce TAA history weight");
             std::println("verified TAA history weight after half a stop: {}", remaining_weight);
+            // Match the reference exposure and jitter: the resumed frame must
+            // seed history, not resolve against the pre-gap image at another exposure.
+            lp.post = false;
+            render_exposure(true, 2.0f);
+            lp.post = true;
+            render_exposure(true, 2.0f);
+            const auto resumed = gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+            int resume_delta = 0;
+            for (size_t i = 0; i < reference.size(); ++i)
+                resume_delta = std::max(resume_delta, std::abs(int(reference[i]) - int(resumed[i])));
+            if (resume_delta > 1) throw std::runtime_error(std::format("TAA reused history after post was disabled: max 8-bit delta {}", resume_delta));
+            std::println("verified TAA post toggle: resumed current tonemap (max 8-bit delta {})", resume_delta);
             lp.ssr = ssr;
+            fx_delta = 1.0f / 60;
         }
         if (lp.ssr && gl.ssr_source() && !vm.ortho) {
             lp.auto_exposure = false;
             lp.temporal_aa = false;
+            fx_delta = 0;
             auto frame_at_exposure = [&](float exposure) {
                 gpu.begin_frame(0);
                 lp.exposure = exposure;
@@ -1737,6 +1782,25 @@ int run(int argc, char** argv) {
                 return gpu.read_texture(gl.ssr_source(), read, 8);
             };
             const auto base = read_source(1), brighter = read_source(2);
+            // The 4-mip Hi-Z minimum is not met at 8x8. Shrink after the history was
+            // allocated, then restore the view: only its second frame may trace again.
+            auto draw_resized = [&](uint32_t w, uint32_t h) {
+                gb.resize(gpu, w, h);
+                gpu.begin_frame(0);
+                View resized = view;
+                resized.width = w; resized.height = h;
+                prepare_game_frame();
+                vm = gl.temporal_view(resized, lp);
+                scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+                render_game(gpu.immediate());
+                gpu.flush();
+                if (gl.ssr_drawn()) throw std::runtime_error("SSR reused history after resize");
+            };
+            draw_resized(8, 8);
+            draw_resized(width, height);
+            frame_at_exposure(2);
+            if (!gl.ssr_drawn()) throw std::runtime_error("SSR did not rewarm after viewport restore");
+            std::println("verified SSR viewport history: 8x8 skips tracing, restored size rewarms");
             const auto* a = reinterpret_cast<const uint16_t*>(base.data());
             const auto* b = reinterpret_cast<const uint16_t*>(brighter.data());
             float max_error = 0;

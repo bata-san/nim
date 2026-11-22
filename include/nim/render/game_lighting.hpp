@@ -481,7 +481,9 @@ private:
     // quarter resolution into a near / far layer pair (plus the transparents' 8 intensity slices),
     // then volumetrics_blur_results and volumetrics_upres_1 add the shafts to the HDR target.
     void render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                            D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes, bool transparent_inputs);
+                            D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes, bool transparent_inputs,
+                            bool use_fog_density);
+    void pack_shaft_fog(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm);
     Scope rigid_scope_, transparent_scope_, transparent_adv_scope_;
     GamePipeline vol_downsample_, vol_blur_, vol_upres_, vol_assemble_;
     struct VolumetricLight {
@@ -499,6 +501,10 @@ private:
     // blurred far / near layers.
     ComPtr<ID3D12Resource> vol_minmax_, vol_layer_[4], vol_blurred_[2];
     ComPtr<ID3D12Resource> vol_intensity_;
+    std::array<ComPtr<ID3D12Resource>, 2> shaft_density_;
+    ComPtr<ID3D12RootSignature> shaft_density_root_;
+    ComPtr<ID3D12PipelineState> shaft_density_pso_;
+    static constexpr UINT kShaftDensityRtv = 15;
     ComPtr<ID3D12DescriptorHeap> vol_rtv_heap_;
     uint32_t vw_ = 0, vh_ = 0;
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_, atmosphere_noise_;

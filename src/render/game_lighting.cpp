@@ -1117,6 +1117,49 @@ float2 ps_main(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
+// Convert the current native atmosphere result to the shaft shader's radial density samples.
+// Only the input layout and units are reconstructed here. The game PS integrates the local light.
+constexpr const char* kShaftDensityHlsl = R"(
+cbuffer P : register(b0) {
+    float2 inv_size;
+    float2 inv_projection;
+    float4 depth_mapping; // near, far, curve, inverse range
+    float2 projection_offset;
+};
+Texture3D<float4> atmosphere : register(t0);
+SamplerState linear_clamp : register(s0);
+
+float2 extinction_depth(float2 uv, float view_depth) {
+    if (view_depth <= depth_mapping.x) return 0;
+    float z = pow(saturate((view_depth - depth_mapping.x) * depth_mapping.w), depth_mapping.z);
+    return -log(max(atmosphere.SampleLevel(linear_clamp, float3(uv, z), 0).xy, 0.00006103515625));
+}
+
+struct Slices { float4 near : SV_Target0; float4 far : SV_Target1; };
+Slices ps_main(float4 pos : SV_Position) {
+    float2 uv = pos.xy * inv_size;
+    float2 xy = (uv * float2(2, -2) + float2(-1, 1) - projection_offset) * inv_projection;
+    float radial_to_view = rsqrt(1 + dot(xy, xy));
+    float optical_depths[9];
+    [unroll] for (uint i = 0; i < 9; ++i) {
+        float k = min(i + 0.5, 8.0);
+        float2 tau = extinction_depth(uv, k * k * radial_to_view);
+        optical_depths[i] = tau.x + tau.y;
+    }
+    float density[8];
+    [unroll] for (uint i = 0; i < 8; ++i) {
+        // The shaft PS samples hats centred at i+1 in sqrt(distance in metres).
+        float a = i + 0.5;
+        float b = min(a + 1.0, 8.0);
+        density[i] = 1000.0 * max(0.0, optical_depths[i + 1] - optical_depths[i]) / (b * b - a * a);
+    }
+    Slices output;
+    output.near = float4(density[0], density[1], density[2], density[3]);
+    output.far = float4(density[4], density[5], density[6], density[7]);
+    return output;
+}
+)";
+
 struct SunShadowConstants {
     V3 fwd; float fx;
     V3 right; float fy;
@@ -1173,6 +1216,9 @@ void GameLighting::release(Gpu& gpu) {
     vol_minmax_.Reset();
     for (auto& r : vol_layer_) r.Reset();
     vol_intensity_.Reset();
+    for (auto& density : shaft_density_) density.Reset();
+    shaft_density_pso_.Reset();
+    shaft_density_root_.Reset();
     for (auto& r : vol_blurred_) r.Reset();
     vol_rtv_heap_.Reset();
     vw_ = vh_ = 0;
@@ -1390,6 +1436,17 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.PS = {lps->GetBufferPointer(), lps->GetBufferSize()};
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
+
+        range.NumDescriptors = 1;
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        shaft_density_root_ = serialize(dev, srsd, "shaft fog density root signature");
+        const auto fog_ps = compile_viewer_env("ps_main", "ps_5_0", kShaftDensityHlsl);
+        pd.pRootSignature = shaft_density_root_.Get();
+        pd.PS = {fog_ps->GetBufferPointer(), fog_ps->GetBufferSize()};
+        pd.NumRenderTargets = 2;
+        pd.RTVFormats[0] = pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shaft_density_pso_)), "shaft fog density PSO");
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kMaterialAoRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
@@ -1414,6 +1471,8 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     clear_owned(0x5D, 0x00, material_ao_.Get());
     clear_owned(ext::Transparent, 0x48, vol_blurred_[0].Get());
     clear_owned(ext::Transparent, 0x50, vol_intensity_.Get());
+    for (uint32_t bank = 0; bank < shaft_density_.size(); ++bank)
+        clear_owned(0x58, bank * 8, shaft_density_[bank].Get());
     for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
     distortion_.Reset();
     distortion_depth_.Reset();
@@ -1452,7 +1511,7 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     {
         vw_ = std::max(1u, (w + 3) / 4);
         vh_ = std::max(1u, (h + 3) / 4);
-        D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, vol_assemble_.loaded() ? 15u : 7u};
+        D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kShaftDensityRtv + 2};
         check_hr(gpu.device()->CreateDescriptorHeap(&vd, IID_PPV_ARGS(&vol_rtv_heap_)), "volumetrics RTV heap");
         const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
         D3D12_CLEAR_VALUE mm{DXGI_FORMAT_R32G32B32A32_FLOAT, {0, 0, 0, 0}};
@@ -1464,6 +1523,14 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
             r = gpu.texture2d(vw_, vh_, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, i < 4 ? &cv : &clear_illuminance);
             gpu.device()->CreateRenderTargetView(r.Get(), nullptr, {vb.ptr + size_t(1 + i) * inc});
+        }
+        const uint32_t dw = ((w + kFroxelTile - 1) / kFroxelTile + 7) & ~7u;
+        const uint32_t dh = ((h + kFroxelTile - 1) / kFroxelTile + 7) & ~7u;
+        for (uint32_t bank = 0; bank < shaft_density_.size(); ++bank) {
+            auto& density = shaft_density_[bank];
+            density = gpu.texture2d(dw, dh, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+            gpu.device()->CreateRenderTargetView(density.Get(), nullptr, {vb.ptr + size_t(kShaftDensityRtv + bank) * inc});
         }
         if (vol_assemble_.loaded()) {
             D3D12_RESOURCE_DESC volume{};
@@ -2083,9 +2150,12 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
     }
     const bool shafts_before_transparents = volumetrics && transparents && vol_intensity_;
+    const bool shaft_fog = p.shaft_fog_density && froxels_on(p) && !vm.ortho;
+    ext_.set_texture(0x58, 0x00, nullptr);
+    ext_.set_texture(0x58, 0x08, nullptr);
     if (shafts_before_transparents) {
         ProfileScope ps_("frame.light.volumetrics");
-        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, true);
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, true, shaft_fog);
     }
     if (transparents) {
         const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
@@ -2101,7 +2171,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     if (volumetrics && !shafts_before_transparents) {
         ProfileScope ps_("frame.light.volumetrics");
-        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, false);
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, false, shaft_fog);
     }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
@@ -2111,6 +2181,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     if (post) {
         { ProfileScope ps_("frame.light.post"); render_post(gpu, cl, gb, p, scopes, distorted); }
     } else {
+        taa_valid_ = taa_prev_valid_ = false;
         ext_.set_texture(ext::Postprocess, 0x00, distorted ? distorted_hdr_.Get() : hdr_.Get());
         Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
@@ -3056,6 +3127,48 @@ void GameLighting::evaluate_volume_draws(size_t count, std::span<const Scope* co
 }
 
 // ---- Volumetrics -------------------------------------------------------------------------------
+void GameLighting::pack_shaft_fog(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm) {
+    const auto volume = ext_.texture(ext::Atmosphere, 0x108);
+    const auto desc = shaft_density_[0]->GetDesc();
+    const float w = float(desc.Width), h = float(desc.Height);
+    const float4 constants[] = {
+        {1 / w, 1 / h, 1 / vm.fx, 1 / vm.fy},
+        ext_.get_v(ext::Atmosphere, 0x130),
+        {vm.proj.c[2][0], vm.proj.c[2][1], 0, 0}
+    };
+    const auto cb = gpu.dynamic(sizeof(constants));
+    std::memcpy(cb.cpu, constants, sizeof(constants));
+    const uint32_t srv = gpu.transient_descriptors(1);
+    write_game_srv(gpu.device(), volume, BindingKind::Texture3D, gpu.srv().cpu(srv));
+    const auto inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv[]{
+        {base.ptr + kShaftDensityRtv * inc}, {base.ptr + (kShaftDensityRtv + 1) * inc}
+    };
+    const D3D12_VIEWPORT vp{0, 0, w, h, 0, 1};
+    const D3D12_RECT sc{0, 0, LONG(desc.Width), LONG(desc.Height)};
+    for (auto& density : shaft_density_)
+        Gpu::barrier(cl, density.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->OMSetRenderTargets(2, rtv, FALSE, nullptr);
+    ID3D12DescriptorHeap* heaps[]{gpu.srv().heap()};
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetGraphicsRootSignature(shaft_density_root_.Get());
+    cl->SetPipelineState(shaft_density_pso_.Get());
+    cl->SetGraphicsRootConstantBufferView(0, cb.gpu);
+    cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(srv));
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->DrawInstanced(3, 1, 0, 0);
+    for (uint32_t bank = 0; bank < shaft_density_.size(); ++bank) {
+        auto* density = shaft_density_[bank].Get();
+        Gpu::barrier(cl, density, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ext_.set_texture(0x58, bank * 8, density);
+    }
+    ext_.note_estimate("shaft fog density: eight samples of local extinction from native atmosphere and interior transmittance",
+                       "original producer unknown; estimate per kilometre from optical depth differences over the native 64 m radial bins");
+}
+
 // The light shaft chain (docs/PROGRESS.md 3.3), read from the DXIL of the passes:
 //  1. downsample_full_depth_to_quarter_max_min (extern 35): per 4x4 block, view depth max / min.
 //  2. each light's volumetrics technique, drawn as the light volume at quarter resolution with a
@@ -3067,7 +3180,8 @@ void GameLighting::evaluate_volume_draws(size_t count, std::span<const Scope* co
 //     +0x98 = (depth, depth) as nim's linear depth), added to the HDR target.
 void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                                       D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& full_scopes,
-                                      bool transparent_inputs) {
+                                      bool transparent_inputs, bool use_fog_density) {
+    if (use_fog_density) pack_shaft_fog(gpu, cl, vm);
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     auto rtv = [&](size_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{vb.ptr + i * inc}; };
@@ -3143,7 +3257,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
                        "finite far distance for the infinite viewer projection; shared with full-resolution linear depth");
     constexpr uint8_t kVolumetricsPass = 0x58, kTemporal = 0x59;
     if (!ext_.zero_policy(kVolumetricsPass))
-        ext_.zero_when_missing(kVolumetricsPass, "volumetric fog density slices (extern 88 t0/t1): producer not identified, zero (base density only)");
+        ext_.zero_when_missing(kVolumetricsPass, "no froxel density input for the light shaft pass: use the authored base density");
     ext_.set(kVolumetricsPass, 0x10, 0.0f);
     ext_.note_estimate("extern 88 +0x10 = 0 (march dither off)", "no temporal filter yet: an undithered march instead of temporal noise");
     if (!ext_.zero_policy(ext::Transparent))

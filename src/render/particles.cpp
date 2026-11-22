@@ -392,7 +392,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     }
     // Warm only new emitters. Each pair returns to the original buffer parity.
     std::vector<float> dts;
-    for (uint32_t pair = 0; pair < kWarmStepsPerFrame / 2 && !warm.empty(); ++pair) {
+    for (uint32_t pair = 0; dt > 0 && pair < kWarmStepsPerFrame / 2 && !warm.empty(); ++pair) {
         dts.clear();
         for (uint32_t i : warm) {
             Emitter& e = emitters_[i];
@@ -403,7 +403,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         step(gpu, cl, warm, dts, scopes, collision_views);
         std::erase_if(warm, [&](uint32_t i) { return emitters_[i].warm_steps == 0; });
     }
-    step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes, collision_views);
+    if (dt > 0) step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes, collision_views);
 
     // Expand each emitter's particles into draw instances.
     ID3D12Resource* cur = state_[parity_].Get();
