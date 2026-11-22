@@ -302,6 +302,16 @@ void AiSimulation::set_character_radius(size_t character, float radius) {
     radius_[character] = radius;
 }
 
+float AiSimulation::walk_speed(const AiAgent& a) const {
+    if (a.character < motions_.size() && motions_[a.character].walk_speed > 0) return motions_[a.character].walk_speed;
+    return params_.walk_speed;
+}
+
+float AiSimulation::run_speed(const AiAgent& a) const {
+    if (a.character < motions_.size() && motions_[a.character].run_speed > 0) return motions_[a.character].run_speed;
+    return std::max(params_.run_speed, walk_speed(a));
+}
+
 float AiSimulation::radius(const AiAgent& a) const { return a.character < radius_.size() ? radius_[a.character] : 0.3f; }
 
 bool WalkGrid::clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const {
@@ -362,17 +372,32 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             }
             if (clip.bone_count != rig.size()) continue;
             const auto gait = measure_clip_gait(skeleton, rig, clip, *feet, fps);
+            const float travel = std::hypot(clip.root_motion.translation[0], clip.root_motion.translation[1]);
+            if (std::fabs(gait.yaw) >= 0.35f && travel < 0.04f && gait.seconds >= 0.3f) {
+                MotionClip t{tag, gait.seconds, 0, {}, false};
+                t.yaw = gait.yaw;
+                set.turns.push_back(t);
+                continue;
+            }
             if (!gait.cyclic) {
                 if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!still || gait.seconds > still->seconds))
                     still = MotionClip{tag, gait.seconds, 0, {}, false};
                 continue;
             }
-            const MotionClip m{tag, gait.seconds, gait.speed, gait.direction};
-            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f) set.locomotion.push_back(m);
+            MotionClip m{tag, gait.seconds, gait.speed, gait.direction};
+            m.authored = gait.authored;
+            // A stride (root travel over one cycle) beyond 4 m is a dash or a multi-cycle move, not a gait (推定).
+            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f && travel <= 4.0f) set.locomotion.push_back(m);
             else if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!set.idle || gait.seconds > set.idle->seconds))
                 set.idle = MotionClip{tag, gait.seconds, 0, {}};
         }
         if (!set.idle) set.idle = still;
+        for (const auto& m : set.locomotion) {
+            if (!m.authored || m.direction[0] < 0.9f) continue;
+            set.walk_speed = set.walk_speed > 0 ? std::min(set.walk_speed, m.speed) : m.speed;
+            set.run_speed = std::max(set.run_speed, m.speed);
+        }
+        if (set.run_speed < set.walk_speed * 1.3f) set.run_speed = 0;
         if (set.locomotion.empty() && !set.idle) set.error = "no usable clips";
     } catch (const std::exception& e) {
         set.error = e.what();
@@ -847,7 +872,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
             face = std::atan2(player[1] - a.position[1], player[0] - a.position[0]);
             if (a.alert == AiAlert::Alerted && !squad_areas_[a.squad].empty()) {
                 target = nearest_objective_point(a.squad, player);
-                speed = params_.run_speed;
+                speed = run_speed(a);
             }
         } else if (!squad_areas_[a.squad].empty() && (a.character >= motions_.size() || !motions_[a.character].locomotion.empty())) {
             if (a.wait > 0) {
@@ -856,7 +881,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
             } else if (dist2d(a.position, a.goal) < 0.3f) {
                 a.wait = std::uniform_real_distribution<float>(params_.wait_min, params_.wait_max)(rng_);
             } else {
-                speed = params_.walk_speed;
+                speed = walk_speed(a);
             }
             target = a.goal;
             // Along the path's waypoints (the last is the goal).
@@ -866,6 +891,38 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         const float dx = target[0] - a.position[0], dy = target[1] - a.position[1], d = std::hypot(dx, dy);
         if (speed > 0 && d > 0.3f && !react) face = std::atan2(dy, dx);
         const float turn = wrap_angle(face - a.yaw);
+        const MotionSet* set = a.character < motions_.size() ? &motions_[a.character] : nullptr;
+        // Turning in place with the character's own turn clip: started when the facing is off by more
+        // than 40 degrees while standing (or about to walk), played to its end at its authored yaw rate.
+        if (set && a.motion.turn && *a.motion.turn < set->turns.size()) {
+            const auto& tc = set->turns[*a.motion.turn];
+            a.motion_time += dt;
+            if (a.motion_time < tc.seconds) {
+                const float rate = std::fabs(tc.yaw) / tc.seconds;
+                if (turn * tc.yaw > 0) a.yaw = wrap_angle(a.yaw + std::clamp(turn, -rate * dt, rate * dt));
+                a.velocity = {};
+                continue;
+            }
+            a.motion.turn.reset();
+            a.motion_time = 0;
+        }
+        if (set && !set->turns.empty() && std::fabs(turn) > 0.7f && !react &&
+            std::hypot(a.velocity[0], a.velocity[1]) < 0.3f) {
+            size_t best = set->turns.size();
+            for (size_t k = 0; k < set->turns.size(); ++k) {
+                if (set->turns[k].yaw * turn <= 0) continue;
+                if (best == set->turns.size() || std::fabs(std::fabs(set->turns[k].yaw) - std::fabs(turn)) <
+                                                     std::fabs(std::fabs(set->turns[best].yaw) - std::fabs(turn)))
+                    best = k;
+            }
+            if (best < set->turns.size()) {
+                a.motion = MotionChoice{};
+                a.motion.turn = best;
+                a.motion_time = 0;
+                a.velocity = {};
+                continue;
+            }
+        }
         a.yaw = wrap_angle(a.yaw + std::clamp(turn, -params_.turn_rate * dt, params_.turn_rate * dt));
         if (speed > 0 && d > 0.3f) {
             // Patrolling: turn towards the goal, then walk along the facing (推定), slowing while the
@@ -892,7 +949,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         const std::array<float, 2> local{a.velocity[0] * c + a.velocity[1] * s, -a.velocity[0] * s + a.velocity[1] * c};
         const MotionChoice before = a.motion;
         if (a.character < motions_.size()) a.motion = select_motion(motions_[a.character], local);
-        if (a.motion.locomotion != before.locomotion) a.motion_time = 0;
+        if (a.motion.locomotion != before.locomotion || before.turn) a.motion_time = 0;
         else {
             float length = 0;
             if (a.character < motions_.size()) {

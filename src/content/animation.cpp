@@ -304,6 +304,9 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
                               std::fabs(rest.scale - 1) < 1e-5f;
         rig.bind_relative.push_back(space == 1 && identity);
         rig.default_pose.push_back(rest);
+        const size_t node = nodes.data + size_t(i) * 72;
+        const int16_t chain_end = int16_t(r.u16_at(node + 0x2C)), chain_root = int16_t(r.u16_at(node + 0x2E));
+        rig.ik_root.push_back(chain_root >= 0 && chain_end == int16_t(rig.skeleton_bone.back()) ? chain_root : int16_t(-1));
     }
     return rig;
 }
@@ -829,11 +832,14 @@ void read_raw_tracks(const TagReader& r, size_t a, const BoneLists& bones, Anima
 //   nibble (0..14, 7 = none) displace the cubic's two inner control points. Rotations are (w, x, y)
 //   snorm16 with |z| = sqrt(1 - w^2 - x^2 - y^2), negative when the low bit of x is set; their four
 //   bytes are the x, y, w, z channels.
-//   Scale and translation values are unorm16 inside per-track (extent 0x50, min 0x60) ranges.
+//   Scale and translation values are 15-bit (key / 32767) inside per-track (extent 0x50, min 0x60)
+//   ranges; the extent is 1 for nearly every track, so a track spans [min, min + 1].
 std::vector<std::array<float, 4>> curve_track(const std::vector<uint16_t>& raw, const std::vector<uint16_t>& blocks,
                                               const std::vector<uint8_t>& lengths, const std::vector<uint8_t>& params,
                                               uint16_t entry, uint32_t frames, int comps, int channels, bool rotation) {
-    auto norm = [&](uint16_t v) { return rotation ? snorm16(v) : unorm16(v); };
+    // Scale and translation keys are 15-bit like the rotation components: no key in the install
+    // exceeds 0x7FFF, and reading them as unorm16 halved every animated offset (feet below the floor).
+    auto norm = [&](uint16_t v) { return rotation ? snorm16(v) : float(v) / 32767.0f; };
     auto channels_of = [&](const uint16_t* k) -> std::array<float, 4> {
         if (!rotation) return {norm(k[0]), comps > 1 ? norm(k[1]) : 0.0f, comps > 2 ? norm(k[2]) : 0.0f, 0};
         // Stored (w, x, y); |z| is derived and the low bit of x is set when z is negative.
@@ -922,6 +928,14 @@ AnimationClip load_animation_clip(PackageManager& pm, TagHash tag) {
     clip.frame_count = std::max<uint32_t>(1, r.u16_at(0x140));
     clip.bone_count = r.u16_at(0x142);
     clip.bone_groups = read_bone_groups(r, 0x170);
+    for (int k = 0; k < 4; ++k) clip.root_motion.rotation[k] = r.f32_at(0x70 + k * 4);
+    for (int k = 0; k < 3; ++k) clip.root_motion.translation[k] = r.f32_at(0x80 + k * 4);
+    if (!std::isfinite(clip.root_motion.rotation[3]) || std::fabs(qnormalize(clip.root_motion.rotation)[3]) < 1e-6f &&
+        std::fabs(clip.root_motion.rotation[2]) < 1e-6f)
+        clip.root_motion.rotation = {0, 0, 0, 1};
+    clip.root_motion.rotation = qnormalize(clip.root_motion.rotation);
+    for (auto& v : clip.root_motion.translation)
+        if (!std::isfinite(v) || std::fabs(v) > 1000) v = 0;
     BoneLists constant{u16_vec(r, 0xA8), u16_vec(r, 0xB8), u16_vec(r, 0xC8)};
     BoneLists animated{u16_vec(r, 0xD8), u16_vec(r, 0xE8), u16_vec(r, 0xF8)};
     // A few clips carry no tracks at all (only the 8080B146 block at 0x28).
@@ -1146,6 +1160,99 @@ bool is_additive(const AnimationRig& rig, const AnimationClip& clip) {
     return votes > 0 && at_identity * 2 > votes;
 }
 
+namespace {
+
+V vsub(const V& a, const V& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
+V vadd(const V& a, const V& b) { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
+V vscale(const V& a, float s) { return {a[0] * s, a[1] * s, a[2] * s}; }
+float vdot(const V& a, const V& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+V vcross(const V& a, const V& b) { return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]}; }
+float vlen(const V& a) { return std::sqrt(vdot(a, a)); }
+
+// Shortest-arc rotation taking direction a onto direction b.
+Q rotation_between(V a, V b) {
+    const float la = vlen(a), lb = vlen(b);
+    if (la < 1e-6f || lb < 1e-6f) return {0, 0, 0, 1};
+    a = vscale(a, 1 / la), b = vscale(b, 1 / lb);
+    const float d = vdot(a, b);
+    if (d > 0.999999f) return {0, 0, 0, 1};
+    if (d < -0.999999f) {
+        V axis = vcross({1, 0, 0}, a);
+        if (vlen(axis) < 1e-3f) axis = vcross({0, 1, 0}, a);
+        axis = vscale(axis, 1 / vlen(axis));
+        return {axis[0], axis[1], axis[2], 0};
+    }
+    const V c = vcross(a, b);
+    return qnormalize({c[0], c[1], c[2], 1 + d});
+}
+
+// Turns `top` about its own joint by `turn`; its descendants follow, except object-space rig nodes
+// other than `follow`, which keep their own (absolute) rotation and only move with their parent.
+void turn_subtree(const Skeleton& sk, const AnimationRig& rig, const std::vector<int32_t>& rig_of, std::vector<BoneTransform>& object,
+                  size_t top, const Q& turn, size_t follow) {
+    const size_t n = sk.size();
+    std::vector<BoneTransform> local(n);
+    std::vector<uint8_t> below(n, 0);
+    below[top] = 1;
+    // Parents precede children in Tiger skeletons.
+    for (size_t x = top + 1; x < n; ++x) {
+        const int p = sk.parents[x];
+        if (p < 0 || !below[size_t(p)]) continue;
+        below[x] = 1;
+        local[x] = inverse(object[size_t(p)]) * object[x];
+    }
+    object[top].rotation = qnormalize(qmul(turn, object[top].rotation));
+    for (size_t x = top + 1; x < n; ++x) {
+        if (!below[x]) continue;
+        const Q keep = object[x].rotation;
+        object[x] = object[size_t(sk.parents[x])] * local[x];
+        const int32_t xr = rig_of[x];
+        if (x != follow && xr >= 0 && rig.object_space[size_t(xr)]) object[x].rotation = keep;
+    }
+}
+
+// Two-bone IK for the rig's chains whose target is a ground-level object-space position: the target
+// node's rest translation sits at the chain end's bind height (the robots' feet; their hand and spine
+// chains target positions in another space and are left to FK). The chain root and middle joint turn
+// in the FK bend plane so that the end joint reaches the target; the end keeps its own object
+// rotation. A target more than 25 cm from the FK end (a clip without targets) is ignored.
+void solve_ground_ik(const Skeleton& sk, const AnimationRig& rig, const std::vector<BoneTransform>& pose,
+                     const std::vector<int32_t>& rig_of, std::vector<BoneTransform>& object) {
+    const size_t n = sk.size();
+    if (rig.ik_root.size() != rig.size() || pose.size() < rig.size() || object.size() != n) return;
+    for (size_t ri = 0; ri < rig.size(); ++ri) {
+        const int root = rig.ik_root[ri];
+        const size_t end = rig.skeleton_bone[ri];
+        if (root < 0 || size_t(root) >= n || end >= n || !rig.object_space[ri]) continue;
+        const int mid = sk.parents[end];
+        if (mid < 0 || sk.parents[size_t(mid)] != root) continue;
+        if (std::fabs(rig.default_pose[ri].translation[2] - sk.bind[end].translation[2]) > 0.05f) continue;
+        const V target = pose[ri].translation;
+        const V a = object[size_t(root)].translation, b = object[size_t(mid)].translation, c = object[end].translation;
+        const float miss = vlen(vsub(target, c));
+        if (miss > 0.25f || miss < 1e-4f) continue;
+        const float upper = vlen(vsub(b, a)), lower = vlen(vsub(c, b));
+        const V to_target = vsub(target, a);
+        if (upper < 1e-4f || lower < 1e-4f || vlen(to_target) < 1e-4f) continue;
+        const float reach = std::clamp(vlen(to_target), std::fabs(upper - lower) + 1e-4f, upper + lower - 1e-4f);
+        const V dir = vscale(to_target, 1 / vlen(to_target));
+        // Bend in the FK bend plane, to the FK middle joint's side (its normal keeps the side when the
+        // target moves past the knee).
+        V side = vcross(vcross(vsub(c, a), vsub(b, a)), dir);
+        if (vlen(side) < 1e-5f) continue;
+        side = vscale(side, 1 / vlen(side));
+        const float cos_a = std::clamp((upper * upper + reach * reach - lower * lower) / (2 * upper * reach), -1.0f, 1.0f);
+        const float sin_a = std::sqrt(std::max(0.0f, 1 - cos_a * cos_a));
+        const V b2 = vadd(a, vadd(vscale(dir, upper * cos_a), vscale(side, upper * sin_a)));
+        turn_subtree(sk, rig, rig_of, object, size_t(root), rotation_between(vsub(b, a), vsub(b2, a)), size_t(mid));
+        const V c1 = object[end].translation;
+        const V c2 = vadd(a, vscale(dir, reach));
+        turn_subtree(sk, rig, rig_of, object, size_t(mid), rotation_between(vsub(c1, b2), vsub(c2, b2)), n);
+    }
+}
+
+} // namespace
+
 void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationClip& clip, float frame,
                    std::vector<BoneTransform>& object, bool authored_local_offsets) {
     std::vector<BoneTransform> pose = rig.default_pose;
@@ -1215,19 +1322,9 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         sample_clip(clip, frame, pose);
     }
     const size_t n = sk.size();
-    // Rigs authored against another reference pose: most object-space nodes' default rotation is
-    // not the skeleton's bind (the UESC robots and the ghost; the runner rigs differ in at most 6 of
-    // 23). Their object-space tracks are applied as the change from the rig default onto the bind
-    // (推定: drawn as absolute rotations, the assault's rifle swung onto its back).
-    size_t object_nodes = 0, reference_nodes = 0;
-    for (size_t i = 0; i < rig.size(); ++i) {
-        if (!rig.object_space[i] || rig.skeleton_bone[i] >= n) continue;
-        ++object_nodes;
-        const auto& q = rig.default_pose[i].rotation;
-        const auto& r = sk.bind[rig.skeleton_bone[i]].rotation;
-        reference_nodes += std::fabs(q[0] * r[0] + q[1] * r[1] + q[2] * r[2] + q[3] * r[3]) < 0.99905f;  // > 5 degrees
-    }
-    const bool reference_delta = object_nodes >= 8 && reference_nodes * 2 > object_nodes;
+    // Object-space rotations are absolute. The UESC robot rigs' default pose is their combat stance,
+    // not the bind: posed with absolute rotations, the stance and the clips put the ankles on the
+    // foot IK targets (within a few cm; checked on the assault rig 80B8019C).
     std::vector<int32_t> rig_of(n, -1);
     for (size_t i = 0; i < rig.size(); ++i)
         if (rig.skeleton_bone[i] < n) rig_of[rig.skeleton_bone[i]] = int32_t(i);
@@ -1285,20 +1382,25 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 o = po * local;
                 if (ri >= 0 && rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
-                    if (reference_delta) {
-                        const auto& rd = rig.default_pose[size_t(ri)].rotation;
-                        o.rotation = qnormalize(qmul(qmul(c.rotation, Q{-rd[0], -rd[1], -rd[2], rd[3]}), sk.bind[b].rotation));
-                    } else {
-                        o.rotation = qnormalize(c.rotation);
+                    o.rotation = qnormalize(c.rotation);
+                    if (sk.parents[size_t(p)] < 0) {
+                        // A rest translation near the bind position is absolute (the robots' rifle);
+                        // near the origin it is an offset from the bind (pelvis, ...).
+                        const auto& rest = rig.default_pose[size_t(ri)].translation;
+                        const auto& bind = sk.bind[b].translation;
+                        float to_bind = 0, to_origin = 0;
+                        for (int k = 0; k < 3; ++k)
+                            to_bind += (rest[k] - bind[k]) * (rest[k] - bind[k]), to_origin += rest[k] * rest[k];
+                        const bool absolute = to_bind < to_origin;
+                        for (int k = 0; k < 3; ++k) o.translation[k] = (absolute ? 0 : bind[k]) + c.translation[k];
                     }
-                    if (sk.parents[size_t(p)] < 0)
-                        for (int k = 0; k < 3; ++k) o.translation[k] = sk.bind[b].translation[k] + c.translation[k];
                 }
             }
             done[b] = 1;
         }
         if (all) break;
     }
+    solve_ground_ik(sk, rig, pose, rig_of, object);
 }
 
 // ---- skin weights --------------------------------------------------------------------------------
@@ -1429,6 +1531,16 @@ ClipGait measure_clip_gait(const Skeleton& skeleton, const AnimationRig& rig, co
     const float sx = -vx / total, sy = -vy / total, speed = std::hypot(sx, sy);
     g.speed = speed;
     if (speed > 1e-3f) g.direction = {sx / speed, sy / speed};
+    const auto& rm = clip.root_motion;
+    g.yaw = 2 * std::atan2(rm.rotation[2], rm.rotation[3]);
+    if (g.yaw > 3.14159265f) g.yaw -= 6.28318531f;
+    if (g.yaw < -3.14159265f) g.yaw += 6.28318531f;
+    const float travel = std::hypot(rm.translation[0], rm.translation[1]);
+    if (travel >= 0.02f && g.seconds > 0) {
+        g.authored = true;
+        g.speed = travel / g.seconds;
+        g.direction = {rm.translation[0] / travel, rm.translation[1] / travel};
+    }
     return g;
 }
 

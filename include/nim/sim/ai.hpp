@@ -30,9 +30,11 @@ namespace nim {
 struct MotionClip {
     TagHash clip;
     float seconds = 0;
-    float speed = 0;                   // m/s the clip stands for (from its feet, 推定)
+    float speed = 0;                   // m/s the clip stands for (root motion / duration; from its feet when it has none, 推定)
     std::array<float, 2> direction{};  // object space, x forward
     bool cyclic = true;                // false: played forwards and back (an idle that does not loop)
+    bool authored = false;             // speed and direction from the clip's root motion
+    float yaw = 0;                     // turns in place: radians over the clip (+ = left)
 };
 // Seconds into a clip of `length` for a clock `time` (back and forth when not cyclic).
 float motion_clip_time(const MotionClip& clip, float time);
@@ -41,17 +43,23 @@ struct MotionSet {
     TagHash skeleton, rig;               // the entity's own components the clips were measured with
     std::vector<MotionClip> locomotion;  // cyclic clips that travel
     std::optional<MotionClip> idle;      // the longest cyclic clip that stands still
+    std::vector<MotionClip> turns;       // clips whose root motion turns in place (20..180 degrees, < 4 cm travel)
+    // The character's own forward locomotion speeds (slowest and fastest forward clip with root
+    // motion); 0 when it has none. The simulation patrols and runs at these instead of AiParams.
+    float walk_speed = 0, run_speed = 0;
     std::string error;                   // why the set is empty, if it is
 };
 // Reads the entity's skeleton, rig and motion-bank clips and measures each clip's gait at `fps`
-// (推定: the clip rate is not decoded). Locomotion: cyclic, 0.6 m/s or faster, foot lift
-// 0.1..0.6 m. Idle: cyclic, slower than 0.15 m/s, foot lift under 0.08 m, at least 1 s; when no
+// (推定: the clip rate is not decoded; speeds come from the clips' root motion where they have it).
+// Locomotion: cyclic, 0.6 m/s or faster, foot lift 0.1..0.6 m. Idle: cyclic, slower than 0.15 m/s, foot lift under 0.08 m, at least 1 s; when no
 // clip qualifies, the longest such clip that does not loop (played back and forth).
 // Characters with no locomotion clip hold their position in the simulation (推定).
 MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps);
 struct MotionChoice {
     std::optional<size_t> locomotion;  // index into MotionSet::locomotion; none = idle
+    std::optional<size_t> turn;        // index into MotionSet::turns while turning in place
     float rate = 1;                    // playback rate: actual speed / clip speed, clamped 0.6..1.6
+    bool operator==(const MotionChoice&) const = default;
 };
 // The locomotion clip whose velocity (speed x direction) is nearest `local_velocity` (object space,
 // x forward); idle below 0.2 m/s.
@@ -194,6 +202,9 @@ public:
     // A body's clearance from walls (m), per MapGameplay::characters (default 0.3).
     void set_character_radius(size_t character, float radius);
     float radius(const AiAgent& agent) const;
+    // Patrol / alerted speeds: the character's own forward clips' root motion, else AiParams (推定).
+    float walk_speed(const AiAgent& agent) const;
+    float run_speed(const AiAgent& agent) const;
     // Open floor at (x, y) near height z for a body of `radius`, on any grid or patch.
     bool open_at(float x, float y, float z, float radius) const;
     // The most room (m to a wall or prop) at (x, y) near height z over the grids and patches (0: none).

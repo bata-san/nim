@@ -50,7 +50,8 @@ Skeleton load_skeleton(PackageManager& pm, TagHash component);
 // ---- Animation rig -------------------------------------------------------------------------------
 // S8080AD7E (inside a component tag next to the skeleton in the entity). Clips address bones in
 // rig order; the rig maps each to a skeleton bone and says in which space the clip's rotation is:
-// 0xA8 Vec of 72-byte nodes (i16 at +8: 0/1 parent-relative, 2/6 object space), 0xB8 a default
+// 0xA8 Vec of 72-byte nodes (i16 at +8: 0/1 parent-relative, 2/6 object space; i16 +0x2C/+0x2E an
+// IK chain's end and root skeleton bones, root -1 for none), 0xB8 a default
 // pose (32 B transforms, rig order), 0xE0 skeleton -> rig and 0xF0 rig -> skeleton (u16).
 struct AnimationBoneGroup {
     uint32_t hash = 0, bones = 0;
@@ -65,6 +66,11 @@ struct AnimationRig {
     std::vector<BoneTransform> default_pose;  // rig order
     std::vector<AnimationBoneGroup> bone_groups;
     std::vector<uint8_t> node_layout;         // full authored node records for layout comparisons
+    // Per rig node: the skeleton bone at the root of the IK chain that ends at this node's bone, or
+    // -1 (node +0x2C i16 chain end = its own bone, +0x2E i16 chain root). The UESC robots chain
+    // thigh -> knee -> ankle and upper arm -> elbow -> wrist; the node's translation track is the
+    // chain's target.
+    std::vector<int16_t> ik_root;
     size_t size() const { return skeleton_bone.size(); }
 };
 AnimationRig load_animation_rig(PackageManager& pm, TagHash component);
@@ -123,6 +129,10 @@ struct AnimationClip {
     uint32_t bone_count = 0;
     std::vector<AnimationBoneGroup> bone_groups;
     ClipCodec codec = ClipCodec::Static;
+    // Header +0x70: the body's travel over the whole clip in object space (x forward, y left):
+    // quaternion, translation, then 1. A locomotion cycle stores its stride (assault walk 1.72 m,
+    // run 3.2 m forward), a turn in place its yaw (+-60/90/100 degrees); most other clips identity.
+    BoneTransform root_motion;
     template <typename T> struct Track { uint16_t bone = 0; std::vector<T> frames; };  // one entry = constant
     std::vector<Track<std::array<float, 4>>> rotations;
     std::vector<Track<std::array<float, 3>>> translations;
@@ -154,8 +164,11 @@ void sample_clip(const AnimationClip& clip, float frame, std::vector<BoneTransfo
 bool is_additive(const AnimationRig& rig, const AnimationClip& clip);
 // Object-space skeleton pose for a clip of the rig at `frame` (additive clips are applied to the
 // rig's default pose). Rotations follow the rig's per-bone
-// space; bone offsets stay those of the bind pose, except that bones directly under the root move
-// by the clip translation (object space, relative to bind). Root motion is dropped.
+// space (object-space rotations are absolute); bone offsets stay those of the bind pose, except that
+// bones directly under the root move by the clip translation (object space: absolute when the rig
+// default sits nearer the bind position than the origin, else relative to bind). Root motion is
+// dropped. Two-bone IK chains whose target is a ground-level object-space position (the robots'
+// feet) are then solved onto the target, keeping the FK bend plane.
 void pose_skeleton(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip, float frame,
                    std::vector<BoneTransform>& object, bool authored_local_offsets = false);
 
@@ -188,7 +201,11 @@ struct ClipGait {
     std::array<float, 2> direction{};    // unit xy in object space (x = forward), zero when standing
     float lift = 0;                      // max foot height range, metres
     bool cyclic = false;
+    bool authored = false;               // speed and direction from the clip's root motion, not its feet
+    float yaw = 0;                       // radians the root motion turns (+ = left, about +z)
 };
+// A clip with root motion (AnimationClip::root_motion, 2 cm or more of travel) takes its speed and
+// direction from it: travel / duration at `fps`. The feet still give lift and cyclic.
 ClipGait measure_clip_gait(const Skeleton& skeleton, const AnimationRig& rig, const AnimationClip& clip,
                            std::array<int, 2> feet, float fps);
 

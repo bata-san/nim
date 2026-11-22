@@ -227,6 +227,45 @@ int main() {
     }
 
     {
+        // A ground-level IK target (the robots' feet, 3.80): thigh and knee turn so the ankle reaches
+        // the target node's translation; the limb keeps its lengths and the knee its bend side.
+        Skeleton leg;
+        leg.parents = {-1, 0, 1, 2, 3};
+        leg.hashes = {1, 2, 3, 4, 5};
+        leg.bind.resize(5);
+        leg.bind[1].translation = {0, 0, 1};
+        leg.bind[2].translation = {0, 0.1f, 1};
+        leg.bind[3].translation = {0.05f, 0.1f, 0.55f};
+        leg.bind[4].translation = {0, 0.1f, 0.1f};
+        leg.local_bind.resize(5);
+        for (size_t i = 0; i < 5; ++i)
+            leg.local_bind[i] = leg.parents[i] < 0 ? leg.bind[i] : inverse(leg.bind[size_t(leg.parents[i])]) * leg.bind[i];
+        AnimationRig rig;
+        rig.skeleton_bone = {0, 2, 3, 4};
+        rig.object_space = {0, 1, 1, 1};
+        rig.default_pose.resize(4);
+        rig.default_pose[3].translation = {0, 0.1f, 0.1f};
+        rig.ik_root = {-1, -1, -1, 2};
+        AnimationClip clip;
+        clip.frame_count = 1;
+        clip.translations = {{3, {{0.12f, 0.1f, 0.12f}}}};
+        std::vector<BoneTransform> posed;
+        pose_skeleton(leg, rig, clip, 0, posed);
+        auto dist = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+            return std::hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+        };
+        CHECK(dist(posed[4].translation, {0.12f, 0.1f, 0.12f}) < 1e-3f);
+        CHECK(std::fabs(dist(posed[2].translation, posed[3].translation) - dist(leg.bind[2].translation, leg.bind[3].translation)) < 1e-3f);
+        CHECK(std::fabs(dist(posed[3].translation, posed[4].translation) - dist(leg.bind[3].translation, leg.bind[4].translation)) < 1e-3f);
+        // Still bent forward: the knee is in front of the hip-ankle line.
+        CHECK(posed[3].translation[0] > 0.12f * (1 - posed[3].translation[2]) / 0.88f + 0.02f);
+        CHECK(std::fabs(posed[4].rotation[3]) > 0.9999f);  // the ankle keeps its own object rotation
+        clip.translations = {{3, {{0.6f, 0.1f, 0.1f}}}};  // far from the FK ankle: not a target
+        pose_skeleton(leg, rig, clip, 0, posed);
+        CHECK(dist(posed[4].translation, leg.bind[4].translation) < 1e-4f);
+    }
+
+    {
         // A local mechanical joint slides and scales. Its child follows the resulting transform.
         Skeleton mechanism;
         mechanism.parents = {-1, 0, 1};

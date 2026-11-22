@@ -1351,8 +1351,10 @@ int cmd_motion_probe(PackageManager& pm, TagHash entity) {
             const auto c = load_animation_clip(pm, clip);
             if (c.bone_count != rig.size()) continue;
             const auto g = measure_clip_gait(skeleton, rig, c, *feet, 30.0f);
-            std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f} dir ({:5.2f} {:5.2f})", clip.str(), c.frame_count, g.seconds,
-                         g.cyclic ? 1 : 0, g.lift, g.speed, g.direction[0], g.direction[1]);
+            std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f}{} dir ({:5.2f} {:5.2f}) root ({:6.3f} {:6.3f} {:6.3f}) yaw {:6.1f}",
+                         clip.str(), c.frame_count, g.seconds, g.cyclic ? 1 : 0, g.lift, g.speed, g.authored ? "*" : " ", g.direction[0],
+                         g.direction[1], c.root_motion.translation[0], c.root_motion.translation[1], c.root_motion.translation[2],
+                         g.yaw * 57.2957795f);
         } catch (const std::exception& e) {
             std::println("{} {}", clip.str(), e.what());
         }
@@ -1379,8 +1381,9 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
     }
     for (size_t c = 0; c < g.characters.size(); ++c) {
         const auto& m = motions[c];
-        std::println("  motion {} {:<28} {} locomotion clips, idle {}{}", g.characters[c].entity.str(), g.characters[c].name_estimate,
-                     m.locomotion.size(), m.idle ? m.idle->clip.str() : "-", m.error.empty() ? "" : "  (" + m.error + ")");
+        std::println("  motion {} {:<28} {} locomotion clips, {} turns, walk {:.2f} run {:.2f} m/s, idle {}{}", g.characters[c].entity.str(),
+                     g.characters[c].name_estimate, m.locomotion.size(), m.turns.size(), m.walk_speed, m.run_speed,
+                     m.idle ? m.idle->clip.str() : "-", m.error.empty() ? "" : "  (" + m.error + ")");
     }
     AiParams params;
     params.player_invisible = !visible;
@@ -2466,6 +2469,48 @@ int cmd_clip(PackageManager& pm, TagHash tag, int frame) {
     return 0;
 }
 
+// Offsets in a tag where a u32 names a tag of the given reference class (or any class with 0).
+int cmd_tag_class_refs(PackageManager& pm, TagHash tag, uint32_t cls) {
+    const auto bytes = pm.read(tag);
+    TagReader r(bytes);
+    for (size_t o = 0; o + 4 <= bytes.size(); o += 4) {
+        const TagHash h(r.u32_at(o));
+        if (!h.is_pkg_ref()) continue;
+        const Entry* e = pm.entry(h);
+        if (!e || (cls && e->reference != cls)) continue;
+        std::println("+{:05X} {} type {}/{} ref {:08X}", o, h.str(), e->type, e->subtype, e->reference);
+    }
+    return 0;
+}
+
+// Every frame of the chosen rig bones' tracks (comma-separated rig indices).
+int cmd_clip_tracks(PackageManager& pm, TagHash tag, const std::string& list) {
+    AnimationClip c = load_animation_clip(pm, tag);
+    std::vector<int> bones;
+    for (size_t at = 0; at < list.size();) {
+        const size_t end = std::min(list.find(',', at), list.size());
+        bones.push_back(std::stoi(list.substr(at, end - at)));
+        at = end + 1;
+    }
+    for (uint32_t f = 0; f < c.frame_count; ++f) {
+        std::print("{:3}", f);
+        for (const int b : bones) {
+            for (const auto& t : c.translations)
+                if (t.bone == b) {
+                    const auto& p = t.frames[std::min<size_t>(f, t.frames.size() - 1)];
+                    std::print("  p{}({:7.4f},{:7.4f},{:7.4f})", b, p[0], p[1], p[2]);
+                }
+            for (const auto& t : c.rotations)
+                if (t.bone == b) {
+                    const auto& q = t.frames[std::min<size_t>(f, t.frames.size() - 1)];
+                    std::print("  r{}({:6.3f},{:6.3f},{:6.3f},{:6.3f})", b, q[0], q[1], q[2], q[3]);
+                }
+        }
+        std::println("");
+    }
+    return 0;
+}
+
 // Decodes every clip; codec histogram and failures.
 int cmd_clips(PackageManager& pm, uint32_t bones) {
     std::map<std::string, size_t> codecs;
@@ -3381,6 +3426,8 @@ int main(int argc, char** argv) {
         if (cmd == "animaudit") return cmd_animaudit(pm);
         if (cmd == "objaudit") return cmd_objaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
+        if (cmd == "clip-tracks" && args.size() >= 3) return cmd_clip_tracks(pm, TagHash(parse_hex(args[1])), args[2]);
+        if (cmd == "tag-class-refs" && args.size() >= 2) return cmd_tag_class_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));

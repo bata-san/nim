@@ -72,11 +72,14 @@ void blend_skin_pose(const Skeleton& skeleton, std::span<const BoneTransform> fr
 }
 
 const MotionClip* chosen_clip(const MotionSet& m, const MotionChoice& choice) {
+    if (choice.turn && *choice.turn < m.turns.size()) return &m.turns[*choice.turn];
     if (choice.locomotion && *choice.locomotion < m.locomotion.size()) return &m.locomotion[*choice.locomotion];
     return m.idle ? &*m.idle : nullptr;
 }
 const MotionClip* clip_by_tag(const MotionSet& m, TagHash tag) {
     for (const auto& c : m.locomotion)
+        if (c.clip == tag) return &c;
+    for (const auto& c : m.turns)
         if (c.clip == tag) return &c;
     if (m.idle && m.idle->clip == tag) return &*m.idle;
     return nullptr;
@@ -129,6 +132,7 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
             if (it != sources.clips.end()) wanted.push_back(*it);
         };
         for (const auto& m : motion.locomotion) want(m);
+        for (const auto& m : motion.turns) want(m);
         if (motion.idle) want(*motion.idle);
         std::string why;
         for (const auto model : models) {
