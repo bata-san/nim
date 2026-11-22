@@ -248,7 +248,9 @@ struct Fonts {
     ImFont* bold = nullptr;
     ImFont* heading = nullptr;  // titles (the bold face)
     ImFont* button = nullptr;   // labels and buttons (medium)
-    ImFont* mono = nullptr;     // PP Fraktion Mono: tags and numbers
+    ImFont* mono = nullptr;     // PP Fraktion Mono Regular: terminal body, tags and numbers
+    ImFont* mono_med = nullptr; // PP Fraktion Mono Medium: terminal headers and rules
+    ImFont* wide = nullptr;     // MarathonShapiro Wide 65: CyberAcme ticker bars
     bool from_game = false;
 };
 Fonts g_fonts;
@@ -348,10 +350,16 @@ void load_fonts(PackageManager* pm) {
     g_fonts.mono = add(game_font("PPFraktionMono-Regular"), 15, nullptr);
     if (!g_fonts.mono) g_fonts.mono = add(first_sys({"consola.ttf"}), 15, nullptr);
     cjk(g_fonts.mono, "NotoSansJP-Regular");
+    g_fonts.mono_med = add(game_font("PPFraktionMono-Medium"), 15, nullptr);
+    if (g_fonts.mono_med) cjk(g_fonts.mono_med, "NotoSansJP-Medium");
+    g_fonts.wide = add(game_font("MarathonShapiro-Wide65"), 15, nullptr);
+    if (!g_fonts.wide) g_fonts.wide = add(game_font("Shapiro-65LightHeavyWide"), 15, nullptr);
     if (!g_fonts.bold) g_fonts.bold = g_fonts.body;
     if (!g_fonts.heading) g_fonts.heading = g_fonts.bold;
     if (!g_fonts.button) g_fonts.button = g_fonts.body;
     if (!g_fonts.mono) g_fonts.mono = g_fonts.body;
+    if (!g_fonts.mono_med) g_fonts.mono_med = g_fonts.mono;
+    if (!g_fonts.wide) g_fonts.wide = g_fonts.bold;
     io.FontDefault = g_fonts.body;
 }
 
@@ -4733,7 +4741,7 @@ public:
             root_dl->AddLine({b0.x, b0.y}, {b1.x, b0.y}, kCxRule, 1.0f);
             root_dl->AddLine({b0.x, b1.y - 1.0f}, {b1.x, b1.y - 1.0f}, kCxRule, 1.0f);
             const std::string unit = std::format("CYBERACME 802.11 (NEURO.FILTER)   {}   ", sep);
-            ImGui::PushFont(g_fonts.mono, ImGui::GetFontSize() * 0.92f / sc);
+            ImGui::PushFont(g_fonts.wide, ImGui::GetFontSize() * 0.90f / sc);
             const ImVec2 us = ImGui::CalcTextSize(unit.c_str());
             const float step = std::max(us.x, 40.0f * sc);
             const float clip_r = with_close ? (b1.x - bar_h - 6 * sc) : b1.x;
@@ -4850,6 +4858,7 @@ public:
         };
 
         // Header: collection name + version tag on line 1, entry title on line 2, === rule on line 3.
+        ImGui::PushFont(g_fonts.mono_med, 0);
         const std::string col_title = upper_ascii(text(c.title, lang));
         const std::string ent_title = upper_ascii(text(e.title, lang));
         const std::string ver = std::format("v.1.{:03d}.{:02d}.tciv", codex.collection + 1, codex.entry + 1);
@@ -4865,6 +4874,7 @@ public:
         ImGui::TextColored(col4(kCxGreen), "%s", ent_title.empty() ? std::format("{:08X}", e.hash).c_str() : ent_title.c_str());
         ImGui::PopTextWrapPos();
         eq_rule(col_right_w - 14 * sc);
+        ImGui::PopFont();
         ImGui::Dummy({0, 4 * sc});
 
         // Scrollable body child with thin dark scrollbar on the far right edge.
