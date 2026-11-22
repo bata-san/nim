@@ -1,5 +1,7 @@
 #include "nim/render/ai_actors.hpp"
 
+#include <limits>
+
 #include "nim/core/package_manager.hpp"
 
 #include <algorithm>
@@ -265,6 +267,7 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         if (s.agent && wanted[s.character].erase(*s.agent)) continue;
         s.agent.reset();
         s.anim = {};
+        s.lift = std::numeric_limits<float>::quiet_NaN();
     }
     for (auto& s : slots_) {
         if (s.agent || wanted[s.character].empty()) continue;
@@ -283,7 +286,16 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
             scene.set_actor(s.actor, std::nullopt);
             continue;
         }
-        scene.set_actor(s.actor, actor_rows(a), std::move(poses));
+        // Grounding (推定, in place of the engine's foot IK, not in game data): the lowest point
+        // of the posed mesh is put on the floor surface under the agent, eased at 12/s.
+        auto rows = actor_rows(a);
+        if (const auto lowest = scene.actor_lowest(s.actor, poses)) {
+            const float floor = sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
+            const float target = floor - *lowest - a.position[2];
+            s.lift = std::isnan(s.lift) || dt <= 0 ? target : s.lift + (target - s.lift) * std::min(1.0f, dt * 12);
+            rows[11] += s.lift;
+        }
+        scene.set_actor(s.actor, rows, std::move(poses));
         ++shown_;
     }
 }
@@ -341,6 +353,7 @@ WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& 
 
     grid.x0 = cx - half, grid.y0 = cy - half, grid.cell = cell, grid.w = grid.h = size;
     std::vector<uint8_t> open(size_t(size) * size, 0);
+    grid.height.assign(size_t(size) * size, std::numeric_limits<float>::quiet_NaN());
     for (uint32_t r = 0; r < size; ++r) {
         const float y = grid.y0 + (float(r) + 0.5f) * cell;
         for (uint32_t c = 0; c < size; ++c) {
@@ -362,6 +375,7 @@ WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& 
             const float dv = depth[size_t(size - 1 - r) * size + c];  // texture row 0 = largest y
             if (dv <= 0) continue;                                      // no surface: not floor
             const float surface = top - (1 - dv) * range;
+            grid.height[size_t(r) * size + c] = surface;
             open[size_t(r) * size + c] = surface > *floor - 0.35f && surface < *floor + 0.45f;
         }
     }

@@ -349,6 +349,8 @@ public:
     uint32_t add_actor(Gpu& gpu, const PreparedMesh& mesh, const std::vector<std::vector<InputElement>>& layouts);
     void set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses = {});
     size_t actor_count() const { return actors_.size(); }
+    // The lowest z of the actor's skinned vertices (every 4th) in object space under `poses`.
+    std::optional<float> actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const;
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }

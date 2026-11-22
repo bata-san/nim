@@ -33,6 +33,24 @@ bool WalkGrid::walkable(float x, float y) const {
     return open[size_t(fy) * w + size_t(fx)] != 0;
 }
 
+std::optional<float> WalkGrid::surface(float x, float y) const {
+    if (!w || height.size() != size_t(w) * h) return std::nullopt;
+    const float fx = (x - x0) / cell, fy = (y - y0) / cell;
+    if (fx < 0 || fy < 0 || fx >= float(w) || fy >= float(h)) return std::nullopt;
+    const float v = height[size_t(fy) * w + size_t(fx)];
+    if (std::isnan(v)) return std::nullopt;
+    return v;
+}
+
+std::optional<float> AiSimulation::ground(float x, float y, float z) const {
+    std::optional<float> best;
+    for (const auto& g : grids_) {
+        const auto s = g.surface(x, y);
+        if (s && std::abs(*s - z) < 1.5f && (!best || std::abs(*s - z) < std::abs(*best - z))) best = s;
+    }
+    return best;
+}
+
 bool WalkGrid::clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const {
     if (!w) return true;
     const float d = std::hypot(b[0] - a[0], b[1] - a[1]);

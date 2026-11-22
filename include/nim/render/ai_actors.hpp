@@ -6,6 +6,7 @@
 #include "nim/sim/ai.hpp"
 
 #include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -77,6 +78,7 @@ private:
         uint32_t actor = 0;
         std::optional<size_t> agent;
         ActorAnimator anim;
+        float lift = std::numeric_limits<float>::quiet_NaN();  // grounding offset (m)
     };
     std::vector<ActorCharacter> characters_;
     std::vector<std::optional<size_t>> by_character_;  // MapGameplay::characters -> characters_

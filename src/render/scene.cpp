@@ -3273,6 +3273,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
             pack_skin_vertex((p - set.skin_pack_offset) * inv_range, normalize(nr), normalize(tg), dst + i * 2, dst + n * 2 + i * 2);
         }
     });
+
     constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     for (const auto& job : jobs) {
         BufferSet& set = *job.set;
@@ -3323,6 +3324,37 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     }
     gpu.flush();
     return id;
+}
+
+std::optional<float> StaticMeshScene::actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const {
+    // Every 4th vertex of the actor's skinned sets, posed as update_skin does (object space).
+    std::optional<float> lowest;
+    for (const auto index : actors_.at(actor).sets) {
+        const auto& set = sets_[index];
+        if (set.skin.bones.empty() || set.vb0_cpu.size() < set.skin.bones.size() * 24) continue;
+        const auto pose = std::ranges::find(poses, set.model, &ModelSkinPose::model);
+        if (pose == poses.end()) continue;
+        const auto& bones = pose->bones;
+        for (size_t i = 0; i < set.skin.bones.size(); i += 4) {
+            const uint8_t* v = set.vb0_cpu.data() + i * 24;
+            const V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
+                       s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
+            float z = 0, total = 0;
+            for (int k = 0; k < 4; ++k) {
+                const float wk = set.skin.weights[i][k];
+                const uint16_t bk = set.skin.bones[i][k];
+                if (wk <= 0 || bk >= bones.size()) continue;
+                const auto& t = bones[bk];
+                const float x = t.rotation[0], y = t.rotation[1], qz = t.rotation[2], w = t.rotation[3], s = t.scale;
+                z += wk * ((2 * (x * qz - y * w) * p.x + 2 * (y * qz + x * w) * p.y + (1 - 2 * (x * x + y * y)) * p.z) * s + t.translation[2]);
+                total += wk;
+            }
+            if (total <= 0) continue;
+            z /= total;
+            if (!lowest || z < *lowest) lowest = z;
+        }
+    }
+    return lowest;
 }
 
 void StaticMeshScene::set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses) {

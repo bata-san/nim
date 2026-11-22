@@ -61,7 +61,9 @@ struct WalkGrid {
     float x0 = 0, y0 = 0, cell = 0.25f;  // world xy of cell (0, 0)'s corner, cell size (m)
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> open;           // w x h, row-major from y0
+    std::vector<float> height;           // w x h top surface z (NaN: none drawn), for grounding
     bool walkable(float x, float y) const;
+    std::optional<float> surface(float x, float y) const;
     bool clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const;  // the straight segment
     size_t open_count() const;
 };
@@ -135,6 +137,8 @@ public:
     const WalkGrid* walk_grid(size_t firing_area) const { return has_walk_grid(firing_area) ? &grids_[firing_area] : nullptr; }
     bool has_walk_grid(size_t firing_area) const { return firing_area < grids_.size() && grids_[firing_area].w != 0; }
     float time() const { return time_; }
+    // The top surface under (x, y) nearest `z` (within 1.5 m) from the walk grids, if any.
+    std::optional<float> ground(float x, float y, float z) const;
 
 private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
