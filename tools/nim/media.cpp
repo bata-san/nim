@@ -524,6 +524,13 @@ size_t AmbientAudioPlayer::decoded_count() const {
     return decoded_.size();
 }
 
+float AmbientAudioPlayer::next_random_unit() {
+    rng_state_ ^= rng_state_ << 13;
+    rng_state_ ^= rng_state_ >> 17;
+    rng_state_ ^= rng_state_ << 5;
+    return float(rng_state_ & 0x00FFFFFFu) / float(0x01000000u);
+}
+
 void AmbientAudioPlayer::request_decode(TagHash wem) {
     if (wem.is_none()) return;
     std::lock_guard lk(mutex_);
@@ -578,10 +585,11 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
         active_voices_ = 0;
         return;
     }
-    constexpr size_t kMaxVoices = 12;
+    constexpr size_t kMaxVoices = 8;
+    constexpr double kLoopThresholdSec = 10.0;  // >= 10s: continuous ambient bed; < 10s: periodic one-shot
     struct Candidate {
         uint32_t event_tag = 0;
-        TagHash wem;
+        const MapAudioEmitter* emitter = nullptr;
         float weight = 0.0f;
         float pan = 0.0f;
     };
@@ -611,15 +619,14 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
                 if (w > c.weight) {
                     c.weight = w;
                     c.pan = pan;
+                    c.emitter = &em;
                 }
                 merged = true;
                 break;
             }
         }
         if (!merged) {
-            // Deterministically pick one WEM stream from the event's variations.
-            const TagHash wem = em.wems[em.event_id % em.wems.size()];
-            best.push_back({em.event.value, wem, w, pan});
+            best.push_back({em.event.value, &em, w, pan});
         }
     }
     if (best.size() > kMaxVoices) {
@@ -636,7 +643,8 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
         return nullptr;
     };
 
-    const float smooth = 1.0f - std::exp(-std::clamp(dt, 0.001f, 0.1f) * 5.0f);
+    const float clamped_dt = std::clamp(dt, 0.001f, 0.1f);
+    const float smooth = 1.0f - std::exp(-clamped_dt * 5.0f);
     // Fade out voices no longer in `best`.
     for (auto& v : voices_) {
         const auto it = std::find_if(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
@@ -647,46 +655,94 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
     }
     std::erase_if(voices_, [&](const ActiveVoice& v) {
         const bool wanted = std::any_of(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
-        return !wanted && v.volume < 0.004f;
+        return !wanted && (v.volume < 0.004f || (!v.looping && (!v.voice || v.voice->queued() == 0)));
     });
 
     // Update or start wanted voices.
-    const float mix_scale = 0.28f * master_volume;  // keep 12 concurrent ambient beds balanced without clipping
+    const float mix_scale = 0.22f * master_volume;
     size_t playing = 0;
     for (const auto& c : best) {
-        const float target_vol = std::min(c.weight * mix_scale, 0.85f * master_volume);
+        const auto& wems = c.emitter->wems;
+        const float target_vol = std::min(c.weight * mix_scale, 0.75f * master_volume);
         auto it = std::find_if(voices_.begin(), voices_.end(), [&](const ActiveVoice& v) { return v.event_tag == c.event_tag; });
         if (it != voices_.end()) {
-            it->volume += (target_vol - it->volume) * smooth;
             it->pan += (c.pan - it->pan) * smooth;
-            if (it->voice) {
-                it->voice->set_volume(it->volume);
-                it->voice->set_pan(it->pan, engine_.master_channels());
-                if (it->volume > 0.005f) ++playing;
+            if (it->looping) {
+                it->volume += (target_vol - it->volume) * smooth;
+                if (it->voice) {
+                    it->voice->set_volume(it->volume);
+                    it->voice->set_pan(it->pan, engine_.master_channels());
+                    if (it->volume > 0.005f) ++playing;
+                }
+            } else {
+                // Periodic one-shot: wait a natural randomized interval between plays and cycle variations.
+                const bool busy = it->voice && it->voice->queued() > 0;
+                if (busy) {
+                    it->volume += (target_vol - it->volume) * smooth;
+                    it->voice->set_volume(it->volume);
+                    it->voice->set_pan(it->pan, engine_.master_channels());
+                    ++playing;
+                } else {
+                    it->voice.reset();
+                    it->cooldown -= clamped_dt;
+                    if (it->cooldown <= 0.0f) {
+                        const TagHash next_wem = wems[it->next_index % wems.size()];
+                        auto pcm = find_pcm(next_wem);
+                        if (!pcm) {
+                            request_decode(next_wem);
+                        } else {
+                            it->wem = next_wem;
+                            it->pcm = std::move(pcm);
+                            it->next_index = (it->next_index + 1u + uint32_t(next_random_unit() * float(wems.size()))) % uint32_t(wems.size());
+                            it->voice = std::make_unique<Voice>(engine_, it->pcm->sample_rate, it->pcm->channels);
+                            if (it->voice->ok()) {
+                                it->volume = target_vol;
+                                it->voice->set_volume(it->volume);
+                                it->voice->set_pan(it->pan, engine_.master_channels());
+                                auto alias = std::shared_ptr<const std::vector<int16_t>>(it->pcm, &it->pcm->samples);
+                                it->voice->submit(alias, true);
+                                it->voice->start();
+                                // Natural pause before next one-shot: 6..18 s (longer when many variations exist).
+                                it->cooldown = 6.0f + next_random_unit() * 12.0f;
+                                ++playing;
+                            }
+                        }
+                    }
+                }
             }
             continue;
         }
-        auto pcm = find_pcm(c.wem);
+        const uint32_t start_idx = uint32_t(c.emitter->event_id % wems.size());
+        const TagHash wem = wems[start_idx];
+        auto pcm = find_pcm(wem);
         if (!pcm) {
-            request_decode(c.wem);
+            request_decode(wem);
             continue;
         }
         if (voices_.size() >= kMaxVoices + 4) continue;
         ActiveVoice av;
         av.event_tag = c.event_tag;
-        av.wem = c.wem;
+        av.wem = wem;
         av.pcm = std::move(pcm);
-        av.voice = std::make_unique<Voice>(engine_, av.pcm->sample_rate, av.pcm->channels);
-        if (av.voice->ok()) {
-            av.volume = target_vol * smooth;
-            av.pan = c.pan;
-            av.voice->set_volume(av.volume);
-            av.voice->set_pan(av.pan, engine_.master_channels());
-            auto alias = std::shared_ptr<const std::vector<int16_t>>(av.pcm, &av.pcm->samples);
-            av.voice->submit_looping(alias);
-            av.voice->start();
+        av.pan = c.pan;
+        av.looping = av.pcm->seconds() >= kLoopThresholdSec;
+        av.next_index = (start_idx + 1u) % uint32_t(wems.size());
+        if (av.looping) {
+            av.voice = std::make_unique<Voice>(engine_, av.pcm->sample_rate, av.pcm->channels);
+            if (av.voice->ok()) {
+                av.volume = target_vol * smooth;
+                av.voice->set_volume(av.volume);
+                av.voice->set_pan(av.pan, engine_.master_channels());
+                auto alias = std::shared_ptr<const std::vector<int16_t>>(av.pcm, &av.pcm->samples);
+                av.voice->submit_looping(alias);
+                av.voice->start();
+                voices_.push_back(std::move(av));
+                ++playing;
+            }
+        } else {
+            // Stagger initial one-shot trigger (1..9 s) so entering an area does not fire every sound at once.
+            av.cooldown = 1.0f + next_random_unit() * 8.0f;
             voices_.push_back(std::move(av));
-            ++playing;
         }
     }
     active_voices_ = playing;

@@ -1531,6 +1531,7 @@ public:
     LightingPass lighting;
     GameLighting game_lighting;
     ParticleScene particles;  // the map's FX
+    bool fx_enabled = true;
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
@@ -2725,7 +2726,7 @@ public:
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
                 GameLighting::TransparentFn transparents;
-                const bool fx = map_scene && particles.loaded();
+                const bool fx = map_scene && fx_enabled && particles.loaded();
                 if (scene.has_transparent() || fx) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
                     if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting);
                     if (fx) particles.render(gpu, c, gb, hdr, vm, game_lighting.externs(), light.delta_time);
@@ -3529,6 +3530,7 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::SSRTip));
             ImGui::Checkbox(ui::tr(ui::S::LightShafts), &light.volumetrics);
             ImGui::SetItemTooltip(ui::tr(ui::S::LightShaftsTip));
+            if (map_scene) ImGui::Checkbox("FX (パーティクル)", &fx_enabled);
             ImGui::Checkbox(ui::tr(ui::S::PostProcess), &light.post);
             ImGui::SetItemTooltip(ui::tr(ui::S::PostProcessTip));
             ImGui::BeginDisabled(!light.post);

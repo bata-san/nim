@@ -184,14 +184,19 @@ private:
         std::unique_ptr<Voice> voice;
         float volume = 0.0f;
         float pan = 0.0f;
+        bool looping = false;
+        float cooldown = 0.0f;  // remaining wait seconds before next one-shot trigger
+        uint32_t next_index = 0;
     };
     void decode_loop();
     void request_decode(TagHash wem);
+    float next_random_unit();
 
     AudioEngine& engine_;
     std::shared_ptr<const MapAudio> audio_;
     std::vector<ActiveVoice> voices_;
     size_t active_voices_ = 0;
+    uint32_t rng_state_ = 0x12345678u;
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
