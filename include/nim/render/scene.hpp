@@ -18,6 +18,7 @@
 namespace nim {
 
 class ExternStore;
+class GameLighting;
 
 // ---- small math (column vectors; M4 stores 4 columns) -----------------------------------------
 struct V3 { float x = 0, y = 0, z = 0; };
@@ -333,7 +334,7 @@ public:
     // against the G-buffer depth read-only. The depth must be in DEPTH_READ.
     // Call from GameLighting's callback: inputs belong to this frame, after its atmosphere passes.
     void render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                            const ViewMatrices& vm, const ExternStore& inputs);
+                            const ViewMatrices& vm, const GameLighting& lighting);
     bool has_visible_distortion() const;
     uint32_t distortion_draws() const { return distortion_draws_; }
     void render_distortion(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h,
@@ -363,6 +364,9 @@ public:
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }
+    size_t transparent_local_reflections() const { return transparent_local_reflections_; }
+    size_t transparent_sky_reflections() const { return transparent_sky_reflections_; }
+    size_t transparent_local_probes() const { return transparent_local_probes_; }
     std::array<size_t, 3> visibility_counts() const;  // visible statics, LOD0 statics, visible placed entities
     // One clock for both shader stages and all passes; channel edits update constants in place.
     void set_material_frame(float seconds, float delta_seconds = 0);
@@ -408,6 +412,7 @@ private:
         std::vector<std::pair<uint32_t, GpuBuffer>> own_cbvs;  // (root parameter, constants)
         std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_regs;
         std::vector<std::pair<uint32_t, uint32_t>> scope_slots;                   // (root parameter, scope_defs_ slot)
+        bool object_reflection = false;
         std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
         std::vector<float4> vs_constants, ps_constants;
         struct AnimatedAtlas { AtlasOperands operands; float4 uv; uint16_t frames; };
@@ -438,7 +443,7 @@ private:
     static constexpr uint32_t kSrvCopies = Gpu::kFramesInFlight + 1;
     uint32_t srv_frame_ = 0;
     void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
-                    bool shadow = false);
+                    bool shadow = false, const GameLighting* lighting = nullptr);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage = 0,
                           const ExternStore* frame_inputs = nullptr);
     std::unique_ptr<ExternStore> material_externs_;
@@ -458,6 +463,7 @@ private:
     TagHash tag_;
     size_t world_transparent_draws_ = 0;
     size_t sky_transparent_draws_ = 0;
+    size_t transparent_local_reflections_ = 0, transparent_sky_reflections_ = 0, transparent_local_probes_ = 0;
     uint64_t shadow_generation_ = 0;
     struct VisibilityKey {
         std::array<float, 16> view;
@@ -592,9 +598,9 @@ private:
     BufferArena arena_;  // geometry and fixed constants of this scene  // 1 x RGBA8 white: VS colour stream of meshes without one
     std::map<uint32_t, ComPtr<ID3D12Resource>> texture_cache_;
     std::unordered_map<uint32_t, GpuBuffer> geometry_cache_;
-    std::map<uint32_t, ComPtr<ID3D12RootSignature>> root_cache_;
+    std::map<uint64_t, ComPtr<ID3D12RootSignature>> root_cache_;
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
-    std::map<std::tuple<uint32_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
+    std::map<std::tuple<uint64_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;          // models in a single entity preview
     bool assembled_ = false;

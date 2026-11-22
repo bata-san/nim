@@ -1166,11 +1166,13 @@ void GameLighting::release(Gpu& gpu) {
     vol_downsample_.release(gpu);
     vol_blur_.release(gpu);
     vol_upres_.release(gpu);
+    vol_assemble_.release(gpu);
     for (auto& vp : vol_pipelines_) vp->release(gpu);
     vol_pipelines_.clear();
     vol_lights_.clear();
     vol_minmax_.Reset();
     for (auto& r : vol_layer_) r.Reset();
+    vol_intensity_.Reset();
     for (auto& r : vol_blurred_) r.Reset();
     vol_rtv_heap_.Reset();
     vw_ = vh_ = 0;
@@ -1284,8 +1286,16 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     // Volumetrics: the quarter-resolution min / max depth (x = max, y = min view depth, z = mean,
     // w = where the mean lies between them), the blur (far, near) and the upres, added to the HDR.
     load_sky(vol_downsample_, "downsample_full_depth_to_quarter_max_min", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
-    load_sky(vol_blur_, "volumetrics_blur_results", {DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}});
-    load_sky(vol_upres_, "volumetrics_upres_1", {DXGI_FORMAT_R16G16B16A16_FLOAT, true});
+    constexpr auto shaft_rgba = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    constexpr auto rgb = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    GamePipeline::Options shaft_blur{shaft_rgba, false, {shaft_rgba}};
+    shaft_blur.write_masks = {rgb, rgb};
+    load_sky(vol_blur_, "volumetrics_blur_results", shaft_blur);
+    GamePipeline::Options shaft_upres{shaft_rgba, true};
+    shaft_upres.write_masks = {rgb};
+    load_sky(vol_upres_, "volumetrics_upres_1", shaft_upres);
+    constexpr auto cdf = DXGI_FORMAT_R16_FLOAT;
+    load_sky(vol_assemble_, "volumetrics_assemble_intensity_slices", {cdf, false, {cdf, cdf, cdf}});
     load_sky(atmo_density_, "atmo_depth_angle_density_lookup_generate", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     load_sky(sky_near_, "sky_lookup_generate_near", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
     load_sky(sky_far_, "sky_lookup_generate_far", {DXGI_FORMAT_R16G16B16A16_FLOAT, false});
@@ -1402,6 +1412,8 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     clear_owned(ext::Deferred, 0xC8, light_specular_.Get());
     clear_owned(ext::Deferred, 0xD0, env_.Get());
     clear_owned(0x5D, 0x00, material_ao_.Get());
+    clear_owned(ext::Transparent, 0x48, vol_blurred_[0].Get());
+    clear_owned(ext::Transparent, 0x50, vol_intensity_.Get());
     for (uint32_t offset : {0u, 8u, 0x10u}) clear_owned(ext::ShadowMask, offset, shadow_mask_.Get());
     distortion_.Reset();
     distortion_depth_.Reset();
@@ -1440,16 +1452,39 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     {
         vw_ = std::max(1u, (w + 3) / 4);
         vh_ = std::max(1u, (h + 3) / 4);
-        D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 7};
+        D3D12_DESCRIPTOR_HEAP_DESC vd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, vol_assemble_.loaded() ? 15u : 7u};
         check_hr(gpu.device()->CreateDescriptorHeap(&vd, IID_PPV_ARGS(&vol_rtv_heap_)), "volumetrics RTV heap");
         const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
         D3D12_CLEAR_VALUE mm{DXGI_FORMAT_R32G32B32A32_FLOAT, {0, 0, 0, 0}};
         vol_minmax_ = gpu.texture2d(vw_, vh_, mm.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &mm);
         gpu.device()->CreateRenderTargetView(vol_minmax_.Get(), nullptr, vb);
+        const D3D12_CLEAR_VALUE clear_illuminance{cv.Format, {0, 0, 0, 1}};
         for (int i = 0; i < 6; ++i) {
             auto& r = i < 4 ? vol_layer_[i] : vol_blurred_[i - 4];
-            r = gpu.texture2d(vw_, vh_, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+            r = gpu.texture2d(vw_, vh_, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, i < 4 ? &cv : &clear_illuminance);
             gpu.device()->CreateRenderTargetView(r.Get(), nullptr, {vb.ptr + size_t(1 + i) * inc});
+        }
+        if (vol_assemble_.loaded()) {
+            D3D12_RESOURCE_DESC volume{};
+            volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            volume.Width = vw_;
+            volume.Height = vh_;
+            volume.DepthOrArraySize = 8;
+            volume.MipLevels = 1;
+            volume.Format = DXGI_FORMAT_R16_FLOAT;
+            volume.SampleDesc.Count = 1;
+            volume.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            const D3D12_HEAP_PROPERTIES memory{D3D12_HEAP_TYPE_DEFAULT};
+            check_hr(gpu.device()->CreateCommittedResource(&memory, D3D12_HEAP_FLAG_NONE, &volume,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(vol_intensity_.ReleaseAndGetAddressOf())),
+                "volumetric intensity distribution");
+            D3D12_RENDER_TARGET_VIEW_DESC slice{volume.Format, D3D12_RTV_DIMENSION_TEXTURE3D};
+            slice.Texture3D.WSize = 1;
+            for (UINT z = 0; z < 8; ++z) {
+                slice.Texture3D.FirstWSlice = z;
+                gpu.device()->CreateRenderTargetView(vol_intensity_.Get(), &slice, {vb.ptr + size_t(7 + z) * inc});
+            }
         }
     }
     sky_near_rt_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -1934,6 +1969,8 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.zero_when_missing(ext::Transparent, "transparent light shaft slices / engine constants not reconstructed: zero");
     grid_ready_ = false;
     for (uint32_t off : {0x28u, 0x30u, 0x38u, 0x40u}) ext_.set_texture(ext::Transparent, off, nullptr);
+    ext_.set_texture(ext::Transparent, 0x48, nullptr);
+    ext_.set_texture(ext::Transparent, 0x50, nullptr);
     ext_.set_texture(ext::Transparent, 0xE0, nullptr);  // engine-bound reflection cube of an isolated preview
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
@@ -2045,6 +2082,11 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         env_pass(env_bg_pso_.Get(), hdr);
         ext_.note_estimate("background gradient", "viewer environment (no map sky)");
     }
+    const bool shafts_before_transparents = volumetrics && transparents && vol_intensity_;
+    if (shafts_before_transparents) {
+        ProfileScope ps_("frame.light.volumetrics");
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, true);
+    }
     if (transparents) {
         const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
         // The transparent view's reciprocal-depth flag is clear. Its soft intersections
@@ -2057,7 +2099,10 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         cl->RSSetViewports(1, &vp);
         cl->RSSetScissorRects(1, &sc);
     }
-    if (volumetrics) { ProfileScope ps_("frame.light.volumetrics"); render_volumetrics(gpu, cl, gb, vm, hdr, scopes); }
+    if (volumetrics && !shafts_before_transparents) {
+        ProfileScope ps_("frame.light.volumetrics");
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, false);
+    }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
     else ssr_history_valid_ = false;  // a later frame must not reflect an image this old
@@ -3021,7 +3066,8 @@ void GameLighting::evaluate_volume_draws(size_t count, std::span<const Scope* co
 //  4. volumetrics_upres_1: bilateral upsample against the full-resolution view depth (Deferred
 //     +0x98 = (depth, depth) as nim's linear depth), added to the HDR target.
 void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                                      D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& full_scopes) {
+                                      D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& full_scopes,
+                                      bool transparent_inputs) {
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     auto rtv = [&](size_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{vb.ptr + i * inc}; };
@@ -3203,9 +3249,30 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     ext_.set(kTemporal, 0xA0, 1.0f);  // cb0[10]: blur on (else the layers pass through)
     for (auto& r : vol_blurred_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE blurred[2] = {rtv(5), rtv(6)};
+    constexpr float neutral_illuminance[4]{0, 0, 0, 1};
+    for (const auto& target : blurred) cl->ClearRenderTargetView(target, neutral_illuminance, 0, nullptr);
     cl->OMSetRenderTargets(2, blurred, FALSE, nullptr);
     vol_blur_.draw(gpu, cl, ext_, qscopes);
     for (auto& r : vol_blurred_) Gpu::barrier(cl, r.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (transparent_inputs) {
+        // The two RGBA slice accumulators contain energy in eight distance bins. The native PS
+        // writes four cumulative fractions per draw, sampled as a Texture3D by transparent t21.
+        ext_.set_texture(ext::Postprocess, 0x00, vol_layer_[2].Get());
+        ext_.set_texture(ext::Postprocess, 0x08, vol_layer_[3].Get());
+        Gpu::barrier(cl, vol_intensity_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        for (uint32_t bank = 0; bank < 2; ++bank) {
+            const auto first = 7 + bank * 4;
+            const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {rtv(first), rtv(first + 1), rtv(first + 2), rtv(first + 3)};
+            cl->OMSetRenderTargets(4, targets, FALSE, nullptr);
+            ext_.set(ext::Postprocess, 0xC0, float4{float(bank), 0, 0, 0});
+            vol_assemble_.draw(gpu, cl, ext_, qscopes);
+        }
+        Gpu::barrier(cl, vol_intensity_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ext_.set_texture(ext::Transparent, 0x48, vol_blurred_[0].Get());
+        ext_.set_texture(ext::Transparent, 0x50, vol_intensity_.Get());
+        ext_.note_estimate("transparent shafts: native eight-bin intensity distribution, far light layer RGB and unit transmittance",
+                           "original transparent t20/t21 contract; exact colour resolve and separate shaft extinction producer unknown");
+    }
 
     // 4. Upres into the HDR target (added: the technique carries no blend state).
     cl->RSSetViewports(1, &fvp);
@@ -3395,6 +3462,10 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
             CubemapVolume v;
             v.pipeline = it->second;
             v.volume = *m;
+            M4 local_to_world;
+            for (size_t column = 0; column < 4; ++column)
+                std::copy_n(m->local_to_world.begin() + column * 4, 4, local_to_world.c[column].begin());
+            if (std::abs(det4(local_to_world)) > 1e-20f) v.world_to_local = inverse_matrix(local_to_world);
             const auto raw = texture(m->specular);
             const auto filtered = filtered_cubes_.find(m->specular.value);
             v.specular = filtered != filtered_cubes_.end() ? filtered->second : raw;

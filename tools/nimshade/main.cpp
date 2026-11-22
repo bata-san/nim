@@ -952,7 +952,7 @@ int run(int argc, char** argv) {
                 inputs.get_v(ext::Deferred, 0x00) != float4{0, 1, 0, 0})
                 throw std::runtime_error("Transparent pass requires current linear depth with a matching decode");
         }
-        if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, inputs);
+        if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, gl);
         if (particles.loaded()) particles.render(gpu, c, gb, hdr, vm, inputs, fx_delta);
     };
     auto distortions = [&](ID3D12GraphicsCommandList* c, uint32_t w, uint32_t h) {
@@ -1105,6 +1105,9 @@ int run(int argc, char** argv) {
             throw std::runtime_error(std::format("stationary TAA motion failed: {} pixels", stationary_motion_max));
         std::println("distortion draws: {}", scene.distortion_draws());
         std::println("world transparent draws: {}", scene.world_transparent_draws());
+        std::println("transparent reflections: {} local draws ({} probes), {} sky draws, camera probe {}",
+                     scene.transparent_local_reflections(), scene.transparent_local_probes(), scene.transparent_sky_reflections(),
+                     gl.transparent_probe_at(vm.eye));
         if (is_map) std::println("sky transparent draws: {}", scene.sky_transparent_draws());
         if (scene.has_visible_light_grid())
             std::println("transparent light grid: {}", gl.light_grid_drawn() ? "ready" : "unavailable");
@@ -1334,6 +1337,8 @@ int run(int argc, char** argv) {
         }
         for (int k = 0; k < 2 && gl.volumetric_layer(k); ++k)
             save(k ? "lighting-shafts-near.bin" : "lighting-shafts-far.bin", gpu.read_texture(gl.volumetric_layer(k), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
+        if (auto* slices = gl.externs().texture(ext::Transparent, 0x50).resource)
+            save("lighting-shafts-cdf.bin", gpu.read_texture(slices, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 2));
         std::ofstream f(out_dir / "lighting.json");
         f << std::format("{{\"width\":{},\"height\":{},\"vp\":[", width, height);
         for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) f << std::format("{}{:.9g}", c || r ? "," : "", vm.vp_abs.c[c][size_t(r)]);
@@ -1572,6 +1577,34 @@ int run(int argc, char** argv) {
                         throw std::runtime_error("Invalid depth range for volumetric lights");
                 }
                 std::println("verified volumetric depth: {} finite min/max ranges", depths.size() / 16);
+                if (scene.has_transparent() && !ext.texture(ext::Transparent, 0x50).resource)
+                    throw std::runtime_error("Transparent shaft depth distribution was not produced");
+            }
+            if (auto* distribution = ext.texture(ext::Transparent, 0x50).resource) {
+                auto* shaft_colour = ext.texture(ext::Transparent, 0x48).resource;
+                const auto vr = distribution->GetDesc();
+                if (shaft_colour != gl.volumetric_layer(0) || vr.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+                    vr.Width != (gb.width() + 3) / 4 || vr.Height != (gb.height() + 3) / 4 || vr.DepthOrArraySize != 8)
+                    throw std::runtime_error("Transparent shafts are missing the current colour or depth distribution");
+                const auto bytes = gpu.read_texture(distribution, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 2);
+                const size_t plane = size_t(vr.Width) * vr.Height;
+                const auto* values = reinterpret_cast<const uint16_t*>(bytes.data());
+                if (bytes.size() != 2 * plane * vr.DepthOrArraySize)
+                    throw std::runtime_error("Transparent shaft depth distribution dimensions do not match");
+                float nearest_max = 0;
+                for (size_t xy = 0; xy < plane; ++xy) {
+                    float last = 0;
+                    for (size_t z = 0; z < vr.DepthOrArraySize; ++z) {
+                        const float value = half(values[z * plane + xy]);
+                        if (!std::isfinite(value) || value < last || value > 1)
+                            throw std::runtime_error("Transparent shaft fraction is invalid or decreases with distance");
+                        last = value;
+                    }
+                    if (last != 1) throw std::runtime_error("Transparent shaft far fraction does not reach one");
+                    nearest_max = std::max(nearest_max, half(values[xy]));
+                }
+                std::println("verified transparent shaft distribution: {}x{}x8, finite fractions, nearest maximum {}",
+                             vr.Width, vr.Height, nearest_max);
             }
         };
         verify_lut(vm);

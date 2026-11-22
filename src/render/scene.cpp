@@ -360,12 +360,16 @@ UINT scope_root_parameter(ShaderStage stage, uint32_t reg) {
 }
 
 ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool dynamic = false,
-    const std::map<uint32_t, SamplerDesc>& vs_samplers = {}, const std::map<uint32_t, SamplerDesc>& ps_samplers = {}) {
-    D3D12_DESCRIPTOR_RANGE ps_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 32, 0, 0, 0};
+    const std::map<uint32_t, SamplerDesc>& vs_samplers = {}, const std::map<uint32_t, SamplerDesc>& ps_samplers = {},
+    bool split_reflection = false) {
+    constexpr uint32_t cube_slot = 26;
+    D3D12_DESCRIPTOR_RANGE ps_ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, split_reflection ? cube_slot : 32, 0, 0, 0},
+                                         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 31 - cube_slot, cube_slot + 1, 0, cube_slot + 1}};
+    D3D12_DESCRIPTOR_RANGE reflection{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, cube_slot, 0, 0};
     D3D12_DESCRIPTOR_RANGE vs_dynamic{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 32, 0, 0, 0};
     D3D12_DESCRIPTOR_RANGE vs_static[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
                                          {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 29, 3, 0, 3}};
-    std::array<D3D12_ROOT_PARAMETER, 31> params{};
+    std::array<D3D12_ROOT_PARAMETER, 32> params{};
     for (auto stage : {ShaderStage::Vertex, ShaderStage::Pixel})
         for (UINT reg = 0; reg <= 13; ++reg) {
             auto& param = params[scope_root_parameter(stage, reg)];
@@ -385,8 +389,15 @@ ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool 
         params[30].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[3].DescriptorTable = {1, &ps_range};
+    params[3].DescriptorTable = {split_reflection ? 2u : 1u, ps_ranges};
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    const UINT base_params = dynamic ? 30 : 31;
+    if (split_reflection) {
+        auto& cube = params[base_params];
+        cube.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        cube.DescriptorTable = {1, &reflection};
+        cube.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
     for (bool vs : {true, false}) {
         for (const auto& [reg, source] : vs ? vs_samplers : ps_samplers) {
@@ -410,7 +421,7 @@ ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool 
             samplers.push_back(desc);
         }
     }
-    D3D12_ROOT_SIGNATURE_DESC desc{dynamic ? 30u : 31u, params.data(), UINT(samplers.size()), samplers.data(),
+    D3D12_ROOT_SIGNATURE_DESC desc{base_params + uint32_t(split_reflection), params.data(), UINT(samplers.size()), samplers.data(),
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
     ComPtr<ID3DBlob> blob, errors;
     check_hr(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors), "Original material root signature");
@@ -626,6 +637,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     info_.clear();
     world_transparent_draws_ = 0;
     sky_transparent_draws_ = 0;
+    transparent_local_reflections_ = transparent_sky_reflections_ = transparent_local_probes_ = 0;
     channels_.clear();
     channel_overrides_.clear();
     channel_defaults_.clear();
@@ -2175,13 +2187,6 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.scopes = std::move(g.scopes);
         item.vs_sources = std::move(g.vs_sources);
         item.ps_sources = std::move(g.ps_sources);
-        ProfileScope profile_root("add.root_signature");
-        // Keyed apart for dynamic parts (another root signature layout); tags never set bit 30.
-        const uint32_t root_key = g.info.technique.value ^ (mesh.dynamic ? 0x40000000u : 0u);
-        auto& root = shared_roots[root_key];
-        if (!root) root = make_gbuffer_root_signature(dev, mesh.dynamic, g.vs_samplers, g.ps_samplers);
-        item.root_sig = root;
-        profile_root.stop();
         upload_textures(g.textures, item.ps_sources, item.textures);
         upload_textures(g.vs_textures, item.vs_sources, item.vs_textures);
         for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}}) {
@@ -2210,6 +2215,23 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         if (const auto cube = ps_kinds.find(26); cube != ps_kinds.end() && advanced_cube(26, cube->second) &&
             !item.textures.contains(26))
             item.ps_sources.extern_textures.try_emplace(26, TfxExternTexture{26, ext::Transparent, 0xE0 / 8});
+        const auto cube = ps_kinds.find(26);
+        const auto cube_source = item.ps_sources.extern_textures.find(26);
+        const auto advanced_scope = item.ps_sources.cbuffer_scopes.find(8);
+        item.object_reflection = g.stage == kStageTransparent && cube != ps_kinds.end() && cube->second == BindingKind::TextureCube &&
+            !item.textures.contains(26) && !item.own_regs.contains({ShaderStage::Pixel, 8}) &&
+            cube_source != item.ps_sources.extern_textures.end() && cube_source->second.extern_id == ext::Transparent &&
+            cube_source->second.offset == 0xE0 / 8 && item.scopes && advanced_scope != item.ps_sources.cbuffer_scopes.end() &&
+            std::ranges::find(item.ps_cbvs, 8u) != item.ps_cbvs.end() &&
+            std::ranges::any_of(*item.scopes, [&](const Scope& scope) {
+                return scope.tag == advanced_scope->second && scope.name == "transparent_advanced";
+            });
+        ProfileScope profile_root("add.root_signature");
+        const uint64_t root_key = g.info.technique.value | (uint64_t(mesh.dynamic) << 32) | (uint64_t(item.object_reflection) << 33);
+        auto& root = shared_roots[root_key];
+        if (!root) root = make_gbuffer_root_signature(dev, mesh.dynamic, g.vs_samplers, g.ps_samplers, item.object_reflection);
+        item.root_sig = root;
+        profile_root.stop();
         item.ps_kinds = ps_kinds;
         item.vs_kinds = vs_kinds;
         auto kind_of = [](const std::map<uint32_t, BindingKind>& m, uint32_t r) {
@@ -2436,7 +2458,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.NumRenderTargets = authored_shadow ? 0 : transparent ? 5 : distortion ? 1 : 4;
         for (UINT r = 0; r < pd.NumRenderTargets; ++r) pd.RTVFormats[r] = transparent ? DXGI_FORMAT_R16G16B16A16_FLOAT : distortion ? DXGI_FORMAT_R8G8B8A8_UNORM : GBuffer::kFormats[r];
         for (const auto& output : outputs)
-            if (_stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
+            // Depth-only shadow shaders may export a constant colour after alpha clipping.
+            if (!authored_shadow && _stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index >= pd.NumRenderTargets)
                 throw UnsupportedMeshPart(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
         pd.DSVFormat = authored_shadow ? DXGI_FORMAT_D32_FLOAT : GBuffer::kDepthFormat;
@@ -3051,26 +3074,33 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
 }
 
 void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
-                                 bool shadow) {
+                                 bool shadow, const GameLighting* lighting) {
     const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     const D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
     cl->SetDescriptorHeaps(1, heaps);
+    struct ReflectionBinding {
+        uint32_t srv;
+        D3D12_GPU_VIRTUAL_ADDRESS constants;
+    };
     struct DrawState {
         uint32_t buffers = UINT32_MAX, table = UINT32_MAX;
+        uint32_t reflection = UINT32_MAX;
         ID3D12RootSignature* root = nullptr;
         ID3D12PipelineState* pso = nullptr;
         D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         std::array<D3D12_GPU_VIRTUAL_ADDRESS, 31> cbv{};
     };
-    auto draw = [&](ID3D12GraphicsCommandList* commands, DrawState& state, const Item& it, uint32_t instances, uint32_t first_instance) {
+    auto draw = [&](ID3D12GraphicsCommandList* commands, DrawState& state, const Item& it, uint32_t instances,
+                    uint32_t first_instance, const ReflectionBinding* reflection = nullptr) {
         const bool root_changed = state.root != it.root_sig.Get();
         if (root_changed) {
             commands->SetGraphicsRootSignature(state.root = it.root_sig.Get());
             state.cbv = {};
             state.table = UINT32_MAX;
+            state.reflection = UINT32_MAX;
         }
         const auto& set = sets_[it.buffers];
         if (it.buffers != state.buffers) {
@@ -3091,13 +3121,19 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         };
         set_cbv(0, it.ps_address);
         set_cbv(6, it.vs_address);
-        for (const auto& [param, address] : it.scope_addresses) set_cbv(param, address);
+        const uint32_t advanced = scope_root_parameter(ShaderStage::Pixel, 8);
+        for (const auto& [param, address] : it.scope_addresses)
+            set_cbv(param, reflection && param == advanced ? reflection->constants : address);
         for (const auto& [param, buffer] : it.own_cbvs) set_cbv(param, buffer.gpu);
         const uint32_t first = it.srv_first + (srv_frame_ % it.srv_copies) * kItemSrvs;
         if (state.table != first) {
             state.table = first;
             commands->SetGraphicsRootDescriptorTable(3, gpu.srv().gpu(first));
             commands->SetGraphicsRootDescriptorTable(it.dynamic ? 2 : 30, gpu.srv().gpu(first + kPsSrvs));
+        }
+        if (reflection && state.reflection != reflection->srv) {
+            state.reflection = reflection->srv;
+            commands->SetGraphicsRootDescriptorTable(it.dynamic ? 30 : 31, gpu.srv().gpu(reflection->srv));
         }
         const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         if (state.topology != topology) commands->IASetPrimitiveTopology(state.topology = topology);
@@ -3112,10 +3148,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         } else commands->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, first_instance);
     };
     if (stage == kStageTransparent) {
-        struct Draw { const Item* item; uint32_t instance; float depth; bool sky; };
+        struct Draw { const Item* item; uint32_t instance; float depth; V3 centre; bool sky; };
         std::vector<Draw> ordered;
-        auto enqueue = [&](const Item& item, uint32_t instance, float depth, bool sky = false) {
-            ordered.push_back({&item, instance, std::isfinite(depth) ? depth : 0, sky});
+        auto enqueue = [&](const Item& item, uint32_t instance, float depth, V3 centre, bool sky = false) {
+            ordered.push_back({&item, instance, std::isfinite(depth) ? depth : 0, centre, sky});
         };
         for (const auto index : transparent_items_) {
             const auto& it = items_[index];
@@ -3125,14 +3161,14 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
                 const auto c = set.model_center;
                 auto placement = [&](uint32_t i) {
                     if (!set.sky_order.empty()) {
-                        enqueue(it, i, set.sky_order[i], true);
+                        enqueue(it, i, set.sky_order[i], {}, true);
                         return;
                     }
                     const auto& p = set.placements[i];
                     const V3 pos{p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3],
                                  p[4] * c.x + p[5] * c.y + p[6] * c.z + p[7],
                                  p[8] * c.x + p[9] * c.y + p[10] * c.z + p[11]};
-                    enqueue(it, i, dot(pos - vm.eye, vm.fwd));
+                    enqueue(it, i, dot(pos - vm.eye, vm.fwd), pos);
                 };
                 if (set.cull == UINT32_MAX)
                     for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
@@ -3142,8 +3178,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
                 const auto& group = cull_groups_[set.cull];
                 for (size_t l = 0; l < group.count.size(); ++l) {
                     if (!((it.lod_mask >> l) & 1)) continue;
-                    for (uint32_t i = group.first[l]; i < group.first[l] + group.count[l]; ++i)
-                        enqueue(it, i, group.visible_depths[i]);
+                    for (uint32_t i = group.first[l]; i < group.first[l] + group.count[l]; ++i) {
+                        const auto& sphere = group.spheres[group.visible_indices[i]];
+                        enqueue(it, i, group.visible_depths[i], {sphere[0], sphere[1], sphere[2]});
+                    }
                 }
             }
         }
@@ -3157,12 +3195,40 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         });
         world_transparent_draws_ = 0;
         sky_transparent_draws_ = 0;
+        transparent_local_reflections_ = transparent_sky_reflections_ = transparent_local_probes_ = 0;
+        std::unordered_map<uint64_t, size_t> placement_probes;
+        std::unordered_map<size_t, ReflectionBinding> reflection_bindings;
         DrawState state;
         for (const auto& entry : ordered) {
-            draw(cl, state, *entry.item, 1, entry.instance);
+            const auto& it = *entry.item;
+            const ReflectionBinding* binding = nullptr;
+            if (it.object_reflection) {
+                size_t probe = 0;
+                if (!entry.sky) {
+                    const uint32_t group = it.dynamic ? it.buffers : sets_[it.buffers].cull;
+                    const uint64_t key = (uint64_t(it.dynamic) << 63) | (uint64_t(group) << 32) | entry.instance;
+                    const auto [slot, first] = placement_probes.try_emplace(key, 0);
+                    if (first) slot->second = lighting->transparent_probe_at(entry.centre);
+                    probe = slot->second;
+                }
+                const auto [slot, first] = reflection_bindings.try_emplace(probe);
+                if (first) {
+                    const auto reflection = lighting->transparent_reflection(probe);
+                    const uint32_t srv = gpu.transient_descriptors(1);
+                    create_texture_srv(gpu.device(), reflection.cube, BindingKind::TextureCube, gpu.srv().cpu(srv));
+                    const auto upload = gpu.dynamic(sizeof(reflection.constants));
+                    std::memcpy(upload.cpu, reflection.constants.data(), sizeof(reflection.constants));
+                    slot->second = {srv, upload.gpu};
+                }
+                binding = &slot->second;
+                if (probe) ++transparent_local_reflections_;
+                else ++transparent_sky_reflections_;
+            }
+            draw(cl, state, it, 1, entry.instance, binding);
             if (entry.sky) ++sky_transparent_draws_;
             else ++world_transparent_draws_;
         }
+        transparent_local_probes_ = reflection_bindings.size() - reflection_bindings.contains(0);
         return;
     }
     auto record = [&](ID3D12GraphicsCommandList* commands, std::span<const size_t> items, bool blended) {
@@ -3776,8 +3842,9 @@ void StaticMeshScene::render_distortion(Gpu& gpu, ID3D12GraphicsCommandList* cl,
 }
 
 void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
-                                         const ViewMatrices& vm, const ExternStore& inputs) {
+                                         const ViewMatrices& vm, const GameLighting& lighting) {
     if (!has_transparent()) return;
+    const auto& inputs = lighting.externs();
     auto& ext = *material_externs_;
     ext.note_estimate("transparent pass order: authored sky order, then object placement depth",
                       "sky collections are stored in ascending order; engine interleaving and ties are unknown");
@@ -3793,7 +3860,7 @@ void StaticMeshScene::render_transparent(Gpu& gpu, ID3D12GraphicsCommandList* cl
     Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE targets[] = {rtv, gb.null_rtv, gb.null_rtv, gb.null_rtv, gb.rtv[3]};
     cl->OMSetRenderTargets(5, targets, FALSE, &gb.dsv_ro);
-    draw_items(gpu, cl, kStageTransparent, gb.width(), gb.height(), vm, false);
+    draw_items(gpu, cl, kStageTransparent, gb.width(), gb.height(), vm, false, &lighting);
     Gpu::barrier(cl, gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 

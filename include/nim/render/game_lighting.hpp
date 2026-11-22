@@ -428,12 +428,20 @@ public:
     V3 sun_toward(const LightingParams& p) const { return sun_direction(p, atm_.valid ? &atm_.data : nullptr); }
 
     ExternStore& externs() { return ext_; }
+    const ExternStore& externs() const { return ext_; }
     const std::vector<std::string>& notes() const { return shading_.notes; }
     TagHash shading_technique() const { return shading_.tag(); }
     ID3D12Resource* shadow_mask() const { return shadow_mask_.Get(); }  // R8, PIXEL_SHADER_RESOURCE
     ID3D12Resource* ambient_occlusion() const { return ao_.Get(); }  // RGBA16F, PIXEL_SHADER_RESOURCE (x = AO)
     ID3D12Resource* material_occlusion() const { return material_ao_.Get(); }  // R8, copied from G-buffer
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
+    struct TransparentReflection {
+        ID3D12Resource* cube = nullptr;
+        std::array<float4, 37> constants{};
+    };
+    // Probe index zero means sky. Other indices belong to the current map or preview.
+    size_t transparent_probe_at(V3 position) const;
+    TransparentReflection transparent_reflection(size_t probe) const;
     ID3D12Resource* distortion_view_depth() const { return distortion_view_depth_.Get(); }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
     // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
@@ -473,9 +481,9 @@ private:
     // quarter resolution into a near / far layer pair (plus the transparents' 8 intensity slices),
     // then volumetrics_blur_results and volumetrics_upres_1 add the shafts to the HDR target.
     void render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
-                            D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes);
+                            D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes, bool transparent_inputs);
     Scope rigid_scope_, transparent_scope_, transparent_adv_scope_;
-    GamePipeline vol_downsample_, vol_blur_, vol_upres_;
+    GamePipeline vol_downsample_, vol_blur_, vol_upres_, vol_assemble_;
     struct VolumetricLight {
         uint32_t pipeline = 0;  // pair: both windings
         std::shared_ptr<const Technique> technique;
@@ -490,6 +498,7 @@ private:
     // Quarter resolution: min/max depth, the light pass targets (far, near, slices 0-3, 4-7), the
     // blurred far / near layers.
     ComPtr<ID3D12Resource> vol_minmax_, vol_layer_[4], vol_blurred_[2];
+    ComPtr<ID3D12Resource> vol_intensity_;
     ComPtr<ID3D12DescriptorHeap> vol_rtv_heap_;
     uint32_t vw_ = 0, vh_ = 0;
     ComPtr<ID3D12Resource> tint_lookup_, lobe_lookup_, lobe3d_lookup_, iridescence_lookup_, atmosphere_noise_;
@@ -593,6 +602,7 @@ private:
         ComPtr<ID3D12Resource> specular, alpha, diffuse;
         ComPtr<ID3D12Resource> shape;
         D3D12_VERTEX_BUFFER_VIEW shape_vbv{};
+        std::optional<M4> world_to_local;
         uint32_t shape_vertices = 0;
         float max_mip = 0;      // the specular cube's last mip
         bool squared = false;   // specular cube stored gamma-2 (UNORM): the PS squares its samples
@@ -690,6 +700,7 @@ private:
     std::map<size_t, float> light_state_;
     void choose_light_state();
     void prepare_transparent_reflection(const ViewMatrices& vm, const CubemapVolume* preview);
+    bool transparent_probe_preview_ = false;
     void render_grid_sun(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& grid_scopes, const SunShadow& shadow);
     GamePipeline grid_sky_, grid_probe_, grid_blend_, grid_encode_, grid_points_, grid_sun_;
     std::array<ComPtr<ID3D12Resource>, 2> grid_sun_vis_;  // [0] result, [1] the "previous" input, all 1

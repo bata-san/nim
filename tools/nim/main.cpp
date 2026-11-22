@@ -814,7 +814,7 @@ private:
             scene.render_gbuffer(gpu, cl, gb, view);
             GameLighting::TransparentFn transparent;
             if (scene.has_transparent()) transparent = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                scene.render_transparent(gpu, c, gb, hdr, view, lighting.externs());
+                scene.render_transparent(gpu, c, gb, hdr, view, lighting);
             };
             GameLighting::DistortionFn distortion;
             if (scene.has_visible_distortion()) distortion = [&](auto* c, uint32_t w, uint32_t h) {
@@ -2698,7 +2698,7 @@ public:
                 GameLighting::TransparentFn transparents;
                 const bool fx = map_scene && particles.loaded();
                 if (scene.has_transparent() || fx) transparents = [&](ID3D12GraphicsCommandList* c, D3D12_CPU_DESCRIPTOR_HANDLE hdr) {
-                    if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting.externs());
+                    if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, game_lighting);
                     if (fx) particles.render(gpu, c, gb, hdr, vm, game_lighting.externs(), light.delta_time);
                 };
                 GameLighting::DistortionFn distortion;
