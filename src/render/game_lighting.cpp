@@ -1740,6 +1740,14 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
                               "nim sun shadow map: the scene's own pipelines drawn from the sun, 5x5 PCF (engine cascades not decoded)");
     else if (ext_.texture(ext::ShadowMask, 0x00).resource == shadow_mask_.Get())
         ext_.estimate_texture(ext::ShadowMask, 0x00, unshadowed_.Get(), unshadowed);
+    // t8 (extern 43 +0x08) is the screen-space ambient occlusion texture (hdao): global_lighting_and_shading
+    // reads it for specular IBL occlusion (r2261), direct sun + hemisphere ambient AO (r564, weighted by
+    // GlobalLighting +0xD0.x) and light-buffer AO (r566, weighted by GlobalLighting +0xD0.y).
+    const bool ssao = p.ssao && hdao_.loaded() && ao_;
+    if (ssao)
+        ext_.set_texture(ext::ShadowMask, 0x08, ao_.Get());
+    else if (ext_.texture(ext::ShadowMask, 0x08).resource == ao_.Get())
+        ext_.estimate_texture(ext::ShadowMask, 0x08, unshadowed_.Get(), "SSAO disabled or unavailable: unoccluded (white) mask");
     for (uint32_t off : {0x00u, 0x08u, 0x10u})
         if (!ext_.texture(ext::ShadowMask, off).resource) ext_.estimate_texture(ext::ShadowMask, off, unshadowed_.Get(), unshadowed);
     if (!ext_.has(ext::ShadowMask, 0x30, 4)) {
@@ -1769,7 +1777,12 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     const V3 sun_dir = sun_toward(p);
     constexpr std::string_view chosen = "meaning reverse-engineered, value chosen (v0.3.1)";
     ext_.estimate(ext::GlobalLighting, 0x50, float4{0, 0, 1, 0}, chosen);  // hemisphere axis
-    ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, 1, 0, 0}, chosen);  // light-buffer occlusion
+    // GlobalLighting +0xD0.x weights SSAO (t8) on direct sun + hemisphere ambient; +0xD0.y weights
+    // SSAO on the diffuse/specular light buffers inside global_lighting_and_shading. When
+    // apply_ssao_to_light_buffers already multiplied the light buffers, keep +0xD0.y = 0 so the
+    // light buffers are not occluded twice.
+    const float light_buf_ao = ssao && apply_ssao_.loaded() ? 0.0f : 1.0f;
+    ext_.estimate(ext::GlobalLighting, 0xD0, float4{1, light_buf_ao, 0, 0}, chosen);  // sun/ambient & light-buffer occlusion
     // The global channels were reset this frame (update_global_channels).
     if (atm_.valid && p.atmosphere) {
         // A map: the sun and the hemisphere ambient are the global channels (sun_color x

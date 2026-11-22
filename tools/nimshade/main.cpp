@@ -1466,6 +1466,11 @@ int run(int argc, char** argv) {
             if (gl.cubemap_count() != gl.cubemaps_requested()) throw std::runtime_error("Original cubemap preparation omitted volumes");
             if (gl.cubemaps_failed()) throw std::runtime_error("Original cubemap volume draw failed");
             const auto& ext = gl.externs();
+            if (lp.ssao && gl.ambient_occlusion()) {
+                if (ext.texture(ext::ShadowMask, 0x08).resource != gl.ambient_occlusion() ||
+                    ext.get_v(ext::GlobalLighting, 0xD0)[1] != 0.0f)
+                    throw std::runtime_error("Shading pass is not reading SSAO on extern 43 +0x08 without double light-buffer occlusion");
+            }
             if (lp.sky_ambient || gl.cubemaps_drawn()) {
                 const auto* packed_ao = gl.material_occlusion();
                 if (!packed_ao || ext.texture(0x5D, 0x00).resource != packed_ao || packed_ao == gl.ambient_occlusion())

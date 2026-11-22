@@ -14,7 +14,7 @@
 | # | 項目 | 状態 | コミット / 場所 | 備考 |
 |---|------|------|-----------------|------|
 | 1 | エンジンパイプラインの取り込み基盤 (GamePipeline, ExternStore, TFX 評価) | 完了 | 〜7ce2de1 | `src/render/game_lighting.cpp` |
-| 2 | SSAO (hdao + apply_ssao_to_light_buffers) | 完了 | 97bf077 | §3.1 |
+| 2 | SSAO (hdao + apply_ssao_to_light_buffers + シェーディング t8) | 完了 | 97bf077, §3.81 | §3.1, §3.81。`extern 43 +0x08` (`t8`) に `ao_` を接続しスペキュラ IBL 遮蔽・太陽/半球環境光 AO を有効化 (ライトバッファ二重乗算を防止) |
 | 3 | 大気 + 空 (sky_lookup_generate_near/far, sky, フォグ) | 大気・空間ノイズ付きフロクセル・密度の時系列再投影を接続。カスケード構成は未確定 | §3.2〜3.2.4、§3.61 | 原CS使用。ノイズの結線・変種選択・格子・距離・履歴重み等は推定 |
 | 4 | ボリューメトリクス (ライトシャフト) | 完了 (密度スライスはフロクセルから推定 §3.79、temporal は未) | 142beb4, §3.79 | §3.3, §3.79。フロクセル大気・屋内フォグの透過率から 64 m・8 段の放射状消散密度スライス (extern 88) を逆算して供給 (生成元は未特定のため推定) |
 | 5 | 拡散・反射プローブ (cubemap_apply / sky hemisphere) | 全域読込・距離フェード既定オフ、CSG は解析専用。箱の位置は +0x110 (§3.4.4)。ゲームとの完全一致は未検証 | §3.4〜3.4.4 | Outpost 313、外周 167 (空レコード含む原一覧169)、低温アーカイブ499。エンジンの順序等は未解明 |
@@ -68,8 +68,7 @@
 ### 3.1 SSAO (完了)
 - hdao_ps (80A74652): extern 0x21 が入力。t0 = デバイス深度、t1 = ビュー深度で **R と G の両方を
   Gather する** (R32 だと G=0 で全サンプル棄却 → AO=1 になる罠)。nim は R32G32 の線形深度を作る。
-- 出力は extern 93 +0x00 (cubemap_apply_* が読む) と apply_ssao_to_light_buffers
-  (blend state 3 = DEST_COLOR 乗算) でライトバッファに掛ける。順序は §3.4 (cubemaps → lights → apply_ssao)。
+- 出力は `extern 43 +0x08` (`global_lighting_and_shading` の `t8` / `deferred_shading` の `t13`、スペキュラ IBL 遮蔽と太陽・半球環境光 AO) に渡し、同時に `apply_ssao_to_light_buffers` (blend state 3 = DEST_COLOR 乗算) でライトバッファ (`t10`/`t11`) に掛ける。`apply_ssao_to_light_buffers` 実行時は `GlobalLighting +0xD0.y = 0` にしてライトバッファの二重遮蔽を防ぐ (§3.81)。なおプローブ (`cubemap_apply_*`) の `extern 93 +0x00` には G-buffer 材質 AO コピー (`material_ao_`) を渡す (§3.76)。
 - extern 0x26 は final_combine など全画面パス共通の入力スロット。別パスで使うときは別 ExternStore に入れる。
 - 調整値 (半径 10px 等) はエンジン側の値で推定。
 
@@ -1631,6 +1630,16 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - `nimcli parts MODEL -v`: 部品レコード 0x28 バイトと、先頭 3 頂点の生データを出す。
 - **未解決**: キャラごとのモジュールの選び方。コンポーネントの 8080BACC (0x18 バイト、ghost 54 件・grenadier 56 件) が 8080BAD0 の「分類ハッシュ:値ハッシュ」の組 (分類 51E7A18D / 4C58EF8F / 6A807A1A) の集合を持ち、タグ条件でモジュールを選ぶ仕組みとみられるが、キャラ側のタグと外部 ID への対応は未解読。そのため ghost の脚 2 種 (ID 9 / 11) は両方描かれ、使わない側のデカールが浮く。ghost のマント (ユーザー指摘「マントの位置がおかしい」) は布の骨の姿勢が未対応。材質のパーミュテーション (色) の選び方も推定のまま (ユーザー指摘「ゲーム内ではありえない色合いのやつとかいる」)。実行中のゲームからは読まない (§2)。
 - **推定の一覧**: 代替部品の判定 (範囲 64 量子化単位以内・インデックス数 5% 以内) と最小 ID の採用、役割 3 を最高 LOD と一緒に描く。
+
+### 3.81 シェーディングパス `extern 43 +0x08` (`t8`) への SSAO 接続とライトバッファ二重乗算の防止 (2026-11-23)
+
+- `global_lighting_and_shading` (PS `80A74242`)、`deferred_shading` (PS `80A740EB`)、`debug_specular_occlusion` (`80A741AD`)、`debug_ssao_unweighted` (`80A7420A`) の DXIL / TFX を照合し、`extern 43` (`ext::ShadowMask`) `+0x08` (PS `t8` / `t13`) が HDAO (SSAO) テクスチャであることを確認した。
+- `80A74242` では `t8.x` が以下の 3 箇所で使われる:
+  1. スペキュラ IBL バッファ (`t12`) に対するスペキュラオクルージョン `r2261 = lerp(t8.x, saturate(cb0[114].x * saturate(t8.x - 1 + pow(t8.x - NdotV, smoothness)) + cb0[114].y), smoothness)` (`cb0[114]` は `ch0x80` / `ch0x81`)。
+  2. 太陽直接光 (拡散・鏡面) と天球アンビエントに対する AO 係数 `r564 = 1 + cb0[135].x * (t8.x - 1)` (`cb0[135].x` は `GlobalLighting +0xD0.x` を透過度で減衰させた値)。
+  3. 拡散・鏡面ライトバッファ (`t10` / `t11`) に対する AO 係数 `r566 = 1 + cb0[136].x * (t8.x - 1)` (`cb0[136].x = GlobalLighting +0xD0.y`)。
+- これまで `nim` は `extern 43 +0x08` を未設定 (`unshadowed_` = 1.0) のままにしていたため、スペキュラ IBL 遮蔽 (`r2261`) と太陽・天球アンビエント AO (`r564`) が常に 1.0 で無効化されていた。
+- SSAO 有効時 (`p.ssao && hdao_.loaded() && ao_`) に `ext::ShadowMask +0x08` へ `ao_` をバインドし、かつ `apply_ssao_to_light_buffers` (`80A74698`) で既にライトバッファ (`light_diffuse_` / `light_specular_`) に SSAO を乗算している場合は `GlobalLighting +0xD0` を `(1, 0, 0, 0)` (`+0xD0.y = 0`) に設定してライトバッファへの SSAO 二重乗算を防止した。`nimshade --verify-frame-inputs` に `extern 43 +0x08` と `GlobalLighting +0xD0.y` の検証を追加し、Outpost と低温アーカイブで通過を確認。
 
 ## 4. 既知の未解決・注意
 - 通常のビルド先は `build/`。シェーダー調査には `tools/re/dump.sh` と `tools/re/decomp.py` を使用する。過去の個別解析スクリプトと検証出力はプロジェクト外へ整理した。`tools/re/` の旧スクリプトは Git 履歴からも参照できる。
