@@ -24,6 +24,28 @@ float dist2d(const std::array<float, 3>& a, const std::array<float, 3>& b) { ret
 
 }  // namespace
 
+// ---- walkable floor --------------------------------------------------------------------------------
+
+bool WalkGrid::walkable(float x, float y) const {
+    if (!w) return true;
+    const float fx = (x - x0) / cell, fy = (y - y0) / cell;
+    if (fx < 0 || fy < 0 || fx >= float(w) || fy >= float(h)) return false;
+    return open[size_t(fy) * w + size_t(fx)] != 0;
+}
+
+bool WalkGrid::clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const {
+    if (!w) return true;
+    const float d = std::hypot(b[0] - a[0], b[1] - a[1]);
+    const int steps = std::max(1, int(d / (cell * 0.5f)));
+    for (int i = 0; i <= steps; ++i) {
+        const float t = float(i) / float(steps);
+        if (!walkable(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)) return false;
+    }
+    return true;
+}
+
+size_t WalkGrid::open_count() const { return size_t(std::count(open.begin(), open.end(), uint8_t(1))); }
+
 // ---- motion ----------------------------------------------------------------------------------------
 
 MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
@@ -50,6 +72,8 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             set.error = "no skeleton and rig on the entity";
             return set;
         }
+        set.skeleton = sk;
+        set.rig = rg;
         const auto skeleton = load_skeleton(pm, sk);
         const auto rig = load_animation_rig(pm, rg);
         const auto feet = find_feet(skeleton);
@@ -57,6 +81,7 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             set.error = "no ankle pair in the skeleton";
             return set;
         }
+        std::optional<MotionClip> still;  // non-cyclic idle candidate
         for (const auto tag : entity_motion_clips(pm, entity)) {
             AnimationClip clip;
             try {
@@ -66,17 +91,29 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             }
             if (clip.bone_count != rig.size()) continue;
             const auto gait = measure_clip_gait(skeleton, rig, clip, *feet, fps);
-            if (!gait.cyclic) continue;
+            if (!gait.cyclic) {
+                if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!still || gait.seconds > still->seconds))
+                    still = MotionClip{tag, gait.seconds, 0, {}, false};
+                continue;
+            }
             const MotionClip m{tag, gait.seconds, gait.speed, gait.direction};
             if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f) set.locomotion.push_back(m);
             else if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!set.idle || gait.seconds > set.idle->seconds))
                 set.idle = MotionClip{tag, gait.seconds, 0, {}};
         }
-        if (set.locomotion.empty() && !set.idle) set.error = "no cyclic clips";
+        if (!set.idle) set.idle = still;
+        if (set.locomotion.empty() && !set.idle) set.error = "no usable clips";
     } catch (const std::exception& e) {
         set.error = e.what();
     }
     return set;
+}
+
+float motion_clip_time(const MotionClip& clip, float time) {
+    if (clip.seconds <= 0) return 0;
+    if (clip.cyclic) return std::fmod(std::max(time, 0.0f), clip.seconds);
+    const float t = std::fmod(std::max(time, 0.0f), 2 * clip.seconds);
+    return t > clip.seconds ? 2 * clip.seconds - t : t;
 }
 
 MotionChoice select_motion(const MotionSet& set, std::array<float, 2> v) {
@@ -118,6 +155,8 @@ std::vector<AiEstimate> ai_estimates(const AiParams& p) {
         {"drone_scan_range", p.drone_scan_range, "m, all around"},
         {"movement", 0, "straight lines inside firing areas; no navmesh was found, so walls are ignored"},
         {"spawn", 0, "every squad spawns at once at its positions (member i at position i mod n)"},
+        {"walk_grid", 0, "patrol points and straight paths only over open floor: a top-down depth render of the map's geometry between the floor and 2 m above it, eroded by 0.3 m (no navmesh found)"},
+        {"stationary", 0, "characters whose motion bank has no locomotion clip (sniper, ghost) hold their position"},
         {"motion_fps", 30, "clip rate used to measure gaits (not decoded)"},
     };
 }
@@ -187,10 +226,36 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
     }
 }
 
-std::array<float, 3> AiSimulation::sample_objective(size_t squad) {
+void AiSimulation::set_walk_grid(size_t firing_area, WalkGrid grid) {
+    if (grids_.size() < areas_.size()) grids_.resize(areas_.size());
+    grids_.at(firing_area) = std::move(grid);
+}
+
+// A random open point of the squad's firing areas that a straight walk from `from` reaches
+// (tries a few; keeps the agent where it is when none does).
+std::array<float, 3> AiSimulation::sample_objective(size_t squad, const std::array<float, 3>& from) {
     const auto& list = squad_areas_[squad];
-    if (list.empty()) return {};
-    const auto& area = areas_[list[std::uniform_int_distribution<size_t>(0, list.size() - 1)(rng_)]];
+    if (list.empty()) return from;
+    for (int attempt = 0; attempt < 24; ++attempt) {
+        const size_t index = list[std::uniform_int_distribution<size_t>(0, list.size() - 1)(rng_)];
+        const auto p = sample_area(index);
+        if (!has_walk_grid(index)) return p;
+        const auto& grid = grids_[index];
+        if (!grid.walkable(p[0], p[1])) continue;
+        // The path must stay on open floor of whichever area it crosses (the start's or the goal's).
+        bool ok = grid.clear(from, p);
+        if (!ok)
+            for (const auto other : list)
+                if (other != index && has_walk_grid(other) && grids_[other].walkable(from[0], from[1]) && grids_[other].walkable(p[0], p[1]) &&
+                    grids_[other].clear(from, p))
+                    ok = true;
+        if (ok) return p;
+    }
+    return from;
+}
+
+std::array<float, 3> AiSimulation::sample_area(size_t index) {
+    const auto& area = areas_[index];
     const float pick = std::uniform_real_distribution<float>(0, area.cumulative.back())(rng_);
     const size_t t = size_t(std::lower_bound(area.cumulative.begin(), area.cumulative.end(), pick) - area.cumulative.begin());
     const auto& tri = area.triangles[std::min(t, area.triangles.size() - 1)];
@@ -251,10 +316,10 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
                 target = nearest_objective_point(a.squad, player);
                 speed = params_.run_speed;
             }
-        } else if (!squad_areas_[a.squad].empty()) {
+        } else if (!squad_areas_[a.squad].empty() && (a.character >= motions_.size() || !motions_[a.character].locomotion.empty())) {
             if (a.wait > 0) {
                 a.wait -= dt;
-                if (a.wait <= 0) a.goal = sample_objective(a.squad);
+                if (a.wait <= 0) a.goal = sample_objective(a.squad, a.position);
             } else if (dist2d(a.position, a.goal) < 0.3f) {
                 a.wait = std::uniform_real_distribution<float>(params_.wait_min, params_.wait_max)(rng_);
             } else {
@@ -289,7 +354,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
                 else if (set.idle) length = set.idle->seconds;
             }
             a.motion_time += dt * a.motion.rate;
-            if (length > 0) a.motion_time = std::fmod(a.motion_time, length);
+            if (length > 0) a.motion_time = std::fmod(a.motion_time, 2 * length);  // motion_clip_time folds it
         }
     }
     for (size_t i = 0; i < drones_.size(); ++i) {

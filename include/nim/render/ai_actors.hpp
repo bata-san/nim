@@ -1,0 +1,112 @@
+#pragma once
+#include "nim/content/animation.hpp"
+#include "nim/content/map.hpp"
+#include "nim/content/tfx.hpp"
+#include "nim/render/scene.hpp"
+#include "nim/sim/ai.hpp"
+
+#include <array>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace nim {
+
+// AI characters drawn in a map scene (docs/PROGRESS.md 3.70): each agent of the estimated
+// simulation (3.69) is the character entity's own assembled model, skinned on the CPU with the
+// motion-bank clip the simulation picked. Indicators (awareness, markers, debug) are nim's own
+// overlay, not a game HUD.
+
+// The indexes a character preview needs (as the Models tab builds them), built once.
+struct ActorSources {
+    std::unordered_map<uint32_t, DynamicModelMaterials> materials;
+    ModelAssemblyIndex assemblies;
+    ModelMotionIndex motions;
+    ModelRigIndex rigs;
+    std::vector<ClipInfo> clips;
+};
+ActorSources index_actor_sources(PackageManager& pm);
+
+// The dynamic models an entity's components name (SDynamicModelComponent, as load_map_entities).
+std::vector<TagHash> entity_dynamic_models(PackageManager& pm, TagHash entity, const ActorSources& sources);
+
+// One character entity, ready to place any number of times.
+struct ActorCharacter {
+    TagHash entity, model;
+    std::shared_ptr<const PreparedMesh> mesh;
+    std::shared_ptr<const PreviewAnimation> binding;
+    std::unordered_map<TagHash, AnimationClip> clips;  // the motion set's clips the binding plays
+    MotionSet motion;
+    bool entity_binding = false;  // bound with the entity's own skeleton and rig (推定)
+    std::string error;  // why it cannot be drawn, if it cannot
+};
+ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion);
+
+// Crossfades between the clips an agent plays.
+struct ActorAnimator {
+    TagHash clip, previous;
+    float time = 0, previous_time = 0, blend = 1;  // blend 0 -> 1: previous -> clip
+};
+// The poses for `agent` (its motion choice and clock), blending out of the previous clip over
+// 0.25 s (推定). Empty when the character has no clip for the choice.
+std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& agent, ActorAnimator& anim, float dt);
+// 3x4 object-to-world rows for an agent (rotation about +z by yaw, model forward +x).
+std::array<float, 12> actor_rows(const AiAgent& agent);
+
+// Actor slots in a scene, reassigned every frame to the agents nearest the camera.
+class AiActors {
+public:
+    // Adds `per_character` hidden actors per drawable character (capped by its agent count).
+    void build(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
+               std::vector<ActorCharacter> characters, const MapGameplay& gameplay, const AiSimulation& sim,
+               size_t per_character);
+    // Places the nearest agents of each character (within `range` m of `eye`), poses them and
+    // hides the rest.
+    void update(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range);
+    void clear() { slots_.clear(), characters_.clear(), by_character_.clear(); }
+    size_t slots() const { return slots_.size(); }
+    size_t shown() const { return shown_; }
+    const std::vector<ActorCharacter>& characters() const { return characters_; }
+    const std::vector<std::string>& notes() const { return notes_; }
+
+private:
+    struct Slot {
+        size_t character = 0;  // characters_ index
+        uint32_t actor = 0;
+        std::optional<size_t> agent;
+        ActorAnimator anim;
+    };
+    std::vector<ActorCharacter> characters_;
+    std::vector<std::optional<size_t>> by_character_;  // MapGameplay::characters -> characters_
+    std::vector<Slot> slots_;
+    std::vector<std::string> notes_;
+    size_t shown_ = 0;
+};
+
+// Open floor of a firing area: the scene drawn straight down into `view` (resized as needed;
+// reused between calls) from 2 m above the floor, each cell open when the top surface there is
+// the floor itself, then eroded by 0.3 m. Actors must be hidden. Waits for the GPU.
+WalkGrid build_walk_grid(Gpu& gpu, StaticMeshScene& scene, const MapFiringArea& area, SunShadow& view, float cell = 0.25f);
+
+// ---- indicators --------------------------------------------------------------------------------
+struct AiOverlayOptions {
+    bool awareness = true;  // meters and ? / ! above enemies
+    bool markers = true;    // firing-area and drone-route markers with distance
+    bool debug = false;     // floor polygons, view cones, hearing rings, goals, labels
+    float range = 80;       // m from the camera
+};
+struct AiOverlay {
+    struct Line { std::array<float, 2> a, b; uint32_t color; float width; };
+    struct Rect { std::array<float, 2> min, max; uint32_t color; bool filled; };
+    struct Text { std::array<float, 2> at; uint32_t color; std::string text; float scale; };
+    std::vector<Line> lines;
+    std::vector<Rect> rects;
+    std::vector<Text> texts;
+};
+// Colours are 0xAABBGGRR (ImGui's IM_COL32). Screen pixels, y down.
+AiOverlay build_ai_overlay(const AiSimulation& sim, const MapGameplay& gameplay, const ViewMatrices& view, float width,
+                           float height, const AiOverlayOptions& options);
+
+} // namespace nim

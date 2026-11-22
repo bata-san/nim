@@ -21,6 +21,8 @@
 #include "nim/content/object_channels.hpp"
 #include "nim/render/scene.hpp"
 #include "nim/render/particles.hpp"
+#include "nim/render/ai_actors.hpp"
+#include "nim/sim/ai.hpp"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -166,7 +168,7 @@ namespace ico {
 constexpr uint32_t Home = 0xE80F, Settings = 0xE713, Statics = 0xE7B8, Text = 0xE8D2, Dialogue = 0xE8BD,
                    Packages = 0xE8B7, Log = 0xE9D9, Tune = 0xE9E9, Frame = 0xE740, Save = 0xE74E, Light = 0xE706,
                    Search = 0xE721, Entities = 0xE99A, Fonts = 0xE8E9, Link = 0xE71B, Eye = 0xE890, Maps = 0xE774,
-                   Movies = 0xE714, Play = 0xE768, Pause = 0xE769, Stop = 0xE71A, Volume = 0xE767, Folder = 0xE8B7, Codex = 0xE8F1;
+                   Movies = 0xE714, Play = 0xE768, Pause = 0xE769, Stop = 0xE71A, Volume = 0xE767, Folder = 0xE8B7, Codex = 0xE8F1, People = 0xE716;
 }
 std::string format_bytes(uint64_t b) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -1894,6 +1896,12 @@ public:
             stop_map();
             error(ui::trf(ui::S::ErrMapStopped, ex.what()));
         }
+        try {
+            update_ai(g);
+        } catch (const std::exception& ex) {
+            ai.failed = true;
+            error(ui::trf(ui::S::ErrAi, ex.what()));
+        }
     }
 
     // ---- maps ----
@@ -1909,6 +1917,7 @@ public:
         loading.reset();  // a live mesh still being prepared is discarded when it arrives
         map_add_failures.clear();
         gpu.wait_idle();
+        reset_ai();
         scene.begin(gpu);
         anim.reset();
         channel_overrides.clear();
@@ -2015,6 +2024,151 @@ public:
                              pr.failed ? ui::trf(ui::S::LogSkipped, pr.failed) : ""));
         }
     }
+    // ---- AI (docs/PROGRESS.md 3.69 / 3.70) ----
+    // The activity's estimated AI simulation, its agents drawn as the characters' own models and
+    // nim's indicators over them. The gameplay, motion banks and character meshes are read on a
+    // thread of their own (own PackageManager); the GPU part runs at the top of a frame.
+    struct AiPrepared {
+        TagHash activity;
+        std::shared_ptr<MapGameplay> gameplay;
+        std::vector<MotionSet> motions;
+        std::vector<ActorCharacter> characters;
+        std::string error;
+        double seconds = 0;
+    };
+    struct AiView {
+        bool enabled = false, awareness = true, markers = true, debug = false, visible = false;
+        float range = 60;
+        TagHash activity;  // the activity the state below belongs to
+        std::future<AiPrepared> pending;
+        std::shared_ptr<MapGameplay> gameplay;
+        std::unique_ptr<AiSimulation> sim;
+        AiActors actors;
+        bool failed = false;
+    } ai;
+    std::vector<std::future<AiPrepared>> ai_discarded;  // preparations of maps left since
+
+    static AiPrepared prepare_ai(fs::path dir, TagHash activity) {
+        AiPrepared out;
+        out.activity = activity;
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            PackageManager pm(dir);
+            pm.build_hash64_index();
+            const ActorSources sources = index_actor_sources(pm);
+            out.gameplay = std::make_shared<MapGameplay>(load_map_gameplay(pm, activity));
+            std::map<uint32_t, size_t> first;
+            for (const auto& ch : out.gameplay->characters) {
+                if (const auto it = first.find(ch.entity.value); it != first.end()) {
+                    out.motions.push_back(out.motions[it->second]);
+                    out.characters.push_back(out.characters[it->second]);
+                    continue;
+                }
+                first[ch.entity.value] = out.motions.size();
+                out.motions.push_back(build_motion_set(pm, ch.entity, kClipFps));
+                out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back()));
+            }
+        } catch (const std::exception& ex) {
+            out.error = ex.what();
+        }
+        out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return out;
+    }
+    void reset_ai() {
+        if (ai.pending.valid()) ai_discarded.push_back(std::move(ai.pending));
+        ai.actors.clear();  // the scene's actors go with the scene (begin / release)
+        ai.sim.reset();
+        ai.gameplay.reset();
+        ai.activity = TagHash();
+        ai.failed = false;
+    }
+    // Top of a frame: start / finish the preparation, then step the simulation and pose the actors.
+    void update_ai(Gpu& g) {
+        std::erase_if(ai_discarded, [](auto& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+        const bool ready_map = map_scene && !map.activity.is_none() && !map.streaming && scene.loaded();
+        if (!ready_map || ai.activity != map.activity) {
+            if (ai.sim || ai.pending.valid() || !ai.activity.is_none()) reset_ai();
+            if (!ready_map) return;
+        }
+        if (!ai.enabled && !ai.sim) return;
+        if (!ai.sim && !ai.pending.valid() && !ai.failed) {
+            ai.activity = map.activity;
+            ai.pending = std::async(std::launch::async, prepare_ai, install, map.activity);
+            info(ui::trf(ui::S::LogAiPreparing, map.activity.str()));
+        }
+        if (ai.pending.valid() && ai.pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            AiPrepared p = ai.pending.get();
+            if (!p.error.empty() || !p.gameplay) {
+                ai.failed = true;
+                error(ui::trf(ui::S::ErrAi, p.error));
+                return;
+            }
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                ai.gameplay = p.gameplay;
+                AiParams params;
+                params.player_invisible = !ai.visible;
+                ai.sim = std::make_unique<AiSimulation>(*ai.gameplay, params, 1, std::move(p.motions));
+                // Open floor of every firing area the squads use (drawn top-down, before actors exist).
+                std::set<size_t> areas;
+                for (const auto& sq : ai.gameplay->squads)
+                    if (sq.objective)
+                        for (const auto fa : ai.gameplay->objectives[*sq.objective].firing_areas) areas.insert(fa);
+                g.wait_idle();
+                SunShadow walk_view;
+                for (const auto fa : areas) ai.sim->set_walk_grid(fa, build_walk_grid(g, scene, ai.gameplay->firing_areas[fa], walk_view));
+                ai.actors.build(g, scene, layouts, std::move(p.characters), *ai.gameplay, *ai.sim, 4);
+                for (const auto& n : ai.actors.notes()) ++map_add_failures["ai: " + n.substr(0, 110)];
+                info(ui::trf(ui::S::LogAiReady, ai.sim->agents().size(), ai.sim->drones().size(), ai.actors.slots(), p.seconds,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()));
+            } catch (const std::exception& ex) {
+                ai.failed = true;
+                ai.actors.clear();
+                ai.sim.reset();
+                error(ui::trf(ui::S::ErrAi, ex.what()));
+                return;
+            }
+        }
+        if (!ai.sim) return;
+        const ViewMatrices vm = make_view(current_view());
+        const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};
+        if (!ai.enabled) {
+            ai.actors.update(scene, *ai.sim, eye, 0, -1);  // hidden, simulation paused
+            return;
+        }
+        const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
+        ai.sim->set_player_invisible(!ai.visible);
+        ai.sim->step(dt, eye);
+        ai.actors.update(scene, *ai.sim, eye, dt, ai.range);
+    }
+    void draw_ai_overlay(ImDrawList* dl, ImVec2 origin, ImVec2 size, float sc) {
+        if (!ai.enabled || !ai.sim || !ai.gameplay || !map_scene) return;
+        AiOverlayOptions options;
+        options.awareness = ai.awareness;
+        options.markers = ai.markers;
+        options.debug = ai.debug;
+        options.range = ai.range;
+        const ViewMatrices vm = make_view(current_view());
+        const AiOverlay o = build_ai_overlay(*ai.sim, *ai.gameplay, vm, size.x, size.y, options);
+        dl->PushClipRect(origin, {origin.x + size.x, origin.y + size.y}, true);
+        for (const auto& r : o.rects) {
+            const ImVec2 a{origin.x + r.min[0], origin.y + r.min[1]}, b{origin.x + r.max[0], origin.y + r.max[1]};
+            if (r.filled) dl->AddRectFilled(a, b, r.color);
+            else dl->AddRect(a, b, r.color);
+        }
+        for (const auto& l : o.lines)
+            dl->AddLine({origin.x + l.a[0], origin.y + l.a[1]}, {origin.x + l.b[0], origin.y + l.b[1]}, l.color, std::max(1.0f, l.width) * sc);
+        for (const auto& t : o.texts) {
+            const ImVec2 at{origin.x + t.at[0], origin.y + t.at[1]};
+            const float font = ImGui::GetFontSize() * std::max(0.6f, t.scale);
+            dl->AddText(nullptr, font, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, (t.color >> 24) * 3 / 4), t.text.c_str());
+            dl->AddText(nullptr, font, at, t.color, t.text.c_str());
+        }
+        dl->PopClipRect();
+        const std::string status = ui::trf(ui::S::AiHud, ai.sim->agents().size(), ai.actors.shown(), ai.sim->time());
+        hud_text(dl, {origin.x + 10 * sc, origin.y + size.y - 2 * ImGui::GetTextLineHeight() - 12 * sc}, IM_COL32(255, 210, 120, 230), status.c_str());
+    }
+
     std::map<std::string, size_t> map_add_failures;
     std::shared_ptr<const std::vector<MapLight>> map_lights;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
@@ -3388,6 +3542,28 @@ public:
         ImGui::SameLine(0, 4 * sc);
         ImGui::SetNextItemWidth(220 * sc);
         ImGui::TextUnformatted("GAME SHADING / STRICT");
+        if (map_scene && !map.activity.is_none()) {
+            ImGui::SameLine(0, 4 * sc);
+            if (ai.enabled) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 210, 120, 255));
+            if (ImGui::Button(icon(ico::People).c_str())) ImGui::OpenPopup("ai");
+            if (ai.enabled) ImGui::PopStyleColor();
+            ImGui::SetItemTooltip(ui::tr(ui::S::AiTip));
+            if (ImGui::BeginPopup("ai")) {
+                ImGui::Checkbox(ui::tr(ui::S::AiEnable), &ai.enabled);
+                ImGui::SetItemTooltip(ui::tr(ui::S::AiEnableTip));
+                ImGui::BeginDisabled(!ai.enabled);
+                ImGui::Checkbox(ui::tr(ui::S::AiAwareness), &ai.awareness);
+                ImGui::Checkbox(ui::tr(ui::S::AiMarkers), &ai.markers);
+                ImGui::Checkbox(ui::tr(ui::S::AiDebug), &ai.debug);
+                ImGui::Checkbox(ui::tr(ui::S::AiVisible), &ai.visible);
+                ImGui::SetItemTooltip(ui::tr(ui::S::AiVisibleTip));
+                ImGui::SetNextItemWidth(180 * sc);
+                ImGui::SliderFloat(ui::tr(ui::S::AiRange), &ai.range, 10, 200, "%.0f m");
+                ImGui::EndDisabled();
+                if (ai.pending.valid()) ImGui::TextDisabled("%s", ui::tr(ui::S::AiLoading));
+                ImGui::EndPopup();
+            }
+        }
         ImGui::SameLine(0, 4 * sc);
         if (ImGui::Button(icon(ico::Frame).c_str())) frame_scene();
         ImGui::SetItemTooltip(ui::tr(ui::S::FrameAll));
@@ -3411,6 +3587,7 @@ public:
             ImGui::TextWrapped("%s", render_error.c_str());
         }
         // bottom-left HUD / messages
+        if (scene.loaded() && map_scene) draw_ai_overlay(dl, origin, size, sc);
         if (scene.loaded() && map_scene) {
             const ViewMatrices vm = make_view(current_view());
             std::string hud = std::format("{}   {} meshes   {} instances   ({:.0f}, {:.0f}, {:.0f})   GAME SHADING", map.name,

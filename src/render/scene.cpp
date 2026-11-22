@@ -641,6 +641,8 @@ void StaticMeshScene::release(Gpu& gpu) {
     skinned_ = skin_dirty_ = false;
     skin_poses_.clear();
     pending_equipment_.clear();
+    actors_.clear();
+    adding_actor_ = -1;
     tag_ = TagHash();
 }
 
@@ -1926,7 +1928,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         t2 = arena_.upload(gpu, data.data(), data.size());
     }
     uint32_t cull = UINT32_MAX;
-    if (!mesh.dynamic || (!dynamic_ && sky_order.empty())) {
+    if (!mesh.dynamic || (!dynamic_ && sky_order.empty() && adding_actor_ < 0)) {
         CullGroup group;
         group.dynamic = mesh.dynamic;
         group.first_item = items_.size();
@@ -2010,7 +2012,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
                 return v.empty() ? ComPtr<ID3D12Resource>{} : gpu.upload(v.data(), v.size() * 4);
             };
-            if (dynamic_ && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
+            if ((dynamic_ || adding_actor_ >= 0) && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
                 // Posed on the CPU (update_skin); the first render uploads the bind pose.
                 const size_t bytes = b.skin_pos.size() * 4;
                 set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2029,6 +2031,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             }
         }
         if (b.color.size() >= 4) set.color = arena_.upload(gpu, b.color.data(), b.color.size() & ~size_t(3));
+        if (adding_actor_ >= 0 && mesh.dynamic) {
+            set.actor = adding_actor_;
+            set.instances = 0;  // hidden until set_actor
+            std::copy(mesh.model_cb.begin(), mesh.model_cb.end(), set.actor_constants.values.begin());
+            actors_[size_t(adding_actor_)].sets.push_back(uint32_t(sets_.size()));
+        }
         sets_.push_back(std::move(set));
     }
     profile_geometry.stop();
@@ -2790,7 +2798,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                 if (it.ps_reads_position) it.ps_placement_addresses[i] = at(it.ps_material, it.ps_constants, position, false);
             };
             if (set.cull == UINT32_MAX)
-                for (uint32_t i = 0; i < set.placements.size(); ++i) placement(i);
+                for (uint32_t i = 0; i < std::min<size_t>(set.placements.size(), set.instances); ++i) placement(i);
             else
                 for (const auto i : cull_groups_[set.cull].visible_placements) placement(i);
         } else if (dynamic_) {
@@ -3189,14 +3197,14 @@ void StaticMeshScene::set_skin_poses(std::vector<ModelSkinPose> poses) {
 
 // Linear blend skinning of every skinned buffer set, packed into this frame's upload buffer and
 // copied into the streams the vertex shaders read. Runs at most once per frame (from
-// render_gbuffer), so alternating between the kFramesInFlight upload buffers is safe.
+// render_gbuffer), so alternating between the kFramesInFlight upload buffers is safe. Sets are
+// skinned in parallel (many actors in a map); the copies are recorded afterwards in order.
 void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     skin_dirty_ = false;
     const uint32_t slot = skin_frame_++ % Gpu::kFramesInFlight;
     struct Mat { float m[12]; };  // rows: rotation * scale | translation
-    std::unordered_map<TagHash, std::vector<Mat>> matrices;
-    for (const auto& pose : skin_poses_) {
-        auto& mats = matrices[pose.model];
+    auto matrices_of = [](const ModelSkinPose& pose) {
+        std::vector<Mat> mats;
         mats.reserve(pose.bones.size());
         for (const auto& t : pose.bones) {
             const float x = t.rotation[0], y = t.rotation[1], z = t.rotation[2], w = t.rotation[3], s = t.scale;
@@ -3204,33 +3212,52 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
                              2 * (x * y + z * w) * s, (1 - 2 * (x * x + z * z)) * s, 2 * (y * z - x * w) * s, t.translation[1],
                              2 * (x * z - y * w) * s, 2 * (y * z + x * w) * s, (1 - 2 * (x * x + y * y)) * s, t.translation[2]}});
         }
-    }
+        return mats;
+    };
+    using PoseMap = std::unordered_map<TagHash, std::vector<Mat>>;
+    PoseMap matrices;
+    for (const auto& pose : skin_poses_) matrices[pose.model] = matrices_of(pose);
+    std::vector<PoseMap> actor_matrices(actors_.size());
+    for (size_t a = 0; a < actors_.size(); ++a)
+        if (actors_[a].rows)
+            for (const auto& pose : actors_[a].poses) actor_matrices[a][pose.model] = matrices_of(pose);
+    struct Job { BufferSet* set; const std::vector<Mat>* mats; uint32_t* dst; };
+    std::vector<Job> jobs;
+    const D3D12_RANGE none{0, 0};
     for (auto& set : sets_) {
         if (!set.skin_upload[0]) continue;
-        const auto pose = matrices.find(set.model);
-        const bool posed = pose != matrices.end();
+        const PoseMap* source = &matrices;
+        if (set.actor >= 0) {
+            if (!actors_[size_t(set.actor)].rows) continue;  // hidden: not drawn
+            source = &actor_matrices[size_t(set.actor)];
+        }
+        const auto pose = source->find(set.model);
+        const bool posed = pose != source->end();
         if (!posed && !set.skin_posed && set.skin_readable) continue;
         set.skin_posed = posed;
-        const size_t n = set.skin.bones.size();
-        ID3D12Resource* upload = set.skin_upload[slot].Get();
         uint32_t* dst = nullptr;
-        const D3D12_RANGE none{0, 0};
-        check_hr(upload->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
+        check_hr(set.skin_upload[slot]->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
+        jobs.push_back({&set, posed ? &pose->second : nullptr, dst});
+    }
+    WorkerPool::instance().parallel_for(jobs.size(), [&](size_t j) {
+        const BufferSet& set = *jobs[j].set;
+        const std::vector<Mat>* mats = jobs[j].mats;
+        uint32_t* dst = jobs[j].dst;
+        const size_t n = set.skin.bones.size();
         const float inv_range = 1.0f / set.skin_range;
         for (size_t i = 0; i < n; ++i) {
             const uint8_t* v = set.vb0_cpu.data() + i * 24;
             V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
                  s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
             V3 nr{s16(v + 8), s16(v + 10), s16(v + 12)}, tg{s16(v + 16), s16(v + 18), s16(v + 20)};
-            if (posed) {
-                const auto& mats = pose->second;
+            if (mats) {
                 float m[12]{};
                 float total = 0;
                 for (int k = 0; k < 4; ++k) {
                     const float wk = set.skin.weights[i][k];
                     const uint16_t bk = set.skin.bones[i][k];
-                    if (wk <= 0 || bk >= mats.size()) continue;
-                    for (int j = 0; j < 12; ++j) m[j] += mats[bk].m[j] * wk;
+                    if (wk <= 0 || bk >= mats->size()) continue;
+                    for (int c = 0; c < 12; ++c) m[c] += (*mats)[bk].m[c] * wk;
                     total += wk;
                 }
                 if (total > 0) {
@@ -3245,8 +3272,13 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
             }
             pack_skin_vertex((p - set.skin_pack_offset) * inv_range, normalize(nr), normalize(tg), dst + i * 2, dst + n * 2 + i * 2);
         }
+    });
+    constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    for (const auto& job : jobs) {
+        BufferSet& set = *job.set;
+        const size_t n = set.skin.bones.size();
+        ID3D12Resource* upload = set.skin_upload[slot].Get();
         upload->Unmap(0, nullptr);
-        constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         if (set.skin_readable) {
             Gpu::barrier(cl, set.skin_pos.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
             Gpu::barrier(cl, set.skin_normal.Get(), kRead, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -3256,6 +3288,77 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         Gpu::barrier(cl, set.skin_pos.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
         Gpu::barrier(cl, set.skin_normal.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead);
         set.skin_readable = true;
+    }
+}
+
+uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const std::vector<std::vector<InputElement>>& layouts) {
+    if (dynamic_) throw std::runtime_error("actors belong in a map scene");
+    const uint32_t id = uint32_t(actors_.size());
+    actors_.emplace_back();
+    adding_actor_ = int32_t(id);
+    struct Done {
+        int32_t& adding;
+        ~Done() { adding = -1; }
+    } done{adding_actor_};
+    const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    PreparedMesh root = mesh;
+    auto parts = std::move(root.attachments);
+    root.attachments.clear();
+    const auto prune = [&] { std::erase_if(actors_[id].sets, [&](uint32_t set) { return set >= sets_.size(); }); };
+    try {
+        add_mesh(gpu, std::move(root), layouts, std::span(&identity, 1));
+    } catch (...) {
+        prune();
+        throw;
+    }
+    for (auto& part : parts) {
+        if (part.animation_equipment) continue;  // held equipment follows the clip: not placed
+        const TagHash part_tag = part.tag;
+        try {
+            add_mesh(gpu, std::move(part), layouts, std::span(&identity, 1));
+        } catch (const std::exception& ex) {
+            prune();
+            notes_.push_back(std::format("actor {} part {}: {}", id, part_tag.str(), ex.what()));
+        }
+    }
+    gpu.flush();
+    return id;
+}
+
+void StaticMeshScene::set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses) {
+    auto& a = actors_.at(actor);
+    a.previous = a.rows && rows ? a.rows : rows;  // first visible frame: no motion
+    a.rows = rows;
+    a.poses = std::move(poses);
+    for (const auto index : a.sets) {
+        auto& set = sets_[index];
+        set.instances = rows ? 1 : 0;
+        if (rows) set.placements.assign(1, *rows);
+    }
+    skin_dirty_ = skinned_;
+}
+
+// This frame's object constants of every visible actor: its model's own constants with the
+// world transform (rows 0-3) and the previous frame's (rows 8-11, motion vectors).
+void StaticMeshScene::bind_actor_constants(Gpu& gpu) {
+    for (const auto& a : actors_) {
+        if (!a.rows) continue;
+        for (const auto index : a.sets) {
+            auto& set = sets_[index];
+            PlacementConstants constants = set.actor_constants;
+            auto put = [&](size_t first, const std::array<float, 12>& p) {
+                auto& cb = constants.values;
+                cb[first + 0] = {p[0], p[4], p[8], 0};
+                cb[first + 1] = {p[1], p[5], p[9], 0};
+                cb[first + 2] = {p[2], p[6], p[10], 0};
+                cb[first + 3] = {p[3], p[7], p[11], 1};
+            };
+            put(0, *a.rows);
+            put(8, a.previous ? *a.previous : *a.rows);
+            const auto alloc = gpu.dynamic(sizeof(PlacementConstants));
+            std::memcpy(alloc.cpu, &constants, sizeof(PlacementConstants));
+            set.object_cb.gpu = alloc.gpu;
+        }
     }
 }
 
@@ -3382,6 +3485,9 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
             visible_static_indices_.insert(visible_static_indices_.end(), group.visible_indices.begin(), group.visible_indices.end());
         }
         const uint8_t stage = shadow && group.authored_shadow ? kStageShadow : 0;
+        // A static mesh casts with its authored shadow-stage parts only: the 96 of Outpost's 3726
+        // static groups with none (hanging cables, foliage, trim) do not cast (3.70, 推定).
+        if (shadow && !group.dynamic && !group.authored_shadow) continue;
         for (size_t index = group.first_item; index < group.end_item; ++index)
             if (items_[index].stage == stage && (group.dynamic || (items_[index].lod_mask & lods))) visible_opaque_.push_back(index);
     }
@@ -3425,6 +3531,7 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     distortion_draws_ = 0;
     srv_frame_ = (srv_frame_ + 1) % kSrvCopies;
     ProfileScope ps_cull("frame.gbuffer.cull");
+    if (!actors_.empty()) bind_actor_constants(gpu);
     cull(gpu, vm, gb.height());
     ps_cull.stop();
     ProfileScope ps_mat("frame.gbuffer.materials");
@@ -3464,6 +3571,7 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
     shadow.valid = false;
     if (!shadow.depth || items_.size() == transparent_count()) return;
     if (skin_dirty_) update_skin(cl);
+    if (!actors_.empty()) bind_actor_constants(gpu);
     ProfileScope ps_cull("frame.shadow.cull");
     cull(gpu, shadow.vm, shadow.size, true);
     ps_cull.stop();

@@ -282,6 +282,20 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(SSRTip, "ゲームの hi_z_generate_* / ssr_* コンピュートパス (設定値は推定)",                                       \
       "The game's hi_z_generate_* and ssr_* compute passes (settings estimated)",                                        \
       "게임의 hi_z_generate_* / ssr_* 컴퓨트 패스 (설정값은 추정)")                                                         \
+    X(AiTip, "AI (推定シミュレーション) とインジケーター", "AI (estimated simulation) and indicators", "AI (추정 시뮬레이션) 와 인디케이터") \
+    X(AiEnable, "AI を動かす", "Run the AI", "AI 실행") \
+    X(AiEnableTip, "このゲームモードの分隊・目標・巡回をゲームデータから読み、推定の行動で敵を動かす (BlockScript の挙動は未解読)", "Reads this mode's squads, objectives and patrols from game data and moves the enemies with estimated behaviour (BlockScript logic not decoded)", "이 게임 모드의 분대·목표·순찰을 게임 데이터에서 읽어 추정 행동으로 적을 움직임 (BlockScript 동작은 미해독)") \
+    X(AiAwareness, "警戒・発見表示", "Alert / detection", "경계·발견 표시") \
+    X(AiMarkers, "目標・地点マーカー", "Objective / point markers", "목표·지점 마커") \
+    X(AiDebug, "デバッグ表示 (範囲・視界・経路)", "Debug (areas, sight, routes)", "디버그 표시 (범위·시야·경로)") \
+    X(AiVisible, "敵にカメラを認識させる", "Let enemies notice the camera", "적이 카메라를 인식") \
+    X(AiVisibleTip, "オフ (既定) ではカメラは敵から見えない。警戒度は計算して表示だけする", "Off (default): the camera is invisible to enemies; awareness is computed and shown only", "끔 (기본): 카메라는 적에게 보이지 않음. 경계도는 계산해 표시만 함") \
+    X(AiRange, "表示距離", "Range", "표시 거리") \
+    X(AiLoading, "AI を準備中…", "Preparing the AI…", "AI 준비 중…") \
+    X(AiHud, "AI 推定: {} 体 (描画 {})  {:.0f} 秒", "AI estimate: {} agents ({} drawn)  {:.0f} s", "AI 추정: {} 체 (표시 {})  {:.0f} 초") \
+    X(LogAiPreparing, "AI を準備中: {}", "Preparing the AI: {}", "AI 준비 중: {}") \
+    X(LogAiReady, "AI: {} 体、ドローン {}、描画枠 {} (読込 {:.1f} 秒、配置 {:.1f} 秒)", "AI: {} agents, {} drones, {} actor slots (read {:.1f} s, set up {:.1f} s)", "AI: {} 체, 드론 {}, 표시 슬롯 {} (읽기 {:.1f} 초, 배치 {:.1f} 초)") \
+    X(ErrAi, "AI を準備できません: {}", "Cannot prepare the AI: {}", "AI 를 준비할 수 없습니다: {}") \
     X(LightShafts, "ライトシャフト", "Light shafts", "라이트 샤프트")                                                    \
     X(LightShaftsTip, "ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)",          \
       "Light volumetrics technique, blur, upres (the fog-density slice has no known source, so 0 = estimated)",           \

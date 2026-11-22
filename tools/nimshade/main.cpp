@@ -26,6 +26,8 @@
 #include "nim/content/weather.hpp"
 #include "nim/render/scene.hpp"
 #include "nim/render/particles.hpp"
+#include "nim/render/ai_actors.hpp"
+#include "nim/sim/ai.hpp"
 
 #include <wincodec.h>
 
@@ -41,6 +43,9 @@
 #include <stdexcept>
 #include <atomic>
 #include <thread>
+#include <map>
+#include <set>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,6 +53,69 @@ using namespace nim;
 namespace fs = std::filesystem;
 
 namespace {
+
+// 5x7 glyphs for the AI overlay's labels in headless renders (the GUI draws them with ImGui).
+const uint8_t* glyph(char c) {
+    static const struct { char c; uint8_t rows[7]; } kFont[] = {
+        {'0', {14, 17, 19, 21, 25, 17, 14}}, {'1', {4, 12, 4, 4, 4, 4, 14}}, {'2', {14, 17, 1, 2, 4, 8, 31}},
+        {'3', {30, 1, 1, 14, 1, 1, 30}}, {'4', {2, 6, 10, 18, 31, 2, 2}}, {'5', {31, 16, 30, 1, 1, 17, 14}},
+        {'6', {6, 8, 16, 30, 17, 17, 14}}, {'7', {31, 1, 2, 4, 8, 8, 8}}, {'8', {14, 17, 17, 14, 17, 17, 14}},
+        {'9', {14, 17, 17, 15, 1, 2, 12}}, {'a', {0, 0, 14, 1, 15, 17, 15}}, {'b', {16, 16, 30, 17, 17, 17, 30}},
+        {'c', {0, 0, 14, 16, 16, 17, 14}}, {'d', {1, 1, 15, 17, 17, 17, 15}}, {'e', {0, 0, 14, 17, 31, 16, 14}},
+        {'f', {6, 9, 8, 28, 8, 8, 8}}, {'g', {0, 15, 17, 17, 15, 1, 14}}, {'h', {16, 16, 22, 25, 17, 17, 17}},
+        {'i', {4, 0, 12, 4, 4, 4, 14}}, {'j', {2, 0, 6, 2, 2, 18, 12}}, {'k', {16, 16, 18, 20, 24, 20, 18}},
+        {'l', {12, 4, 4, 4, 4, 4, 14}}, {'m', {0, 0, 26, 21, 21, 17, 17}}, {'n', {0, 0, 22, 25, 17, 17, 17}},
+        {'o', {0, 0, 14, 17, 17, 17, 14}}, {'p', {0, 0, 30, 17, 30, 16, 16}}, {'q', {0, 0, 15, 17, 15, 1, 1}},
+        {'r', {0, 0, 22, 25, 16, 16, 16}}, {'s', {0, 0, 15, 16, 14, 1, 30}}, {'t', {8, 8, 28, 8, 8, 9, 6}},
+        {'u', {0, 0, 17, 17, 17, 19, 13}}, {'v', {0, 0, 17, 17, 17, 10, 4}}, {'w', {0, 0, 17, 17, 21, 21, 10}},
+        {'x', {0, 0, 17, 10, 4, 10, 17}}, {'y', {0, 0, 17, 17, 15, 1, 14}}, {'z', {0, 0, 31, 2, 4, 8, 31}},
+        {'?', {14, 17, 1, 2, 4, 0, 4}}, {'!', {4, 4, 4, 4, 4, 0, 4}}, {'.', {0, 0, 0, 0, 0, 12, 12}},
+        {'_', {0, 0, 0, 0, 0, 0, 31}}, {'-', {0, 0, 0, 31, 0, 0, 0}},
+    };
+    if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    for (const auto& g : kFont)
+        if (g.c == c) return g.rows;
+    return nullptr;
+}
+
+// Draws the AI overlay (lines, rectangles, labels) over an RGBA8 image, alpha-blended.
+void draw_overlay(std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, const AiOverlay& o) {
+    auto plot = [&](int x, int y, uint32_t c) {
+        if (x < 0 || y < 0 || x >= int(w) || y >= int(h)) return;
+        uint8_t* px = rgba.data() + (size_t(y) * w + size_t(x)) * 4;
+        const float a = float(c >> 24) / 255.0f;
+        for (int k = 0; k < 3; ++k) px[k] = uint8_t(px[k] * (1 - a) + float((c >> (8 * k)) & 255) * a + 0.5f);
+    };
+    for (const auto& r : o.rects) {
+        const int x0 = int(std::floor(r.min[0])), y0 = int(std::floor(r.min[1])), x1 = int(std::ceil(r.max[0])), y1 = int(std::ceil(r.max[1]));
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                if (r.filled || y == y0 || y == y1 - 1 || x == x0 || x == x1 - 1) plot(x, y, r.color);
+    }
+    for (const auto& l : o.lines) {
+        const float dx = l.b[0] - l.a[0], dy = l.b[1] - l.a[1];
+        const int steps = int(std::min(4000.0f, std::max(std::abs(dx), std::abs(dy)))) + 1;
+        const int half = std::max(0, int(l.width / 2));
+        for (int i = 0; i <= steps; ++i) {
+            const int x = int(l.a[0] + dx * float(i) / float(steps)), y = int(l.a[1] + dy * float(i) / float(steps));
+            for (int oy = -half; oy <= half; ++oy)
+                for (int ox = -half; ox <= half; ++ox) plot(x + ox, y + oy, l.color);
+        }
+    }
+    for (const auto& t : o.texts) {
+        const int scale = std::max(1, int(t.scale * 2 + 0.5f));
+        int x = int(t.at[0]);
+        for (const char c : t.text) {
+            if (const uint8_t* g = glyph(c))
+                for (int row = 0; row < 7; ++row)
+                    for (int col = 0; col < 5; ++col)
+                        if (g[row] & (16 >> col))
+                            for (int sy = 0; sy < scale; ++sy)
+                                for (int sx = 0; sx < scale; ++sx) plot(x + col * scale + sx, int(t.at[1]) + row * scale + sy, t.color);
+            x += 6 * scale;
+        }
+    }
+}
 
 void write_png(const fs::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba) {
     ComPtr<IWICImagingFactory> f;
@@ -120,6 +188,9 @@ int run(int argc, char** argv) {
     bool reference = false;
     bool heat_cascade = false;
     std::vector<std::pair<std::string, uint32_t>> weather_args;  // controller name part, state hash
+    bool ai = false, ai_visible = false, ai_debug = false, ai_frame = false;
+    float ai_time = 20, ai_range = 60, ai_frame_distance = 6, ai_frame_height = 1.7f;
+    size_t ai_per_character = 4;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
@@ -158,6 +229,17 @@ int run(int argc, char** argv) {
         else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-entities") no_entities = true;
+        else if (args[i] == "--ai") ai = true;
+        else if (args[i] == "--ai-visible") ai_visible = true;
+        else if (args[i] == "--ai-debug") ai_debug = true;
+        else if (args[i] == "--ai-frame") ai_frame = true;
+        else if (args[i] == "--ai-frame-at" && i + 1 < args.size()) {
+            ai_frame = true;
+            if (std::sscanf(args[++i].c_str(), "%f,%f", &ai_frame_distance, &ai_frame_height) != 2) throw std::runtime_error("--ai-frame-at DISTANCE,HEIGHT");
+        }
+        else if (args[i] == "--ai-time" && i + 1 < args.size()) ai_time = std::stof(args[++i]);
+        else if (args[i] == "--ai-range" && i + 1 < args.size()) ai_range = std::stof(args[++i]);
+        else if (args[i] == "--ai-actors" && i + 1 < args.size()) ai_per_character = std::stoull(args[++i]);
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
@@ -224,7 +306,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT]");
         return 2;
     }
     if (install.empty()) {
@@ -256,6 +338,10 @@ int run(int argc, char** argv) {
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
     std::vector<MapParticle> particle_placements;
+    // --ai (3.70): the activity's estimated AI simulation, its agents drawn as actors.
+    std::optional<MapGameplay> ai_gameplay;
+    std::unique_ptr<AiSimulation> ai_sim;
+    AiActors ai_actors;
     if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassBubbleParent) {
         // A map: the static instances within --map-radius of where the geometry is.
         auto t0 = std::chrono::steady_clock::now();
@@ -459,6 +545,116 @@ int run(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         std::println("  prepare {:.1f}s, add {:.1f}s", prep_s, add_s);
         for (const auto& [why, n] : failures) std::println("  skipped {}: {}", n, why);
+        if (ai) {
+            if (selected_activity.is_none()) throw std::runtime_error("--ai needs --activity");
+            const auto ta = std::chrono::steady_clock::now();
+            const ActorSources sources = index_actor_sources(pm);
+            ai_gameplay = load_map_gameplay(pm, selected_activity);
+            std::vector<MotionSet> motions;
+            std::vector<ActorCharacter> characters;
+            std::map<uint32_t, size_t> first;
+            for (const auto& ch : ai_gameplay->characters) {
+                if (const auto it = first.find(ch.entity.value); it != first.end()) {
+                    motions.push_back(motions[it->second]);
+                    characters.push_back(characters[it->second]);
+                    continue;
+                }
+                first[ch.entity.value] = motions.size();
+                motions.push_back(build_motion_set(pm, ch.entity, 30.0f));
+                characters.push_back(prepare_actor_character(pm, sources, motions.back()));
+                const auto& c = characters.back();
+                std::println("ai character {} {}: model {} clips {} {}", ch.entity.str(), ch.name_estimate, c.model.is_none() ? "-" : c.model.str(),
+                             c.clips.size(), c.error);
+            }
+            AiParams params;
+            params.player_invisible = !ai_visible;
+            ai_sim = std::make_unique<AiSimulation>(*ai_gameplay, params, 1, motions);
+            const V3 eye = eye_arg ? *eye_arg : V3{focus[0], focus[1], focus[2]};
+            const std::array<float, 3> player{eye.x, eye.y, eye.z};
+            {
+                // Open floor of the firing areas the nearby squads use (3.70).
+                const auto tw = std::chrono::steady_clock::now();
+                std::set<size_t> wanted;
+                for (const auto& a : ai_sim->agents())
+                    if (std::hypot(a.position[0] - eye.x, a.position[1] - eye.y) < ai_range + 30)
+                        if (const auto ob = ai_gameplay->squads[a.squad].objective)
+                            for (const auto fa : ai_gameplay->objectives[*ob].firing_areas) wanted.insert(fa);
+                SunShadow walk_view;
+                size_t open = 0, cells = 0;
+                for (const auto fa : wanted) {
+                    auto grid = build_walk_grid(gpu, scene, ai_gameplay->firing_areas[fa], walk_view);
+                    open += grid.open_count(), cells += grid.open.size();
+                    ai_sim->set_walk_grid(fa, std::move(grid));
+                }
+                std::println("ai walk grids: {} firing areas, {:.0f} m2 open in {:.1f}s", wanted.size(), double(open) * 0.0625,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
+            }
+            for (float t = 0; t < ai_time; t += 0.1f) ai_sim->step(0.1f, player);
+            std::vector<bool> characters_drawable;
+            for (const auto& c : characters) characters_drawable.push_back(c.mesh != nullptr);
+            ai_actors.build(gpu, scene, layouts, std::move(characters), *ai_gameplay, *ai_sim, ai_per_character);
+            // Run the clips' crossfades to rest over the last half second.
+            for (int k = 0; k < 5; ++k) {
+                ai_sim->step(0.1f, player);
+                ai_actors.update(scene, *ai_sim, player, 0.1f, ai_range);
+            }
+            std::println("ai: {} agents, {} drones after {:.0f}s; {} actor slots, {} shown within {:.0f} m ({:.1f}s)", ai_sim->agents().size(),
+                         ai_sim->drones().size(), ai_sim->time(), ai_actors.slots(), ai_actors.shown(), ai_range,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count());
+            {
+                std::vector<std::pair<float, size_t>> order;
+                for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
+                    const auto& a = ai_sim->agents()[k];
+                    order.push_back({std::hypot(a.position[0] - eye.x, a.position[1] - eye.y, a.position[2] - eye.z), k});
+                }
+                std::ranges::sort(order);
+                for (size_t k = 0; k < std::min<size_t>(order.size(), 8); ++k) {
+                    const auto& a = ai_sim->agents()[order[k].second];
+                    std::println("  ai agent {} at ({:.1f} {:.1f} {:.1f}) {:.1f} m, yaw {:.2f}, {}", ai_gameplay->characters[a.character].name_estimate,
+                                 a.position[0], a.position[1], a.position[2], order[k].first, a.yaw, a.motion.locomotion ? "moving" : "idle");
+                }
+            }
+            for (const auto& n : ai_actors.notes()) std::println("  ai note: {}", n);
+            // --ai-frame: look at the drawable agent nearest the given view from open floor in
+            // front of it (a point inside one of its squad's firing areas), 4 m away, at eye height.
+            if (ai_frame) {
+                // From open floor with a clear straight line at body height to the agent (walk grids).
+                std::vector<std::pair<float, size_t>> order;
+                for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
+                    const auto& a = ai_sim->agents()[k];
+                    if (a.character < characters_drawable.size() && characters_drawable[a.character])
+                        order.push_back({std::hypot(a.position[0] - eye.x, a.position[1] - eye.y), k});
+                }
+                std::ranges::sort(order);
+                std::optional<std::pair<V3, V3>> best;
+                for (const auto& [unused, k] : order) {
+                    const auto& a = ai_sim->agents()[k];
+                    const auto ob = ai_gameplay->squads[a.squad].objective;
+                    if (!ob) continue;
+                    for (const auto fa : ai_gameplay->objectives[*ob].firing_areas) {
+                        const WalkGrid* grid = ai_sim->walk_grid(fa);
+                        if (!grid || !grid->walkable(a.position[0], a.position[1])) continue;
+                        for (int s = 0; s < 16 && !best; ++s) {
+                            const float ang = a.yaw + float(s) * 0.3927f;
+                            const std::array<float, 3> q{a.position[0] + ai_frame_distance * std::cos(ang), a.position[1] + ai_frame_distance * std::sin(ang), a.position[2]};
+                            if (!grid->walkable(q[0], q[1]) || !grid->clear(q, a.position)) continue;
+                            if (std::ranges::any_of(ai_sim->agents(), [&](const AiAgent& o) { return std::hypot(o.position[0] - q[0], o.position[1] - q[1]) < 1.5f; }))
+                                continue;
+                            best = {V3{q[0], q[1], q[2] + ai_frame_height}, V3{a.position[0], a.position[1], a.position[2] + 1.0f}};
+                        }
+                        if (best) break;
+                    }
+                    if (best) break;
+                }
+                if (!best) throw std::runtime_error("--ai-frame: no drawable agent with open floor around it");
+                eye_arg = best->first;
+                look_arg = best->second;
+                ai_actors.update(scene, *ai_sim, {eye_arg->x, eye_arg->y, eye_arg->z}, 0.0f, ai_range);
+                std::println("ai frame: eye ({:.1f} {:.1f} {:.1f}) look ({:.1f} {:.1f} {:.1f})", eye_arg->x, eye_arg->y, eye_arg->z, look_arg->x,
+                             look_arg->y, look_arg->z);
+            }
+            for (const auto& e : ai_estimates(params)) std::println("  ai estimate {} = {:.2f}: {}", e.name, e.value, e.note);
+        }
     } else if (const Entry* e = pm.entry(mesh_tag); e && e->reference == kClassDynamicModel) {
         auto t0 = std::chrono::steady_clock::now();
         auto mats = index_dynamic_model_materials(pm);
@@ -843,8 +1039,17 @@ int run(int argc, char** argv) {
             for (const auto& n : particles.notes()) std::println("  {}", n);
             if (std::getenv("NIM_FX_DUMP")) std::print("{}", particles.debug_dump(gpu));
         }
-        write_png(out_dir / "composite_game.png", width, height,
-                  gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+        auto composite = gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+        write_png(out_dir / "composite_game.png", width, height, composite);
+        if (ai_sim) {
+            AiOverlayOptions options;
+            options.debug = ai_debug;
+            options.range = ai_range;
+            const auto overlay = build_ai_overlay(*ai_sim, *ai_gameplay, vm, float(width), float(height), options);
+            draw_overlay(composite, width, height, overlay);
+            write_png(out_dir / "composite_ai.png", width, height, composite);
+            std::println("ai overlay: {} lines, {} rects, {} labels", overlay.lines.size(), overlay.rects.size(), overlay.texts.size());
+        }
         if (shadow.valid) {
             auto d = gpu.read_texture(shadow.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
             const float* f = reinterpret_cast<const float*>(d.data());

@@ -1960,6 +1960,12 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     size_t shadowing = 0;
     for (const auto& l : lights) ++techniques[l.technique.value], shadowing += l.shadowing;
     std::println("{} lights ({} shadowing), {} distinct lighting-apply techniques", lights.size(), shadowing, techniques.size());
+    {
+        std::map<uint32_t, size_t> shadow_techniques;
+        for (const auto& l : lights)
+            if (l.shadowing && !l.shadow_technique.is_none()) ++shadow_techniques[l.shadow_technique.value];
+        for (const auto& [t, n] : shadow_techniques) std::println("  shadow technique {} x{}", TagHash(t).str(), n);
+    }
     std::vector<const MapLight*> shown;
     for (const auto& l : lights)
         if (shown.size() < 8 && l.shadowing) shown.push_back(&l);

@@ -342,6 +342,13 @@ public:
     bool skinned() const { return skinned_; }
     void set_skin_poses(std::vector<ModelSkinPose> poses);
     void load_animation_equipment(Gpu& gpu, const std::vector<std::vector<InputElement>>& layouts, std::span<const ModelSkinPose> poses);
+    // Actors (docs/PROGRESS.md 3.70): skinned entity previews placed in a map scene and moved and
+    // posed every frame (AI characters). add_actor adds one hidden copy of `mesh` and its assembled
+    // parts; set_actor shows it at `rows` (3x4 object to world) with `poses` (as set_skin_poses),
+    // or hides it when rows is empty.
+    uint32_t add_actor(Gpu& gpu, const PreparedMesh& mesh, const std::vector<std::vector<InputElement>>& layouts);
+    void set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses = {});
+    size_t actor_count() const { return actors_.size(); }
     size_t transparent_count() const { return transparent_items_.size(); }
     size_t world_transparent_draws() const { return world_transparent_draws_; }
     size_t sky_transparent_draws() const { return sky_transparent_draws_; }
@@ -495,7 +502,17 @@ private:
             D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
         };
         std::unique_ptr<EquipmentPlacement> equipment;
+        int32_t actor = -1;                  // actors_ index: moved and posed per frame
+        PlacementConstants actor_constants{};  // the model's own constants (rows 0-3 replaced per frame)
     };
+    struct Actor {
+        std::vector<uint32_t> sets;
+        std::optional<std::array<float, 12>> rows, previous;
+        std::vector<ModelSkinPose> poses;
+    };
+    std::vector<Actor> actors_;
+    int32_t adding_actor_ = -1;
+    void bind_actor_constants(Gpu& gpu);
     void update_skin(ID3D12GraphicsCommandList* cl);
     void rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,

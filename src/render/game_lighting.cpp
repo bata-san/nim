@@ -2740,7 +2740,7 @@ std::optional<ViewMatrices> light_shadow_view(const MapLight& l) {
 
 std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, size_t scene_items,
                                                               size_t budget) {
-    constexpr uint32_t kSize = 1024;
+    constexpr uint32_t kSize = 512;
     std::vector<SunShadow*> out;
     if (!light_shadows_) return out;
     const LightFrustum frustum(vm);
@@ -2764,8 +2764,8 @@ std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12Gr
         out.push_back(ll.shadow.get());
     }
     if (!out.empty() || light_shadows_used_)
-        ext_.note_estimate("shadowing lights: 1024^2 depth map of the loaded scene per light (reversed depth, frustum of the light matrix), deferred_shadow +0x30.x = -7000, +0x180 = 2 (21 taps), deferred_light +0x154 = 1",
-                           "the engine shadow map render (resolution, atlas, caster set, bias, filter quality) is not in game data; slots read from the +0xD8 PS, -7000 is the D2 default (Alkahest)");
+        ext_.note_estimate("shadowing lights: 512^2 depth map of the loaded scene per light (reversed depth, frustum of the light matrix), deferred_shadow +0x30.x = -7000, +0x180 = 2 (21 taps), deferred_light +0x154 = 1",
+                           "the engine shadow map render (resolution, atlas, bias, filter quality) is not in game data; casters: static meshes with authored shadow-stage parts (those parts) and dynamic models; slots read from the +0xD8 PS, -7000 is the D2 default (Alkahest)");
     return out;
 }
 

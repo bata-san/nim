@@ -29,16 +29,22 @@ struct MotionClip {
     float seconds = 0;
     float speed = 0;                   // m/s the clip stands for (from its feet, 推定)
     std::array<float, 2> direction{};  // object space, x forward
+    bool cyclic = true;                // false: played forwards and back (an idle that does not loop)
 };
+// Seconds into a clip of `length` for a clock `time` (back and forth when not cyclic).
+float motion_clip_time(const MotionClip& clip, float time);
 struct MotionSet {
     TagHash entity;
+    TagHash skeleton, rig;               // the entity's own components the clips were measured with
     std::vector<MotionClip> locomotion;  // cyclic clips that travel
     std::optional<MotionClip> idle;      // the longest cyclic clip that stands still
     std::string error;                   // why the set is empty, if it is
 };
 // Reads the entity's skeleton, rig and motion-bank clips and measures each clip's gait at `fps`
 // (推定: the clip rate is not decoded). Locomotion: cyclic, 0.6 m/s or faster, foot lift
-// 0.1..0.6 m. Idle: cyclic, slower than 0.15 m/s, foot lift under 0.08 m, at least 1 s.
+// 0.1..0.6 m. Idle: cyclic, slower than 0.15 m/s, foot lift under 0.08 m, at least 1 s; when no
+// clip qualifies, the longest such clip that does not loop (played back and forth).
+// Characters with no locomotion clip hold their position in the simulation (推定).
 MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps);
 struct MotionChoice {
     std::optional<size_t> locomotion;  // index into MotionSet::locomotion; none = idle
@@ -47,6 +53,18 @@ struct MotionChoice {
 // The locomotion clip whose velocity (speed x direction) is nearest `local_velocity` (object space,
 // x forward); idle below 0.2 m/s.
 MotionChoice select_motion(const MotionSet& set, std::array<float, 2> local_velocity);
+
+// ---- walkable floor -----------------------------------------------------------------------------
+// Which cells of a firing area's floor are open (no prop or wall up to head height), from a
+// top-down depth render of the map's own geometry (render/ai_actors.hpp build_walk_grid).
+struct WalkGrid {
+    float x0 = 0, y0 = 0, cell = 0.25f;  // world xy of cell (0, 0)'s corner, cell size (m)
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> open;           // w x h, row-major from y0
+    bool walkable(float x, float y) const;
+    bool clear(const std::array<float, 3>& a, const std::array<float, 3>& b) const;  // the straight segment
+    size_t open_count() const;
+};
 
 // ---- simulation ------------------------------------------------------------------------------------
 struct AiParams {  // every value here is an estimate (推定)
@@ -109,12 +127,19 @@ public:
     const std::vector<AiAgent>& agents() const { return agents_; }
     const std::vector<AiDrone>& drones() const { return drones_; }
     const AiParams& params() const { return params_; }
+    void set_player_invisible(bool invisible) { params_.player_invisible = invisible; }
     const std::vector<MotionSet>& motions() const { return motions_; }
+    // Restricts patrol points and paths in `firing_area` to its open floor; without one, the
+    // whole polygon counts as open.
+    void set_walk_grid(size_t firing_area, WalkGrid grid);
+    const WalkGrid* walk_grid(size_t firing_area) const { return has_walk_grid(firing_area) ? &grids_[firing_area] : nullptr; }
+    bool has_walk_grid(size_t firing_area) const { return firing_area < grids_.size() && grids_[firing_area].w != 0; }
     float time() const { return time_; }
 
 private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
-    std::array<float, 3> sample_objective(size_t squad);
+    std::array<float, 3> sample_objective(size_t squad, const std::array<float, 3>& from);
+    std::array<float, 3> sample_area(size_t firing_area);
     std::array<float, 3> nearest_objective_point(size_t squad, const std::array<float, 3>& to) const;
     void perceive(const std::array<float, 3>& eye, float yaw, float range, float cos_half_fov, bool cone,
                   const std::array<float, 3>& player, float dt, float& awareness, AiAlert& alert, bool& sees) const;
@@ -124,6 +149,7 @@ private:
     std::mt19937_64 rng_;
     std::vector<MotionSet> motions_;
     std::vector<Area> areas_;                     // MapGameplay::firing_areas
+    std::vector<WalkGrid> grids_;                 // per firing area, empty = no grid
     std::vector<std::vector<size_t>> squad_areas_;  // per squad: firing areas of its objective
     std::vector<AiAgent> agents_;
     std::vector<AiDrone> drones_;
