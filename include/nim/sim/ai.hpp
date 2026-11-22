@@ -144,6 +144,7 @@ private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
     std::array<float, 3> sample_objective(size_t squad, const std::array<float, 3>& from);
     std::array<float, 3> sample_area(size_t firing_area);
+    void separate();
     std::array<float, 3> nearest_objective_point(size_t squad, const std::array<float, 3>& to) const;
     void perceive(const std::array<float, 3>& eye, float yaw, float range, float cos_half_fov, bool cone,
                   const std::array<float, 3>& player, float dt, float& awareness, AiAlert& alert, bool& sees) const;

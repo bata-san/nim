@@ -191,6 +191,8 @@ int run(int argc, char** argv) {
     bool ai = false, ai_visible = false, ai_debug = false, ai_frame = false;
     float ai_time = 20, ai_range = 60, ai_frame_distance = 6, ai_frame_height = 1.7f;
     size_t ai_per_character = 4;
+    uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
+    std::optional<size_t> ai_subject;
     std::vector<std::string> pos;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--install" && i + 1 < args.size()) install = args[++i];
@@ -240,6 +242,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-time" && i + 1 < args.size()) ai_time = std::stof(args[++i]);
         else if (args[i] == "--ai-range" && i + 1 < args.size()) ai_range = std::stof(args[++i]);
         else if (args[i] == "--ai-actors" && i + 1 < args.size()) ai_per_character = std::stoull(args[++i]);
+        else if (args[i] == "--ai-strip" && i + 1 < args.size()) ai_strip = uint32_t(std::stoul(args[++i])), ai_frame = true;
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
@@ -306,7 +309,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N]");
         return 2;
     }
     if (install.empty()) {
@@ -622,8 +625,13 @@ int run(int argc, char** argv) {
                 std::vector<std::pair<float, size_t>> order;
                 for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
                     const auto& a = ai_sim->agents()[k];
-                    if (a.character < characters_drawable.size() && characters_drawable[a.character])
-                        order.push_back({std::hypot(a.position[0] - eye.x, a.position[1] - eye.y), k});
+                    if (a.character < characters_drawable.size() && characters_drawable[a.character]) {
+                        const float d = std::hypot(a.position[0] - eye.x, a.position[1] - eye.y);
+                        const bool walking = std::hypot(a.velocity[0], a.velocity[1]) > 0.5f &&
+                                             std::hypot(a.goal[0] - a.position[0], a.goal[1] - a.position[1]) > 4.0f;
+                        if (ai_strip && !walking) continue;
+                        order.push_back({d, k});
+                    }
                 }
                 std::ranges::sort(order);
                 std::optional<std::pair<V3, V3>> best;
@@ -649,6 +657,9 @@ int run(int argc, char** argv) {
                 if (!best) throw std::runtime_error("--ai-frame: no drawable agent with open floor around it");
                 eye_arg = best->first;
                 look_arg = best->second;
+                for (const auto& [unused, k] : order)
+                    if (std::abs(ai_sim->agents()[k].position[0] - best->second.x) < 1e-3f && std::abs(ai_sim->agents()[k].position[1] - best->second.y) < 1e-3f)
+                        ai_subject = k;
                 ai_actors.update(scene, *ai_sim, {eye_arg->x, eye_arg->y, eye_arg->z}, 0.0f, ai_range);
                 std::println("ai frame: eye ({:.1f} {:.1f} {:.1f}) look ({:.1f} {:.1f} {:.1f})", eye_arg->x, eye_arg->y, eye_arg->z, look_arg->x,
                              look_arg->y, look_arg->z);
@@ -1049,6 +1060,27 @@ int run(int argc, char** argv) {
             draw_overlay(composite, width, height, overlay);
             write_png(out_dir / "composite_ai.png", width, height, composite);
             std::println("ai overlay: {} lines, {} rects, {} labels", overlay.lines.size(), overlay.rects.size(), overlay.texts.size());
+        }
+        // --ai-strip: the camera follows the agent from its side, one frame per 0.1 s.
+        for (uint32_t k = 0; ai_sim && ai_subject && k < ai_strip; ++k) {
+            const std::array<float, 3> player{view.eye.x, view.eye.y, view.eye.z};
+            ai_sim->step(0.1f, player);
+            const auto& a = ai_sim->agents()[*ai_subject];
+            const float side = a.yaw + 1.5708f;
+            view.eye = {a.position[0] + ai_frame_distance * std::cos(side), a.position[1] + ai_frame_distance * std::sin(side), a.position[2] + ai_frame_height};
+            view.target = {a.position[0], a.position[1], a.position[2] + 1.0f};
+            ai_actors.update(scene, *ai_sim, player, 0.1f, ai_range);
+            vm = make_view(view);
+            gpu.begin_frame(k % 2);
+            prepare_game_frame();
+            scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+            render_game(gpu.immediate());
+            gpu.flush();
+            write_png(out_dir / std::format("strip_{:02}.png", k), width, height,
+                      gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
+            std::println("strip {}: clip {} t {:.2f} rate {:.2f} speed {:.2f} yaw {:.2f}", k,
+                         a.motion.locomotion ? ai_sim->motions()[a.character].locomotion[*a.motion.locomotion].clip.str() : "idle", a.motion_time,
+                         a.motion.rate, std::hypot(a.velocity[0], a.velocity[1]), a.yaw);
         }
         if (shadow.valid) {
             auto d = gpu.read_texture(shadow.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);

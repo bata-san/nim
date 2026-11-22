@@ -1215,6 +1215,19 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         sample_clip(clip, frame, pose);
     }
     const size_t n = sk.size();
+    // Rigs authored against another reference pose: most object-space nodes' default rotation is
+    // not the skeleton's bind (the UESC robots and the ghost; the runner rigs differ in at most 6 of
+    // 23). Their object-space tracks are applied as the change from the rig default onto the bind
+    // (推定: drawn as absolute rotations, the assault's rifle swung onto its back).
+    size_t object_nodes = 0, reference_nodes = 0;
+    for (size_t i = 0; i < rig.size(); ++i) {
+        if (!rig.object_space[i] || rig.skeleton_bone[i] >= n) continue;
+        ++object_nodes;
+        const auto& q = rig.default_pose[i].rotation;
+        const auto& r = sk.bind[rig.skeleton_bone[i]].rotation;
+        reference_nodes += std::fabs(q[0] * r[0] + q[1] * r[1] + q[2] * r[2] + q[3] * r[3]) < 0.99905f;  // > 5 degrees
+    }
+    const bool reference_delta = object_nodes >= 8 && reference_nodes * 2 > object_nodes;
     std::vector<int32_t> rig_of(n, -1);
     for (size_t i = 0; i < rig.size(); ++i)
         if (rig.skeleton_bone[i] < n) rig_of[rig.skeleton_bone[i]] = int32_t(i);
@@ -1272,7 +1285,12 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
                 o = po * local;
                 if (ri >= 0 && rig.object_space[size_t(ri)]) {
                     const auto& c = pose[size_t(ri)];
-                    o.rotation = qnormalize(c.rotation);
+                    if (reference_delta) {
+                        const auto& rd = rig.default_pose[size_t(ri)].rotation;
+                        o.rotation = qnormalize(qmul(qmul(c.rotation, Q{-rd[0], -rd[1], -rd[2], rd[3]}), sk.bind[b].rotation));
+                    } else {
+                        o.rotation = qnormalize(c.rotation);
+                    }
                     if (sk.parents[size_t(p)] < 0)
                         for (int k = 0; k < 3; ++k) o.translation[k] = sk.bind[b].translation[k] + c.translation[k];
                 }

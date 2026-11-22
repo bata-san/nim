@@ -7,6 +7,7 @@
 #include <cmath>
 #include <format>
 #include <numbers>
+#include <unordered_map>
 
 namespace nim {
 
@@ -318,6 +319,46 @@ void AiSimulation::perceive(const std::array<float, 3>& eye, float yaw, float ra
     else alert = awareness >= params_.suspicious_at ? AiAlert::Suspicious : AiAlert::Unaware;
 }
 
+// Bodies keep apart (推定: 0.9 m between centres; the engine's avoidance is not in game data):
+// overlapping agents (squad members spawned on one point, crossing paths) are pushed apart
+// evenly, onto open floor only.
+void AiSimulation::separate() {
+    constexpr float kGap = 0.9f;
+    std::unordered_map<int64_t, std::vector<size_t>> cells;
+    auto key = [](float x, float y) { return (int64_t(std::floor(x / kGap)) << 32) ^ int64_t(uint32_t(int32_t(std::floor(y / kGap)))); };
+    for (size_t i = 0; i < agents_.size(); ++i) cells[key(agents_[i].position[0], agents_[i].position[1])].push_back(i);
+    std::vector<std::array<float, 2>> push(agents_.size(), {0, 0});
+    for (size_t i = 0; i < agents_.size(); ++i) {
+        const auto& a = agents_[i];
+        const int64_t cx = int64_t(std::floor(a.position[0] / kGap)), cy = int64_t(std::floor(a.position[1] / kGap));
+        for (int64_t ox = -1; ox <= 1; ++ox)
+            for (int64_t oy = -1; oy <= 1; ++oy) {
+                const auto it = cells.find(((cx + ox) << 32) ^ int64_t(uint32_t(int32_t(cy + oy))));
+                if (it == cells.end()) continue;
+                for (const size_t j : it->second) {
+                    if (j <= i) continue;
+                    const auto& b = agents_[j];
+                    if (std::abs(a.position[2] - b.position[2]) > 1.5f) continue;
+                    float dx = b.position[0] - a.position[0], dy = b.position[1] - a.position[1];
+                    float d = std::hypot(dx, dy);
+                    if (d >= kGap) continue;
+                    if (d < 1e-4f) dx = std::cos(float(i) * 2.4f), dy = std::sin(float(i) * 2.4f), d = 1;
+                    const float s = 0.5f * (kGap - d) / d;
+                    push[i][0] -= dx * s, push[i][1] -= dy * s;
+                    push[j][0] += dx * s, push[j][1] += dy * s;
+                }
+            }
+    }
+    for (size_t i = 0; i < agents_.size(); ++i) {
+        auto& a = agents_[i];
+        const float nx = a.position[0] + push[i][0], ny = a.position[1] + push[i][1];
+        bool open = true;
+        for (const auto fa : squad_areas_[a.squad])
+            if (fa < grids_.size() && grids_[fa].w) open = grids_[fa].walkable(nx, ny) || !grids_[fa].walkable(a.position[0], a.position[1]);
+        if (open) a.position[0] = nx, a.position[1] = ny;
+    }
+}
+
 void AiSimulation::step(float dt, const std::array<float, 3>& player) {
     time_ += dt;
     const float cos_half = std::cos(params_.fov_degrees * 0.5f * kPi / 180.0f);
@@ -346,18 +387,27 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
             target = a.goal;
         }
         const float dx = target[0] - a.position[0], dy = target[1] - a.position[1], d = std::hypot(dx, dy);
+        if (speed > 0 && d > 0.3f && !react) face = std::atan2(dy, dx);
+        const float turn = wrap_angle(face - a.yaw);
+        a.yaw = wrap_angle(a.yaw + std::clamp(turn, -params_.turn_rate * dt, params_.turn_rate * dt));
         if (speed > 0 && d > 0.3f) {
-            if (!react) face = std::atan2(dy, dx);
+            // Patrolling: turn towards the goal, then walk along the facing (推定), slowing while the
+            // goal is off to the side, so the gait is the forward one rather than a sidestep.
+            // Reacting (facing the player): move straight at the point (strafing clips).
+            std::array<float, 2> dir{dx / d, dy / d};
+            if (!react) {
+                const float off = std::cos(wrap_angle(face - a.yaw));
+                speed *= std::clamp((off - 0.3f) / 0.7f, 0.0f, 1.0f);
+                dir = {std::cos(a.yaw), std::sin(a.yaw)};
+            }
             const float step = std::min(speed * dt, d);
-            a.velocity = {dx / d * step / dt, dy / d * step / dt, 0};
-            a.position[0] += dx / d * step;
-            a.position[1] += dy / d * step;
+            a.velocity = {dir[0] * step / dt, dir[1] * step / dt, 0};
+            a.position[0] += dir[0] * step;
+            a.position[1] += dir[1] * step;
             a.position[2] += (target[2] - a.position[2]) * std::min(1.0f, step / d);
         } else {
             a.velocity = {};
         }
-        const float turn = wrap_angle(face - a.yaw);
-        a.yaw = wrap_angle(a.yaw + std::clamp(turn, -params_.turn_rate * dt, params_.turn_rate * dt));
         // Motion: velocity in the object's frame (x forward, y left).
         const float c = std::cos(a.yaw), s = std::sin(a.yaw);
         const std::array<float, 2> local{a.velocity[0] * c + a.velocity[1] * s, -a.velocity[0] * s + a.velocity[1] * c};
@@ -375,6 +425,7 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
             if (length > 0) a.motion_time = std::fmod(a.motion_time, 2 * length);  // motion_clip_time folds it
         }
     }
+    separate();
     for (size_t i = 0; i < drones_.size(); ++i) {
         auto& d = drones_[i];
         const auto& spline = g_.point_groups[d.group].spline;

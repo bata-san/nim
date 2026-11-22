@@ -2450,6 +2450,26 @@ int cmd_skin(PackageManager& pm, TagHash tag) {
         }
         std::println(" mesh {} vertices {} (single {}, two {}, four {}) skin buffer {} B stride {}  max bone {}", i, w.bones.size(),
                      single, two, four, sk.data.size(), sk.stride, w.max_bone);
+        // Per bone: vertices whose largest weight is that bone, and their bind-pose bounds.
+        struct Stat { size_t n = 0; float lo[3]{1e9f, 1e9f, 1e9f}, hi[3]{-1e9f, -1e9f, -1e9f}; };
+        std::map<uint16_t, Stat> stats;
+        for (size_t v = 0; v < w.bones.size(); ++v) {
+            size_t best = 0;
+            for (size_t k = 1; k < 4; ++k)
+                if (w.weights[v][k] > w.weights[v][best]) best = k;
+            auto& s = stats[w.bones[v][best]];
+            ++s.n;
+            for (size_t a = 0; a < 3; ++a) {
+                int16_t q;
+                std::memcpy(&q, vb0.data.data() + v * vb0.stride + 2 * a, 2);
+                const float p = q / 32767.0f * m.model_scale[a] + m.model_offset[a];
+                s.lo[a] = std::min(s.lo[a], p);
+                s.hi[a] = std::max(s.hi[a], p);
+            }
+        }
+        for (const auto& [bone, s] : stats)
+            std::println("   bone {:3} vertices {:6} bounds ({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})", bone, s.n, s.lo[0], s.lo[1],
+                         s.lo[2], s.hi[0], s.hi[1], s.hi[2]);
     }
     return 0;
 }
@@ -2500,6 +2520,39 @@ float clip_stretch(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         }
     }
     return stretch;
+}
+
+// Object-space rig nodes whose authored default rotation differs from the skeleton's bind
+// rotation (> 5 degrees), per distinct skeleton/rig pair, with a model that uses it.
+int cmd_objaudit(PackageManager& pm) {
+    pm.build_hash64_index();
+    const auto materials = index_dynamic_model_materials(pm);
+    const auto rigs = index_model_skeletons(pm, materials, nullptr);
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> pairs;
+    for (const auto& [model, binding] : rigs)
+        if (!binding.rig.is_none()) pairs.emplace(std::pair{binding.skeleton.value, binding.rig.value}, model);
+    size_t total = 0, differing = 0;
+    for (const auto& [key, model] : pairs) {
+        try {
+            const auto sk = load_skeleton(pm, TagHash(key.first));
+            const auto rig = load_animation_rig(pm, TagHash(key.second));
+            size_t object = 0, off = 0;
+            for (size_t i = 0; i < rig.size(); ++i) {
+                if (!rig.object_space[i] || rig.skeleton_bone[i] >= sk.size()) continue;
+                ++object;
+                const auto& a = rig.default_pose[i].rotation;
+                const auto& b = sk.bind[rig.skeleton_bone[i]].rotation;
+                const float d = std::fabs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+                if (2 * std::acos(std::min(1.0f, d)) > 0.0873f) ++off;
+            }
+            ++total;
+            differing += off > 0;
+            std::println("skeleton {:08X} rig {:08X} model {:08X} bones {} object {} differing {}", key.first, key.second, model, rig.size(),
+                         object, off);
+        } catch (const std::exception&) {}
+    }
+    std::println("{} pairs, {} with differing object-space defaults", total, differing);
+    return 0;
 }
 
 // Every skinned dynamic model: whether it has a skeleton, a rig and clips, and for each rig the
@@ -3218,6 +3271,7 @@ int main(int argc, char** argv) {
         if (cmd == "rig" && args.size() >= 2) return cmd_rig(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skeletons") return cmd_skeletons(pm);
         if (cmd == "animaudit") return cmd_animaudit(pm);
+        if (cmd == "objaudit") return cmd_objaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])));
