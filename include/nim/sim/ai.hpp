@@ -23,8 +23,8 @@ namespace nim {
 // in the packages and Marathon.exe's code is encrypted on disk (3.68), so movement, perception
 // and alert rules below are explicit estimates, listed by `ai_estimates` and shown as 推定.
 //
-// The player is the camera. By default enemies never react to it (`player_invisible`); their
-// awareness of it is still computed so an indicator can show what they would notice.
+// The player is the camera. By default enemies neither notice nor react to it (`player_invisible`):
+// the camera raises no awareness, and awareness from a visible stretch only decays.
 
 // ---- motion (character locomotion from the motion bank) -----------------------------------------
 struct MotionClip {
@@ -54,8 +54,9 @@ struct MotionSet {
 };
 // Reads the entity's skeleton, rig and motion-bank clips and measures each clip's gait at `fps`
 // (推定: the clip rate is not decoded; speeds come from the clips' root motion where they have it).
-// Locomotion: cyclic, 0.6 m/s or faster, foot lift 0.1..0.6 m. Idle: cyclic, slower than 0.15 m/s, foot lift under 0.08 m, at least 1 s; when no
-// clip qualifies, the longest such clip that does not loop (played back and forth).
+// Locomotion: cyclic, 0.6 m/s or faster, foot lift 0.1..0.6 m. Idle: slower than 0.15 m/s, foot lift under 0.08 m; the longest loop
+// (0.5 s or more), else the longest clip that does not loop (1 s or more, played back and forth). Both keep the upright posture: the
+// head within 0.12 m of the highest head among the locomotion clips (crouched moves and idles are left out, 推定).
 // Characters with no locomotion clip hold their position in the simulation (推定).
 MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps);
 struct MotionChoice {
@@ -103,7 +104,7 @@ struct AiParams {  // every value here is an estimate (推定)
     float suspicious_at = 0.35f, alerted_at = 1.0f;
     float drone_speed = 5.0f;       // m/s along its spline
     float drone_scan_range = 15.0f; // m, all around
-    bool player_invisible = true;   // enemies compute awareness but never act on it
+    bool player_invisible = true;   // the camera raises no awareness and causes no reaction
     // Dropship squads (spawned at a uesc_dropship_spawner, 3.71): called when the player comes
     // within range, then the ship's own clips (arrival, open hold, departure) and the members
     // dropping from its open rear bay to the floor one after another.
@@ -154,6 +155,7 @@ struct AiDropship {
     float start = -1;                  // simulation time the arrival begins; < 0 until called
     uint32_t variant = 0;              // picks one of the arrival / departure clips
     std::vector<size_t> members;       // agents, in exit order
+    std::vector<size_t> squads;        // every squad it carries: spawners at the same coordinates share one ship
 };
 enum class AiDropshipPhase : uint8_t { Waiting, Arriving, Unloading, Departing, Gone };
 struct AiDropshipState {

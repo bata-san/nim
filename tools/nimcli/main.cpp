@@ -1403,6 +1403,41 @@ int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
     const auto feet = find_feet(skeleton);
     if (!feet) throw std::runtime_error("no ankle pair");
     std::println("skeleton {} rig {} feet {} {}", sk.str(), rg.str(), (*feet)[0], (*feet)[1]);
+    // Foot IK targets (ground-level chains), 10th percentile (the planted foot, as build_motion_set),
+    // to compare with the ankles' bind height; 0 without foot targets.
+    auto foot_floor = [&](const AnimationClip& c) {
+        std::vector<float> zs;
+        for (const auto& t : c.translations) {
+            if (t.bone >= rig.size() || rig.ik_root[t.bone] < 0) continue;
+            const size_t end = rig.skeleton_bone[t.bone];
+            if (std::fabs(rig.default_pose[t.bone].translation[2] - skeleton.bind[end].translation[2]) > 0.05f) continue;
+            for (const auto& f : t.frames) zs.push_back(f[2]);
+        }
+        if (zs.empty()) return 0.0f;
+        std::ranges::nth_element(zs, zs.begin() + zs.size() / 10);
+        return zs[zs.size() / 10];
+    };
+    // Posture: the height of the highest bind bone (the head) and how far forward of the pelvis
+    // (bone 1) it sits, averaged over the clip; a standing idle keeps the rig default stance's values.
+    size_t head = 0;
+    for (size_t b = 0; b < skeleton.bind.size(); ++b)
+        if (skeleton.bind[b].translation[2] > skeleton.bind[head].translation[2]) head = b;
+    auto posture = [&](const AnimationClip& c) {
+        std::vector<BoneTransform> pose;
+        float top = 0, lean = 0;
+        for (uint32_t f = 0; f < c.frame_count; ++f) {
+            pose_skeleton(skeleton, rig, c, float(f), pose);
+            top += pose[head].translation[2];
+            lean += pose[head].translation[0] - pose[1].translation[0];
+        }
+        return std::pair{top / float(c.frame_count), lean / float(c.frame_count)};
+    };
+    {
+        AnimationClip stance;
+        stance.bone_count = uint32_t(rig.size());
+        const auto [top, lean] = posture(stance);
+        std::println("default stance: head bone {} top {:.3f} lean {:.3f} (bind {:.3f})", head, top, lean, skeleton.bind[head].translation[2]);
+    }
     if (all) {
         std::print("rig groups");
         for (const auto& g : rig.bone_groups) std::print(" {:08X}:{}", g.hash, g.bones);
@@ -1420,16 +1455,7 @@ int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
                     std::println(": does not map");
                     continue;
                 }
-                // Foot IK targets (ground-level chains), 10th percentile, against the ankles' bind height.
-                std::vector<float> zs;
-                for (const auto& t : mapped->translations) {
-                    if (t.bone >= rig.size() || rig.ik_root[t.bone] < 0) continue;
-                    const size_t end = rig.skeleton_bone[t.bone];
-                    if (std::fabs(rig.default_pose[t.bone].translation[2] - skeleton.bind[end].translation[2]) > 0.05f) continue;
-                    for (const auto& f : t.frames) zs.push_back(f[2]);
-                }
-                std::ranges::sort(zs);
-                const float low = zs.empty() ? 0 : zs[zs.size() / 10];  // as build_motion_set: the planted foot
+                const float low = foot_floor(*mapped);
                 const auto g = measure_clip_gait(skeleton, rig, *mapped, *feet, 30.0f);
                 std::println(": mapped, foot floor {:.4f} (ankle {:.4f}) cyclic {} lift {:.2f} speed {:5.2f}{} yaw {:6.1f}", low,
                              skeleton.bind[size_t((*feet)[0])].translation[2], g.cyclic ? 1 : 0, g.lift, g.speed, g.authored ? "*" : " ",
@@ -1437,10 +1463,10 @@ int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
                 continue;
             }
             const auto g = measure_clip_gait(skeleton, rig, c, *feet, 30.0f);
-            std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f}{} dir ({:5.2f} {:5.2f}) root ({:6.3f} {:6.3f} {:6.3f}) yaw {:6.1f}",
+            std::println("{} {:4} frames {:5.2f}s cyclic {} lift {:.2f} speed {:5.2f}{} dir ({:5.2f} {:5.2f}) root ({:6.3f} {:6.3f} {:6.3f}) yaw {:6.1f} foot floor {:.4f} top {:.3f} lean {:.3f}",
                          clip.str(), c.frame_count, g.seconds, g.cyclic ? 1 : 0, g.lift, g.speed, g.authored ? "*" : " ", g.direction[0],
                          g.direction[1], c.root_motion.translation[0], c.root_motion.translation[1], c.root_motion.translation[2],
-                         g.yaw * 57.2957795f);
+                         g.yaw * 57.2957795f, foot_floor(c), posture(c).first, posture(c).second);
         } catch (const std::exception& e) {
             std::println("{} {}", clip.str(), e.what());
         }
@@ -1482,6 +1508,9 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
     AiSimulation sim(g, params, seed, motions);
     std::println("agents {} drones {} player ({:.1f} {:.1f} {:.1f}) {}", sim.agents().size(), sim.drones().size(), player[0], player[1], player[2],
                  visible ? "visible" : "invisible to enemies");
+    size_t shared = 0, carried = 0;
+    for (const auto& d : sim.dropships()) shared += d.squads.size() > 1, carried += d.squads.size();
+    std::println("dropships {} carrying {} squads ({} ships shared by squads spawned at the same coordinates)", sim.dropships().size(), carried, shared);
     std::string j = "{\"frames\":[";
     const int steps = int(seconds / dt);
     std::array<size_t, 3> peak{};

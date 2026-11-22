@@ -289,7 +289,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(AiMarkers, "目標・地点マーカー", "Objective / point markers", "목표·지점 마커") \
     X(AiDebug, "デバッグ表示 (範囲・視界・経路)", "Debug (areas, sight, routes)", "디버그 표시 (범위·시야·경로)") \
     X(AiVisible, "敵にカメラを認識させる", "Let enemies notice the camera", "적이 카메라를 인식") \
-    X(AiVisibleTip, "オフ (既定) ではカメラは敵から見えない。警戒度は計算して表示だけする", "Off (default): the camera is invisible to enemies; awareness is computed and shown only", "끔 (기본): 카메라는 적에게 보이지 않음. 경계도는 계산해 표시만 함") \
+    X(AiVisibleTip, "オフ (既定) ではカメラは敵から見えず、近づいても警戒度は上がらない", "Off (default): the camera is invisible to enemies and raises no awareness, however close", "끔 (기본): 카메라는 적에게 보이지 않으며, 가까이 가도 경계도가 오르지 않음") \
     X(AiRange, "表示距離", "Range", "표시 거리") \
     X(AiLoading, "AI を準備中…", "Preparing the AI…", "AI 준비 중…") \
     X(AiHud, "AI 推定: {} 体 (描画 {})  {:.0f} 秒", "AI estimate: {} agents ({} drawn)  {:.0f} s", "AI 추정: {} 체 (표시 {})  {:.0f} 초") \

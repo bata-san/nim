@@ -380,9 +380,28 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         };
         float ankle = 0;
         for (const int b : *feet) ankle += skeleton.bind[size_t(b)].translation[2] * 0.5f;
+        // Posture: the mean object-space height of the head (the highest bind bone) over the clip.
+        size_t head = 0;
+        for (size_t b = 0; b < skeleton.size(); ++b)
+            if (skeleton.bind[b].translation[2] > skeleton.bind[head].translation[2]) head = b;
+        auto head_height = [&](const AnimationClip& clip) {
+            std::vector<BoneTransform> pose;
+            const uint32_t samples = std::min<uint32_t>(clip.frame_count, 12);
+            float sum = 0;
+            for (uint32_t k = 0; k < samples; ++k) {
+                pose_skeleton(skeleton, rig, clip, float(k * clip.frame_count / samples), pose);
+                sum += head < pose.size() ? pose[head].translation[2] : 0.0f;
+            }
+            return samples ? sum / float(samples) : 0.0f;
+        };
+        struct Stand {
+            MotionClip clip;
+            float head = 0;
+        };
         struct Found {
             std::vector<MotionClip> locomotion, turns;
-            std::optional<MotionClip> idle, still;
+            std::vector<float> locomotion_head;
+            std::vector<Stand> stands;  // clips that stand still (cyclic or played back and forth)
         } own, borrowed;
         for (const auto tag : entity_motion_clips(pm, entity)) {
             AnimationClip clip;
@@ -392,6 +411,7 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
                 continue;
             }
             Found* into = &own;
+            bool planted = true;  // its foot IK targets (if any) stand at this skeleton's ankle height
             if (clip.bone_count != rig.size()) {
                 // Another robot's clip of the shared bank, rebound by bone group. Only clips whose
                 // planted feet stand at this skeleton's ankle height (within 5 mm: a body of the same
@@ -402,6 +422,10 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
                 if (!floor || std::fabs(*floor - ankle) > 0.005f) continue;
                 clip = std::move(*mapped);
                 into = &borrowed;
+            } else if (const auto floor = foot_floor(clip)) {
+                // Own clips: only tells a stance (feet near the ankle height; the grenadier's idles
+                // plant 8 mm low) from a layer whose foot targets sit at the origin.
+                planted = std::fabs(*floor - ankle) <= 0.03f;
             }
             const auto gait = measure_clip_gait(skeleton, rig, clip, *feet, fps);
             const float travel = std::hypot(clip.root_motion.translation[0], clip.root_motion.translation[1]);
@@ -411,25 +435,51 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
                 into->turns.push_back(t);
                 continue;
             }
-            if (!gait.cyclic) {
-                if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!into->still || gait.seconds > into->still->seconds))
-                    into->still = MotionClip{tag, gait.seconds, 0, {}, false};
+            // An idle is a full-body stance: clips whose foot targets sit at the origin (the recruit's
+            // 80A4AB6C, 173 frames) are layers without a stance of their own.
+            if (planted && gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= (gait.cyclic ? 0.5f : 1.0f)) {
+                into->stands.push_back({MotionClip{tag, gait.seconds, 0, {}, gait.cyclic}, head_height(clip)});
                 continue;
             }
+            if (!gait.cyclic) continue;
             MotionClip m{tag, gait.seconds, gait.speed, gait.direction};
             m.authored = gait.authored;
             // A stride (root travel over one cycle) beyond 4 m is a dash or a multi-cycle move, not a gait (推定).
-            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f && travel <= 4.0f) into->locomotion.push_back(m);
-            else if (gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= 1.0f && (!into->idle || gait.seconds > into->idle->seconds))
-                into->idle = MotionClip{tag, gait.seconds, 0, {}};
+            if (gait.speed >= 0.6f && gait.lift >= 0.1f && gait.lift <= 0.6f && travel <= 4.0f) {
+                into->locomotion.push_back(m);
+                into->locomotion_head.push_back(head_height(clip));
+            }
         }
+        // Upright clips only (推定: the simulation has no crouch state): the bank also holds crouched
+        // moves and idles (the recruit's crouched runs hold the head at 1.17-1.27 m and its idle
+        // 80A4AA6B at 1.14 m, against 1.42-1.49 m walking and running upright). A clip is upright
+        // when its head is within 0.12 m of the highest head among the same clips' locomotion. The
+        // idle is the longest upright loop, else the longest upright clip played back and forth.
+        auto pick_idle = [](Found& f) -> std::optional<MotionClip> {
+            std::optional<float> upright;
+            if (!f.locomotion_head.empty()) {
+                upright = *std::ranges::max_element(f.locomotion_head);
+                std::vector<MotionClip> kept;
+                for (size_t k = 0; k < f.locomotion.size(); ++k)
+                    if (*upright - f.locomotion_head[k] <= 0.12f) kept.push_back(f.locomotion[k]);
+                f.locomotion = std::move(kept);
+            }
+            const Stand* best = nullptr;
+            for (const auto& c : f.stands) {
+                if (upright && std::fabs(c.head - *upright) > 0.12f) continue;
+                if (!best || (c.clip.cyclic && !best->clip.cyclic) || (c.clip.cyclic == best->clip.cyclic && c.clip.seconds > best->clip.seconds))
+                    best = &c;
+            }
+            return best ? std::optional<MotionClip>(best->clip) : std::nullopt;
+        };
+        const auto own_idle = pick_idle(own), borrowed_idle = pick_idle(borrowed);
         // The character's own clips first; what it lacks comes from the shared family (推定: the
         // motion graph's choice is not decoded).
         set.locomotion = !own.locomotion.empty() ? own.locomotion : borrowed.locomotion;
         set.turns = !own.turns.empty() ? own.turns : borrowed.turns;
-        set.idle = own.idle ? own.idle : own.still ? own.still : borrowed.idle ? borrowed.idle : borrowed.still;
+        set.idle = own_idle ? own_idle : borrowed_idle;
         set.borrowed = (own.locomotion.empty() && !borrowed.locomotion.empty() ? 1 : 0) +
-                       (own.turns.empty() && !borrowed.turns.empty() ? 2 : 0) + (!own.idle && !own.still && set.idle ? 4 : 0);
+                       (own.turns.empty() && !borrowed.turns.empty() ? 2 : 0) + (!own_idle && set.idle ? 4 : 0);
         for (const auto& m : set.locomotion) {
             if (!m.authored || m.direction[0] < 0.9f) continue;
             set.walk_speed = set.walk_speed > 0 ? std::min(set.walk_speed, m.speed) : m.speed;
@@ -543,12 +593,23 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
         std::optional<size_t> ship;
         for (const auto& p : sq.positions)
             if (p.model.value == kDropshipModel) {
+                // Squads whose spawners sit at the same coordinates share one ship: their members
+                // leave it one after another (two ships in one place would overlap).
+                if (const auto same = std::ranges::find_if(dropships_, [&](const AiDropship& o) {
+                        return std::fabs(o.position[0] - p.position[0]) < 0.01f && std::fabs(o.position[1] - p.position[1]) < 0.01f &&
+                               std::fabs(o.position[2] - p.position[2]) < 0.01f;
+                    }); same != dropships_.end()) {
+                    ship = size_t(same - dropships_.begin());
+                    same->squads.push_back(s);
+                    break;
+                }
                 AiDropship d;
                 d.squad = s;
                 d.position = p.position;
                 const auto& q = p.rotation;
                 d.yaw = std::atan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] * q[1] + q[2] * q[2]));
                 d.variant = uint32_t(s * 2654435761u >> 7);
+                d.squads = {s};
                 ship = dropships_.size();
                 dropships_.push_back(d);
                 break;
@@ -699,14 +760,16 @@ void AiSimulation::perceive(const std::array<float, 3>& eye, float yaw, float ra
     const float d = std::hypot(dx, dy);
     float rise = 0;
     sees = false;
-    if (d < range && std::abs(dz) < params_.vertical_limit) {
+    // An invisible camera (the default) is neither seen nor heard, however close: awareness only decays.
+    const bool noticeable = !params_.player_invisible && std::abs(dz) < params_.vertical_limit;
+    if (noticeable && d < range) {
         const bool inside = !cone || d < 1e-3f || (dx * std::cos(yaw) + dy * std::sin(yaw)) / d >= cos_half_fov;
         if (inside) {
             sees = true;
             rise += params_.sight_rise * (1 - d / range);
         }
     }
-    if (d < params_.hearing_range && std::abs(dz) < params_.vertical_limit) rise += params_.hearing_rise;
+    if (noticeable && d < params_.hearing_range) rise += params_.hearing_rise;
     awareness = std::clamp(rise > 0 ? awareness + rise * dt : awareness - params_.decay * dt, 0.0f, 1.0f);
     // Hysteresis: an alerted enemy stays alerted until it falls below the suspicious threshold.
     if (awareness >= params_.alerted_at) alert = AiAlert::Alerted;

@@ -519,10 +519,10 @@ int main() {
         }
         CHECK(inside && moved);
         CHECK(a[0].awareness == 0 && a[0].alert == nim::AiAlert::Unaware);
-        // The player standing next to them: awareness rises (hearing at least), but an invisible
-        // player changes nothing about where they go.
+        // An invisible player standing next to them raises no awareness and changes nothing about
+        // where they go (3.84).
         const auto c = run(true, {5, 6, 0}, 5), d = run(true, {1000, 0, 0}, 5);
-        CHECK(c[0].awareness > 0.5f && c[0].alert != nim::AiAlert::Unaware);
+        CHECK(c[0].awareness == 0 && c[0].alert == nim::AiAlert::Unaware && !c[0].sees_player);
         CHECK(c[0].position == d[0].position && c[1].position == d[1].position);
         const auto e = run(false, {5, 6, 0}, 5);
         CHECK(e[0].alert == nim::AiAlert::Alerted);

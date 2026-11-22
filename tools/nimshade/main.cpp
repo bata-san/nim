@@ -645,7 +645,11 @@ int run(int argc, char** argv) {
                     ai_actors.build_dropships(gpu, scene, layouts, std::move(ship), 3);
                     break;
                 }
-            std::println("ai dropships: {} squads arrive by ship", ai_sim->dropships().size());
+            {
+                size_t carried = 0;
+                for (const auto& d : ai_sim->dropships()) carried += d.squads.size();
+                std::println("ai dropships: {} ships carry {} squads (spawners at the same coordinates share a ship)", ai_sim->dropships().size(), carried);
+            }
             if (ai_ship_strip) {
                 std::vector<std::pair<float, size_t>> order;
                 for (size_t i = 0; i < ai_sim->dropships().size(); ++i)
@@ -778,6 +782,16 @@ int run(int argc, char** argv) {
                 ai_actors.update(scene, *ai_sim, {eye_arg->x, eye_arg->y, eye_arg->z}, 0.0f, ai_range);
                 std::println("ai frame: eye ({:.1f} {:.1f} {:.1f}) look ({:.1f} {:.1f} {:.1f})", eye_arg->x, eye_arg->y, eye_arg->z, look_arg->x,
                              look_arg->y, look_arg->z);
+                if (ai_subject) {
+                    const auto& a = ai_sim->agents()[*ai_subject];
+                    const MotionSet* set = a.character < ai_sim->motions().size() ? &ai_sim->motions()[a.character] : nullptr;
+                    const MotionClip* clip = !set ? nullptr
+                                             : a.motion.turn ? &set->turns[*a.motion.turn]
+                                             : a.motion.locomotion ? &set->locomotion[*a.motion.locomotion]
+                                             : set->idle ? &*set->idle : nullptr;
+                    std::println("ai frame subject: agent {} {} {} clip {} at {:.2f} s", *ai_subject, ai_gameplay->characters[a.character].name_estimate,
+                                 a.motion.turn ? "turning" : a.motion.locomotion ? "moving" : "idle", clip ? clip->clip.str() : std::string("none"), a.motion_time);
+                }
             }
             for (const auto& e : ai_estimates(params)) std::println("  ai estimate {} = {:.2f}: {}", e.name, e.value, e.note);
         }
