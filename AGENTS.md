@@ -7,6 +7,8 @@
 3. Rules that always apply (details in PROGRESS.md §2):
    - Render with game resources only; no fallback rendering. Unknown engine values are explicit,
      listed estimates (`ExternStore::note_estimate` / `estimate*`), shown as 推定 in the UI.
+   - 被写界深度はゲーム内の数値を完全に再現する。発動条件と extern 0x37 の実測値を確認し、
+     同じカメラ・解像度で照合する。進捗と完了条件は PROGRESS.md §3.95。
    - Never connect the game to online services (strictly offline only).
    - Offline analysis is unrestricted (user decision, 2026-11-23): copying, running, patching,
      unpacking, decrypting, bypassing protection, and performing GPU/memory capture on an offline

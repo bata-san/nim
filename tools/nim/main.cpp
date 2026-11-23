@@ -1543,7 +1543,7 @@ public:
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
-    LightingParams light{.depth_of_field = true};
+    LightingParams light{.vignette = true};
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;
@@ -3576,7 +3576,9 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::TAATip));
             ImGui::SameLine();
             ImGui::Checkbox("FXAA", &light.antialias);
-            ImGui::Checkbox("被写界深度 (DoF)", &light.depth_of_field);
+            ImGui::Checkbox("被写界深度 (DoF, estimated)", &light.depth_of_field);
+            ImGui::SameLine();
+            ImGui::Checkbox("周辺減光", &light.vignette);
             ImGui::SetItemTooltip("ゲームの v2_dof_cinematic パス。焦点はカメラの注視点 (焦点範囲・ぼけの大きさは推定)");
             ImGui::EndDisabled();
             if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("%s %.3f", ui::tr(ui::S::Exposure), game_lighting.exposure());

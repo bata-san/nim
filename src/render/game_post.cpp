@@ -111,6 +111,12 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         load(dof_blur_, "v2_dof_cinematic_gaussian_blur", {f16, false});
         load(dof_combine_, "v2_dof_cinematic_final_combine", {f16, false});
     }
+    {
+        // The screen overlay the tonemap multiplies by (t2): draw_vignette writes (0, 0, 0, a).
+        GamePipeline::Options vignette{DXGI_FORMAT_R8G8B8A8_UNORM, false};
+        vignette.blend_state = 8;  // premultiplied alpha: white * (1 - a) (the stage's blend, estimate)
+        load(vignette_, "draw_vignette", vignette);
+    }
     load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
     load(grading_convert_, "color_grading_convert_to_volume_texture_sdr", {});
     Texture black;
@@ -119,7 +125,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDofRtv + 9};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDofRtv + 10};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -136,6 +142,8 @@ void GameLighting::release_post(Gpu& gpu) {
         gp->release(gpu);
     for (ComPtr<ID3D12Resource>* r : {std::addressof(dof_coc_), std::addressof(dof_tile_h_rt_), std::addressof(dof_tile_v_rt_), std::addressof(dof_neighbor_rt_), std::addressof(dof_half_), std::addressof(dof_half_coc_), std::addressof(dof_apply_rt_), std::addressof(dof_blur_rt_), std::addressof(dof_out_)})
         r->Reset();
+    vignette_.release(gpu);
+    screen_overlay_.Reset();
     for (auto& r : bloom_line_) r.Reset();
     ae_columns_rt_.Reset();
     grading_strip_.Reset();
@@ -251,6 +259,11 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         dof_apply_rt_ = target(dof_hw_, dof_hh_, f16, kDofRtv + 6);
         dof_blur_rt_ = target(dof_hw_, dof_hh_, f16, kDofRtv + 7);
         dof_out_ = target(w, h, f16, kDofRtv + 8);
+    }
+    if (vignette_.loaded()) {
+        cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 1;
+        screen_overlay_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kDofRtv + 9);
+        cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 0;
     }
     taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -595,7 +608,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     e.set_texture(kScreenArea, 0x30, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x38, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x50, bloom_tex);
-    e.set_texture(kScreenArea, 0x58, unshadowed_.Get());
+    const bool vignette = p.vignette && vignette_.loaded() && screen_overlay_;
+    e.set_texture(kScreenArea, 0x58, vignette ? render_vignette(gpu, cl, scopes) : unshadowed_.Get());
     e.set(kScreenArea, 0x90, float4{float(kGradingSize), 0, 0, 0});
     e.set(kScreenArea, 0x170, float4{0, 1, 0, 0});  // chromatic aberration ramps (none)
     e.set(kScreenArea, 0x180, float4{0, 1, 0, 0});
@@ -605,7 +619,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                        "engine screen_area settings (extern 0x1E) not in game data");
     ext_.note_estimate("grading: native SDR LUT from no layers and an identity matrix",
                        "grading layer data (scope color_grading_ubershader) source not found");
-    ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
+    if (!vignette)
+        ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay not drawn");
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
     const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
@@ -714,6 +729,35 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         fxaa_.draw(gpu, cl, e, scopes);
     }
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+// draw_vignette (PS 80A74994) into the screen overlay the tonemap multiplies by. From the pixel
+// position: q = |(pos - 0.5) * +0x00.zw - +0x00.xy|, an ellipse radius r = A / (sqrt(B^2 - A c) + B) with
+// A = dot(q^2, +0x10.xy), B = dot(q, +0x10.zw), c = +0x20 (r = |q| for (1, 1, 0, 0), c = -1), or a
+// rectangle edge through +0x30; a = (smoothstep(saturate(r * +0x40.x + +0x40.y)) * +0x40.z + +0x40.w)
+// * Postprocess +0xC0.w. Extern 0x29 is engine-filled: the values are estimates.
+ID3D12Resource* GameLighting::render_vignette(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes) {
+    constexpr uint8_t kVignette = 0x29;
+    constexpr float start = 0.35f, end = 0.75f, strength = 0.4f;
+    auto& e = ext_;
+    e.set(kVignette, 0x00, float4{0.5f, 0.5f, 1.0f / float(w_), 1.0f / float(h_)});
+    e.set(kVignette, 0x10, float4{1, 1, 0, 0});
+    e.set(kVignette, 0x20, -1.0f);
+    e.set(kVignette, 0x30, float4{-1, -1, 1, 1});  // the rectangle test never wins (q >= 0)
+    e.set(kVignette, 0x40, float4{1 / (end - start), -start / (end - start), strength, 0});
+    e.set(ext::Postprocess, 0xC0, float4{0, 0, 0, 1});
+    e.note_estimate(std::format("vignette: elliptical in screen uv, from {} to {} radius in normalized screen coordinates, strength {}", start, end, strength),
+                    "draw_vignette is the game's; its settings (extern 0x29) and the overlay blend are engine code");
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{post_rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(kDofRtv + 9) * inc};
+    Gpu::barrier(cl, screen_overlay_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float white[4]{1, 1, 1, 1};
+    cl->ClearRenderTargetView(rtv, white, 0, nullptr);
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    viewport(cl, w_, h_);
+    vignette_.draw(gpu, cl, e, scopes);
+    Gpu::barrier(cl, screen_overlay_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return screen_overlay_.Get();
 }
 
 bool GameLighting::dof_ready() const {

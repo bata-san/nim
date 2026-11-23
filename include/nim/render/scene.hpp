@@ -689,6 +689,8 @@ struct LightingParams {
     bool temporal_aa = true;
     // Cinematic depth of field (with post only): the engine's v2_dof_cinematic_* passes, focused at
     // dof_focus metres of view depth (> 0). The focus ranges and blur size are estimates.
+    // Vignette (with post only): the engine's draw_vignette; its strength and radii are estimates.
+    bool vignette = false;
     bool depth_of_field = false;
     float dof_focus = 0;
 };

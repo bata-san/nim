@@ -185,7 +185,7 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_distortion = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
-    bool dof = false;
+    bool dof = false, vignette = false;
     float dof_focus = 0;
     bool shaft_fog_density = false;
     float exposure_arg = 1;
@@ -278,6 +278,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-aa") no_aa = true;
         else if (args[i] == "--no-taa") no_taa = true;
         else if (args[i] == "--dof") dof = true;
+        else if (args[i] == "--vignette") vignette = true;
         else if (args[i] == "--dof-focus" && i + 1 < args.size()) dof = true, dof_focus = std::stof(args[++i]);
         else if (args[i] == "--exposure" && i + 1 < args.size()) exposure_arg = std::stof(args[++i]);
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
@@ -332,7 +333,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--vignette] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -988,6 +989,7 @@ int run(int argc, char** argv) {
     lp.temporal_aa = !no_taa;
     // Depth of field: focused on the look point unless a distance is given.
     lp.depth_of_field = dof;
+    lp.vignette = vignette;
     lp.dof_focus = dof_focus > 0 ? dof_focus : std::sqrt(dot(view.target - view.eye, view.target - view.eye));
     if (dof) std::println("depth of field: focus {:.1f} m", lp.dof_focus);
     lp.exposure = exposure_arg;

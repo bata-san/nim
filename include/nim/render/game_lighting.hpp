@@ -671,6 +671,10 @@ private:
     ID3D12Resource* render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl, ID3D12Resource* image, const LightingParams& p,
                                const ScopeBufferFn& scopes);
     bool dof_ready() const;
+    // The engine's draw_vignette into the overlay the tonemap multiplies by (docs/PROGRESS.md 3.95).
+    ID3D12Resource* render_vignette(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
+    GamePipeline vignette_;
+    ComPtr<ID3D12Resource> screen_overlay_;
     // prepare (full-res CoC), 12-texel tile max (horizontal, vertical), neighbourhood max,
     // half-res downsample (colour + CoC), gather, fill blur, full-res combine.
     GamePipeline dof_prepare_, dof_tile_h_, dof_tile_v_, dof_neighbor_, dof_down_, dof_apply_, dof_blur_, dof_combine_;
