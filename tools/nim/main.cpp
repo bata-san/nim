@@ -1317,6 +1317,7 @@ private:
                                     mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr,
                                     &*cache);
                                 if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
+                                piece.mesh.patrol_start = model.patrol_start;
                                 piece.rows = std::move(model.rows);
                                 piece.sky_order = std::move(model.sky_order);
                             }
@@ -2833,6 +2834,7 @@ public:
             }
             const View camera = current_view();
             ViewMatrices vm = game_view ? game_lighting.temporal_view(camera, light) : make_view(camera);
+            if (map_scene) scene.update_curtains(vm.eye, light.frame_delta_time);
             prepare_scope.reset();
             auto audio_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Audio);
             if (ambient_audio) {

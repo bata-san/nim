@@ -688,7 +688,8 @@ private:
     ComPtr<ID3D12Resource> dlaa_depth_, dlaa_motion_;
     float dlaa_jitter_x_ = 0, dlaa_jitter_y_ = 0;
     bool dlaa_reset_ = true;
-    ComPtr<ID3D12Resource> output_sdr_;
+    ComPtr<ID3D12Resource> output_sdr_, tonemap_input_;
+    GamePipeline tonemap_clamp_;
     // prepare (full-res CoC), 12-texel tile max (horizontal, vertical), neighbourhood max,
     // half-res downsample (colour + CoC), gather, fill blur, full-res combine.
     GamePipeline dof_prepare_, dof_tile_h_, dof_tile_v_, dof_neighbor_, dof_down_, dof_apply_, dof_blur_, dof_combine_;

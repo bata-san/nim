@@ -72,6 +72,7 @@ struct MapStatic {
     // Per instance: the 3x4 object-to-world rows (rotation * scale, translation in .w).
     std::vector<std::array<float, 12>> rows;
     std::vector<float> sky_order;  // one authored sort key per row for sky collections
+    bool patrol_start = false;  // static drone placement replaced while the patrol simulation is shown
 };
 inline constexpr uint32_t kBubbleOutpost = 0x80AF9550;  // exp_outpost
 inline constexpr uint32_t kClassMapDecals = 0x808081B2;
@@ -93,8 +94,9 @@ struct MapLayout {
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
     // Nodes (id at node +0x70) nim leaves out by user decision (3.111), filled by hide_scripted_nodes:
-    std::unordered_set<uint64_t> hidden_nodes;     // not drawn at all: model, FX and lights
+    std::unordered_set<uint64_t> hidden_nodes;     // model, FX, lights and ambient emitters are omitted
     std::unordered_set<uint64_t> hidden_fx_nodes;  // their FX (particles and FX lights) not run
+    std::unordered_set<uint64_t> patrol_drone_nodes;
     bool hidden(uint64_t node, bool fx) const { return hidden_nodes.contains(node) || (fx && hidden_fx_nodes.contains(node)); }
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});

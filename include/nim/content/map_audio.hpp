@@ -24,6 +24,7 @@ struct MapAudioEmitter {
     std::vector<std::array<float, 3>> points;  // non-empty for polyline/multi-point emitters
     float radius = 0.0f;                       // authored bounding radius (m), 0 for point emitters
     float gain = 1.0f;                         // authored scale/gain (+0x38)
+    float max_distance = 0.0f;                // Wwise event range, 0 when absent
     bool polyline = false;
     bool global = false;
 

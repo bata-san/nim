@@ -21,6 +21,7 @@ constexpr uint32_t kDistortedHdrRtv = 11;
 constexpr uint32_t kDofRtv = 3 * 4 + 9;  // first post RTV slot of the depth of field (after bloom, TAA, lens, line)
 constexpr uint32_t kOutputSdrRtv = kDofRtv + 10;
 constexpr uint32_t kDlaaDepthRtv = kOutputSdrRtv + 1, kDlaaMotionRtv = kDlaaDepthRtv + 1;
+constexpr uint32_t kTonemapInputRtv = kDlaaMotionRtv + 1;
 constexpr uint8_t kDof = 0x37;           // the depth of field settings the engine fills
 
 float4 distortion_uv_scale(uint32_t w, uint32_t h) {
@@ -73,6 +74,9 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         GamePipeline::Options opt{DXGI_FORMAT_R8G8B8A8_UNORM, false};
         opt.drop_extra_targets = true;
         load(post_tonemap_, "screen_area_global_lut3d", opt);
+        GamePipeline::Options clamp{f16, false};
+        clamp.blend_state = 10;  // native MAX blend against a target cleared to zero
+        load(tonemap_clamp_, "copy_texture", clamp);
         // FXAA reads one RGBA texture. Write the native tonemap MRTs together and
         // copy only the second target's alpha into the colour target.
         GamePipeline::Options luma{DXGI_FORMAT_R8G8B8A8_UNORM, false, {DXGI_FORMAT_R8G8B8A8_UNORM}};
@@ -133,7 +137,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDlaaMotionRtv + 1};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kTonemapInputRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -155,6 +159,8 @@ void GameLighting::release_post(Gpu& gpu) {
     output_gamma_.release(gpu);
     output_sharpen_.release(gpu);
     output_sdr_.Reset();
+    tonemap_input_.Reset();
+    tonemap_clamp_.release(gpu);
     dlss_.release(gpu);
     dlaa_copy_depth_.release(gpu);
     dlaa_copy_motion_.release(gpu);
@@ -289,6 +295,8 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w,
     }
     if (output_gamma_.loaded() || output_sharpen_.loaded())
         output_sdr_ = target(out_w, out_h, DXGI_FORMAT_R8G8B8A8_UNORM, kOutputSdrRtv);
+    if (tonemap_clamp_.loaded())
+        tonemap_input_ = target(out_w, out_h, DXGI_FORMAT_R16G16B16A16_FLOAT, kTonemapInputRtv);
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ae_fence_ = {};
@@ -676,6 +684,24 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     const ScopeBufferFn out_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
         return (out_view_cb && reg == 12) ? out_view_cb : scopes(stage, reg);
     };
+
+    if (tonemap_input_) {
+        // Mode 4 takes a logarithm of each channel. Negative values from lighting can
+        // become white via the LUT while their true intensity is below black.
+        const auto source = image->GetDesc();
+        e.set_texture(pp, 0x00, image);
+        e.set(pp, 0x50, size4(uint32_t(source.Width), source.Height));
+        e.set(pp, 0xC0, float4{1, 1, 1, 1});
+        begin(tonemap_input_.Get(), kTonemapInputRtv, out_w_, out_h_);
+        constexpr float black[4]{};
+        cl->ClearRenderTargetView(rtv(kTonemapInputRtv), black, 0, nullptr);
+        tonemap_clamp_.draw(gpu, cl, e, out_scopes);
+        end(tonemap_input_.Get());
+        e.set_texture(pp, 0x00, nullptr);
+        image = tonemap_input_.Get();
+        ext_.note_estimate("SDR tonemap input: HDR channels below black clipped to 0",
+                           "the native mode 4 curve requires nonnegative RGB; source of the game's clamp is unresolved");
+    }
 
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
     // LUT at +0x30, then out = LUT * t2 (+0x58) + t1 (+0x50).

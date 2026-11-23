@@ -634,10 +634,10 @@ void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> r
         const auto pt = em.closest_point(eye);
         const float dx = pt[0] - eye[0], dy = pt[1] - eye[1], dz = pt[2] - eye[2];
         const float d2 = dx * dx + dy * dy + dz * dz;
-        const float max_dist = em.global ? 1e9f : std::max(52.0f, em.radius + 40.0f);
+        const float max_dist = em.max_distance > 0.0f ? em.max_distance : std::max(52.0f, em.radius + 40.0f);
         if (!em.global && d2 > max_dist * max_dist) continue;
         const float d = std::sqrt(d2);
-        const float ref_dist = std::max(7.0f, em.radius + 5.0f);
+        const float ref_dist = std::min(std::max(7.0f, em.radius + 5.0f), max_dist * 0.45f);
         const float edge_fade = em.global ? 1.0f : std::clamp(1.0f - (d / max_dist) * (d / max_dist), 0.0f, 1.0f);
         const float att = em.global ? 0.55f : (edge_fade / (1.0f + (d / ref_dist) * (d / ref_dist)));
         const float w = std::clamp(em.gain, 0.1f, 3.0f) * att;

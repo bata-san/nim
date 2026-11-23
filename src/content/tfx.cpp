@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -215,10 +216,12 @@ TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation,
     if (variant == 0xFFFF || variant >= technique_map.size()) return TagHash();
     const Range& r = technique_map[variant];
     if (r.count == 0) return TagHash();
-    // Condition rows run parallel to the techniques but may stop early (§3.117: UESC 80B80192 has
-    // 110 rows for 220 techniques). Read by +8 instead, the assault's boss and miniboss bodies
-    // swapped (the warden and commander colours).
-    const size_t first = r.start;
+    // A range's condition rows start at its +8 field; ranges with the same value share the rows
+    // (§3.119). UESC 80B80192 has 110 rows for 220 techniques: ranges 0/1 share rows 0..9, 2/5 rows
+    // 10..99, 3/4 rows 100..109, and row k of ranges 0 and 1 picks techniques with the same PS
+    // (80A4BACF / 80A4BB01 -> 80A4BAC8). Reading the rows from the technique start gave the
+    // miniboss's second body range the default palette and the boss's the miniboss palette.
+    const size_t first = r.condition_start;
     if (!tags.empty() && uint64_t(first) + r.count <= technique_conditions.size() &&
         uint64_t(r.start) + r.count <= techniques.size()) {
         // 871AC0EA is the "any" value: rows pair each named combination with an any-row, so a
@@ -271,11 +274,52 @@ TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation,
     return i < techniques.size() ? techniques[i] : TagHash();
 }
 
+namespace {
+constexpr uint32_t kRegionKey = 0x51E7A18D;       // fnv1("region")
+constexpr uint32_t kPermutationKey = 0x4C58EF8F;  // fnv1("permutation")
+constexpr uint32_t kNoneValue = 0x2CA33BDB;       // fnv1("none")
+}  // namespace
+
 std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
                                                              std::span<const std::pair<uint32_t, uint32_t>> tags) {
     const auto bytes = pm.read(entity);
     const TagReader r(bytes);
     const auto comps = r.vec_at(0x08);
+    // State keys from the part groups (+0x28 Vec<8080BACC>) of the entity's dynamic model
+    // components (resource class 80808678, or 80808655 wrapping one).
+    std::set<uint32_t> state_keys;
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
+        if (!e || e->type != 8 || e->reference != kClassComponent) continue;
+        try {
+            const auto cb = pm.read(c);
+            const TagReader cr(cb);
+            const uint64_t rel = cr.u64_at(0x18);
+            if (rel == 0 || 0x18 + rel < 4 || 0x18 + rel >= cb.size()) continue;
+            const size_t base = 0x18 + size_t(rel);
+            const uint32_t cls = cr.u32_at(base - 4);
+            if (cls != 0x80808678 && cls != 0x80808655) continue;
+            const auto groups = cr.vec_at(base + 0x28);
+            if (groups.element_class != 0x8080BACC) continue;
+            for (uint64_t g = 0; g < groups.count; ++g) {
+                const auto pairs = cr.vec_at(groups.data + size_t(g) * 0x18 + 8);
+                if (pairs.element_class != 0x8080BAD0) continue;
+                for (uint64_t q = 0; q < pairs.count; ++q) {
+                    const uint32_t key = cr.u32_at(pairs.data + size_t(q) * 8), value = cr.u32_at(pairs.data + size_t(q) * 8 + 4);
+                    if (value == kNoneValue && key != kRegionKey && key != kPermutationKey) state_keys.insert(key);
+                }
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> state;
+    for (const uint32_t key : state_keys) {
+        uint32_t value = kNoneValue;
+        for (const auto& [k, v] : tags)
+            if (k == key) value = v;
+        state.push_back({key, value});
+    }
     for (uint64_t k = 0; k < comps.count; ++k) {
         const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
         const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
@@ -311,6 +355,7 @@ std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm,
                 }
             }
             if (!best) return std::nullopt;
+            out.state = state;
             out.entry = cr.u32_at(*best + 4);
             const auto permutations = cr.vec_at(*best + 0x20);
             for (uint64_t q = 0; q < std::min(permutations.count, regions.count); ++q)
@@ -415,8 +460,17 @@ MaterialDefaults entity_material_defaults(PackageManager& pm, TagHash entity) {
 }
 
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions) {
-    constexpr uint32_t kRegion = 0x51E7A18D;       // fnv1("region")
-    constexpr uint32_t kPermutation = 0x4C58EF8F;  // fnv1("permutation")
+    constexpr uint32_t kRegion = kRegionKey;
+    constexpr uint32_t kPermutation = kPermutationKey;
+    // An alternate part set of a state key (the helmet decals of 6A807A1A = 7CB23A4E and of
+    // {..., none}) is drawn only for the character's state. Both were drawn before, and the
+    // alternate pass in scene.cpp kept the lower external identifier (the 7CB23A4E set).
+    for (const auto& [key, value] : regions.state) {
+        bool names = false, holds = false;
+        for (const auto& [k, v] : group_tags)
+            if (k == key) names = true, holds = holds || v == value;
+        if (names && !holds) return false;
+    }
     bool names_permutation = false, constrained = false;
     for (const auto& [k, v] : group_tags) names_permutation |= k == kPermutation;
     if (!names_permutation) return true;
@@ -512,7 +566,7 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                             return uint64_t(rg.start) + rg.count > m.techniques.size();
                         })) continue;
                     for (const auto& rg : m.technique_map)
-                        if (rg.unk8 == 0) {
+                        if (rg.condition_start == 0) {
                             m.permutation_count = std::max(1u, rg.count);
                             break;
                         }

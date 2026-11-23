@@ -803,6 +803,7 @@ void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim,
 }
 
 void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range) {
+    scene.set_patrol_drones_active(range >= 0 && !drone_slots_.empty());
     sounds_.clear();
     stopped_.clear();
     emitters_.clear();

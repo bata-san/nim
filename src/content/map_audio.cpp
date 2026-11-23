@@ -1,6 +1,7 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/tfx.hpp"
+#include "nim/content/wwise.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
@@ -56,6 +57,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
 
     struct EventInfo {
         uint32_t event_id = 0;
+        float max_distance = 0;
         std::vector<TagHash> wems;
     };
     std::unordered_map<uint32_t, EventInfo> event_cache;
@@ -78,6 +80,8 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
                         unique_wems.insert(wem.value);
                     }
                 }
+                const float range = wwise_event_range(pm, er.tag_at(0x14)).first;
+                if (std::isfinite(range) && range > 0) info.max_distance = range;
             }
         } catch (...) {
         }
@@ -97,6 +101,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
         for (uint64_t i = 0; i < nodes.count; ++i) {
             const size_t e = nodes.data + size_t(i) * 0x90;
             if (e + 0x90 > data.size()) break;
+            if (layout.hidden(r.u64_at(e + 0x70), false)) continue;
             size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
             for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
                 const uint32_t type = r.u32_at(p - 4);
@@ -142,6 +147,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
             MapAudioEmitter em;
             em.event = ev;
             em.event_id = info.event_id;
+            em.max_distance = info.max_distance;
             em.wems = info.wems;
             em.position = {r.f32_at(o + 0x20), r.f32_at(o + 0x24), r.f32_at(o + 0x28)};
             const float g = r.f32_at(o + 0x38);
@@ -178,6 +184,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
             MapAudioEmitter em;
             em.event = ev;
             em.event_id = info.event_id;
+            em.max_distance = info.max_distance;
             em.wems = info.wems;
             em.position = {r.f32_at(o + 0x20), r.f32_at(o + 0x24), r.f32_at(o + 0x28)};
             const float g = r.f32_at(o + 0x38);

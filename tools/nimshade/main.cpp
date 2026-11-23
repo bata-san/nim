@@ -199,7 +199,7 @@ int run(int argc, char** argv) {
     float emissive_gain = 1;
     float output_gamma = 1, output_sharpen = 0, output_grain = 0, chromatic_aberration = 0;
     bool assume_lights_on = true;
-    std::optional<V3> eye_arg, look_arg;
+    std::optional<V3> eye_arg, look_arg, curtain_from;
     float sun_arg = -1, sky_arg = -1;
     bool reference = false;
     bool heat_cascade = false;
@@ -324,6 +324,12 @@ int run(int argc, char** argv) {
             sscanf_s(args[i + 1].c_str(), "%f,%f,%f", &v.x, &v.y, &v.z);
             (args[i] == "--eye" ? eye_arg : look_arg) = v;
             ++i;
+        }
+        else if (args[i] == "--curtain-from" && i + 1 < args.size()) {
+            V3 origin{};
+            if (sscanf_s(args[++i].c_str(), "%f,%f,%f", &origin.x, &origin.y, &origin.z) != 3)
+                throw std::runtime_error("--curtain-from expects X,Y,Z");
+            curtain_from = origin;
         }
         else if (args[i] == "--sun" && i + 1 < args.size()) sun_arg = std::stof(args[++i]);
         else if (args[i] == "--sky" && i + 1 < args.size()) sky_arg = std::stof(args[++i]);
@@ -577,6 +583,7 @@ int run(int argc, char** argv) {
                             const auto mat = entity_materials.find(region[r].mesh.value);
                             prepared[j] = prepare_dynamic_model(wpm, region[r].mesh, mat == entity_materials.end() ? nullptr : &mat->second, -1,
                                                                 nullptr, &cache);
+                            prepared[j]->patrol_start = region[r].patrol_start;
                             if (prepared[j]->no_drawable) prepared[j].reset(), errors[j] = "entity model with no drawable parts";
                         }
                     } catch (const std::exception& ex) {
@@ -1116,6 +1123,10 @@ int run(int argc, char** argv) {
     if (eye_arg) view.eye = *eye_arg;
     if (look_arg) view.target = *look_arg;
     ViewMatrices vm = make_view(view);
+    if (curtain_from) {
+        scene.update_curtains(*curtain_from, 0.0f);
+        std::println("curtain contacts: {}", scene.update_curtains(vm.eye, 1.0f / 60.0f));
+    }
 
     auto* cl = gpu.immediate();
     scene.set_material_frame(material_time);

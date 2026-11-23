@@ -2445,13 +2445,18 @@ int cmd_map_entity_models(PackageManager& pm, TagHash bubble, TagHash activity) 
     if (!activity.is_none())
         for (const auto& m : list_activity_maps(pm))
             if (m.activity == activity && m.bubble == bubble) tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
-    const MapEntities me = load_map_entities(pm, load_map_layout(pm, bubble, tables), materials);
+    MapLayout layout = load_map_layout(pm, bubble, tables);
+    if (!activity.is_none()) hide_scripted_nodes(pm, layout, activity);
+    const MapEntities me = load_map_entities(pm, layout, materials);
     std::println("{} node tables, {} nodes, {} entities, {} placements with a model, {} models", me.node_tables, me.nodes, me.entities,
                  me.placements, me.models.size());
     std::map<size_t, std::pair<size_t, std::string>> stage_models;  // render stage -> (models, samples)
     for (const auto& m : me.models) {
         std::print("  {} x{}  first at ({:.1f} {:.1f} {:.1f}) top {:.1f}", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11],
                    std::ranges::max(m.rows, {}, [](const auto& r) { return r[11]; })[11]);
+        const auto& first = m.rows.front();
+        std::print(" x-axis ({:.3f} {:.3f} {:.3f}) y-axis ({:.3f} {:.3f} {:.3f})",
+                   first[0], first[4], first[8], first[1], first[5], first[9]);
         try {
             const DynamicModel dm = load_dynamic_model(pm, m.mesh);
             std::set<size_t> stages;
@@ -2465,7 +2470,7 @@ int cmd_map_entity_models(PackageManager& pm, TagHash bubble, TagHash activity) 
                 if (e.first++ < 6) e.second += std::format(" {}x{}", m.mesh.str(), m.rows.size());
             }
         } catch (...) {}
-        std::println("");
+        std::println("{}", m.patrol_start ? " (patrol start)" : "");
     }
     for (const auto& [s, e] : stage_models) std::println("stage {:2} models {:4}{}", s, e.first, e.second);
     return 0;
@@ -3329,12 +3334,13 @@ int cmd_model_materials(PackageManager& pm, TagHash tag, std::span<const std::pa
                 if (part.variant_shader_index == v) ++parts, indices += part.index_count;
         std::string t;
         for (uint32_t k = 0; k < rg.count; ++k) t += " " + m.techniques[rg.start + k].str();
-        std::println("  variant {:3} count {} start {:3} unk8 {:08X} parts {:3} idx {:7}:{}", v, rg.count, rg.start, rg.unk8, parts, indices, t);
+        std::println("  variant {:3} count {} start {:3} conditions {:3} parts {:3} idx {:7}:{}", v, rg.count, rg.start, rg.condition_start,
+                     parts, indices, t);
         if (!tags.empty()) std::println("    selected for the given tags: {}", m.technique(uint16_t(v), m.default_permutation, tags).str());
-        if (uint64_t(rg.start) + rg.count <= m.technique_conditions.size())
+        if (uint64_t(rg.condition_start) + rg.count <= m.technique_conditions.size())
             for (uint32_t k = 0; k < rg.count; ++k) {
                 std::string c;
-                for (const uint16_t g : m.technique_conditions[rg.start + k]) {
+                for (const uint16_t g : m.technique_conditions[rg.condition_start + k]) {
                     c += std::format(" [{}:", g);
                     if (g < m.part_tags.size())
                         for (const auto& [a, b] : m.part_tags[g]) c += std::format(" {:08X}={:08X}", a, b);
@@ -4563,13 +4569,18 @@ int main(int argc, char** argv) {
         if (cmd == "scope-survey" && args.size() >= 2) return cmd_scope_survey(pm, unsigned(std::stoul(args[1])));
         if (cmd == "map-audio" && args.size() >= 2) {
             const TagHash bubble(parse_hex(args[1]));
+            TagHash act;
             std::vector<TagHash> extra;
             if (args.size() >= 3 && !args[2].starts_with("--")) {
-                const TagHash act(parse_hex(args[2]));
+                act = TagHash(parse_hex(args[2]));
                 for (const auto& m : list_activity_maps(pm))
                     if (m.activity == act && m.bubble == bubble) extra = load_activity_node_tables(pm, act, m.bubble_name, m.activity_map);
             }
-            const MapLayout layout = load_map_layout(pm, bubble, extra);
+            MapLayout layout = load_map_layout(pm, bubble, extra);
+            if (!act.is_none()) {
+                pm.build_hash64_index();
+                hide_scripted_nodes(pm, layout, act);
+            }
             const MapAudio audio = load_map_audio(pm, layout);
             std::println("map {}: {} emitters ({} point, {} polyline, {} global), {} unique events ({} with WEM, {} without), {} unique WEMs",
                          bubble.str(), audio.emitters.size(), audio.point_emitters, audio.polyline_emitters, audio.global_emitters,
@@ -4586,9 +4597,10 @@ int main(int argc, char** argv) {
                 if (near_pt) {
                     if (em.distance_to({(*near_pt)[0], (*near_pt)[1], (*near_pt)[2]}) > (*near_pt)[3]) continue;
                 } else if (em.wems.empty() || shown >= 12) continue;
-                std::println("  {} event {} ({:08X}) pos ({:.1f} {:.1f} {:.1f}) r={:.1f} gain={:.2f} wems={} first={}",
+                std::println("  {} event {} ({:08X}) pos ({:.1f} {:.1f} {:.1f}) r={:.1f} gain={:.2f} wems={} first={} range={:.1f}",
                              em.polyline ? "poly" : em.global ? "glob" : "pt  ", em.event.str(), em.event_id,
-                             em.position[0], em.position[1], em.position[2], em.radius, em.gain, em.wems.size(), em.wems[0].str());
+                             em.position[0], em.position[1], em.position[2], em.radius, em.gain, em.wems.size(),
+                             em.wems.empty() ? "-" : em.wems.front().str(), em.max_distance);
                 ++shown;
             }
             return 0;

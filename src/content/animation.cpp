@@ -1463,6 +1463,16 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         }
         if (all) break;
     }
+    if (rig.component.value == 0x80B80983u &&
+        (clip.tag.value == 0x80A9714Au || clip.tag.value == 0x80A97171u) &&
+        sk.size() == 107) {
+        // With no cloth simulation, use the authored hanging shape of the four cape
+        // chains at rest. They follow the posed pelvis, so the cape stays attached.
+        // The rig's current lower fold pinches the hem almost flat from the side.
+        const BoneTransform pelvis = object[1] * sk.inverse_bind[1];
+        for (size_t b = 88; b < sk.size(); ++b)
+            if (b != 100) object[b] = pelvis * sk.bind[b];  // bone 100 is the core
+    }
     solve_ground_ik(sk, rig, pose, rig_of, object);
 }
 

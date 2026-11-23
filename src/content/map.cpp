@@ -954,7 +954,7 @@ std::vector<MapStatic> map_region(const std::vector<MapStatic>& placed, std::arr
     std::vector<std::pair<float, MapStatic>> found;
     const float r2 = radius * radius;
     for (const auto& st : placed) {
-        MapStatic m{st.mesh, {}, {}};
+        MapStatic m{st.mesh, {}, {}, st.patrol_start};
         float nearest = 1e30f;
         for (size_t i = 0; i < st.rows.size(); ++i) {
             const auto& r = st.rows[i];
@@ -1023,7 +1023,7 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
     std::unordered_multimap<uint32_t, uint32_t> by_component;  // SDynamicModelComponent tag -> model
     for (const auto& [model, m] : materials) by_component.emplace(m.component.value, model);
     std::unordered_map<uint32_t, std::vector<uint32_t>> entity_models;
-    std::unordered_map<uint32_t, size_t> slot;  // model -> out.models index
+    std::unordered_map<uint64_t, size_t> slot;  // model and patrol-start flag -> out.models index
     for (const auto table : map.node_tables) {
             std::vector<uint8_t> data;
             try {
@@ -1037,7 +1037,8 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
             for (uint64_t k = 0; k < nodes.count; ++k) {
                 const size_t e = nodes.data + size_t(k) * 0x90;
                 if (e + 0x90 > data.size()) break;
-                if (map.hidden(r.u64_at(e + 0x70), false)) continue;  // hide_scripted_nodes (3.111)
+                const auto node = r.u64_at(e + 0x70);
+                if (map.hidden(node, false)) continue;  // hide_scripted_nodes (3.111)
                 ++out.nodes;
                 const uint64_t h64 = r.u64_at(e + 0x30);
                 if (!h64 || h64 == ~0ull) continue;
@@ -1066,9 +1067,10 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                 }
                 if (it->second.empty()) continue;
                 const auto rows = quat_rows(r, e);
+                const bool patrol_start = map.patrol_drone_nodes.contains(node);
                 for (uint32_t m : it->second) {
-                    auto [s, fresh] = slot.try_emplace(m, out.models.size());
-                    if (fresh) out.models.push_back({TagHash(m), {}});
+                    auto [s, fresh] = slot.try_emplace((uint64_t(m) << 1) | uint64_t(patrol_start), out.models.size());
+                    if (fresh) out.models.push_back({TagHash(m), {}, {}, patrol_start});
                     out.models[s->second].rows.push_back(rows);
                 }
                 ++out.placements;
@@ -1539,6 +1541,14 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity)
     }
     for (const TagHash a : activities) {
         const MapGameplay g = load_map_gameplay(pm, a);
+        for (const auto& group : g.point_groups) {
+            if (group.spline.size() < 2 || !group.owner || *group.owner >= g.scripts.size()) continue;
+            const auto& owner = g.scripts[*group.owner];
+            if (!owner.module.ends_with("uesc_scan_drone.bs")) continue;
+            for (const auto& [offset, placement] : owner.placements)
+                if (offset == 0x758 && placement.id && !placement.model.is_none())
+                    map.patrol_drone_nodes.insert(placement.id);
+        }
         auto place_all = [&](size_t k, std::unordered_set<uint64_t>& into) {
             for (const auto& [off, p] : g.scripts[k].placements)
                 if (p.id) into.insert(p.id);
@@ -1670,7 +1680,12 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             }
             if (it->second.empty()) continue;
             const auto rows = quat_rows(r, e);
-            for (const auto& [s, gate] : it->second) out.push_back({TagHash(s), rows, gate});
+            for (const auto& [s, gate] : it->second) {
+                // The user asked to remove the dark smoke in the Compiler room.
+                // Keep other systems, including the other effects on this same node.
+                if (map.bubble.value == 0x80B385FAu && ent->value == 0x80AA4CE0u && s == 0x80AA4CBFu) continue;
+                out.push_back({TagHash(s), rows, gate});
+            }
         }
     }
     return out;

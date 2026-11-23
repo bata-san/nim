@@ -199,6 +199,8 @@ struct PreparedMesh {
     bool distance_field_preview = false; // preview-only material state and camera framing
     bool inferred_transparent_stage = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement
+    bool patrol_start = false;  // authored drone starts the simulation replaces
+    std::shared_ptr<const Skeleton> curtain_skeleton;
     std::vector<Group> groups;
     std::vector<Buffers> buffers;
     std::vector<PreparedMesh> attachments;  // authored equipment parts, in the same preview space
@@ -370,6 +372,8 @@ public:
     // authored channel defaults, under the scene's overrides. Its materials then evaluate apart
     // from the other actors of the same model.
     void set_actor_channels(uint32_t actor, const ChannelValues& values);
+    void set_patrol_drones_active(bool active);
+    size_t update_curtains(V3 eye, float dt);
     size_t actor_count() const { return actors_.size(); }
     // The lowest z of the actor's skinned vertices (every 4th) in object space under `poses`.
     std::optional<float> actor_lowest(uint32_t actor, const std::vector<ModelSkinPose>& poses) const;
@@ -539,6 +543,7 @@ private:
         };
         std::unique_ptr<EquipmentPlacement> equipment;
         int32_t actor = -1;                  // actors_ index: moved and posed per frame
+        int32_t curtain = -1;                // curtains_ index: independent skin per placement
         PlacementConstants actor_constants{};  // the model's own constants (rows 0-3 replaced per frame)
     };
     struct Actor {
@@ -547,6 +552,14 @@ private:
         std::vector<ModelSkinPose> poses;
     };
     std::vector<Actor> actors_;
+    struct Curtain {
+        std::shared_ptr<const Skeleton> skeleton;
+        std::array<float, 12> rows;
+        std::vector<float> angles;
+        ModelSkinPose pose;
+    };
+    std::vector<Curtain> curtains_;
+    std::optional<V3> curtain_eye_;
     int32_t adding_actor_ = -1;
     void bind_actor_constants(Gpu& gpu);
     void update_skin(ID3D12GraphicsCommandList* cl);
@@ -559,13 +572,16 @@ private:
     // View culling of static instances (a viewer choice, not the game's visibility system):
     // world bounding spheres, and per frame the indices that survive into the instance stream.
     struct CullGroup {
+        static constexpr uint32_t kChunkSize = 32;
         std::vector<std::array<float, 4>> spheres;
+        std::vector<float4> chunk_bounds;
         float4 bounds{};
         std::vector<uint32_t> visible_placements;
         size_t first_item = 0, end_item = 0;
         uint32_t first_set = 0, set_count = 0;
         uint32_t stream_offset = 0;
         bool dynamic = false;
+        bool patrol_start = false;
         bool authored_shadow = false;
         bool has_transparency = false;
         std::vector<float> visible_depths;  // follows the compacted instance stream, including LOD order
@@ -595,6 +611,7 @@ private:
     std::array<std::vector<uint32_t>, 8> cull_scratch_;
     std::vector<uint32_t> visible_static_indices_, visible_static_groups_;
     std::vector<CullGroup> cull_groups_;
+    bool patrol_drones_active_ = false;
     std::vector<size_t> uncullable_opaque_, visible_opaque_, visible_blended_;
     std::vector<uint32_t> visible_static_indices_other_, visible_static_groups_other_;
     std::vector<size_t> visible_opaque_other_, visible_blended_other_;

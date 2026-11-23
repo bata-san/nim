@@ -664,7 +664,7 @@ int main() {
     // Condition rows may cover only the leading ranges; 871AC0EA is "any".
     {
         DynamicModelMaterials material;
-        material.technique_map = {{2, 0, 0}, {2, 2, 0}};
+        material.technique_map = {{2, 0, 0}, {2, 2, 2}};
         material.techniques = {TagHash(0x80A4A7F2), TagHash(0x80A4A7FB), TagHash(0x80A4A83B), TagHash(0x80A4A844)};
         material.part_tags = {{{1, 5}}, {{1, 0x871AC0EA}}, {{2, 6}, {2, 7}}};
         material.technique_conditions = {{0}, {1}, {1}, {0}};
@@ -673,6 +673,11 @@ int main() {
         CHECK(material.technique(0, 0, named) == TagHash(0x80A4A7F2));
         CHECK(material.technique(0, 0, other) == TagHash(0x80A4A7FB));
         CHECK(material.technique(1, 0, other) == TagHash(0x80A4A83B));
+        // Ranges with the same condition start share the rows (UESC 80B80192 ranges 0 and 1).
+        material.technique_map = {{2, 0, 0}, {2, 2, 0}};
+        CHECK(material.technique(1, 0, named) == TagHash(0x80A4A83B));
+        CHECK(material.technique(1, 0, other) == TagHash(0x80A4A844));
+        material.technique_map = {{2, 0, 0}, {2, 2, 2}};
         material.technique_conditions = {{2}, {1}};
         const std::pair<uint32_t, uint32_t> either[] = {{2, 7}, {1, 5}};
         CHECK(material.technique(0, 1, either) == TagHash(0x80A4A7F2));  // 6 or 7
@@ -800,6 +805,17 @@ int main() {
         CHECK(part_group_visible(narrow, elite_assault));
         CHECK(part_group_visible(plain_body, elite_assault));
         CHECK(part_group_visible(unlisted, elite_assault));
+        // State keys: 6A807A1A pairs {..., none} with 7CB23A4E; a character without the tag is `none`.
+        constexpr uint32_t helmet_state = 0x6A807A1A, none = 0x2CA33BDB;
+        elite_assault.state = {{helmet_state, none}};
+        const std::vector<std::pair<uint32_t, uint32_t>> broken = {{helmet_state, 0x7CB23A4E}, {region, 0x9D4305AE}};
+        const std::vector<std::pair<uint32_t, uint32_t>> intact = {{helmet_state, 0xD09AD130}, {helmet_state, none}, {region, 0x9D4305AE}};
+        CHECK(!part_group_visible(broken, elite_assault));
+        CHECK(part_group_visible(intact, elite_assault));
+        CHECK(part_group_visible(narrow, elite_assault));  // 5266EA90 lists no `none`: not a state key
+        elite_assault.state = {{helmet_state, 0x7CB23A4E}};
+        CHECK(part_group_visible(broken, elite_assault));
+        CHECK(!part_group_visible(intact, elite_assault));
     }
 
     if (g_failures) return 1;

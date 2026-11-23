@@ -625,6 +625,9 @@ void StaticMeshScene::release(Gpu& gpu) {
     scopes_resolved_ = false;
     scope_defs_.clear();
     cull_groups_.clear();
+    patrol_drones_active_ = false;
+    curtains_.clear();
+    curtain_eye_.reset();
     uncullable_opaque_.clear();
     visible_opaque_.clear();
     visible_opaque_other_.clear();
@@ -1021,7 +1024,28 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         out.permutation_count = materials->permutation_count;
     }
     if (tag.value == 0x80B0CD84) out.channel_defaults[0x3969B148] = {0, 0, 0, 0};
+    std::optional<RegionPermutations> turret_mount;
+    if (tag.value == 0x80A4A511u && !regions && materials) {
+        // The standard UESC turret's selector has separate mutually exclusive mounts.
+        // The map node's mount state is unresolved, so preview its authored "default" row.
+        constexpr std::pair<uint32_t, uint32_t> tags[]{{0x26170C92u, 0xD7635D2Au}, {0x2229FB38u, 0x2EA8FB98u}};
+        turret_mount = entity_region_permutations(pm, TagHash(0x80A4A6B2u), tags);
+        if (turret_mount) regions = &*turret_mount;
+    }
     DynamicModel model = load_dynamic_model(pm, tag);
+    TagHash curtain;
+    switch (tag.value) {
+    case 0x80AC9159u: case 0x80ACBD3Du: curtain = TagHash(0x80AC940Bu); break;
+    case 0x80AC9043u: curtain = TagHash(0x80AC8677u); break;
+    case 0x80A44CE9u: case 0x80A440ADu: curtain = TagHash(0x80A45C99u); break;
+    case 0x80A453D5u: case 0x80ACBC5Fu: curtain = TagHash(0x80A451A9u); break;
+    case 0x80A453B4u: curtain = TagHash(0x80A45D75u); break;
+    }
+    if (!curtain.is_none()) {
+        auto skeleton = load_skeleton(pm, curtain);
+        if (model.bone_count > 0 && model.bone_count <= skeleton.size())
+            out.curtain_skeleton = std::make_shared<Skeleton>(std::move(skeleton));
+    }
     out.bone_count = model.bone_count;
     const V3 scale{model.model_scale[0], model.model_scale[1], model.model_scale[2]};
     const V3 offset{model.model_offset[0], model.model_offset[1], model.model_offset[2]};
@@ -2020,11 +2044,24 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
     scopes_resolved_ = false;
     // All or nothing: a mesh that fails validation leaves no partial parts behind.
     const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count(), distortion = distortion_items_.size();
-    const size_t instances = instance_total_, culls = cull_groups_.size();
+    const size_t instances = instance_total_, culls = cull_groups_.size(), curtains = curtains_.size();
     const size_t uncullable = uncullable_opaque_.size();
     const size_t decals = decal_items_.size();
     try {
-        add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
+        if (mesh.curtain_skeleton && !dynamic_ && adding_actor_ < 0 && sky_order.empty()) {
+            for (const auto& rows : placements) {
+                PreparedMesh piece = mesh;
+                const size_t first_set = sets_.size();
+                add_mesh_parts(gpu, std::move(piece), layouts, std::span(&rows, 1), {});
+                const auto index = int32_t(curtains_.size());
+                curtains_.push_back({mesh.curtain_skeleton, rows, std::vector<float>(mesh.bone_count),
+                                     {mesh.tag, {}, {}}});
+                for (size_t s = first_set; s < sets_.size(); ++s) sets_[s].curtain = index;
+                retire_prepared(std::move(piece));
+            }
+        } else {
+            add_mesh_parts(gpu, std::move(mesh), layouts, placements, sky_order);
+        }
         retire_prepared(std::move(mesh));
         ++shadow_generation_;
     } catch (...) {
@@ -2042,6 +2079,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         info_.resize(infos);
         instance_total_ = instances;
         cull_groups_.resize(culls);
+        curtains_.resize(curtains);
         uncullable_opaque_.resize(uncullable);
         throw;
     }
@@ -2081,6 +2119,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     if (mesh.inferred_dynamic_lod)
         material_externs_->note_estimate("dynamic model alternates: only the lowest external identifier is drawn",
                                          "parts with the same material, bind-pose bounds and index count are one piece's variants");
+    if (mesh.tag.value == 0x80A4A511u && mesh.region_hidden_parts)
+        material_externs_->note_estimate("UESC turret mount: authored default permutation",
+                                         "per-placement mount tags are unresolved");
+    if (mesh.curtain_skeleton && !dynamic_)
+        material_externs_->note_estimate("strip curtains: camera contact and hinge relaxation",
+                                         "uses authored strip bones with an estimated contact radius and damping");
 
     if (std::ranges::any_of(mesh.buffers, [](const auto& b) { return b.float_positions && !b.skin.bones.empty(); }))
         material_externs_->note_estimate("cloth mesh: posed by its skin weights only",
@@ -2116,11 +2160,11 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     if (!mesh.dynamic || (!dynamic_ && sky_order.empty() && adding_actor_ < 0)) {
         CullGroup group;
         group.dynamic = mesh.dynamic;
+        group.patrol_start = mesh.patrol_start;
         group.first_item = items_.size();
         group.first_set = set_base;
         group.set_count = uint32_t(mesh.buffers.size());
         group.spheres.reserve(n);
-        V3 lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
         for (const auto& m : placements) {
             const V3 c = mesh.center;
             const V3 x{m[0], m[4], m[8]}, y{m[1], m[5], m[9]}, z{m[2], m[6], m[10]};
@@ -2128,13 +2172,24 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             const float xy = std::fabs(dot(x,y)), xz = std::fabs(dot(x,z)), yz = std::fabs(dot(y,z));
             const float scale = std::sqrt(std::max({dot(x,x) + xy + xz, dot(y,y) + xy + yz, dot(z,z) + xz + yz}));
             const V3 center = x * c.x + y * c.y + z * c.z + V3{m[3], m[7], m[11]};
-            const float r = mesh.radius * scale;
+            const float r = (mesh.radius + (mesh.curtain_skeleton ? 0.8f : 0.0f)) * scale;
             group.spheres.push_back({center.x, center.y, center.z, r});
-            lo = {std::min(lo.x, center.x - r), std::min(lo.y, center.y - r), std::min(lo.z, center.z - r)};
-            hi = {std::max(hi.x, center.x + r), std::max(hi.y, center.y + r), std::max(hi.z, center.z + r)};
         }
-        const auto center = (hi + lo) * 0.5f, extent = (hi - lo) * 0.5f;
-        group.bounds = n == 1 ? group.spheres.front() : float4{center.x, center.y, center.z, std::sqrt(dot(extent, extent))};
+        const auto bounds = [](std::span<const float4> spheres) {
+            if (spheres.size() == 1) return spheres.front();
+            V3 lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
+            for (const auto& [x, y, z, r] : spheres) {
+                lo = {std::min(lo.x, x - r), std::min(lo.y, y - r), std::min(lo.z, z - r)};
+                hi = {std::max(hi.x, x + r), std::max(hi.y, y + r), std::max(hi.z, z + r)};
+            }
+            const auto center = (hi + lo) * 0.5f, extent = (hi - lo) * 0.5f;
+            return float4{center.x, center.y, center.z, std::sqrt(dot(extent, extent))};
+        };
+        const std::span<const float4> spheres(group.spheres);
+        group.bounds = bounds(spheres);
+        if (spheres.size() >= 2 * CullGroup::kChunkSize)
+            for (size_t first = 0; first < spheres.size(); first += CullGroup::kChunkSize)
+                group.chunk_bounds.push_back(bounds(spheres.subspan(first, std::min<size_t>(CullGroup::kChunkSize, spheres.size() - first))));
         group.levels = mesh.lod_levels ? mesh.lod_levels : 1;
         if (std::popcount(group.levels) > 1 && material_externs_)
             material_externs_->note_estimate("static mesh LOD: highest available detail within 25 m of the bounds; farther LOD uses a 1080p reference projection",
@@ -2197,7 +2252,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             auto up = [&](const std::vector<uint32_t>& v) -> ComPtr<ID3D12Resource> {
                 return v.empty() ? ComPtr<ID3D12Resource>{} : gpu.upload(v.data(), v.size() * 4);
             };
-            if ((dynamic_ || adding_actor_ >= 0) && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
+            const bool cpu_skin = dynamic_ || adding_actor_ >= 0 || mesh.curtain_skeleton;
+            if (cpu_skin && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
                 // Posed on the CPU (update_skin); the first render uploads the bind pose.
                 const size_t bytes = b.skin_pos.size() * 4;
                 set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2210,7 +2266,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 set.skin_pack_offset = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
                 set.skin_range = mesh.model_cb[13][3];
                 skinned_ = skin_dirty_ = true;
-            } else if ((dynamic_ || adding_actor_ >= 0) && b.float_positions && !b.skin.bones.empty() &&
+            } else if (cpu_skin && b.float_positions && !b.skin.bones.empty() &&
                        b.skin.bones.size() * 48 <= b.vb0.data.size()) {
                 // Float vertices (cloth): posed on the CPU into vb0 itself; the first render uploads
                 // the bind pose.
@@ -2591,6 +2647,14 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             pd.RasterizerState.DepthBias = -16;
             pd.RasterizerState.SlopeScaledDepthBias = -2;
             pd.RasterizerState.DepthBiasClamp = -0.01f;
+        } else if (g.stage == 0 && item.ps_material.shader.value == 0x80A4ACE1u) {
+            // This cutout shader draws lettering on skinned armour in the opaque pass.
+            // Let it win over the surface it sits on after the two meshes are skinned.
+            pd.RasterizerState.DepthBias = 4;
+            pd.RasterizerState.SlopeScaledDepthBias = 0.5f;
+            pd.RasterizerState.DepthBiasClamp = 0.000005f;
+            material_externs_->note_estimate("UESC armour markings: small positive depth bias",
+                                             "the game draws thin cutouts over the same skinned armour surface");
         }
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
@@ -3498,6 +3562,9 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         if (actors_[a].rows)
             for (const auto& pose : actors_[a].poses)
                 if (!pose.bones.empty()) actor_matrices[a][pose.model] = matrices_of(pose);
+    std::vector<std::vector<Mat>> curtain_matrices(curtains_.size());
+    for (size_t i = 0; i < curtains_.size(); ++i)
+        if (!curtains_[i].pose.bones.empty()) curtain_matrices[i] = matrices_of(curtains_[i].pose);
     struct Job { BufferSet* set; const std::vector<Mat>* mats; uint32_t* dst; };
     std::vector<Job> jobs;
     const D3D12_RANGE none{0, 0};
@@ -3509,12 +3576,15 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
             source = &actor_matrices[size_t(set.actor)];
         }
         const auto pose = source->find(set.model);
-        const bool posed = pose != source->end();
+        const std::vector<Mat>* mats = pose == source->end() ? nullptr : &pose->second;
+        if (set.curtain >= 0 && !curtain_matrices[size_t(set.curtain)].empty())
+            mats = &curtain_matrices[size_t(set.curtain)];
+        const bool posed = mats != nullptr;
         if (!posed && !set.skin_posed && set.skin_readable) continue;
         set.skin_posed = posed;
         uint32_t* dst = nullptr;
         check_hr(set.skin_upload[slot]->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
-        jobs.push_back({&set, posed ? &pose->second : nullptr, dst});
+        jobs.push_back({&set, mats, dst});
     }
     WorkerPool::instance().parallel_for(jobs.size(), [&](size_t j) {
         const BufferSet& set = *jobs[j].set;
@@ -3643,6 +3713,9 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
         if (calm_compiler_cape)
             material_externs_->note_estimate("Compiler at rest: fixed hem mask and no moving surface detail",
                                              "resting values inferred from the cape pixel shaders");
+        if (calm_compiler_cape)
+            material_externs_->note_estimate("Compiler at rest: hanging cape chains follow the pelvis",
+                                             "the original bind shape supplies the lower cape while idle; cloth simulation is unresolved");
         if (mesh.tag.value == 0x80A9707Eu)
             material_externs_->note_estimate("Compiler at rest: silver armor and half-strength green core",
                                              "0x5B7CD2A2 = 0 and 0x6057A3B9 = 0.875 select the original material paths");
@@ -3775,6 +3848,76 @@ void StaticMeshScene::set_actor_channels(uint32_t actor, const ChannelValues& va
     }
 }
 
+void StaticMeshScene::set_patrol_drones_active(bool active) {
+    if (patrol_drones_active_ == active) return;
+    patrol_drones_active_ = active;
+    ++shadow_generation_;
+}
+
+size_t StaticMeshScene::update_curtains(V3 eye, float dt) {
+    const V3 past_eye = std::exchange(curtain_eye_, eye).value_or(eye);
+    const V3 movement = eye - past_eye;
+    const bool moved = dot(movement, movement) > 0.000001f && dot(movement, movement) < 16;
+    const float relaxation = std::exp(-std::clamp(dt, 0.0f, 0.1f) * 6.0f);
+    size_t contacts = 0;
+    for (auto& curtain : curtains_) {
+        const auto& rows = curtain.rows;
+        const V3 origin{rows[3], rows[7], rows[11]};
+        const auto offset = eye - origin;
+        const bool was_bent = !curtain.pose.bones.empty();
+        if (!was_bent && (!moved || dot(offset, offset) > 100)) continue;
+        const V3 x{rows[0], rows[4], rows[8]}, y{rows[1], rows[5], rows[9]}, z{rows[2], rows[6], rows[10]};
+        const float scale_sq = dot(x, x);
+        if (scale_sq < 1e-6f) continue;
+        const float local_x = dot(offset, x) / scale_sq;
+        const float old_x = dot(past_eye - origin, x) / scale_sq;
+        const float dx = local_x - old_x;
+        const float along = std::abs(dx) > 0.001f ? std::clamp(-old_x / dx, 0.0f, 1.0f) : 1.0f;
+        const auto contact = past_eye + movement * along - origin;
+        const float contact_y = dot(contact, y) / scale_sq, contact_z = dot(contact, z) / scale_sq;
+        const bool touch = moved && std::abs(dx) > 0.001f && std::abs(old_x + along * dx) < 0.45f;
+        const auto& sk = *curtain.skeleton;
+        bool bent = false, changed = false;
+        for (size_t b = 1; b < curtain.angles.size(); ++b) {
+            if (sk.parents[b] != 0) continue;
+            const auto& hinge = sk.bind[b].translation;
+            const float old = curtain.angles[b];
+            float angle = old * relaxation;
+            if (touch && contact_z <= hinge[2] + 0.2f && contact_z >= hinge[2] - 2.9f) {
+                const float influence = std::max(0.0f, 1.0f - std::abs(contact_y - hinge[1]) / 0.55f);
+                if (influence > 0) {
+                    angle = std::copysign(std::max(std::abs(angle), 0.85f * influence), -dx);
+                    ++contacts;
+                }
+            }
+            curtain.angles[b] = std::abs(angle) > 0.002f ? angle : 0.0f;
+            changed |= old != curtain.angles[b];
+            bent |= curtain.angles[b] != 0;
+        }
+        if (!changed) continue;
+        skin_dirty_ = true;
+        ++shadow_generation_;
+        if (!bent) {
+            curtain.pose.bones.clear();
+            continue;
+        }
+        auto& pose = curtain.pose.bones;
+        pose.resize(curtain.angles.size());
+        for (size_t b = 1; b < pose.size(); ++b) {
+            const int parent = sk.parents[b];
+            if (parent != 0) {
+                if (parent > 0 && size_t(parent) < b) pose[b] = pose[size_t(parent)];
+                continue;
+            }
+            BoneTransform rotation, pivot;
+            rotation.rotation = {0, std::sin(curtain.angles[b] * 0.5f), 0, std::cos(curtain.angles[b] * 0.5f)};
+            pivot.translation = sk.bind[b].translation;
+            pose[b] = pivot * rotation * inverse(pivot);
+        }
+    }
+    return contacts;
+}
+
 // This frame's object constants of every visible actor: its model's own constants with the
 // world transform (rows 0-3) and the previous frame's (rows 8-11, motion vectors).
 void StaticMeshScene::bind_actor_constants(Gpu& gpu) {
@@ -3870,25 +4013,26 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
         group.first = {};
         group.count = {};
         group.visible = 0;
+        if (group.patrol_start && patrol_drones_active_) return;
         float z = 0;
         if (outside(group.bounds, z)) return;
         thread_local std::array<std::vector<uint32_t>, 8> lod_scratch;
         auto& cull_scratch = lod_scratch;
         for (auto& v : cull_scratch) v.clear();
-        for (uint32_t i = 0; i < group.spheres.size(); ++i) {
-            const auto& sp = group.spheres[i];
-            if (group.spheres.size() != 1 && outside(sp, z)) continue;
+        const auto test_placement = [&](uint32_t index) {
+            const auto& sp = group.spheres[index];
+            if (group.spheres.size() != 1 && outside(sp, z)) return;
             const float r = sp[3];
             const float projected = vm.ortho > 0 ? r / vm.ortho : r * vm.fy / std::max(z - r, 1e-4f);
             const auto delta = V3{sp[0], sp[1], sp[2]} - vm.eye;
             const float d2 = dot(delta, delta);
             const bool near_camera = vm.ortho == 0 && d2 <= (25 + r) * (25 + r);
             const float min_px = (vm.ortho == 0 && d2 > (40 + r) * (40 + r)) ? 1.8f : 1.25f;
-            if (!near_camera && projected * half_h < min_px) continue;
+            if (!near_camera && projected * half_h < min_px) return;
             ++group.visible;
             if (group.dynamic) {
-                group.visible_placements.push_back(i);
-                continue;
+                group.visible_placements.push_back(index);
+                return;
             }
             const float px = projected * (vm.ortho > 0 ? half_h : 540.0f);
             constexpr std::array<float, 7> detail_radii{144, 60, 24, 12, 7, 3, 1};
@@ -3896,7 +4040,17 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
             while (!near_camera && level < int(detail_radii.size()) && px < detail_radii[size_t(level)]) ++level;
             while (level > 0 && !((group.levels >> level) & 1)) --level;
             while (level < 7 && !((group.levels >> level) & 1)) ++level;
-            cull_scratch[size_t(level)].push_back(i);
+            cull_scratch[size_t(level)].push_back(index);
+        };
+        if (group.chunk_bounds.empty()) {
+            for (uint32_t index = 0; index < group.spheres.size(); ++index) test_placement(index);
+        } else {
+            for (uint32_t chunk = 0; chunk < group.chunk_bounds.size(); ++chunk) {
+                if (outside(group.chunk_bounds[chunk], z)) continue;
+                const uint32_t first = chunk * CullGroup::kChunkSize;
+                const uint32_t end = std::min(first + CullGroup::kChunkSize, uint32_t(group.spheres.size()));
+                for (uint32_t index = first; index < end; ++index) test_placement(index);
+            }
         }
         if (!group.visible || group.dynamic) return;
         uint32_t first = 0;

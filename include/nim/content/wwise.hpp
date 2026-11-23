@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nim {
@@ -149,6 +150,8 @@ struct WwiseEventData {
 std::unordered_map<uint32_t, TagHash> index_wwise_streams(PackageManager& pm);
 // Reads event tag `event` and its bank; throws when either is missing or unreadable. Sources the
 // event does not list are looked up in `all_streams` (index_wwise_streams) when given.
+// Authored maximum distance in metres and longest stream duration in seconds.
+std::pair<float, float> wwise_event_range(PackageManager& pm, TagHash event_info);
 WwiseEventData load_wwise_event(PackageManager& pm, TagHash event,
                                 const std::unordered_map<uint32_t, TagHash>* all_streams = nullptr);
 

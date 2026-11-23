@@ -134,7 +134,9 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag);
 constexpr uint32_t kClassComponent = 0x8080BADB;
 struct DynamicModelMaterials {
     TagHash component;  // the component tag it came from
-    struct Range { uint32_t count = 0, start = 0, unk8 = 0; };
+    // condition_start (+8): first row of technique_conditions for this range. Ranges with the same
+    // value share their rows (docs/PROGRESS.md 3.119).
+    struct Range { uint32_t count = 0, start = 0, condition_start = 0; };
     std::vector<Range> technique_map;
     std::vector<TagHash> techniques;
     uint32_t permutation_count = 1;
@@ -157,11 +159,16 @@ struct DynamicModelMaterials {
 // u32 name, +0x10 Vec<8080BAD0> conditions, +0x20 Vec<u32> permutation per region). The entry
 // whose conditions all hold in the spawned character's tags gives each region its permutation;
 // a part group naming permutations is drawn only when its region's permutation is among them.
+// State keys (3.119): a key that some part group of the entity's models pairs with the value
+// `none` (6A807A1A on the UESC helmets: {D09AD130, A9D28BB0, 4A3554B4, none} against 7CB23A4E)
+// selects one of two alternate part sets. A group naming a state key is drawn only when the
+// character's value, `none` when it has no such tag, is among its values.
 struct RegionPermutations {
     TagHash selector;   // the entity component holding the table
     uint32_t entry = 0;  // the chosen entry's name
     std::vector<std::pair<uint32_t, uint32_t>> region_permutation;
     size_t ties = 0;     // other entries as specific as the chosen one whose conditions also hold
+    std::vector<std::pair<uint32_t, uint32_t>> state;  // state key -> the character's value
 };
 std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
                                                              std::span<const std::pair<uint32_t, uint32_t>> tags);

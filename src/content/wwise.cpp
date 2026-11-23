@@ -614,6 +614,15 @@ std::unordered_map<uint32_t, TagHash> index_wwise_streams(PackageManager& pm) {
     return out;
 }
 
+std::pair<float, float> wwise_event_range(PackageManager& pm, TagHash event_info) {
+    const Entry* entry = pm.entry(event_info);
+    if (!entry || entry->reference != kClassAudioEventInfo || entry->file_size < 12) return {};
+    const auto bytes = pm.read(event_info);
+    if (bytes.size() < 12) return {};
+    TagReader r(bytes);
+    return {r.f32_at(4), r.f32_at(8)};
+}
+
 WwiseEventData load_wwise_event(PackageManager& pm, TagHash event, const std::unordered_map<uint32_t, TagHash>* all_streams) {
     const Entry* e = pm.entry(event);
     if (!e || e->type != 8 || e->reference != kClassAudioEvent)
@@ -624,15 +633,9 @@ WwiseEventData load_wwise_event(PackageManager& pm, TagHash event, const std::un
     out.tag = event;
     out.play_id = r.u32_at(0x08);
     out.stop_id = r.u32_at(0x0C);
-    if (const TagHash info = r.tag_at(0x14); !info.is_none())
-        if (const Entry* ie = pm.entry(info); ie && ie->reference == kClassAudioEventInfo) {
-            const auto ib = pm.read(info);
-            TagReader ir(ib);
-            if (ib.size() >= 12) {
-                out.max_distance = ir.f32_at(4);
-                out.longest = ir.f32_at(8);
-            }
-        }
+    const auto [max_distance, longest] = wwise_event_range(pm, r.tag_at(0x14));
+    out.max_distance = max_distance;
+    out.longest = longest;
     const auto streams = r.vec_at(0x20);
     for (uint64_t k = 0; k < streams.count; ++k) {
         const TagHash w = r.tag_at(streams.data + k * 4);
