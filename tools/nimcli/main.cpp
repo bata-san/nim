@@ -3411,6 +3411,33 @@ int cmd_tag_audio(PackageManager& pm, TagHash root, int depth) {
     return 0;
 }
 
+// Every hash64 reference (u64 at a 4-byte step that resolves to a tag) in an entity and its
+// components: where an entity's child entities, models and items are named.
+int cmd_entity_h64(PackageManager& pm, TagHash entity) {
+    pm.build_hash64_index();
+    std::vector<TagHash> tags{entity};
+    {
+        const auto d = pm.read(entity);
+        TagReader r(d);
+        const auto comps = r.vec_at(0x08);
+        for (uint64_t k = 0; k < comps.count; ++k) tags.push_back(TagHash(r.u32_at(comps.data + size_t(k) * 12)));
+    }
+    for (const TagHash t : tags) {
+        std::vector<uint8_t> d;
+        try { d = pm.read(t); } catch (...) { continue; }
+        for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+            uint64_t v;
+            std::memcpy(&v, d.data() + o, 8);
+            if ((v >> 32) == 0 || v == ~0ull) continue;
+            const auto target = pm.resolve64(v);
+            if (!target) continue;
+            const Entry* e = pm.entry(*target);
+            std::println("{} +0x{:X}  {:016X} -> {} class {:08X}", t.str(), o, v, target->str(), e ? e->reference : 0);
+        }
+    }
+    return 0;
+}
+
 int cmd_entity_fx(PackageManager& pm, TagHash entity) {
     const auto ed = pm.read(entity);
     std::set<uint32_t> listed;
@@ -3967,6 +3994,7 @@ int main(int argc, char** argv) {
         if (cmd == "tag-audio" && args.size() >= 2)
             return cmd_tag_audio(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 2);
         if (cmd == "entity-fx" && args.size() >= 2) return cmd_entity_fx(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "entity-h64" && args.size() >= 2) return cmd_entity_h64(pm, TagHash(parse_hex(args[1])));
         if (cmd == "refs" && args.size() >= 2)
             return cmd_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "dynamic" && args.size() >= 2) return cmd_dynamic(pm, TagHash(parse_hex(args[1])));

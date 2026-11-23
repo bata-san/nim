@@ -232,6 +232,31 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
 ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion,
                                        std::span<const std::pair<uint32_t, uint32_t>> tags) {
     ActorCharacter c = prepare_character_model(pm, sources, motion, tags);
+    // The weapon (3.93): the model of the weapon the spawn tags select, held at b_r_grip.
+    if (c.binding && c.mesh && !tags.empty()) {
+        try {
+            c.weapon = entity_weapon(pm, motion.entity, tags);
+            const auto& skeleton = c.binding->skeleton;
+            constexpr uint32_t kRightGrip = 0xEF4BAB19;  // fnv1("b_r_grip")
+            const auto grip = std::ranges::find(skeleton.hashes, kRightGrip);
+            if (c.weapon && !c.weapon->visual.is_none() && grip != skeleton.hashes.end()) {
+                const auto models = entity_dynamic_models(pm, c.weapon->visual, sources);
+                if (!models.empty()) {
+                    auto gun = prepare_entity_preview(pm, models.front(), sources.materials, sources.assemblies);
+                    if (!gun.no_drawable) {
+                        gun.attachments.clear();  // sights and other mods: not posed here
+                        c.weapon_model = gun.tag;
+                        c.weapon_bones = std::max<size_t>(gun.bone_count, 1);
+                        c.grip_bone = int32_t(grip - skeleton.hashes.begin());
+                        PreparedMesh mesh = *c.mesh;
+                        mesh.attachments.push_back(std::move(gun));
+                        c.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
+                    }
+                }
+            }
+        } catch (const std::exception&) {
+        }
+    }
     if (c.binding) {
         try {
             c.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&c.entity, 1)));
@@ -246,6 +271,55 @@ std::vector<TagHash> dropship_entities(const MapGameplay& gameplay) {
     for (const auto& sq : gameplay.squads)
         for (const auto& p : sq.positions)
             if (p.model.value == 0x80ACA5E7u && p.entity.value && std::ranges::find(out, p.entity) == out.end()) out.push_back(p.entity);
+    return out;
+}
+
+TagHash drone_entity(const MapGameplay& gameplay, size_t point_group) {
+    if (point_group >= gameplay.point_groups.size()) return {};
+    const auto& owner = gameplay.point_groups[point_group].owner;
+    if (!owner || *owner >= gameplay.scripts.size()) return {};
+    for (const auto& [off, p] : gameplay.scripts[*owner].placements)
+        if (!p.entity.is_none()) return p.entity;
+    return {};
+}
+
+ActorCharacter prepare_actor_drone(PackageManager& pm, const ActorSources& sources, TagHash entity) {
+    MotionSet motion;
+    try {
+        motion = build_motion_set(pm, entity, kClipFps);
+    } catch (const std::exception& e) {
+        motion.entity = entity, motion.error = e.what();
+    }
+    ActorCharacter c = prepare_actor_character(pm, sources, motion);
+    if (c.mesh) return c;
+    // No clips fit (the scan drone has no motion set): its first dynamic model in its rest pose.
+    try {
+        c.models = entity_dynamic_models(pm, entity, sources);
+        if (c.models.empty()) throw std::runtime_error("no dynamic model");
+        auto mesh = prepare_entity_preview(pm, c.models.front(), sources.materials, sources.assemblies);
+        if (mesh.no_drawable) throw std::runtime_error("nothing drawable");
+        c.entity = entity;
+        c.model = mesh.tag;
+        c.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
+        c.binding.reset();
+        c.error.clear();
+        try {
+            c.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&entity, 1)));
+        } catch (const std::exception&) {
+        }
+    } catch (const std::exception& e) {
+        c.error = std::format("{}; {}", c.error, e.what());
+    }
+    return c;
+}
+
+std::vector<TagHash> drone_entities(const MapGameplay& gameplay) {
+    std::vector<TagHash> out;
+    for (size_t i = 0; i < gameplay.point_groups.size(); ++i) {
+        const auto& pg = gameplay.point_groups[i];
+        if (pg.spline.size() < 2 || !pg.owner || !gameplay.scripts[*pg.owner].module.ends_with("uesc_scan_drone.bs")) continue;
+        if (const auto e = drone_entity(gameplay, i); !e.is_none() && std::ranges::find(out, e) == out.end()) out.push_back(e);
+    }
     return out;
 }
 
@@ -318,7 +392,7 @@ float actor_clip_frame(const ActorCharacter& c, TagHash tag, float time) {
     const float t = info ? motion_clip_time(*info, time) : std::fmod(time, std::max(clip.frame_count, 1u) / kClipFps);
     return std::min(t * kClipFps, float(std::max(clip.frame_count, 1u) - 1));
 }
-constexpr uint64_t kAgentEmitter = 1ull << 32, kShipEmitter = 2ull << 32;
+constexpr uint64_t kAgentEmitter = 1ull << 32, kShipEmitter = 2ull << 32, kDroneEmitter = 3ull << 32;
 }  // namespace
 
 void AiActors::emit_clip_sounds(const EntitySounds& sounds, const AnimationClip& clip, float from, float to, bool wrapped,
@@ -395,6 +469,12 @@ std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& a
     } else {
         anim.blend = 1;
     }
+    // The weapon (3.93): rigid at the posed b_r_grip (every bone of its model, at bind, there).
+    if (!c.weapon_model.is_none() && c.grip_bone >= 0 && !poses.empty() && size_t(c.grip_bone) < poses.front().bones.size() &&
+        size_t(c.grip_bone) < c.binding->skeleton.bind.size()) {
+        const BoneTransform grip = poses.front().bones[size_t(c.grip_bone)] * c.binding->skeleton.bind[size_t(c.grip_bone)];
+        poses.push_back({c.weapon_model, std::vector<BoneTransform>(c.weapon_bones, grip), {}});
+    }
     return poses;
 }
 
@@ -418,15 +498,16 @@ void AiActors::build(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::ve
                 if (p.model.value == 0x80ACA5E7u && !entity) entity = p.entity.value;
         dropship_entity_.push_back(entity);
     }
-    // One drawable character per entity: characters (squad slots) sharing an entity share it.
-    std::unordered_map<uint32_t, size_t> by_entity;
+    // One drawable character per prepared mesh: characters sharing an entity and spawn tags (so
+    // the same permutations and weapon, 3.92 / 3.93) are copies sharing one mesh.
+    std::unordered_map<const PreparedMesh*, size_t> by_mesh;
     for (size_t i = 0; i < characters.size() && i < gameplay.characters.size(); ++i) {
         auto& c = characters[i];
         if (!c.mesh) {
             if (!c.error.empty()) notes_.push_back(std::format("{} ({}): {}", gameplay.characters[i].name_estimate, c.entity.str(), c.error));
             continue;
         }
-        auto [it, fresh] = by_entity.try_emplace(c.entity.value, characters_.size());
+        auto [it, fresh] = by_mesh.try_emplace(c.mesh.get(), characters_.size());
         if (fresh) characters_.push_back(std::move(c));
         by_character_[i] = it->second;
     }
@@ -479,6 +560,74 @@ void AiActors::build_dropships(Gpu& gpu, StaticMeshScene& scene, const std::vect
             notes_.push_back(std::format("dropship {}: {}", ship_.model.str(), e.what()));
             break;
         }
+    }
+}
+
+void AiActors::build_drones(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
+                            std::vector<ActorCharacter> drones, const MapGameplay& gameplay, const AiSimulation& sim, size_t slots) {
+    drone_kinds_.clear(), drone_kind_.clear(), drone_slots_.clear();
+    for (auto& d : drones) {
+        if (!d.mesh) {
+            if (!d.error.empty()) notes_.push_back(std::format("drone {}: {}", d.entity.str(), d.error));
+            continue;
+        }
+        drone_kinds_.push_back(std::move(d));
+    }
+    std::vector<size_t> count(drone_kinds_.size());
+    for (const auto& dr : sim.drones()) {
+        const auto e = drone_entity(gameplay, dr.group);
+        const auto k = std::ranges::find(drone_kinds_, e, &ActorCharacter::entity);
+        drone_kind_.push_back(k == drone_kinds_.end() ? std::nullopt : std::optional(size_t(k - drone_kinds_.begin())));
+        if (k != drone_kinds_.end()) ++count[size_t(k - drone_kinds_.begin())];
+    }
+    for (size_t k = 0; k < drone_kinds_.size(); ++k)
+        for (size_t n = 0; n < std::min(slots, count[k]); ++n) {
+            try {
+                drone_slots_.push_back({k, scene.add_actor(gpu, *drone_kinds_[k].mesh, layouts)});
+            } catch (const std::exception& e) {
+                notes_.push_back(std::format("drone {}: {}", drone_kinds_[k].entity.str(), e.what()));
+                break;
+            }
+        }
+}
+
+// Each drone kind's slots go to its drones nearest the camera, at the simulated position and
+// heading, playing the entity's idle clip (its motion set's; rest pose without one).
+void AiActors::update_drones(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range) {
+    drones_shown_ = 0;
+    drone_clock_ += dt;
+    std::vector<std::vector<std::pair<float, size_t>>> nearby(drone_kinds_.size());
+    if (range >= 0)
+        for (size_t i = 0; i < sim.drones().size() && i < drone_kind_.size(); ++i) {
+            if (!drone_kind_[i]) continue;
+            const auto& p = sim.drones()[i].position;
+            const float dist = std::hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
+            if (dist <= range) nearby[*drone_kind_[i]].push_back({dist, i});
+        }
+    for (auto& list : nearby) std::ranges::sort(list);
+    std::vector<size_t> used(drone_kinds_.size());
+    for (const auto& slot : drone_slots_) {
+        auto& list = nearby[slot.kind];
+        if (used[slot.kind] >= list.size()) {
+            scene.set_actor(slot.actor, std::nullopt);
+            continue;
+        }
+        const size_t index = list[used[slot.kind]++].second;
+        const auto& d = sim.drones()[index];
+        const auto& kind = drone_kinds_[slot.kind];
+        std::vector<ModelSkinPose> poses;
+        if (kind.binding && kind.motion.idle && kind.clips.contains(kind.motion.idle->clip))
+            poses = kind.binding->poses(kind.clips.at(kind.motion.idle->clip),
+                                        actor_clip_frame(kind, kind.motion.idle->clip, drone_clock_ + float(index) * 0.37f));
+        const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+        scene.set_actor(slot.actor, std::array<float, 12>{c, -s, 0, d.position[0], s, c, 0, d.position[1], 0, 0, 1, d.position[2]},
+                        std::move(poses));
+        // Its component loops (3.90) while shown, at the drone.
+        const uint64_t emitter = kDroneEmitter | index;
+        emitters_.push_back({emitter, d.position});
+        now_shown_.insert(emitter);
+        if (kind.sounds) emit_loops(*kind.sounds, emitter);
+        ++drones_shown_;
     }
 }
 
@@ -560,6 +709,7 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
     emitters_.clear();
     now_shown_.clear();
     update_dropships(scene, sim, eye, range);
+    update_drones(scene, sim, eye, dt, range);
     const auto& agents = sim.agents();
     // Per character: its agents within range, nearest first.
     std::vector<std::vector<std::pair<float, size_t>>> nearby(characters_.size());

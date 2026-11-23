@@ -269,6 +269,70 @@ std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm,
     return std::nullopt;
 }
 
+namespace {
+// The resource of each component of an entity, with its class (resource pointer at +0x18).
+template <typename F> void for_each_component_resource(PackageManager& pm, TagHash entity, F&& f) {
+    const auto bytes = pm.read(entity);
+    const TagReader r(bytes);
+    const auto comps = r.vec_at(0x08);
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
+        if (!e || e->type != 8 || e->reference != kClassComponent) continue;
+        try {
+            const auto cb = pm.read(c);
+            const TagReader cr(cb);
+            const uint64_t rel = cr.u64_at(0x18);
+            if (rel == 0 || 0x18 + rel < 4 || 0x18 + rel >= cb.size()) continue;
+            const size_t base = 0x18 + size_t(rel);
+            if (f(c, cr, base, cr.u32_at(base - 4))) return;
+        } catch (const std::exception&) {
+        }
+    }
+}
+}  // namespace
+
+std::optional<EntityWeapon> entity_weapon(PackageManager& pm, TagHash entity, std::span<const std::pair<uint32_t, uint32_t>> tags) {
+    constexpr uint32_t kWeaponType = 0xEAFBB478;  // fnv1("weapon_type")
+    std::optional<EntityWeapon> out;
+    pm.build_hash64_index();
+    for_each_component_resource(pm, entity, [&](TagHash, const TagReader& r, size_t base, uint32_t cls) {
+        if (cls != 0x80804656) return false;
+        const auto sets = r.vec_at(base + 0x28);
+        const auto rows = r.vec_at(base + 0x190);
+        if (sets.element_class != 0x8080BACC || rows.element_class != 0x8080465E) return false;
+        for (uint64_t i = 0; i < rows.count; ++i) {
+            const size_t row = rows.data + size_t(i) * 0x40;
+            const uint32_t set = r.u32_at(row + 8);
+            if (set >= sets.count) continue;
+            const auto pairs = r.vec_at(sets.data + size_t(set) * 0x18 + 8);
+            if (!pairs.count) continue;
+            bool hold = true;
+            uint32_t weapon_type = 0;
+            for (uint64_t q = 0; q < pairs.count && hold; ++q) {
+                const std::pair<uint32_t, uint32_t> want{r.u32_at(pairs.data + size_t(q) * 8), r.u32_at(pairs.data + size_t(q) * 8 + 4)};
+                hold = std::ranges::find(tags, want) != tags.end();
+                if (want.first == kWeaponType) weapon_type = want.second;
+            }
+            if (!hold) continue;
+            const auto weapons = r.vec_at(row + 0x30);
+            if (!weapons.count || weapons.element_class != 0x80804664) continue;
+            const auto weapon = pm.resolve64(r.u64_at(weapons.data + 0x10));
+            if (!weapon) continue;
+            out = EntityWeapon{weapon_type, *weapon, {}};
+            return true;
+        }
+        return false;
+    });
+    if (!out) return std::nullopt;
+    for_each_component_resource(pm, out->weapon, [&](TagHash, const TagReader& r, size_t base, uint32_t cls) {
+        if (cls != 0x808032B3) return false;
+        if (const auto visual = pm.resolve64(r.u64_at(base + 0x160))) out->visual = *visual;
+        return true;
+    });
+    return out;
+}
+
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions) {
     constexpr uint32_t kRegion = 0x51E7A18D;       // fnv1("region")
     constexpr uint32_t kPermutation = 0x4C58EF8F;  // fnv1("permutation")

@@ -164,6 +164,18 @@ struct RegionPermutations {
 std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
                                                              std::span<const std::pair<uint32_t, uint32_t>> tags);
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions);
+
+// A combatant's weapon (docs/PROGRESS.md 3.93). The entity's weapon table (component resource class
+// 80804656): +0x28 Vec<8080BACC> tag sets ({weapon_type = ...}), +0x190 Vec<8080465E> rows of 0x40
+// bytes (+0x08 u32 tag set index, +0x30 Vec<80804664> whose +0x10 is the weapon entity's hash64).
+// The row whose tag set holds in the spawned character's tags names the weapon entity; its
+// component of resource class 808032B3 names (+0x160 hash64) the entity of the weapon's look, which
+// carries the dynamic model (its root bone b_handle is held at the hand's b_r_grip).
+struct EntityWeapon {
+    uint32_t weapon_type = 0;
+    TagHash weapon, visual;  // the weapon entity and the entity of its model
+};
+std::optional<EntityWeapon> entity_weapon(PackageManager& pm, TagHash entity, std::span<const std::pair<uint32_t, uint32_t>> tags);
 // Model tag -> materials, from one pass over every component tag (a few seconds).
 std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm);
 

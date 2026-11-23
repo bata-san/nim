@@ -585,24 +585,31 @@ int run(int argc, char** argv) {
             ai_gameplay = load_map_gameplay(pm, selected_activity);
             std::vector<MotionSet> motions;
             std::vector<ActorCharacter> characters;
-            std::map<uint32_t, size_t> first;
+            // Motion sets per entity; characters per entity and spawn tags (the tags pick the
+            // region permutations and the weapon, 3.92 / 3.93).
+            std::map<uint32_t, size_t> motion_of;
+            std::map<std::pair<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>, size_t> first;
             for (const auto& ch : ai_gameplay->characters) {
-                if (const auto it = first.find(ch.entity.value); it != first.end()) {
-                    motions.push_back(motions[it->second]);
+                const auto [m, fresh_motion] = motion_of.try_emplace(ch.entity.value, motions.size());
+                motions.push_back(fresh_motion ? build_motion_set(pm, ch.entity, 30.0f) : MotionSet(motions[m->second]));
+                if (const auto it = first.find({ch.entity.value, ch.tags}); it != first.end()) {
                     characters.push_back(characters[it->second]);
                     continue;
                 }
-                first[ch.entity.value] = motions.size();
-                motions.push_back(build_motion_set(pm, ch.entity, 30.0f));
+                first[{ch.entity.value, ch.tags}] = characters.size();
                 characters.push_back(prepare_actor_character(pm, sources, motions.back(), ch.tags));
                 const auto& c = characters.back();
                 std::string models;
-                for (const auto m : c.models) models += " " + m.str();
+                for (const auto mo : c.models) models += " " + mo.str();
                 std::println("ai character {} {}: model {} clips {} (entity models{}) {}", ch.entity.str(), ch.name_estimate,
                              c.model.is_none() ? "-" : c.model.str(), c.clips.size(), models, c.error);
                 if (c.regions)
                     std::println("  region permutations: entry {:08X} ({} ties), {} parts of other permutations left out", c.regions->entry,
                                  c.regions->ties, c.mesh ? c.mesh->region_hidden_parts : 0);
+                if (c.weapon)
+                    std::println("  weapon: weapon_type {:08X} entity {} model entity {} model {} ({} bones) at bone {}", c.weapon->weapon_type,
+                                 c.weapon->weapon.str(), c.weapon->visual.str(), c.weapon_model.is_none() ? "-" : c.weapon_model.str(),
+                                 c.weapon_bones, c.grip_bone);
             }
             AiParams params;
             params.player_invisible = !ai_visible;
@@ -658,6 +665,17 @@ int run(int argc, char** argv) {
                 size_t carried = 0;
                 for (const auto& d : ai_sim->dropships()) carried += d.squads.size();
                 std::println("ai dropships: {} ships carry {} squads (spawners at the same coordinates share a ship)", ai_sim->dropships().size(), carried);
+            }
+            {
+                // Scan drones (3.94): each drone entity once, drawn where the simulation flies it.
+                std::vector<ActorCharacter> drones;
+                for (const auto e : drone_entities(*ai_gameplay)) {
+                    drones.push_back(prepare_actor_drone(pm, sources, e));
+                    const auto& d = drones.back();
+                    std::println("ai drone {}: model {} clips {} idle {} {}", e.str(), d.model.is_none() ? "-" : d.model.str(), d.clips.size(),
+                                 d.motion.idle ? d.motion.idle->clip.str() : "-", d.error);
+                }
+                ai_actors.build_drones(gpu, scene, layouts, std::move(drones), *ai_gameplay, *ai_sim, 3);
             }
             if (ai_ship_strip) {
                 std::vector<std::pair<float, size_t>> order;
@@ -783,7 +801,24 @@ int run(int argc, char** argv) {
             }
             // --ai-frame: look at the drawable agent nearest the given view from open floor in
             // front of it (a point inside one of its squad's firing areas), 4 m away, at eye height.
-            if (ai_frame) {
+            if (ai_frame && ai_subject_name == "drone") {
+                // --ai-subject drone: the scan drone nearest the given view, from its side.
+                std::optional<size_t> pick;
+                float nearest = 1e30f;
+                for (size_t k = 0; k < ai_sim->drones().size(); ++k) {
+                    const auto& p = ai_sim->drones()[k].position;
+                    if (const float d = std::hypot(p[0] - eye.x, p[1] - eye.y, p[2] - eye.z); d < nearest) nearest = d, pick = k;
+                }
+                if (!pick) throw std::runtime_error("--ai-frame: no drone");
+                const auto& dr = ai_sim->drones()[*pick];
+                const float side = dr.yaw + 1.5708f;
+                eye_arg = V3{dr.position[0] + ai_frame_distance * std::cos(side), dr.position[1] + ai_frame_distance * std::sin(side),
+                             dr.position[2] + ai_frame_height - 1.0f};
+                look_arg = V3{dr.position[0], dr.position[1], dr.position[2]};
+                ai_actors.update(scene, *ai_sim, {eye_arg->x, eye_arg->y, eye_arg->z}, 0.0f, ai_range);
+                std::println("ai frame: drone {} at ({:.1f} {:.1f} {:.1f}), {} drones drawn", *pick, dr.position[0], dr.position[1], dr.position[2],
+                             ai_actors.drones_shown());
+            } else if (ai_frame) {
                 // From open floor with a clear straight line at body height to the agent (walk grids).
                 std::vector<std::pair<float, size_t>> order;
                 for (size_t k = 0; k < ai_sim->agents().size(); ++k) {

@@ -2081,6 +2081,7 @@ public:
         std::vector<MotionSet> motions;
         std::vector<ActorCharacter> characters;
         ActorDropship ship;  // the dropship squads' ship (3.71); no model = none on this map
+        std::vector<ActorCharacter> drones;  // one per scan drone entity (3.94)
         std::string error;
         double seconds = 0;
     };
@@ -2105,21 +2106,25 @@ public:
             pm.build_hash64_index();
             const ActorSources sources = index_actor_sources(pm);
             out.gameplay = std::make_shared<MapGameplay>(load_map_gameplay(pm, activity));
-            std::map<uint32_t, size_t> first;
+            // Motion sets per entity; characters per entity and spawn tags (3.92 / 3.93).
+            std::map<uint32_t, size_t> motion_of;
+            std::map<std::pair<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>, size_t> first;
             for (const auto& ch : out.gameplay->characters) {
-                if (const auto it = first.find(ch.entity.value); it != first.end()) {
-                    out.motions.push_back(out.motions[it->second]);
+                const auto [m, fresh_motion] = motion_of.try_emplace(ch.entity.value, out.motions.size());
+                out.motions.push_back(fresh_motion ? build_motion_set(pm, ch.entity, kClipFps) : MotionSet(out.motions[m->second]));
+                if (const auto it = first.find({ch.entity.value, ch.tags}); it != first.end()) {
                     out.characters.push_back(out.characters[it->second]);
                     continue;
                 }
-                first[ch.entity.value] = out.motions.size();
-                out.motions.push_back(build_motion_set(pm, ch.entity, kClipFps));
+                first[{ch.entity.value, ch.tags}] = out.characters.size();
                 out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back(), ch.tags));
             }
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes; its sounds
             // (3.90) from every such node's entity.
             if (const auto ships = dropship_entities(*out.gameplay); !ships.empty())
                 out.ship = prepare_actor_dropship(pm, sources, TagHash(0x80ACA5E7u), ships);
+            // Scan drones (3.94): each drone entity once.
+            for (const auto e : drone_entities(*out.gameplay)) out.drones.push_back(prepare_actor_drone(pm, sources, e));
         } catch (const std::exception& ex) {
             out.error = ex.what();
         }
@@ -2177,6 +2182,7 @@ public:
                 ai.actors.build(g, scene, layouts, std::move(p.characters), *ai.gameplay, *ai.sim, 4);
                 ai.actors.apply_radii(*ai.sim);
                 if (!p.ship.model.is_none()) ai.actors.build_dropships(g, scene, layouts, std::move(p.ship), 3);
+                ai.actors.build_drones(g, scene, layouts, std::move(p.drones), *ai.gameplay, *ai.sim, 3);
                 if (auto* eng = audio_engine()) {
                     if (!entity_audio) entity_audio = std::make_unique<media::EntityAudioPlayer>(*eng);
                     entity_audio->set_package(*pm);

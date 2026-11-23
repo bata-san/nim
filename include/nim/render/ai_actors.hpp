@@ -47,6 +47,12 @@ struct ActorCharacter {
     std::vector<TagHash> models;  // every dynamic model the entity names, the drawn one first
     std::shared_ptr<const EntitySounds> sounds;  // what its clips and components play (3.90)
     std::optional<RegionPermutations> regions;  // the permutations its spawn tags select (3.92)
+    // The weapon its spawn tags select (3.93): its model is one of the mesh's attachments, every
+    // bone posed at the body skeleton's b_r_grip (the model's root bone b_handle sits there).
+    std::optional<EntityWeapon> weapon;
+    TagHash weapon_model;
+    size_t weapon_bones = 0;
+    int32_t grip_bone = -1;
     std::string error;  // why it cannot be drawn, if it cannot
 };
 // `tags`: the spawned character's tags (MapCharacter::tags); they select the model's region
@@ -78,9 +84,17 @@ ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sou
                                      std::span<const TagHash> entities = {});
 // The entities of the dropship squads' spawner nodes (model 80ACA5E7), each once.
 std::vector<TagHash> dropship_entities(const MapGameplay& gameplay);
+// Scan drones (docs/PROGRESS.md 3.94): the entity of a patrol point group's owner (the
+// uesc_scan_drone component's own node, o_uesc_scan_drone), none when it places no node.
+TagHash drone_entity(const MapGameplay& gameplay, size_t point_group);
+// Every scan drone entity (point groups with a spline owned by uesc_scan_drone.bs), each once.
+std::vector<TagHash> drone_entities(const MapGameplay& gameplay);
+// A drone entity as a character: with its motion set's clips when they fit its rig, else its
+// first dynamic model unposed (rest pose; no binding).
+ActorCharacter prepare_actor_drone(PackageManager& pm, const ActorSources& sources, TagHash entity);
 
 // A sound the actors start (docs/PROGRESS.md 3.90): an audio event at an emitter. Emitters are
-// agents ((1 << 32) | agent index) and dropships ((2 << 32) | dropship index).
+// agents ((1 << 32) | agent index), dropships ((2 << 32) | dropship index) and scan drones ((3 << 32) | drone index).
 struct ActorSound {
     TagHash event;
     uint64_t emitter = 0;
@@ -111,7 +125,14 @@ public:
     // Adds `slots` hidden dropships (drawn while arriving, unloading or departing, nearest first).
     void build_dropships(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
                          ActorDropship ship, size_t slots);
+    // Adds `slots` hidden scan drones per drawable drone entity (`drones`: one per entity, as
+    // prepare_actor_character), drawn at the simulation's drones nearest the camera (3.94).
+    void build_drones(Gpu& gpu, StaticMeshScene& scene, const std::vector<std::vector<InputElement>>& layouts,
+                      std::vector<ActorCharacter> drones, const MapGameplay& gameplay, const AiSimulation& sim, size_t slots);
+    size_t drones_shown() const { return drones_shown_; }
+    const std::vector<ActorCharacter>& drone_kinds() const { return drone_kinds_; }
     void clear() {
+        drone_kinds_.clear(), drone_kind_.clear(), drone_slots_.clear();
         slots_.clear(), characters_.clear(), by_character_.clear(), ship_slots_.clear(), ship_ = {};
         sounds_.clear(), stopped_.clear(), emitters_.clear(), shown_emitters_.clear(), ship_frames_.clear(), dropship_entity_.clear();
     }
@@ -168,6 +189,13 @@ private:
     std::unordered_set<uint64_t> shown_emitters_, now_shown_;
     std::unordered_map<size_t, std::pair<const AnimationClip*, float>> ship_frames_;  // per dropship
     std::vector<uint32_t> dropship_entity_;  // per dropship: its spawner node's entity (0: unknown)
+    std::vector<ActorCharacter> drone_kinds_;          // per drawable drone entity
+    std::vector<std::optional<size_t>> drone_kind_;    // per AiSimulation drone -> drone_kinds_
+    struct DroneSlot { size_t kind = 0; uint32_t actor = 0; };
+    std::vector<DroneSlot> drone_slots_;
+    float drone_clock_ = 0;
+    size_t drones_shown_ = 0;
+    void update_drones(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float dt, float range);
     uint32_t sound_rng_ = 0x2545F491u;
     void emit_clip_sounds(const EntitySounds& sounds, const AnimationClip& clip, float from, float to, bool wrapped, uint64_t emitter);
     void emit_loops(const EntitySounds& sounds, uint64_t emitter);
