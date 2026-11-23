@@ -3632,9 +3632,9 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::BloomTip));
             ImGui::SliderFloat(ui::tr(ui::S::EmissiveGain), &light.emissive_gain, 0.0f, 3.0f, "%.2f");
             if (g_frame_generation.built()) {
-                ImGui::BeginDisabled(!g_frame_generation.supported());
-                ImGui::Checkbox("NVIDIA DLSS Frame Generation (2x)", &g_frame_generation_requested);
-                ImGui::EndDisabled();
+                if (ImGui::Checkbox("NVIDIA DLSS Frame Generation (2x)", &g_frame_generation_requested) &&
+                    g_frame_generation_requested && !g_frame_generation.initialize_device(gpu.device()))
+                    g_frame_generation_requested = false;
                 if (!g_frame_generation.status().empty())
                     ImGui::TextDisabled("%s", g_frame_generation.status().c_str());
                 if (g_frame_generation_proxy)

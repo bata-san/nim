@@ -158,6 +158,17 @@ ComPtr<ID3D12Device> FrameGeneration::attach(ID3D12Device* device) {
 #endif
 }
 
+bool FrameGeneration::initialize_device(ID3D12Device* device) {
+#if NIM_WITH_STREAMLINE
+    if (!impl_->initialized) init();
+    if (impl_->initialized && !impl_->available) attach(device);
+    return impl_->available;
+#else
+    (void)device;
+    return false;
+#endif
+}
+
 bool FrameGeneration::supported() const {
 #if NIM_WITH_STREAMLINE
     return impl_->available;

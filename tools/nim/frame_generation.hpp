@@ -12,6 +12,7 @@ public:
     FrameGeneration();
     ~FrameGeneration();
     void init();
+    bool initialize_device(ID3D12Device* device);
     ComPtr<ID3D12Device> attach(ID3D12Device* device);
     bool upgrade_factory(ComPtr<IDXGIFactory6>& factory);
     bool supported() const;
