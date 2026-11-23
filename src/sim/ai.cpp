@@ -527,8 +527,23 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         // The character's own clips first; what it lacks comes from the shared family (推定: the
         // motion graph's choice is not decoded).
         set.locomotion = !own.locomotion.empty() ? own.locomotion : borrowed.locomotion;
-        // The Compiler (80A97147) hovers rather than walking with foot root motion; use its own
-        // authored hover/glide and surge clips so it animates smoothly while moving (推定).
+        // The Compiler (80A97147) hovers rather than walking with foot root motion; its 3.6 KB
+        // 80A9714A clip is a minimal additive layer, whereas 80A97153 (90 frames, 50 KB, cyclic)
+        // is its full-body authored idle stance. Pair it with its authored hover/glide clips (推定).
+        if (entity.value == 0x80A97147u) {
+            try {
+                const AnimationClip idle = load_animation_clip(pm, TagHash(0x80A97153u));
+                if (idle.frame_count > 1) {
+                    MotionClip m;
+                    m.clip = TagHash(0x80A97153u);
+                    m.seconds = float(idle.frame_count - 1) / fps;
+                    m.cyclic = true;
+                    m.authored = true;
+                    set.idle = m;
+                }
+            } catch (...) {
+            }
+        }
         if (entity.value == 0x80A97147u && set.locomotion.empty()) {
             auto add_hover = [&](uint32_t tag_val, float speed, bool cyclic) {
                 try {

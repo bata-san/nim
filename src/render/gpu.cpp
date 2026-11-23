@@ -80,7 +80,19 @@ void Gpu::init(bool warp, QueueDeviceHook queue_hook) {
             dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         }
-        fopen_s(&g_debug_log, "nim_d3d.log", "w");
+        wchar_t exe[MAX_PATH]{};
+        if (const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH); n > 0 && n < MAX_PATH) {
+            std::wstring path(exe, n);
+            if (const size_t sep = path.find_last_of(L"\\/"); sep != std::wstring::npos) path.resize(sep + 1);
+            path += L"nim_d3d.log";
+            _wfopen_s(&g_debug_log, path.c_str(), L"w");
+        } else {
+            fopen_s(&g_debug_log, "nim_d3d.log", "w");
+        }
+        if (g_debug_log) {
+            std::fprintf(g_debug_log, "nim D3D12 debug + DRED active\n");
+            std::fflush(g_debug_log);
+        }
     }
     check_hr(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "CreateDXGIFactory2");
     ComPtr<IDXGIAdapter1> ad;
@@ -139,13 +151,17 @@ void Gpu::init_queue(uint32_t descriptors, ID3D12Device* queue_device) {
 }
 
 uint64_t Gpu::signal() {
-    check_hr(queue_->Signal(fence_.Get(), ++fence_value_), "Signal");
+    const HRESULT hr = queue_->Signal(fence_.Get(), ++fence_value_);
+    if (FAILED(hr)) check_device();
+    check_hr(hr, "Signal");
     return fence_value_;
 }
 
 void Gpu::wait(uint64_t v) {
     if (fence_->GetCompletedValue() >= v) return;
-    check_hr(fence_->SetEventOnCompletion(v, event_), "SetEventOnCompletion");
+    const HRESULT hr = fence_->SetEventOnCompletion(v, event_);
+    if (FAILED(hr)) check_device();
+    check_hr(hr, "SetEventOnCompletion");
     WaitForSingleObject(event_, INFINITE);
 }
 
@@ -169,6 +185,7 @@ void Gpu::flush() {
 void Gpu::check_device() {
     const HRESULT hr = device_->GetDeviceRemovedReason();
     if (SUCCEEDED(hr)) return;
+    std::string dred_summary;
     if (g_debug_log) {
         std::fprintf(g_debug_log, "Device removed reason: 0x%08X\n", unsigned(hr));
         ComPtr<ID3D12DeviceRemovedExtendedData> dred;
@@ -176,16 +193,21 @@ void Gpu::check_device() {
         if (SUCCEEDED(device_.As(&dred)) && SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
             for (auto* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
                 const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-                std::fprintf(g_debug_log, "DRED list %s: %u of %u ops done\n", n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?",
-                             done, n->BreadcrumbCount);
-                if (done < n->BreadcrumbCount)
+                const char* lname = n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?";
+                std::fprintf(g_debug_log, "DRED list %s: %u of %u ops done\n", lname, done, n->BreadcrumbCount);
+                if (done < n->BreadcrumbCount) {
+                    if (dred_summary.empty())
+                        dred_summary = std::format("\nDRED: list {} op {}/{} (op={})", lname, done, n->BreadcrumbCount,
+                                                   int(n->pCommandHistory[done]));
                     for (UINT i = done > 4 ? done - 4 : 0; i < std::min(n->BreadcrumbCount, done + 4); ++i)
                         std::fprintf(g_debug_log, "   %s op %u = %d\n", i == done ? ">>" : "  ", i, int(n->pCommandHistory[i]));
+                }
             }
         }
         D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
         if (dred && SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
             std::fprintf(g_debug_log, "DRED page fault VA 0x%llx\n", (unsigned long long)pf.PageFaultVA);
+            dred_summary += std::format("\nPageFault VA=0x{:x}", (unsigned long long)pf.PageFaultVA);
             for (auto* a = pf.pHeadExistingAllocationNode; a; a = a->pNext)
                 std::fprintf(g_debug_log, "  existing: %s type %d\n", a->ObjectNameA ? a->ObjectNameA : "?", int(a->AllocationType));
             for (auto* a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext)
@@ -194,7 +216,7 @@ void Gpu::check_device() {
         std::fflush(g_debug_log);
     }
     removed_ = true;
-    check_hr(hr, "GPU execution (device removed)");
+    throw std::runtime_error(std::format("GPU execution (device removed) failed (hr=0x{:08X}){}", uint32_t(hr), dred_summary));
 }
 
 uint64_t Gpu::vram_usage() const {

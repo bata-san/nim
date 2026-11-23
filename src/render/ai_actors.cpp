@@ -950,10 +950,10 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         // The face indicator (UESC robots, material 80A4B5C4): its state follows the agent's alert.
         if (a.is_compiler) {
             // Compiler (80A97147): drive its authored object channels (world center C9A10362,
-            // charge_progress 7C7E0071, shimmer C6BC8C0E, core glow 6057A3B9) and hover bob
-            // from compiler_charge (0 at rest -> 1 at peak combat surge, 推定).
+            // charge_progress 7C7E0071, shimmer C6BC8C0E, core glow 6057A3B9) from compiler_charge
+            // (0 at rest -> 1 at peak combat surge, 推定).
             const float c = a.compiler_charge;
-            rows[11] += 0.25f * c + 0.06f * std::sin(sim.time() * 2.2f);
+            rows[11] += 0.25f * c;
             scene.set_actor_channels(s.actor, {
                 {0xC9A10362u, {a.position[0], a.position[1], a.position[2] + 1.5f, 1.0f}},
                 {0x7C7E0071u, {c, c, c, c}},
