@@ -1,11 +1,14 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/dialogue.hpp"
+#include "nim/content/entity_audio.hpp"
+#include "nim/content/wwise.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace nim {
@@ -85,6 +88,9 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
     };
 
     std::set<uint32_t> polyline_tags, point_tags, global_tags;
+    std::unordered_map<uint32_t, std::vector<TagHash>> object_events;
+    std::unordered_map<uint32_t, float> object_distances;
+    std::set<std::tuple<uint32_t, std::array<float, 3>>> object_instances;
     for (TagHash table : layout.node_tables) {
         std::vector<uint8_t> data;
         try {
@@ -97,6 +103,28 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
         for (uint64_t i = 0; i < nodes.count; ++i) {
             const size_t e = nodes.data + size_t(i) * 0x90;
             if (e + 0x90 > data.size()) break;
+            const uint64_t entity_hash = r.u64_at(e + 0x30);
+            if (entity_hash && entity_hash != ~0ull) {
+                const auto entity = pm.resolve64(entity_hash);
+                const auto* entry = entity ? pm.entry(*entity) : nullptr;
+                if (entry && entry->type == 8 && entry->reference == 0x8080BAAD) {
+                    const auto [events, first] = object_events.try_emplace(entity->value);
+                    if (first) events->second = load_entity_sounds(pm, std::span(&*entity, 1), true).loops;
+                    const std::array pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
+                    if (std::ranges::all_of(pos, [](float v) { return std::isfinite(v); })) {
+                        for (const auto event : events->second) {
+                            if (!object_instances.emplace(event.value, pos).second) continue;
+                            auto [distance, fresh] = object_distances.try_emplace(event.value, 0);
+                            if (fresh) {
+                                try { distance->second = load_wwise_event(pm, event).max_distance; }
+                                catch (...) { continue; }
+                            }
+                            if (std::isfinite(distance->second) && distance->second > 1)
+                                out.objects.push_back({*entity, event, pos, distance->second});
+                        }
+                    }
+                }
+            }
             size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
             for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
                 const uint32_t type = r.u32_at(p - 4);

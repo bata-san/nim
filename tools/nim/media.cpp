@@ -1088,4 +1088,50 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
     }
 }
 
+void MapObjectAudioPlayer::set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio) {
+    clear();
+    audio_ = std::move(audio);
+    if (source_count()) player_.set_package(pm);
+}
+
+void MapObjectAudioPlayer::clear() {
+    player_.clear();
+    active_.clear();
+    audio_.reset();
+}
+
+void MapObjectAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> right, float dt,
+                                  float volume, bool enabled) {
+    if (!audio_ || audio_->objects.empty()) return;
+    std::vector<std::pair<float, size_t>> nearby;
+    if (enabled && volume > 0) {
+        for (size_t i = 0; i < audio_->objects.size(); ++i) {
+            const auto& source = audio_->objects[i];
+            const float distance = std::hypot(eye[0] - source.position[0], eye[1] - source.position[1],
+                                              eye[2] - source.position[2]);
+            if (distance < source.max_distance) nearby.emplace_back(distance, i);
+        }
+        constexpr size_t limit = 16;
+        const auto end = nearby.begin() + std::min(limit, nearby.size());
+        std::partial_sort(nearby.begin(), end, nearby.end());
+        nearby.erase(end, nearby.end());
+    }
+    std::vector<EntityAudioPlayer::Cue> cues;
+    std::vector<uint64_t> stopped;
+    std::vector<std::pair<uint64_t, std::array<float, 3>>> now;
+    for (const auto& candidate : nearby) {
+        const size_t index = candidate.second;
+        const uint64_t id = uint64_t(index) + 1;
+        const auto& source = audio_->objects[index];
+        now.emplace_back(id, source.position);
+        if (std::ranges::none_of(active_, [id](const auto& source) { return source.first == id; }))
+            cues.push_back({source.event, id});
+    }
+    for (const auto& source : active_)
+        if (std::ranges::none_of(now, [&](const auto& current) { return current.first == source.first; }))
+            stopped.push_back(source.first);
+    player_.update(cues, stopped, now, eye, right, dt, volume, enabled);
+    active_ = std::move(now);
+}
+
 } // namespace nim::media

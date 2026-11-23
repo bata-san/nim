@@ -342,7 +342,8 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
             ext.estimate(kGeneric, o, float4{1, 1, 1, 1},
                          "per-instance effect parameters (tint / alpha) the pattern sequencer writes; not decoded: 1");
         ext.set(kParticle, 0x144, 1.0f);
-        ext.note_estimate("extern 27 +0x144 = 1", "particle draw fade (cb0[186] of the draw VS), producer not found");
+        ext.note_estimate("particle draw fade = 1, except Perimeter mist 80B0D19F near the camera",
+                          "isolated this emitter as the corridor washout; fade in from 50 to 95 m until its sequencer is decoded");
         if (gated_)
             ext.note_estimate(std::format("{} particle placements of exfil devices not run: exfil_activation_progress = 0", gated_),
                               "their component's sequence reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
@@ -541,6 +542,15 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         const uint32_t used = uint32_t(std::min<uint64_t>(e.spawned, e.capacity));
         if (!used) continue;
         System& s = *systems_[e.system];
+        float fade = 1.0f;
+        if (s.def.tag.value == 0x80B0D19Fu) {
+            // This mist volume has no decoded runtime opacity. Its own VS draw fade
+            // keeps the corridor clear without disabling the map's other FX or atmosphere.
+            const float t = std::clamp((std::sqrt(-depth) - 50.0f) / 45.0f, 0.0f, 1.0f);
+            if (t == 0) continue;
+            fade = t * t * (3.0f - 2.0f * t);
+        }
+        ext.set(kParticle, 0x144, fade);
         object_cb = object_constants_->GetGPUVirtualAddress() + uint64_t(i) * sizeof(ParticleObjectConstants);
         ext.set(kParticle, 0x178, float(e.offset * kHistoryFloat4s));
         ext.set(kParticle, 0x17C, float(e.offset * kHistoryFloat4s));

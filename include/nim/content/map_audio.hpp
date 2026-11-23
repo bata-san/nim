@@ -33,7 +33,14 @@ struct MapAudioEmitter {
     float distance_to(std::array<float, 3> p) const;
 };
 
+struct MapObjectSound {
+    TagHash entity, event;
+    std::array<float, 3> position{};
+    float max_distance = 0;
+};
+
 struct MapAudio {
+    std::vector<MapObjectSound> objects;
     std::vector<MapAudioEmitter> emitters;
     size_t point_emitters = 0;
     size_t polyline_emitters = 0;

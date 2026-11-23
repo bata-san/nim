@@ -302,4 +302,18 @@ private:
     std::thread worker_;
 };
 
+class MapObjectAudioPlayer {
+public:
+    explicit MapObjectAudioPlayer(AudioEngine& engine) : player_(engine) {}
+    void set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio);
+    void clear();
+    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float volume, bool enabled);
+    size_t source_count() const { return audio_ ? audio_->objects.size() : 0; }
+
+private:
+    EntityAudioPlayer player_;
+    std::shared_ptr<const MapAudio> audio_;
+    std::vector<std::pair<uint64_t, std::array<float, 3>>> active_;
+};
+
 } // namespace nim::media

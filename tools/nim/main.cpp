@@ -5,6 +5,7 @@
 // game's own G-buffer shaders and, by default, shaded by the game's own deferred lighting pass;
 // the UI itself is set in the game's fonts, read from the user's install at startup.
 #include "media.hpp"
+#include "frame_generation.hpp"
 #include "ui_text.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
@@ -1348,6 +1349,8 @@ struct Window {
     std::vector<RECT> caption_hot;
 };
 Window g_win;
+FrameGeneration g_frame_generation;
+bool g_frame_generation_requested = false, g_frame_generation_proxy = false;
 
 LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
@@ -1418,9 +1421,7 @@ void create_back_buffers(Gpu& gpu) {
     }
 }
 
-void init_swapchain(Gpu& gpu) {
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
-    check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_win.rtv_heap)), "rtv heap");
+void create_swapchain(Gpu& gpu, bool use_frame_generation) {
     BOOL tearing = FALSE;
     gpu.factory()->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
     g_win.tearing = tearing == TRUE;
@@ -1433,13 +1434,26 @@ void init_swapchain(Gpu& gpu) {
     sd.Scaling = DXGI_SCALING_STRETCH;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | (g_win.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     ComPtr<IDXGISwapChain1> sc1;
-    check_hr(gpu.factory()->CreateSwapChainForHwnd(gpu.queue(), g_win.hwnd, &sd, nullptr, nullptr, &sc1),
-             "CreateSwapChainForHwnd");
+    ComPtr<IDXGIFactory6> factory = gpu.factory();
+    g_frame_generation_proxy = use_frame_generation && g_frame_generation.upgrade_factory(factory);
+    HRESULT created = factory->CreateSwapChainForHwnd(gpu.queue(), g_win.hwnd, &sd, nullptr, nullptr, &sc1);
+    if (FAILED(created) && g_frame_generation_proxy) {
+        g_frame_generation_proxy = false;
+        created = gpu.factory()->CreateSwapChainForHwnd(gpu.queue(), g_win.hwnd, &sd, nullptr, nullptr, &sc1);
+    }
+    check_hr(created, "CreateSwapChainForHwnd");
+    if (!g_frame_generation_proxy) g_frame_generation_requested = false;
     check_hr(sc1.As(&g_win.swapchain), "IDXGISwapChain3");
     gpu.factory()->MakeWindowAssociation(g_win.hwnd, DXGI_MWA_NO_ALT_ENTER);
     g_win.swapchain->SetMaximumFrameLatency(2);
     g_win.waitable = g_win.swapchain->GetFrameLatencyWaitableObject();
     create_back_buffers(gpu);
+}
+
+void init_swapchain(Gpu& gpu) {
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
+    check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_win.rtv_heap)), "rtv heap");
+    create_swapchain(gpu, false);
     for (auto& a : g_win.alloc)
         check_hr(gpu.device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)), "allocator");
     check_hr(gpu.device()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_win.alloc[0].Get(), nullptr,
@@ -1448,7 +1462,17 @@ void init_swapchain(Gpu& gpu) {
     g_win.list->Close();
 }
 
+void release_swapchain(Gpu& gpu) {
+    g_frame_generation.set_active(false);
+    gpu.wait_idle();
+    for (auto& b : g_win.back) b.Reset();
+    if (g_win.waitable) CloseHandle(g_win.waitable);
+    g_win.waitable = nullptr;
+    g_win.swapchain.Reset();
+}
+
 void resize_swapchain(Gpu& gpu, UINT w, UINT h) {
+    g_frame_generation.set_active(false);
     gpu.wait_idle();
     for (auto& b : g_win.back) b.Reset();
     DXGI_SWAP_CHAIN_DESC1 sd{};
@@ -1547,6 +1571,8 @@ public:
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;
+    bool frame_generation_rect_valid = false;
+    uint32_t frame_generation_x = 0, frame_generation_y = 0;
     std::optional<TagHash> loading;
     std::optional<TagHash> no_drawable_tag;
     std::string no_drawable_reason;
@@ -1633,6 +1659,9 @@ public:
     std::unique_ptr<media::AmbientAudioPlayer> ambient_audio;
     bool ambient_audio_enabled = true;
     float ambient_audio_volume = 0.75f;
+    std::unique_ptr<media::MapObjectAudioPlayer> object_audio;
+    bool object_audio_enabled = true;
+    float object_audio_volume = 0.75f;
     // Sounds of the AI actors and dropships (3.90): cues gathered by update_ai, played each frame.
     std::unique_ptr<media::EntityAudioPlayer> entity_audio;
     bool entity_audio_enabled = true;
@@ -1727,6 +1756,7 @@ public:
             map = MapView{};
             map_scene = false;
             if (ambient_audio) ambient_audio->clear();
+            if (object_audio) object_audio->clear();
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
@@ -1979,6 +2009,7 @@ public:
         map.particles_set = false;
         map.audio_set = false;
         if (ambient_audio) ambient_audio->clear();
+        if (object_audio) object_audio->clear();
         particles.release(gpu);
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
@@ -2053,6 +2084,8 @@ public:
             if (auto* eng = audio_engine()) {
                 if (!ambient_audio) ambient_audio = std::make_unique<media::AmbientAudioPlayer>(*eng);
                 ambient_audio->set_map(*pm, pr.audio);
+                if (!object_audio) object_audio = std::make_unique<media::MapObjectAudioPlayer>(*eng);
+                object_audio->set_map(*pm, pr.audio);
             }
         }
         if (added) {
@@ -2730,7 +2763,8 @@ public:
                 scene.set_global_channels(game_lighting.world_channels());
                 scene.set_material_time_of_day(game_lighting.time_of_day(light));
             }
-            ViewMatrices vm = game_view ? game_lighting.temporal_view(current_view(), light) : make_view(current_view());
+            const View camera = current_view();
+            ViewMatrices vm = game_view ? game_lighting.temporal_view(camera, light) : make_view(camera);
             if (ambient_audio) {
                 if (map_scene)
                     ambient_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
@@ -2738,6 +2772,9 @@ public:
                 else
                     ambient_audio->update({}, {}, light.frame_delta_time, 0.0f, false);
             }
+            if (object_audio)
+                object_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
+                                     light.frame_delta_time, object_audio_volume, object_audio_enabled && map_scene);
             if (entity_audio) {
                 entity_audio->update(entity_cues, entity_stopped, entity_emitters, {vm.eye.x, vm.eye.y, vm.eye.z},
                                      {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time, entity_audio_volume,
@@ -2777,11 +2814,14 @@ public:
                 };
                 game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow,
                                      scene.has_visible_light_grid() || (fx && particles.has_emitters_near(vm.eye)), distortion);
+                if (g_frame_generation_proxy && !map.streaming && map_scene && scene.loaded() && frame_generation_rect_valid)
+                    g_frame_generation.tag(cl, gb, camera, vm, frame_generation_x, frame_generation_y);
             } else lighting.render(gpu, cl, gb, vm, light);
             render_error.clear();
         } catch (const std::exception& ex) {
             if (render_error != ex.what()) error(ui::trf(ui::S::ErrRenderStopped, ex.what()));
             render_error = ex.what();
+            g_frame_generation.set_active(false);
             capture_requested = false;
             // This is an explicit error surface, never a replacement material or lit scene.
             Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2829,6 +2869,7 @@ public:
     void ui() {
         media_tick();
         viewport_visible = false;
+        frame_generation_rect_valid = false;
         ImGuiViewport* vp = ImGui::GetMainViewport();
         const float sc = ImGui::GetStyle().FontScaleDpi;
         const float side_w = (g_prefs.sidebar_open ? 220 : 52) * sc, title_h = 44 * sc, status_h = 28 * sc;
@@ -3534,10 +3575,18 @@ public:
         view_h = uint32_t(std::max(16.0f, size.y));
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         auto* dl = ImGui::GetWindowDrawList();
-        if (gb.lit && gb.width() == view_w && gb.height() == view_h)
+        if (gb.lit && gb.width() == view_w && gb.height() == view_h) {
             ImGui::Image(ImTextureID(gpu.srv().gpu(gb.srv_first + 5).ptr), size);
-        else
+            const auto display = ImGui::GetIO().DisplaySize;
+            frame_generation_rect_valid = origin.x >= 0 && origin.y >= 0 &&
+                origin.x + float(view_w) <= display.x && origin.y + float(view_h) <= display.y;
+            if (frame_generation_rect_valid) {
+                frame_generation_x = uint32_t(origin.x);
+                frame_generation_y = uint32_t(origin.y);
+            }
+        } else {
             ImGui::Dummy(size);
+        }
         const ImVec2 end = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(origin);
         // The toolbar drawn on top must win hover and clicks over this catch-all.
@@ -3582,6 +3631,15 @@ public:
             ImGui::Checkbox(ui::tr(ui::S::Bloom), &light.bloom);
             ImGui::SetItemTooltip(ui::tr(ui::S::BloomTip));
             ImGui::SliderFloat(ui::tr(ui::S::EmissiveGain), &light.emissive_gain, 0.0f, 3.0f, "%.2f");
+            if (g_frame_generation.built()) {
+                ImGui::BeginDisabled(!g_frame_generation.supported());
+                ImGui::Checkbox("NVIDIA DLSS Frame Generation (2x)", &g_frame_generation_requested);
+                ImGui::EndDisabled();
+                if (!g_frame_generation.status().empty())
+                    ImGui::TextDisabled("%s", g_frame_generation.status().c_str());
+                if (g_frame_generation_proxy)
+                    ImGui::TextDisabled("Presents per rendered frame: %u", g_frame_generation.presents_per_frame());
+            }
             ImGui::Checkbox("TAA", &light.temporal_aa);
             ImGui::SetItemTooltip(ui::tr(ui::S::TAATip));
             ImGui::SameLine();
@@ -3632,6 +3690,12 @@ public:
                 ImGui::SliderFloat("環境音量", &ambient_audio_volume, 0.0f, 1.5f, "%.2f");
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("再生中: %zu ボイス / %zu 音源", ambient_audio->active_voices(), ambient_audio->emitter_count());
+            }
+            if (map_scene && object_audio && object_audio->source_count()) {
+                ImGui::Checkbox("オブジェクト音を再生", &object_audio_enabled);
+                ImGui::BeginDisabled(!object_audio_enabled);
+                ImGui::SliderFloat("オブジェクト音量", &object_audio_volume, 0.0f, 1.5f, "%.2f");
+                ImGui::EndDisabled();
             }
             if (map_scene && entity_audio && ai.sim) {
                 ImGui::SeparatorText("敵・船の音");
@@ -5343,7 +5407,8 @@ int run(const std::wstring& cmdline) {
 
     auto app = std::make_unique<App>();
     try {
-        app->gpu.init(false);
+        g_frame_generation.init();
+        app->gpu.init(false, [](ID3D12Device* device) { return g_frame_generation.attach(device); });
         init_swapchain(app->gpu);
         app->lighting.init(app->gpu);
     } catch (const std::exception& ex) {
@@ -5359,7 +5424,8 @@ int run(const std::wstring& cmdline) {
         LPWSTR* argv = CommandLineToArgvW(cmdline.c_str(), &argc);
         for (int i = 1; argv && i < argc; ++i) {
             std::wstring a = argv[i];
-            if (fs::is_directory(a)) install_arg = fs::path(a);
+            if (a == L"--frame-generation") g_frame_generation_requested = g_frame_generation.supported();
+            else if (fs::is_directory(a)) install_arg = fs::path(a);
             else if (a.size() == 8 && a.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos)
                 tag_arg = TagHash(uint32_t(std::stoul(a, nullptr, 16)));
         }
@@ -5434,7 +5500,13 @@ int run(const std::wstring& cmdline) {
             if (msg.message == WM_QUIT) done = true;
         }
         if (done) break;
-        if (IsIconic(g_win.hwnd)) { Sleep(16); continue; }
+        if (IsIconic(g_win.hwnd)) { g_frame_generation.set_active(false); Sleep(16); continue; }
+        if (g_frame_generation_requested != g_frame_generation_proxy) {
+            release_swapchain(app->gpu);
+            g_frame_generation.set_active(g_frame_generation_requested);
+            create_swapchain(app->gpu, g_frame_generation_requested);
+            g_frame_generation.reset_history();
+        }
         if (g_win.pending_w && g_win.pending_h) {
             resize_swapchain(app->gpu, g_win.pending_w, g_win.pending_h);
             g_win.pending_w = g_win.pending_h = 0;
@@ -5444,6 +5516,12 @@ int run(const std::wstring& cmdline) {
         WaitForSingleObjectEx(g_win.waitable, 1000, TRUE);
         app->gpu.wait(g_win.fence[fi]);
         app->gpu.begin_frame(fi);
+        const bool generation_scene = g_frame_generation_proxy && app->map_scene && !app->map.streaming &&
+            app->frame_generation_rect_valid && app->light.mode == ViewMode::Lit && app->scene.loaded() &&
+            GetForegroundWindow() == g_win.hwnd;
+        g_frame_generation.set_active(generation_scene);
+        g_frame_generation.begin_frame(uint32_t(frame));
+        g_frame_generation.mark(FrameGeneration::Marker::simulation_start);
         app->apply_pending(app->gpu);
 
         ImGui_ImplDX12_NewFrame();
@@ -5452,6 +5530,10 @@ int run(const std::wstring& cmdline) {
         app->ui();
         ImGui::Render();
 
+        if (!app->frame_generation_rect_valid || !app->map_scene || app->map.streaming)
+            g_frame_generation.set_active(false);
+        g_frame_generation.mark(FrameGeneration::Marker::simulation_end);
+        g_frame_generation.mark(FrameGeneration::Marker::render_start);
         auto* cl = g_win.list.Get();
         check_hr(g_win.alloc[fi]->Reset(), "allocator Reset");
         check_hr(cl->Reset(g_win.alloc[fi].Get(), nullptr), "list Reset");
@@ -5473,7 +5555,11 @@ int run(const std::wstring& cmdline) {
         check_hr(cl->Close(), "Close");
         ID3D12CommandList* lists[] = {cl};
         app->gpu.queue()->ExecuteCommandLists(1, lists);
+        g_frame_generation.mark(FrameGeneration::Marker::render_end);
+        g_frame_generation.mark(FrameGeneration::Marker::present_start);
         const HRESULT present = g_win.swapchain->Present(1, 0);
+        g_frame_generation.mark(FrameGeneration::Marker::present_end);
+        g_frame_generation.after_present();
         if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) {
             // The GPU faulted: every later frame would only wait out timeouts, so say so and quit.
             std::string why = "GPU error";
@@ -5499,6 +5585,8 @@ int run(const std::wstring& cmdline) {
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    release_swapchain(app->gpu);
+    g_frame_generation.shutdown();
     DestroyWindow(g_win.hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;

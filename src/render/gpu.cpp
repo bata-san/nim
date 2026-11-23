@@ -68,7 +68,7 @@ void debug_name(ID3D12Resource* r, const char* kind, uint64_t a, uint64_t b) {
 }
 }  // namespace
 
-void Gpu::init(bool warp) {
+void Gpu::init(bool warp, QueueDeviceHook queue_hook) {
     // NIM_D3D_DEBUG=1: D3D12 debug layer + DRED, messages to nim_d3d.log in the current directory.
     char flag[8] = {};
     const bool debug = GetEnvironmentVariableA("NIM_D3D_DEBUG", flag, sizeof(flag)) > 0 && flag[0] == '1';
@@ -105,7 +105,8 @@ void Gpu::init(bool warp) {
         sm.HighestShaderModel < D3D_SHADER_MODEL_6_6)
         throw std::runtime_error("GPU/driver lacks Shader Model 6.6, which the game's shaders need (try --warp)");
 
-    init_queue(1000000);  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
+    const auto queue_device = queue_hook ? queue_hook(device_.Get()) : ComPtr<ID3D12Device>{};
+    init_queue(1000000, queue_device.Get());  // shader-visible CBV/SRV/UAV (tier 1 limit 1M); maps need many
 }
 
 Gpu::~Gpu() {
@@ -119,10 +120,10 @@ void Gpu::init_preview(ID3D12Device* device) {
     init_queue(1 << 17);
 }
 
-void Gpu::init_queue(uint32_t descriptors) {
+void Gpu::init_queue(uint32_t descriptors, ID3D12Device* queue_device) {
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    check_hr(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
+    check_hr((queue_device ? queue_device : device_.Get())->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
     check_hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc_)), "CreateCommandAllocator");
     check_hr(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_.Get(), nullptr, IID_PPV_ARGS(&list_)),
              "CreateCommandList");

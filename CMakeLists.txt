@@ -95,7 +95,7 @@ target_link_libraries(nimfbx_extract PRIVATE nim_core)
 
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)
-add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_text.cpp
+add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_text.cpp tools/nim/frame_generation.cpp
     ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp)
@@ -110,6 +110,25 @@ if(NIM_DLSS_SDK)
               "$<TARGET_FILE_DIR:${viewer}>/nvngx_dlss.dll"
       VERBATIM)
   endforeach()
+endif()
+
+set(NIM_STREAMLINE_SDK "" CACHE PATH "Optional NVIDIA Streamline Windows x64 SDK root")
+if(NIM_STREAMLINE_SDK)
+  set(NIM_SL_BIN "${NIM_STREAMLINE_SDK}/bin/x64")
+  set(NIM_SL_DLLS sl.interposer.dll sl.common.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.dll nvngx_dlssg.dll)
+  foreach(dll IN LISTS NIM_SL_DLLS)
+    if(NOT EXISTS "${NIM_SL_BIN}/${dll}")
+      message(FATAL_ERROR "Streamline SDK missing bin/x64/${dll}")
+    endif()
+    add_custom_command(TARGET nim POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NIM_SL_BIN}/${dll}" "$<TARGET_FILE_DIR:nim>/${dll}"
+      VERBATIM)
+  endforeach()
+  target_compile_definitions(nim PRIVATE NIM_WITH_STREAMLINE=1)
+  target_include_directories(nim SYSTEM PRIVATE "${NIM_STREAMLINE_SDK}/include")
+  target_link_libraries(nim PRIVATE wintrust crypt32)
+else()
+  target_compile_definitions(nim PRIVATE NIM_WITH_STREAMLINE=0)
 endif()
 
 # ---- tests -------------------------------------------------------------------

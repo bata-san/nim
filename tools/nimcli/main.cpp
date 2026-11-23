@@ -72,6 +72,7 @@
 #include "nim/render/scene.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <set>
 #include <chrono>
 #include <cstring>
@@ -4127,6 +4128,10 @@ int main(int argc, char** argv) {
             std::println("map {}: {} emitters ({} point, {} polyline, {} global), {} unique events ({} with WEM, {} without), {} unique WEMs",
                          bubble.str(), audio.emitters.size(), audio.point_emitters, audio.polyline_emitters, audio.global_emitters,
                          audio.unique_events, audio.events_with_wems, audio.events_without_wems, audio.unique_wems);
+            std::println("object audio: {} placed looping emitters", audio.objects.size());
+            for (const auto& em : audio.objects | std::views::take(12))
+                std::println("  entity {} event {} pos ({:.1f} {:.1f} {:.1f}) max distance {:.1f} m",
+                             em.entity.str(), em.event.str(), em.position[0], em.position[1], em.position[2], em.max_distance);
             size_t shown = 0;
             for (const auto& em : audio.emitters) {
                 if (em.wems.empty() || shown >= 12) continue;

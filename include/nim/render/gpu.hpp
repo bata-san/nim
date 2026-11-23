@@ -71,7 +71,8 @@ public:
     Gpu(const Gpu&) = delete;
     Gpu& operator=(const Gpu&) = delete;
     ~Gpu();
-    void init(bool warp = false);
+    using QueueDeviceHook = ComPtr<ID3D12Device>(*)(ID3D12Device*);
+    void init(bool warp = false, QueueDeviceHook queue_hook = nullptr);
     // Independent command queue and descriptors on the viewport's device.
     void init_preview(ID3D12Device* device);
     ID3D12Device* device() const { return device_.Get(); }
@@ -131,7 +132,7 @@ public:
                         D3D12_RESOURCE_STATES to);
 
 private:
-    void init_queue(uint32_t descriptors);
+    void init_queue(uint32_t descriptors, ID3D12Device* queue_device = nullptr);
     ComPtr<IDXGIFactory6> factory_;
     ComPtr<IDXGIAdapter3> adapter3_;
     ComPtr<ID3D12Device> device_;
