@@ -537,6 +537,8 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         // hit-flinch appearance. Use seq 1 (80A97148) for idle and calm hover so the neck stays
         // steady and the lower cape does not billow.
         if (entity.value == 0x80A97147u) {
+            set.locomotion.clear();
+            set.turns.clear();
             try {
                 const AnimationClip idle = load_animation_clip(pm, TagHash(0x80A97148u));
                 if (idle.frame_count > 1) {
@@ -546,11 +548,9 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
                     m.cyclic = true;
                     m.authored = true;
                     set.idle = m;
-                    if (set.locomotion.empty()) {
-                        m.speed = 1.6f;
-                        m.direction = {1.0f, 0.0f};
-                        set.locomotion.push_back(m);
-                    }
+                    m.speed = 1.6f;
+                    m.direction = {1.0f, 0.0f};
+                    set.locomotion.push_back(m);
                 }
             } catch (...) {
             }
