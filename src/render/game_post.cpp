@@ -385,10 +385,13 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
     const bool automatic = p.post && p.auto_exposure && ae_columns_.loaded() && bloom_initial_.loaded() && bloom_down_.loaded();
     if (!automatic) {
         ae_valid_ = false;
+        ae_auto_ = 1.0f;
         ae_fence_ = {};
         exposure_ = p.exposure;
         return;
     }
+    ext_.note_estimate("auto exposure: limit brightening to +1 stop and 1 stop/s, darken at up to 4 stops/s",
+                       "viewer limits for excessive flashes during scene and lighting changes");
     const uint64_t done = gpu.completed();
     int newest = -1;
     for (uint64_t back = 1; back <= ae_readback_.size() && back <= ae_frame_; ++back) {
@@ -423,19 +426,19 @@ void GameLighting::update_exposure(Gpu& gpu, const LightingParams& p) {
                     ? std::clamp(ext_.channels[i][0], -16.0f, 16.0f) : d;
             };
             const float min_stops = ch(0x05, -3), max_stops = ch(0x06, 3);
-            const float lo = std::exp2(std::min(min_stops, max_stops)), hi = std::exp2(std::max(min_stops, max_stops));
+            const float lo = std::exp2(std::clamp(std::min(min_stops, max_stops), -4.0f, 1.0f));
+            const float hi = std::exp2(std::clamp(std::max(min_stops, max_stops), -4.0f, 1.0f));
             // ch(0x00) is autoexposure_zero_bias (0.25 across maps). Using 0.5 * ch00^2 (0.03125)
             // keeps twilight/indoor maps (lum ~0.031..0.048) near 0.65..1.0x exposure instead of
             // pegging at +1 stop (2.0x) and overexposing lights.
             const float zero_bias = ch(0x00, 0.25f);
             const float key = zero_bias > 0.0f ? 0.5f * zero_bias * zero_bias : 0.03125f;
             const float target = std::clamp(key * std::exp2(ch(0x01, 0)) / std::max(ae_luminance_, 1e-6f), lo, hi);
-            if (!ae_valid_) ae_auto_ = target;
-            else {
-                const float dt = std::clamp(p.frame_delta_time, 0.0f, 0.25f);
-                const float rate = target < ae_auto_ ? 3.0f : 1.5f;  // darken faster than brighten
-                ae_auto_ = std::exp2(std::lerp(std::log2(ae_auto_), std::log2(target), 1 - std::exp(-rate * dt)));
-            }
+            const float dt = std::clamp(p.frame_delta_time, 0.0f, 1.0f / 30.0f);
+            const float current = ae_valid_ ? std::log2(ae_auto_) : 0.0f;
+            const float delta = std::log2(target) - current;
+            // Bound adaptation even when history was reset or streaming stalled a frame.
+            ae_auto_ = std::exp2(current + std::clamp(delta, -4.0f * dt, 1.0f * dt));
             ae_valid_ = true;
         }
     }

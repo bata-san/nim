@@ -284,13 +284,21 @@ private:
     std::vector<AiDropship> dropships_;
     void step_dropships(float dt, const std::array<float, 3>& player);
     void step_spawns(const std::array<float, 3>& player);
-    void spawn(AiAgent& a);
+    bool spawn(AiAgent& a);
+    std::vector<std::vector<size_t>> ground_squad_members_;
+    std::vector<float> spawn_retry_at_;
     std::vector<uint8_t> squad_spawned_;          // per squad without a dropship
     size_t alternatives_dropped_ = 0;              // squads left out as another's alternative (3.112)
     mutable std::vector<float> unload_cache_;     // per dropship: unload_seconds, < 0 = not yet
+    struct Landing { float time, floor; };
+    mutable std::vector<std::optional<Landing>> landing_cache_;
     // A member's drop from the bay (ship space): x, z and its velocity at `t` s after it starts
     // walking out, and whether it is still leaving (false once it has walked off).
-    struct ExitPose { std::array<float, 3> at; std::array<float, 3> velocity; bool airborne = false, leaving = true; };
+    struct ExitPose {
+        std::array<float, 3> at{}, velocity{};
+        float duration = 0;
+        bool airborne = false, leaving = true;
+    };
     ExitPose exit_pose(const AiDropship& d, const AiAgent& a, float t) const;
     float unload_seconds(const AiDropship& d) const;
     float floor_below(size_t squad, float x, float y, float z) const;

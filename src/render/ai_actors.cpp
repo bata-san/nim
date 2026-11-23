@@ -856,7 +856,8 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
                     if (const auto top = sim.ground(x, y, floor); top && *top > floor && *top <= floor + 0.5f)
                         target = std::max(target, *top - p.z - a.position[2]);
                 }
-            s.lift = std::isnan(s.lift) || dt <= 0 ? target : s.lift + (target - s.lift) * std::min(1.0f, dt * 12);
+            s.lift = std::isnan(s.lift) || dt <= 0 || a.exit >= 0 || target > s.lift
+                ? target : s.lift + (target - s.lift) * std::min(1.0f, dt * 12);
             rows[11] += s.lift;
             if (checking_) {
                 GroundCheck g{*s.agent, floor, 0, 0, sim.ground(a.position[0], a.position[1], a.position[2]).has_value()};
@@ -1042,7 +1043,7 @@ WalkGrid build_ground_patch(Gpu& gpu, StaticMeshScene& scene, const std::array<f
     WalkGrid grid;
     const uint32_t size = std::clamp(uint32_t(std::ceil(2 * half / cell)), 16u, 1024u);
     cell = 2 * half / float(size);
-    const float top = from_above ? at[2] - 0.5f : at[2] + 2.0f, range = from_above ? 80.0f : 8.0f;
+    const float top = from_above ? at[2] : at[2] + 2.0f, range = from_above ? 80.0f : 8.0f;
     grid.x0 = at[0] - half, grid.y0 = at[1] - half, grid.cell = cell, grid.w = grid.h = size;
     grid.height = top_down_heights(gpu, scene, view, at[0], at[1], half, size, top, range);
     // The floor the point stands on (from above: whatever is highest below it), nearest the centre

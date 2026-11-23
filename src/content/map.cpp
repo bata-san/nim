@@ -1679,13 +1679,14 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
 // An FX light's SLight +0x00..+0x5F are all zero in the record: the FX sequence writes them while
 // it plays. The values nim runs it with (estimate, listed by GameLighting::set_lights): unused clip
 // planes (0, 0, -1, 500000) with exponent 0 as on the authored map lights, and the weights
-// +0x50 = (1, 1, 0, 0): diffuse / specular 1 and shadow 1 as on 4,175 of Outpost's map lights,
-// +0x58 = 0 (the FX light PS 80AA4075 fades its colour by cubic(+0x58) from 1 at 0 to 0 at 1).
+// +0x50 supplies the same diffuse and shadow weights as the authored map lights.
+// +0x58 is the FX light's fade phase. Use mid-fade for sequences with no decoded phase.
 static void fill_fx_light_record(MapLight& l) {
     l.fx = true;
     if (std::ranges::any_of(l.params, [](float v) { return v != 0; })) return;
     for (size_t k = 0; k < 4; ++k) l.params[k * 4 + 2] = -1, l.params[k * 4 + 3] = 500000;
     l.params[20] = 1, l.params[21] = 1;
+    l.params[22] = 0.5f;
 }
 
 std::vector<MapLight> load_map_fx_lights(PackageManager& pm, const MapLayout& map, size_t* attached) {

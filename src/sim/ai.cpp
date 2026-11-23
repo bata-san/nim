@@ -288,7 +288,11 @@ std::vector<AiSimulation::GroundNeed> AiSimulation::uncovered() const {
         if (!a.dropship && !open_at(a.position[0], a.position[1], a.position[2], 0.01f)) add(a.position, false);
     for (const auto& d : dropships_) {
         const float c = std::cos(d.yaw), s = std::sin(d.yaw);
-        add({d.position[0] - 6 * c, d.position[1] - 6 * s, d.position[2]}, true);  // behind the bay
+        const float up = std::max(0.0f, params_.dropship_jump_up);
+        const float probe_top = d.position[2] + params_.dropship_lip_height + up * up / (2 * 9.81f) + 0.2f;
+        // Centre the ground patch along the drop and departure, below the jump's highest point.
+        const float behind = params_.dropship_jump_x - 3.0f;
+        add({d.position[0] + behind * c, d.position[1] + behind * s, probe_top}, true);
     }
     return out;
 }
@@ -297,6 +301,7 @@ void AiSimulation::add_ground_patch(WalkGrid patch) {
     if (patch.w) patches_.push_back(std::move(patch));
     grid_index_dirty_ = true;
     unload_cache_.clear();
+    landing_cache_.clear();
 }
 
 void AiSimulation::set_character_radius(size_t character, float radius) {
@@ -616,6 +621,8 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
     }
     squad_areas_.resize(g.squads.size());
     squad_spawned_.assign(g.squads.size(), 0);
+    ground_squad_members_.resize(g.squads.size());
+    spawn_retry_at_.assign(g.squads.size(), 0.0f);
     for (size_t s = 0; s < g.squads.size(); ++s)
         if (const auto o = g.squads[s].objective)
             for (const auto a : g.objectives[*o].firing_areas)
@@ -707,12 +714,16 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
                 a.seat = {-4.6f + 0.9f * float(k / 2), k % 2 ? 0.6f : -0.6f, params_.dropship_bay_height};
                 dropships_[*ship].members.push_back(agents_.size());
             }
-            const std::string& name = g.characters[a.character].name_estimate;
-            a.sight = name.find("boss") != std::string::npos && name.find("miniboss") == std::string::npos ? params_.sight_boss
-                    : name.find("miniboss") != std::string::npos                                            ? params_.sight_miniboss
-                    : name.find("elite") != std::string::npos                                               ? params_.sight_elite
-                                                                                                             : params_.sight_base;
+            const auto& character = g.characters[a.character];
+            static const uint32_t type = fnv1("type"), elite = fnv1("elite"), miniboss = fnv1("miniboss"), boss = fnv1("boss");
+            const auto tier = std::ranges::find(character.tags, type, &std::pair<uint32_t, uint32_t>::first);
+            const auto& name = character.name_estimate;
+            a.sight = (tier != character.tags.end() ? tier->second == miniboss : name.find("miniboss") != std::string::npos) ? params_.sight_miniboss
+                    : (tier != character.tags.end() ? tier->second == boss : name.find("boss") != std::string::npos) ? params_.sight_boss
+                    : (tier != character.tags.end() ? tier->second == elite : name.find("elite") != std::string::npos) ? params_.sight_elite
+                    : params_.sight_base;
             a.wait = std::uniform_real_distribution<float>(0, params_.wait_max)(rng_);
+            if (!ship) ground_squad_members_[s].push_back(agents_.size());
             agents_.push_back(a);
         }
     }
@@ -735,6 +746,7 @@ void AiSimulation::set_walk_grid(size_t firing_area, WalkGrid grid) {
     grids_.at(firing_area) = std::move(grid);
     grid_index_dirty_ = true;
     unload_cache_.clear();
+    landing_cache_.clear();
 }
 
 // A random open point of the squad's firing areas that a straight walk from `from` reaches
@@ -846,8 +858,10 @@ std::array<float, 3> AiSimulation::nearest_objective_point(size_t squad, const s
         for (const auto& tri : areas_[a].triangles) {
             std::array<float, 3> c{};
             for (size_t k = 0; k < 3; ++k) c[k] = (tri[0][k] + tri[1][k] + tri[2][k]) / 3;
-            for (const auto& p : {tri[0], tri[1], tri[2], c})
-                if (const float d = dist2d(p, to); d < bd) bd = d, best = p;
+            for (const auto& p : {tri[0], tri[1], tri[2], c}) {
+                const float dx = p[0] - to[0], dy = p[1] - to[1], dz = p[2] - to[2];
+                if (const float d = dx * dx + dy * dy + dz * dz; d < bd) bd = d, best = p;
+            }
         }
     return best;
 }
@@ -921,7 +935,12 @@ void AiSimulation::separate() {
             // badly overlapped (members spawned on one point), anywhere off the grids.
             const float now = room_at(a.position[0], a.position[1], a.position[2]), next = room_at(nx, ny, a.position[2]);
             const bool overlapped = std::hypot(push[i][0], push[i][1]) > 0.25f * r;
-            if (now <= 0 || next >= r || (next > 0 && (overlapped || next >= now - 0.1f))) a.position[0] = nx, a.position[1] = ny;
+            if (next >= r || (next > 0 && (overlapped || next >= now - 0.1f)) ||
+                (now <= 0 && !ground(a.position[0], a.position[1], a.position[2]))) {
+                const auto floor = ground(nx, ny, a.position[2]);
+                if (!floor || std::abs(*floor - a.position[2]) <= 0.45f)
+                    a.position = {nx, ny, floor.value_or(a.position[2])};
+            }
             continue;  // no step towards room while pushed (it would gather them again)
         }
         const float here = room_at(a.position[0], a.position[1], a.position[2]);
@@ -994,14 +1013,39 @@ AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgen
         const float up = params_.dropship_jump_up, h = bay - floor;
         return (up + std::sqrt(std::max(0.0f, up * up + 2 * kG * h))) / kG;
     };
-    float floor = floor_at(kEdge - 1.0f);
-    float fall = fall_time(floor);
-    floor = floor_at(kEdge - params_.dropship_jump_back * fall);
-    fall = fall_time(floor);
+    auto height = [&](float time) {
+        return bay + params_.dropship_jump_up * time - 0.5f * kG * time * time;
+    };
+    if (landing_cache_.empty()) landing_cache_.resize(agents_.size());
+    auto& landing = landing_cache_[size_t(&a - agents_.data())];
+    if (!landing) {
+        const float initial = fall_time(floor_at(kEdge - 1.0f));
+        const float endpoint = floor_at(kEdge - params_.dropship_jump_back * initial);
+        landing = Landing{fall_time(endpoint), endpoint};
+        // A platform can intercept the descent before its projected endpoint.
+        const float apex = std::max(0.0f, params_.dropship_jump_up / kG);
+        const float end = landing->time;
+        const int samples = std::max(1, int(std::ceil((end - apex) * 60)));
+        for (int i = 1; i <= samples; ++i) {
+            const float sample = apex + (end - apex) * float(i) / float(samples);
+            const float x = kEdge - params_.dropship_jump_back * sample;
+            const float wx = d.position[0] + c * x - s * a.seat[1], wy = d.position[1] + s * x + c * a.seat[1];
+            std::optional<float> surface;
+            each_grid(wx, wy, [&](const WalkGrid& grid) {
+                const auto z = grid.surface(wx, wy);
+                if (z && *z <= d.position[2] + bay + 0.2f && (!surface || *z > *surface)) surface = z;
+            });
+            if (!surface || height(sample) > *surface - d.position[2]) continue;
+            landing = Landing{sample, *surface - d.position[2]};
+            break;
+        }
+    }
+    const auto [fall, floor] = *landing;
     const float land = kEdge - params_.dropship_jump_back * fall;
     const float tj = t - walk;
+    p.duration = walk + fall + params_.dropship_exit_walk;
     if (tj < fall) {
-        p.at = {kEdge - params_.dropship_jump_back * tj, a.seat[1], bay + params_.dropship_jump_up * tj - 0.5f * kG * tj * tj};
+        p.at = {kEdge - params_.dropship_jump_back * tj, a.seat[1], height(tj)};
         p.velocity = {};  // the idle pose in the air (no jump clip found)
         p.airborne = true;
         return p;
@@ -1014,6 +1058,27 @@ AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgen
     p.at = {land + dx * w, a.seat[1] + dy * w, floor};
     p.velocity = {w < 1 ? dx / params_.dropship_exit_walk : 0.0f, w < 1 ? dy / params_.dropship_exit_walk : 0.0f, 0};
     p.leaving = w < 1;
+    auto world = [&](float x, float y, float z) {
+        return std::array<float, 3>{d.position[0] + c * x - s * y, d.position[1] + s * x + c * y, d.position[2] + z};
+    };
+    auto last = world(land, a.seat[1], floor);
+    if (ground(last[0], last[1], last[2])) {
+        const int steps = std::max(1, int(std::ceil(std::hypot(dx, dy) * w / 0.25f)));
+        for (int i = 1; i <= steps; ++i) {
+            const float f = w * float(i) / float(steps);
+            auto next = world(land + dx * f, a.seat[1] + dy * f, last[2] - d.position[2]);
+            const auto z = follow(last, next, 0.01f, 0, 0.125f, true);
+            if (!z) {
+                const float previous = w * float(i - 1) / float(steps);
+                p.at = {land + dx * previous, a.seat[1] + dy * previous, last[2] - d.position[2]};
+                p.velocity = {};
+                break;
+            }
+            next[2] = *z;
+            p.at[2] = next[2] - d.position[2];
+            last = next;
+        }
+    }
     return p;
 }
 
@@ -1021,14 +1086,7 @@ float AiSimulation::exit_seconds(const AiDropship& d) const {
     // The longest way out of any member (the rear seats walk least, the front seats most).
     float longest = 0;
     for (const auto m : d.members) {
-        const auto& a = agents_[m];
-        float lo = 0, hi = 60;
-        if (exit_pose(d, a, hi).leaving) continue;
-        for (int i = 0; i < 20; ++i) {
-            const float mid = 0.5f * (lo + hi);
-            (exit_pose(d, a, mid).leaving ? lo : hi) = mid;
-        }
-        longest = std::max(longest, hi);
+        longest = std::max(longest, exit_pose(d, agents_[m], 60).duration);
     }
     return longest;
 }
@@ -1101,7 +1159,7 @@ void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) 
             a.position = world(p.at);
             a.yaw = wrap_angle(d.yaw + kPi);
             a.exit_floor = d.position[2] + p.at[2];
-            a.velocity = {c * p.velocity[0], s * p.velocity[0], 0};
+            a.velocity = {c * p.velocity[0] - s * p.velocity[1], s * p.velocity[0] + c * p.velocity[1], 0};
             if (!p.leaving) {
                 a.exit = -1;
                 a.goal = a.position;
@@ -1114,31 +1172,39 @@ void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) 
     }
 }
 
-void AiSimulation::spawn(AiAgent& a) {
-    a.active = true;
+bool AiSimulation::spawn(AiAgent& a) {
     a.riding = false;
     a.exit = -1;
     a.position = a.home;
     // Not on top of another (3.112, 推定): the nearest open floor around the node, in rings 0.9 m
-    // apart, at least 0.9 m from every active agent.
+    // apart, with space for both bodies and at least 0.9 m from every active agent.
     auto free_at = [&](const std::array<float, 3>& p) {
         for (const auto& o : agents_)
-            if (&o != &a && o.active && std::hypot(o.position[0] - p[0], o.position[1] - p[1]) < 0.9f && std::fabs(o.position[2] - p[2]) < 2)
+            if (&o != &a && o.active && std::fabs(o.position[2] - p[2]) < 2 &&
+                std::hypot(o.position[0] - p[0], o.position[1] - p[1]) < std::max(0.9f, radius(a) + radius(o)))
                 return false;
         return true;
     };
-    if (!free_at(a.position)) {
+    const bool has_floor = std::ranges::any_of(grids_, [](const WalkGrid& g) { return g.w != 0; }) || !patches_.empty();
+    if (const auto z = ground(a.position[0], a.position[1], a.position[2])) a.position[2] = *z;
+    const auto origin = a.position;
+    const bool origin_open = open_at(origin[0], origin[1], origin[2], 0.01f);
+    if (!free_at(origin) || (has_floor && !open_at(origin[0], origin[1], origin[2], radius(a)))) {
         bool placed = false;
         for (int ring = 1; ring <= 4 && !placed; ++ring)
             for (int k = 0; k < 6 * ring && !placed; ++k) {
                 const float t = 2 * kPi * float(k) / float(6 * ring), r = 0.9f * float(ring);
                 std::array<float, 3> p{a.home[0] + r * std::cos(t), a.home[1] + r * std::sin(t), a.home[2]};
                 const auto z = ground(p[0], p[1], p[2]);
-                if (!z) continue;
-                p[2] = *z;
-                if (open_at(p[0], p[1], p[2], 0.35f) && path_clear(a.home, p, 0.3f) && free_at(p)) a.position = p, placed = true;
+                if (z) p[2] = *z;
+                const bool reachable = z && open_at(p[0], p[1], p[2], radius(a)) &&
+                    (origin_open ? path_clear(origin, p, 0.3f) : std::fabs(p[2] - origin[2]) <= 0.45f);
+                if ((!has_floor || reachable) && free_at(p))
+                    a.position = p, placed = true;
             }
+        if (!placed) return false;
     }
+    a.active = true;
     a.goal = a.position;
     a.path.clear();
     a.path_next = 0;
@@ -1149,6 +1215,7 @@ void AiSimulation::spawn(AiAgent& a) {
     a.motion = MotionChoice{};
     a.motion_time = 0;
     a.wait = std::uniform_real_distribution<float>(0, params_.wait_max)(rng_);
+    return true;
 }
 
 // Spawning by distance (3.111, 推定: the engine's encounter scripts are code): squads appear when the
@@ -1181,15 +1248,22 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
         return n >= params_.spawn_crowd;
     };
     for (size_t s = 0; s < g_.squads.size(); ++s) {
-        if (!squad_spawned_[s] && nearest[s] < params_.spawn_range) {
-            if (std::ranges::none_of(agents_, [&](const AiAgent& a) { return a.squad == s && !a.dropship; }) || crowded(s)) continue;
-            squad_spawned_[s] = 1;
-            for (auto& a : agents_)
-                if (a.squad == s && !a.dropship) spawn(a), ++path_stats_.spawned;
+        const auto& members = ground_squad_members_[s];
+        if (nearest[s] < params_.spawn_range && time_ >= spawn_retry_at_[s] &&
+            std::ranges::any_of(members, [&](size_t i) { return !agents_[i].active; })) {
+            spawn_retry_at_[s] = time_ + 0.25f;
+            if (crowded(s)) continue;
+            for (size_t i : members) {
+                if (!agents_[i].active && spawn(agents_[i])) {
+                    ++path_stats_.spawned;
+                    squad_spawned_[s] = 1;
+                }
+            }
         } else if (squad_spawned_[s] && nearest[s] > params_.despawn_range && members_far[s]) {
             squad_spawned_[s] = 0;
-            for (auto& a : agents_)
-                if (a.squad == s && !a.dropship) a.active = false, ++path_stats_.despawned;
+            spawn_retry_at_[s] = 0.0f;
+            for (size_t i : members)
+                if (agents_[i].active) agents_[i].active = false, ++path_stats_.despawned;
         }
     }
     for (size_t i = 0; i < dropships_.size(); ++i) {
@@ -1235,7 +1309,12 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         if (react) {
             face = std::atan2(player[1] - a.position[1], player[0] - a.position[0]);
             if (a.alert == AiAlert::Alerted && !squad_areas_[a.squad].empty()) {
-                target = nearest_objective_point(a.squad, player);
+                auto approach = player;
+                const float angle = float((&a - agents_.data()) % 23) * 2.399963f;
+                approach[0] += 4.0f * std::cos(angle);
+                approach[1] += 4.0f * std::sin(angle);
+                approach[2] = a.position[2];
+                target = nearest_objective_point(a.squad, approach);
                 speed = run_speed(a);
             }
         } else if (!squad_areas_[a.squad].empty() && (a.character >= motions_.size() || !motions_[a.character].locomotion.empty())) {
@@ -1299,10 +1378,18 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
                 dir = {std::cos(a.yaw), std::sin(a.yaw)};
             }
             const float step = std::min(speed * dt, d);
-            a.velocity = {dir[0] * step / dt, dir[1] * step / dt, 0};
-            a.position[0] += dir[0] * step;
-            a.position[1] += dir[1] * step;
-            a.position[2] += (target[2] - a.position[2]) * std::min(1.0f, step / d);
+            auto next = a.position;
+            next[0] += dir[0] * step;
+            next[1] += dir[1] * step;
+            if (ground(a.position[0], a.position[1], a.position[2])) {
+                const auto z = follow(a.position, next, 0.01f, 0, 0.125f, true);
+                if (z) next[2] = *z;
+                else next = a.position;
+            } else {
+                next[2] += (target[2] - a.position[2]) * std::min(1.0f, step / d);
+            }
+            a.velocity = {(next[0] - a.position[0]) / dt, (next[1] - a.position[1]) / dt, 0};
+            a.position = next;
         } else {
             a.velocity = {};
         }

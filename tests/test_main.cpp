@@ -576,6 +576,26 @@ int main() {
             CHECK(lowest_airborne < 0.01f);
             CHECK(behind);
             for (const auto& a : sd.agents()) CHECK(a.active && !a.riding && a.exit < 0 && std::abs(a.position[2]) < 0.01f);
+
+            // The falling agents cross a raised platform before the projected landing on z=0.
+            nim::AiSimulation raised(gd, nim::AiParams{}, 7);
+            nim::WalkGrid platform;
+            platform.x0 = -4.8f;
+            platform.y0 = 3;
+            platform.cell = 0.1f;
+            platform.w = 8;
+            platform.h = 40;
+            platform.height.assign(platform.w * platform.h, 8.0f);
+            platform.set_free(std::vector<uint8_t>(platform.height.size(), 1));
+            raised.add_ground_patch(std::move(platform));
+            raised.call_dropship(0);
+            float lowest = 100;
+            for (int i = 0; i < 140; ++i) {
+                raised.step(0.1f, {5, 60, 0});
+                for (const auto& a : raised.agents())
+                    if (a.active) lowest = std::min(lowest, a.position[2]);
+            }
+            CHECK(std::abs(lowest - 8.0f) < 0.01f);
         }
 
         // Walk grids (3.72): room to the nearest blocked cell, paths that follow the floor up

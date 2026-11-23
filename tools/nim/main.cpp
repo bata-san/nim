@@ -2781,11 +2781,13 @@ public:
         light.entity_preview = entity_preview_active && !map_scene;
         light.dof_edges_only = map_scene;  // flying retains an orbit radius unrelated to surface depth
         light.dof_focus = cam.distance;
+        LightingParams frame_light = light;
+        frame_light.auto_exposure = map_scene && light.auto_exposure;
         try {
             const bool game_view = game_ready && light.mode == ViewMode::Lit;
             auto prepare_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Prepare);
             if (game_ready) {
-                if (game_view) game_lighting.prepare_frame(gpu, gb, light);
+                if (game_view) game_lighting.prepare_frame(gpu, gb, frame_light);
                 else game_lighting.update_global_channels(light);
                 scene.set_exposure(game_view ? game_lighting.exposure() : light.exposure);
                 scene.set_global_channel_values(game_lighting.externs().channels);
@@ -2854,7 +2856,7 @@ public:
                 if (scene.has_visible_distortion()) distortion = [&](auto* c, uint32_t w, uint32_t h) {
                     scene.render_distortion(gpu, c, w, h, vm, game_lighting.externs());
                 };
-                game_lighting.render(gpu, cl, gb, vm, light, transparents, shadow,
+                game_lighting.render(gpu, cl, gb, vm, frame_light, transparents, shadow,
                                      scene.has_visible_light_grid() || (fx && particles.has_emitters_near(vm.eye)), distortion);
                 if (g_frame_generation_proxy && !map.streaming && map_scene && scene.loaded() && frame_generation_rect_valid)
                     g_frame_generation.tag(cl, gb, camera, vm, frame_generation_x, frame_generation_y);
@@ -3672,7 +3674,7 @@ public:
             ImGui::Checkbox(ui::tr(ui::S::PostProcess), &light.post);
             ImGui::SetItemTooltip(ui::tr(ui::S::PostProcessTip));
             ImGui::BeginDisabled(!light.post);
-            ImGui::Checkbox(ui::tr(ui::S::AutoExposure), &light.auto_exposure);
+            if (map_scene) ImGui::Checkbox(ui::tr(ui::S::AutoExposure), &light.auto_exposure);
             ImGui::SetItemTooltip(ui::tr(ui::S::AutoExposureTip));
             ImGui::SameLine();
             ImGui::Checkbox(ui::tr(ui::S::Bloom), &light.bloom);
@@ -3709,7 +3711,8 @@ public:
             ImGui::Checkbox("周辺減光", &light.vignette);
             ImGui::SetItemTooltip("ゲームの v2_dof_cinematic パス。焦点はカメラの注視点 (焦点範囲・ぼけの大きさは推定)");
             ImGui::EndDisabled();
-            if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("%s %.3f", ui::tr(ui::S::Exposure), game_lighting.exposure());
+            if (map_scene && light.post && light.auto_exposure && game_ready)
+                ImGui::TextDisabled("%s %.3f", ui::tr(ui::S::Exposure), game_lighting.exposure());
             ImGui::ColorEdit3(ui::tr(ui::S::SunColor), &light.sun_color.x);
             ImGui::SliderFloat(ui::tr(ui::S::SkyIntensity), &light.sky_intensity, 0, 4);
             ImGui::ColorEdit3(ui::tr(ui::S::SkyZenith), &light.sky_top.x);
@@ -3935,11 +3938,6 @@ public:
             empty_state(ico::Entities, ui::tr(ui::S::NothingSelected), ui::tr(ui::S::ClickCardHint));
             return;
         }
-        ImGui::PushFont(g_fonts.bold, 0);
-        ImGui::Text("%s %s", scene.dynamic() ? "DYNAMIC" : "STATIC", scene.tag().str().c_str());
-        ImGui::PopFont();
-        ImGui::SameLine();
-        if (ImGui::SmallButton(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(scene.tag().str().c_str());
         if (!ImGui::BeginTabBar("model_details")) return;
         if (anim && scene.skinned() && ImGui::BeginTabItem(ui::tr(ui::S::AnimationTab))) {
             animation_panel();

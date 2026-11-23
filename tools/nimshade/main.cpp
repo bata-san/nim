@@ -1147,7 +1147,7 @@ int run(int argc, char** argv) {
     lp.time_of_day = time_of_day;
     lp.day_night_state = day_night_state;
     lp.post = !no_post;
-    lp.auto_exposure = !no_auto_exposure;
+    lp.auto_exposure = is_map && !no_auto_exposure;
     lp.bloom = !no_bloom;
     if (bloom_highlight) lp.bloom_highlight = *bloom_highlight;
     lp.antialias = !no_aa;

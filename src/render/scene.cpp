@@ -948,9 +948,8 @@ void pack_skin_vertex(V3 p, V3 normal, V3 tangent, uint32_t* pos, uint32_t* nrm)
 
 // Packed positions of skinned meshes ((position - offset) / range, 21/21/22-bit snorm) are clamped to
 // [-1, 1]. A range tied to the bind-pose box squashed limbs and parts that a clip moves farther
-// than that, so the range is fixed at 128 m around the model (0.12 mm steps, below the source
-// vertices' own snorm16 precision for models larger than 8 m) unless the model itself is larger.
-constexpr float kSkinMinRange = 128.0f;
+// than that. Reserve 2048 m around the model for clips that move far from the bind pose.
+constexpr float kSkinMinRange = 2048.0f;
 float skin_pack_range(float half_extent) { return std::max(half_extent * 2.0f, kSkinMinRange); }
 
 // The bind pose in the layout the game's compute skinning writes (24-byte layout-7 vertices).
