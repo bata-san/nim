@@ -326,6 +326,9 @@ public:
     // Clears the G-buffer and draws every G-buffer group. Leaves targets in RENDER_TARGET.
     void render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
     // Depth of the G-buffer parts from the sun (shadow.fit first); sets shadow.valid.
+    // Draw bundles for large opaque lists (frame command lists only: off for one-off views
+    // recorded on the immediate list, such as the AI floor probes).
+    void allow_bundles(bool allow) { bundles_allowed_ = allow; }
     void render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow);
     void render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map);
     // Draws the overhead visibility map over the scene (radius around `center`) and hands it to
@@ -600,6 +603,7 @@ private:
     // Opaque draws are recorded into kDrawBundles bundles in parallel (a few draw calls per frame).
     static constexpr size_t kDrawBundles = 8;
     std::array<DrawBundle, kDrawBundles * 4 * Gpu::kFramesInFlight> draw_bundles_;
+    bool bundles_allowed_ = true;
     void cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bool shadow = false);
     uint32_t item_instances(const Item& it) const;  // this frame's, after cull()
     struct ScopeDef { const Scope* scope; ShaderStage stage; uint32_t reg; };

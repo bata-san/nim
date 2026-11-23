@@ -3395,7 +3395,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     const std::span<const size_t> opaque(stage == kStageDecal ? decal_items_ : visible_opaque_);
     std::array<DrawBundle*, kDrawBundles> bundles{};
     size_t available = 0;
-    if (opaque.size() >= 1800) {
+    if (opaque.size() >= 1800 && bundles_allowed_) {
         const auto completed = gpu.completed();
         for (auto& bundle : draw_bundles_) {
             if (bundle.fence > completed) continue;

@@ -661,6 +661,22 @@ int main() {
         CHECK(material.technique(0, 0, elite_unit) == TagHash(0x80A4BACF));
         CHECK(material.technique(0, 2) == TagHash(0x80A4BACF));
     }
+    // Ranges read condition rows from +8; 871AC0EA holds for values no row of the range names.
+    {
+        DynamicModelMaterials material;
+        material.technique_map = {{2, 0, 0}, {2, 2, 0}};  // both ranges share rows 0-1
+        material.techniques = {TagHash(0x80A4A7F2), TagHash(0x80A4A7FB), TagHash(0x80A4A83B), TagHash(0x80A4A844)};
+        material.part_tags = {{{1, 5}}, {{1, 0x871AC0EA}}, {{2, 6}, {2, 7}}};
+        material.technique_conditions = {{0}, {1}};
+        const std::pair<uint32_t, uint32_t> named[] = {{1, 5}};
+        const std::pair<uint32_t, uint32_t> other[] = {{1, 9}};
+        CHECK(material.technique(0, 0, named) == TagHash(0x80A4A7F2));
+        CHECK(material.technique(0, 0, other) == TagHash(0x80A4A7FB));
+        CHECK(material.technique(1, 0, other) == TagHash(0x80A4A844));
+        material.technique_conditions = {{2}, {1}};
+        const std::pair<uint32_t, uint32_t> either[] = {{2, 7}, {1, 5}};
+        CHECK(material.technique(0, 1, either) == TagHash(0x80A4A7F2));  // 6 or 7
+    }
 
     // Map ambient audio emitter geometry (point, polyline segment, global).
     {

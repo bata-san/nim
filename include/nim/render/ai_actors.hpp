@@ -53,6 +53,9 @@ struct ActorCharacter {
     TagHash weapon_model;
     BoneTransform weapon_from_handle;
     int32_t grip_bone = -1;
+    // The weapon's hold pose (3.117, weapon_hold_clip) and the {hand, bone} pairs it moves.
+    TagHash hold_clip;
+    std::vector<std::pair<int32_t, int32_t>> hold_bones;
     std::string error;  // why it cannot be drawn, if it cannot
 };
 // `tags`: the spawned character's tags (MapCharacter::tags); they select the model's region

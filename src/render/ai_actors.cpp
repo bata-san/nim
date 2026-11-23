@@ -165,6 +165,14 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
         for (const auto& m : motion.locomotion) want(m);
         for (const auto& m : motion.turns) want(m);
         if (motion.idle) want(*motion.idle);
+        // The hold pose of the weapon its spawn tags name (3.117): layered on the hands.
+        constexpr uint32_t kWeaponType = 0xEAFBB478;  // fnv1("weapon_type")
+        if (const auto wt = std::ranges::find(tags, kWeaponType, &std::pair<uint32_t, uint32_t>::first); wt != tags.end())
+            if (const auto data = entity_motion_data(pm, motion.entity))
+                if (const TagHash hold = weapon_hold_clip(pm, *data, wt->second); !hold.is_none()) {
+                    c.hold_clip = hold;
+                    want(MotionClip{hold});
+                }
         std::string why;
         for (const auto model : models) {
             auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions, tags);
@@ -243,6 +251,23 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
 ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion,
                                        std::span<const std::pair<uint32_t, uint32_t>> tags) {
     ActorCharacter c = prepare_character_model(pm, sources, motion, tags);
+    // The hand bones the weapon hold pose moves (3.117): every descendant of b_r_hand / b_l_hand
+    // (fingers, b_r_grip), kept relative to the hand the body's clip places.
+    if (c.binding && !c.hold_clip.is_none() && c.clips.contains(c.hold_clip)) {
+        const auto& sk = c.binding->skeleton;
+        constexpr uint32_t kRightHand = 0xEA6B9DDE, kLeftHand = 0x67CB838C;  // fnv1("b_r_hand"), fnv1("b_l_hand")
+        for (size_t b = 0; b < sk.size(); ++b) {
+            if (sk.hashes[b] != kRightHand && sk.hashes[b] != kLeftHand) continue;
+            for (size_t d = 0; d < sk.size(); ++d) {
+                int32_t p = sk.parents[d];
+                while (p >= 0 && size_t(p) != b) p = sk.parents[size_t(p)];
+                if (p >= 0) c.hold_bones.push_back({int32_t(b), int32_t(d)});
+            }
+        }
+        if (c.hold_bones.empty()) c.hold_clip = {};
+    } else {
+        c.hold_clip = {};
+    }
     // The weapon (3.93): the model of the weapon the spawn tags select, held at b_r_grip.
     if (c.binding && c.mesh && !tags.empty()) {
         try {
@@ -490,6 +515,17 @@ std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& a
         }
     } else {
         anim.blend = 1;
+    }
+    // The weapon hold pose (3.117): each hand's descendants as the hold clip places them relative
+    // to that hand (skin matrices: S_d' = S_hand * S_hand_hold^-1 * S_d_hold).
+    if (!c.hold_clip.is_none() && !poses.empty()) {
+        const auto hold = c.binding->poses(c.clips.at(c.hold_clip), 0);
+        if (!hold.empty() && hold.front().bones.size() == poses.front().bones.size()) {
+            auto& now = poses.front().bones;
+            const auto& held = hold.front().bones;
+            for (const auto& [hand, bone] : c.hold_bones)
+                now[size_t(bone)] = now[size_t(hand)] * inverse(held[size_t(hand)]) * held[size_t(bone)];
+        }
     }
     // The weapon (3.93): rigid at the posed b_r_grip (every bone of its model, at bind, there).
     if (!c.weapon_model.is_none() && c.grip_bone >= 0 && !poses.empty() && size_t(c.grip_bone) < poses.front().bones.size() &&
@@ -821,15 +857,16 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
             scene.set_actor(s.actor, std::nullopt);
             continue;
         }
-        // Sounds (3.90): the clip events passed since the last frame, the component loops when
-        // the agent appears, at the agent (1 m up).
+        // Sounds (3.90): the clip events passed since the last frame, at the agent (1 m up).
         {
             const auto& ch = characters_[s.character];
             const uint64_t emitter = kAgentEmitter | *s.agent;
             emitters_.push_back({emitter, {a.position[0], a.position[1], a.position[2] + 1}});
             now_shown_.insert(emitter);
             if (ch.sounds && dt > 0 && ch.clips.contains(s.anim.clip)) {
-                emit_loops(*ch.sounds, emitter);
+                // No component loops (3.117): a character's looping events with a stop event are
+                // started by its actions (weapons, abilities; the engine's scripts are code), so
+                // looping all of them roared from every enemy and the Compiler.
                 const float frame = actor_clip_frame(ch, s.anim.clip, a.motion_time);
                 if (s.cue_agent == s.agent && s.cue_clip == s.anim.clip && s.cue_frame >= 0) {
                     if (frame != s.cue_frame)
@@ -910,8 +947,8 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
 namespace {
 
 // Top surface heights (NaN: nothing drawn) of a size x size grid of `cell` m centred on (cx, cy),
-// row-major from the smallest y, looking straight down from `top` over `range` m (the shadow
-// pass: opaque geometry with shadow parts, alpha tested as the game's shadow shaders do).
+// row-major from the smallest y, looking straight down from `top` over `range` m (the G-buffer
+// pass: all opaque geometry, alpha tested as its materials do).
 std::vector<float> top_down_heights(Gpu& gpu, StaticMeshScene& scene, SunShadow& view, float cx, float cy, float half, uint32_t size,
                                     float top, float range) {
     view.resize(gpu, size);
@@ -945,13 +982,27 @@ std::vector<float> top_down_heights(Gpu& gpu, StaticMeshScene& scene, SunShadow&
     tr.c[3] = {-cx, -cy, -top, 1};
     vm.vp_abs = mul(vm.vp_rel, tr);
     vm.vp_prev = vm.vp_abs;
-    scene.render_shadow(gpu, gpu.immediate(), view);
-    const auto bytes = gpu.read_texture(view.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);
-    const float* depth = reinterpret_cast<const float*>(bytes.data());
+    // The G-buffer pass, not the shadow pass (3.117): a static mesh casts with its authored shadow
+    // parts only (96 of Outpost's 3,726), so rock without them (the plateau by Perimeter's ship at
+    // (-251, -7, 32.5)) was missing from the floor and dropship members fell through it.
+    GBuffer gb;
+    // Recorded on the immediate list and flushed by the read: its descriptors and uploads are
+    // handed back (one probe per firing area and dropship would exhaust the frame's regions).
+    const uint32_t mark = gpu.transient_mark();
+    const size_t upload_mark = gpu.dynamic_mark();
+    gb.resize(gpu, size, size);
+    scene.allow_bundles(false);
+    scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
+    scene.allow_bundles(true);
+    const auto bytes = gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);  // plane 0: R32 depth
+    gb.release(gpu);
+    gpu.transient_rewind(mark);
+    gpu.dynamic_rewind(upload_mark);
+    auto depth_at = [&](size_t i) { float v; std::memcpy(&v, bytes.data() + i * 4, 4); return v; };
     std::vector<float> out(size_t(size) * size, std::numeric_limits<float>::quiet_NaN());
     for (uint32_t r = 0; r < size; ++r)
         for (uint32_t c = 0; c < size; ++c)
-            if (const float dv = depth[size_t(size - 1 - r) * size + c]; dv > 0)  // texture row 0 = largest y
+            if (const float dv = depth_at(size_t(size - 1 - r) * size + c); dv > 0)  // texture row 0 = largest y
                 out[size_t(r) * size + c] = top - (1 - dv) * range;
     return out;
 }

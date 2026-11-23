@@ -1786,12 +1786,20 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
     size_t shared = 0, carried = 0;
     for (const auto& d : sim.dropships()) shared += d.squads.size() > 1, carried += d.squads.size();
     std::println("dropships {} carrying {} squads ({} ships shared by squads spawned at the same coordinates)", sim.dropships().size(), carried, shared);
+    for (const auto& d : sim.dropships()) std::println("  ship at ({:.1f} {:.1f} {:.1f}) yaw {:.2f} members {}", d.position[0], d.position[1], d.position[2], d.yaw, d.members.size());
     std::string j = "{\"frames\":[";
     const int steps = int(seconds / dt);
     std::array<size_t, 3> peak{};
     float walked = 0;
+    size_t dropped_peak = 0, calls = 0;
+    std::vector<float> starts(sim.dropships().size(), -1);
     for (int i = 0; i <= steps; ++i) {
         if (i) sim.step(dt, player);
+        size_t dropped = 0;
+        for (const auto& a : sim.agents()) dropped += a.active && a.dropship.has_value();
+        dropped_peak = std::max(dropped_peak, dropped);
+        for (size_t k = 0; k < sim.dropships().size(); ++k)
+            if (sim.dropships()[k].start >= 0 && sim.dropships()[k].start != starts[k]) starts[k] = sim.dropships()[k].start, ++calls;
         std::array<size_t, 3> count{};
         for (const auto& a : sim.agents()) ++count[size_t(a.alert)], walked += std::hypot(a.velocity[0], a.velocity[1]) * (i ? dt : 0);
         for (const auto& d : sim.drones()) ++count[size_t(d.alert)];
@@ -1815,6 +1823,7 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
         }
     }
     std::println("after {:.1f}s: walked {:.0f} m in total; peak unaware {} suspicious {} alerted {}", sim.time(), walked, peak[0], peak[1], peak[2]);
+    std::println("dropships called {} times; at most {} dropped members active at once", calls, dropped_peak);
     for (const auto& a : sim.agents())
         if (a.alert != AiAlert::Unaware)
             std::println("  {} at ({:.1f} {:.1f} {:.1f}) awareness {:.2f} {}", g.characters[a.character].name_estimate, a.position[0], a.position[1],
@@ -1946,6 +1955,8 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
     for (const auto& ch : g.characters) {
         std::string l;
         for (const auto h : ch.labels) l += std::format(" {:08X}", h);
+        l += " tags";
+        for (const auto& [k, v] : ch.tags) l += std::format(" {:08X}={:08X}", k, v);
         std::println("  {} entity {} labels{}  {}", ch.item.str(), ch.entity.str(), l, ch.name_estimate.empty() ? "-" : ch.name_estimate);
     }
     {
@@ -3302,7 +3313,7 @@ int cmd_skin(PackageManager& pm, TagHash tag, int only_part) {
 // Each part's bind-pose bounds (decoded positions over its index range), technique, stage, LOD.
 // The materials of a dynamic model's entity component: technique map ranges, the techniques of
 // every permutation and the parts using each variant (docs/PROGRESS.md 3.113).
-int cmd_model_materials(PackageManager& pm, TagHash tag) {
+int cmd_model_materials(PackageManager& pm, TagHash tag, std::span<const std::pair<uint32_t, uint32_t>> tags = {}) {
     const auto all = index_dynamic_model_materials(pm);
     const auto it = all.find(tag.value);
     if (it == all.end()) { std::println("no component materials for {}", tag.str()); return 1; }
@@ -3319,6 +3330,18 @@ int cmd_model_materials(PackageManager& pm, TagHash tag) {
         std::string t;
         for (uint32_t k = 0; k < rg.count; ++k) t += " " + m.techniques[rg.start + k].str();
         std::println("  variant {:3} count {} start {:3} unk8 {:08X} parts {:3} idx {:7}:{}", v, rg.count, rg.start, rg.unk8, parts, indices, t);
+        if (!tags.empty()) std::println("    selected for the given tags: {}", m.technique(uint16_t(v), m.default_permutation, tags).str());
+        if (uint64_t(rg.unk8) + rg.count <= m.technique_conditions.size())
+            for (uint32_t k = 0; k < rg.count; ++k) {
+                std::string c;
+                for (const uint16_t g : m.technique_conditions[rg.unk8 + k]) {
+                    c += std::format(" [{}:", g);
+                    if (g < m.part_tags.size())
+                        for (const auto& [a, b] : m.part_tags[g]) c += std::format(" {:08X}={:08X}", a, b);
+                    c += "]";
+                }
+                std::println("      {} {}", m.techniques[rg.start + k].str(), c);
+            }
     }
     return 0;
 }
@@ -4513,7 +4536,13 @@ int main(int argc, char** argv) {
         if (cmd == "tag-class-refs" && args.size() >= 2) return cmd_tag_class_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "motion-banks") return cmd_motion_banks(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
-        if (cmd == "model-materials" && args.size() >= 2) return cmd_model_materials(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "model-materials" && args.size() >= 2) {
+            std::vector<std::pair<uint32_t, uint32_t>> tags;  // key=value hex pairs
+            for (size_t i = 2; i < args.size(); ++i)
+                if (const auto eq = args[i].find('='); eq != std::string::npos)
+                    tags.push_back({uint32_t(parse_hex(args[i].substr(0, eq))), uint32_t(parse_hex(args[i].substr(eq + 1)))});
+            return cmd_model_materials(pm, TagHash(parse_hex(args[1])), tags);
+        }
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
         if (cmd == "mesh-slice" && args.size() >= 3) {
             float b[4];

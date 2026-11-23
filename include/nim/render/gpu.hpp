@@ -114,6 +114,9 @@ public:
     // Work recorded on the immediate list only and flushed can hand its descriptors back.
     uint32_t transient_mark() const { return transient_offset_; }
     void transient_rewind(uint32_t mark);
+    // The same for this frame's upload region (only after flushing the immediate work that read it).
+    size_t dynamic_mark() const { return dynamic_offset_; }
+    void dynamic_rewind(size_t mark) { dynamic_offset_ = mark; }
 
     ComPtr<ID3D12Resource> buffer(size_t size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
                                   D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);

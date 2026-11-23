@@ -289,7 +289,10 @@ std::vector<AiSimulation::GroundNeed> AiSimulation::uncovered() const {
     for (const auto& d : dropships_) {
         const float c = std::cos(d.yaw), s = std::sin(d.yaw);
         const float up = std::max(0.0f, params_.dropship_jump_up);
-        const float probe_top = d.position[2] + params_.dropship_lip_height + up * up / (2 * 9.81f) + 0.2f;
+        // From 2.2 m over the ramp's top (3.117): ground rising above the ship's origin (Perimeter
+        // (-251, -7, 32.5): 2 m higher behind it) was cut by a probe at the jump's apex, and the
+        // members fell to a firing area 13 m below inside the rock.
+        const float probe_top = d.position[2] + params_.dropship_lip_height + std::max(up * up / (2 * 9.81f), 2.0f) + 0.2f;
         // Centre the ground patch along the drop and departure, below the jump's highest point.
         const float behind = params_.dropship_jump_x - 3.0f;
         add({d.position[0] + behind * c, d.position[1] + behind * s, probe_top}, true);
@@ -580,6 +583,10 @@ std::vector<AiEstimate> ai_estimates(const AiParams& p) {
         {"dropship_jump_back", p.dropship_jump_back, "m/s backwards off the ramp; the fall is free (9.81 m/s2), in the idle pose (no jump clip found)"},
         {"dropship_jump_up", p.dropship_jump_up, "m/s up off the ramp's end (a step off that clears it)"},
         {"dropship_call_range", p.dropship_call_range, "m: a dropship squad's ship is called when the player comes this close to its spawner (the engine's encounter trigger is script code)"},
+        {"dropship_max_active", float(p.dropship_max_active), "ships in the air at once; the squads of one spawner are alternatives (one rides; 3.117, the encounter scripts are code)"},
+        {"dropship_call_gap", p.dropship_call_gap, "s between two ship calls"},
+        {"dropship_return_min", p.dropship_return_min, "s before a ship that has left can come again (uniform to dropship_return_max)"},
+        {"dropship_return_max", p.dropship_return_max, "s"},
         {"dropship_call_delay", p.dropship_call_delay, "s, uniform random delay after the call"},
         {"dropship_arrive", p.dropship_arrive, "s: arrival clip length at the 30 fps clip rate"},
         {"dropship_depart", p.dropship_depart, "s: departure clip length at 30 fps"},
@@ -661,6 +668,25 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
                 const size_t pick = std::uniform_int_distribution<size_t>(0, squads.size() - 1)(rng_);
                 for (size_t i = 0; i < squads.size(); ++i) chosen[squads[i]] = i == pick;
             }
+        }
+    }
+    // One squad per dropship spawner (3.117, 推定): squads whose spawners sit at the same
+    // coordinates (in different groups or none) shared one ship and all came out of it
+    // (Perimeter: 64 squads in 47 ships); they are alternatives like those above.
+    {
+        std::map<std::array<int64_t, 3>, std::vector<size_t>> by_spawner;
+        for (size_t s = 0; s < g.squads.size(); ++s) {
+            if (!chosen[s]) continue;
+            for (const auto& p : g.squads[s].positions)
+                if (p.model.value == kDropshipModel) {
+                    by_spawner[{std::llround(p.position[0] * 100), std::llround(p.position[1] * 100), std::llround(p.position[2] * 100)}].push_back(s);
+                    break;
+                }
+        }
+        for (const auto& [_, squads] : by_spawner) {
+            if (squads.size() < 2) continue;
+            const size_t pick = std::uniform_int_distribution<size_t>(0, squads.size() - 1)(rng_);
+            for (size_t i = 0; i < squads.size(); ++i) chosen[squads[i]] = i == pick;
         }
     }
     for (size_t s = 0; s < g.squads.size(); ++s) {
@@ -991,6 +1017,8 @@ float AiSimulation::floor_below(size_t squad, float x, float y, float z) const {
 // below the landing point, then 2 s walking 3 m further back.
 AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgent& a, float t) const {
     constexpr float kLip = -4.6f, kRamp = -5.4f, kG = 9.81f;  // the floor rises to the ramp's top between them
+    // Ground near or above the ramp's top (3.117, 推定): stepped onto in kStepTime instead of a jump.
+    constexpr float kStepUp = 2.0f, kStepDown = 0.3f, kStepTime = 0.4f;
     const float kEdge = params_.dropship_jump_x;
     const float walk = std::max(0.0f, (a.seat[0] - kEdge) / params_.dropship_bay_walk);
     const float bay = params_.dropship_lip_height;  // the jump starts from the lip
@@ -1007,9 +1035,12 @@ AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgen
     const float c = std::cos(d.yaw), s = std::sin(d.yaw);
     auto floor_at = [&](float x) {
         const float wx = d.position[0] + c * x - s * a.seat[1], wy = d.position[1] + s * x + c * a.seat[1];
-        return floor_below(d.squad, wx, wy, d.position[2] + bay) - d.position[2];
+        // Ground up to kStepUp above the ramp's top counts (a ship hovering low over a rise lands its
+        // members on it); below that, whatever is highest.
+        return floor_below(d.squad, wx, wy, d.position[2] + bay + kStepUp) - d.position[2];
     };
     auto fall_time = [&](float floor) {
+        if (floor > bay - kStepDown) return kStepTime;  // a step, not a fall
         const float up = params_.dropship_jump_up, h = bay - floor;
         return (up + std::sqrt(std::max(0.0f, up * up + 2 * kG * h))) / kG;
     };
@@ -1023,27 +1054,35 @@ AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgen
         const float endpoint = floor_at(kEdge - params_.dropship_jump_back * initial);
         landing = Landing{fall_time(endpoint), endpoint};
         // A platform can intercept the descent before its projected endpoint.
-        const float apex = std::max(0.0f, params_.dropship_jump_up / kG);
-        const float end = landing->time;
-        const int samples = std::max(1, int(std::ceil((end - apex) * 60)));
-        for (int i = 1; i <= samples; ++i) {
-            const float sample = apex + (end - apex) * float(i) / float(samples);
-            const float x = kEdge - params_.dropship_jump_back * sample;
-            const float wx = d.position[0] + c * x - s * a.seat[1], wy = d.position[1] + s * x + c * a.seat[1];
-            std::optional<float> surface;
-            each_grid(wx, wy, [&](const WalkGrid& grid) {
-                const auto z = grid.surface(wx, wy);
-                if (z && *z <= d.position[2] + bay + 0.2f && (!surface || *z > *surface)) surface = z;
-            });
-            if (!surface || height(sample) > *surface - d.position[2]) continue;
-            landing = Landing{sample, *surface - d.position[2]};
-            break;
+        if (endpoint <= bay - kStepDown) {
+            const float apex = std::max(0.0f, params_.dropship_jump_up / kG);
+            const float end = landing->time;
+            const int samples = std::max(1, int(std::ceil((end - apex) * 60)));
+            for (int i = 1; i <= samples; ++i) {
+                const float sample = apex + (end - apex) * float(i) / float(samples);
+                const float x = kEdge - params_.dropship_jump_back * sample;
+                const float wx = d.position[0] + c * x - s * a.seat[1], wy = d.position[1] + s * x + c * a.seat[1];
+                std::optional<float> surface;
+                each_grid(wx, wy, [&](const WalkGrid& grid) {
+                    const auto z = grid.surface(wx, wy);
+                    if (z && *z <= d.position[2] + bay + kStepUp + 0.2f && (!surface || *z > *surface)) surface = z;
+                });
+                if (!surface || height(sample) > *surface - d.position[2]) continue;
+                landing = Landing{sample, *surface - d.position[2]};
+                break;
+            }
         }
     }
     const auto [fall, floor] = *landing;
     const float land = kEdge - params_.dropship_jump_back * fall;
     const float tj = t - walk;
     p.duration = walk + fall + params_.dropship_exit_walk;
+    if (tj < fall && floor > bay - kStepDown) {
+        const float u = std::clamp(tj / fall, 0.0f, 1.0f);
+        p.at = {kEdge - params_.dropship_jump_back * tj, a.seat[1], bay + (floor - bay) * u * u * (3 - 2 * u)};
+        p.velocity = {-params_.dropship_jump_back, 0, 0};
+        return p;
+    }
     if (tj < fall) {
         p.at = {kEdge - params_.dropship_jump_back * tj, a.seat[1], height(tj)};
         p.velocity = {};  // the idle pose in the air (no jump clip found)
@@ -1129,8 +1168,17 @@ void AiSimulation::call_all_dropships() {
 void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) {
     for (size_t i = 0; i < dropships_.size(); ++i) {
         auto& d = dropships_[i];
-        if (d.start < 0 && dist2d(d.position, player) < params_.dropship_call_range)
-            d.start = time_ + std::uniform_real_distribution<float>(0, params_.dropship_call_delay)(rng_);
+        if (d.start < 0 && time_ >= d.ready_at && time_ >= next_dropship_call_ && dist2d(d.position, player) < params_.dropship_call_range) {
+            size_t flying = 0;
+            for (size_t j = 0; j < dropships_.size(); ++j) {
+                const auto phase = dropship_state(j).phase;
+                flying += dropships_[j].start >= 0 && phase != AiDropshipPhase::Gone;
+            }
+            if (flying < params_.dropship_max_active) {
+                d.start = time_ + std::uniform_real_distribution<float>(0, params_.dropship_call_delay)(rng_);
+                next_dropship_call_ = time_ + params_.dropship_call_gap;
+            }
+        }
         const auto state = dropship_state(i);
         if (state.phase == AiDropshipPhase::Waiting) continue;
         const float since_landing = (time_ - d.start) - params_.dropship_arrive;
@@ -1271,6 +1319,7 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
         if (d.start < 0 || dropship_state(i).phase != AiDropshipPhase::Gone || !far(d.position)) continue;
         if (std::ranges::any_of(d.members, [&](size_t m) { return agents_[m].active && !far(agents_[m].position); })) continue;
         d.start = -1;
+        d.ready_at = time_ + std::uniform_real_distribution<float>(params_.dropship_return_min, params_.dropship_return_max)(rng_);
         for (const auto m : d.members) {
             auto& a = agents_[m];
             path_stats_.despawned += a.active;

@@ -215,22 +215,53 @@ TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation,
     if (variant == 0xFFFF || variant >= technique_map.size()) return TagHash();
     const Range& r = technique_map[variant];
     if (r.count == 0) return TagHash();
-    if (!tags.empty() && technique_conditions.size() == techniques.size() &&
+    // Range +8 is the first condition row (§3.117): ranges that repeat a layout share rows (UESC
+    // 80B80192 variants 0/1 both start at row 0, 2/5 at 10, 3/4 at 100; the recruit's 1/3 at 15).
+    const size_t first = r.unk8;
+    if (!tags.empty() && uint64_t(first) + r.count <= technique_conditions.size() &&
         uint64_t(r.start) + r.count <= techniques.size()) {
+        // 871AC0EA is the "any" value: rows pair each named combination with an any-row, so a
+        // character no named row fits (the recruit's type 4CF9B596, which no row names) takes the
+        // first any-row instead of an arbitrary permutation. Named values outrank it.
+        constexpr uint32_t kAny = 0x871AC0EA;
+        auto value_of = [&](uint32_t key) -> std::optional<uint32_t> {
+            for (const auto& [k, v] : tags)
+                if (k == key) return v;
+            return std::nullopt;
+        };
+        // A group holds when, for each key it names, the character's value is one of the
+        // group's values for that key (several values of one key are alternatives).
+        auto holds = [&](const std::vector<std::pair<uint32_t, uint32_t>>& group) {
+            if (group.empty()) return false;
+            for (const auto& [key, unused] : group) {
+                const auto v = value_of(key);
+                bool ok = false;
+                for (const auto& [k, want] : group) {
+                    if (k != key) continue;
+                    if (want == kAny)
+                        ok = true;
+                    else
+                        ok |= v && *v == want;
+                }
+                if (!ok) return false;
+            }
+            return true;
+        };
         std::optional<size_t> selected;
-        size_t specificity = 0;
-        for (size_t i = r.start; i < size_t(r.start) + r.count; ++i) {
-            const auto& requirements = technique_conditions[i];
-            if (requirements.size() < specificity || techniques[i].is_none()) continue;
-            const bool match = std::ranges::all_of(requirements, [&](uint16_t group) {
-                return group < part_tags.size() && !part_tags[group].empty() &&
-                    std::ranges::all_of(part_tags[group], [&](const auto& constraint) {
-                        return std::ranges::find(tags, constraint) != tags.end();
-                    });
-            });
-            if (match && (!selected || requirements.size() > specificity)) {
+        size_t best = 0;
+        for (size_t k = 0; k < r.count; ++k) {
+            const size_t i = size_t(r.start) + k;
+            if (techniques[i].is_none()) continue;
+            size_t score = 0;
+            bool match = true;
+            for (const uint16_t g : technique_conditions[first + k]) {
+                if (g >= part_tags.size() || !holds(part_tags[g])) { match = false; break; }
+                const bool other = std::ranges::any_of(part_tags[g], [](const auto& kv) { return kv.second == kAny; });
+                score += other ? 1 : 16;  // a named value outranks "any"
+            }
+            if (match && (!selected || score > best)) {
                 selected = i;
-                specificity = requirements.size();
+                best = score;
             }
         }
         if (selected) return techniques[*selected];
@@ -501,7 +532,7 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                         // Each technique has a slice of u16 indices into the component's tag sets.
                         const auto indices = r.vec_at(base + 0x3F8);
                         const auto conditions = r.vec_at(base + 0x408);
-                        if (conditions.count == techs.count && conditions.element_class == 0x80808682 &&
+                        if (conditions.count <= techs.count && conditions.element_class == 0x80808682 &&
                             indices.element_class == 0x80800006 &&
                             conditions.data <= bytes.size() && conditions.count <= (bytes.size() - conditions.data) / 4 &&
                             indices.data <= bytes.size() && indices.count <= (bytes.size() - indices.data) / 2) {

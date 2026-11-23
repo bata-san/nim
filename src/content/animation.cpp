@@ -1525,6 +1525,35 @@ std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity) {
 
 std::vector<TagHash> motion_bank_clips(PackageManager& pm, TagHash bank) { return read_motion_bank(pm, bank); }
 
+TagHash weapon_hold_clip(PackageManager& pm, const EntityMotionData& data, uint32_t weapon_type) {
+    if (data.states.is_none() || !weapon_type) return {};
+    constexpr uint32_t kHoldSet = 0xA4121ABE;
+    constexpr uint32_t kWeaponCategory = 0x03;
+    const auto bytes = pm.read(data.states);
+    const TagReader r(bytes);
+    const auto sets = r.vec_at(0x08);
+    for (uint64_t s = 0; s < sets.count; ++s) {
+        const size_t e = sets.data + size_t(s) * 32;
+        if (r.u32_at(e + 0x10) != kHoldSet) continue;
+        const auto layers = r.vec_at(e);
+        if (!layers.count) return {};
+        const auto variants = r.vec_at(layers.data);
+        for (uint64_t v = 0; v < variants.count; ++v) {
+            const size_t at = variants.data + size_t(v) * 0x50;
+            const auto conds = r.vec_at(at);
+            bool match = false;
+            for (uint64_t k = 0; k < conds.count; ++k)
+                match = match || (r.u32_at(conds.data + size_t(k) * 8) == kWeaponCategory && r.u32_at(conds.data + size_t(k) * 8 + 4) == weapon_type);
+            if (!match) continue;
+            const auto clips = r.vec_at(at + 0x10);
+            if (!clips.count) continue;
+            const uint32_t index = r.u32_at(clips.data);
+            return index < data.bank_clips.size() ? data.bank_clips[index] : TagHash();
+        }
+    }
+    return {};
+}
+
 std::optional<EntityMotionData> entity_motion_data(PackageManager& pm, TagHash entity) {
     EntityMotionData out;
     const auto bytes = pm.read(entity);
@@ -1543,6 +1572,8 @@ std::optional<EntityMotionData> entity_motion_data(PackageManager& pm, TagHash e
                 out.character_tag = cr.u32_at(resource + 0xF0);
                 out.graph = cr.tag_at(resource + 0xF4);
             } else if (cls == 0x8080397B && out.parameters.is_none()) {
+                if (const TagHash st = cr.tag_at(resource + 0x184); st.is_pkg_ref())
+                    if (const Entry* se = pm.entry(st); se && se->reference == 0x808039DB) out.states = st;
                 const TagHash p = cr.tag_at(resource + 0x178);
                 const Entry* pe = p.is_pkg_ref() ? pm.entry(p) : nullptr;
                 if (pe && pe->reference == 0x80803B54) out.parameters = p;

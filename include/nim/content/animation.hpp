@@ -211,8 +211,13 @@ struct EntityMotionData {
     std::unordered_map<uint32_t, std::vector<TagHash>> named;  // parameter table: name -> clips
     std::unordered_set<uint32_t> parameter_clips;              // every clip the parameter table holds
     std::unordered_set<uint32_t> action_clips;                 // every clip a node of the action graph plays
+    TagHash states;                                            // locomotion state machine (808039DB, resource 8080397B +0x184)
 };
 std::optional<EntityMotionData> entity_motion_data(PackageManager& pm, TagHash entity);
+// The weapon hold pose (3.117): the locomotion state machine's set A4121ABE (flags 2, a layered
+// set) has, in its first layer, one short clip (2-7 frames) per weapon_type, the variant's
+// condition {category 03 (weapon), weapon_type value}. None when the entity has no such variant.
+TagHash weapon_hold_clip(PackageManager& pm, const EntityMotionData& data, uint32_t weapon_type);
 // Rebinds a clip authored for another rig of the same family by bone group: each clip group
 // (AnimationClip::bone_groups, hash and node count, in track order) whose hash and count a group of
 // `rig` has moves onto that group's nodes; tracks of groups the rig lacks are dropped and those rig

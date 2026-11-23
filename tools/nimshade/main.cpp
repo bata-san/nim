@@ -31,6 +31,7 @@
 #include "nim/content/wwise.hpp"
 
 #include <wincodec.h>
+#include <dbghelp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -671,6 +672,7 @@ int run(int argc, char** argv) {
                     std::println("  weapon: weapon_type {:08X} entity {} model entity {} model {} at hand bone {}", c.weapon->weapon_type,
                                  c.weapon->weapon.str(), c.weapon->visual.str(), c.weapon_model.is_none() ? "-" : c.weapon_model.str(),
                                  c.grip_bone);
+                std::println("  hold pose: {} ({} hand bones)", c.hold_clip.is_none() ? "-" : c.hold_clip.str(), c.hold_bones.size());
             }
             AiParams params;
             params.player_invisible = !ai_visible;
@@ -801,7 +803,7 @@ int run(int argc, char** argv) {
             if (ai_ship_strip) {
                 std::vector<std::pair<float, size_t>> order;
                 for (size_t i = 0; i < ai_sim->dropships().size(); ++i)
-                    if (ai_sim->dropship_state(i).phase == AiDropshipPhase::Waiting && ai_sim->dropships()[i].members.size() >= 3) {
+                    if (ai_sim->dropship_state(i).phase == AiDropshipPhase::Waiting && ai_sim->dropships()[i].members.size() >= 1) {
                         const auto& d = ai_sim->dropships()[i];
                         order.push_back({std::hypot(d.position[0] - eye.x, d.position[1] - eye.y), i});
                     }
@@ -2086,9 +2088,47 @@ int run(int argc, char** argv) {
     return 0;
 }
 
+// A crash's code and call stack on stderr (symbols when a PDB sits next to the executable).
+LONG WINAPI print_crash(EXCEPTION_POINTERS* info) {
+    std::fprintf(stderr, "crash: exception %08lX at %p\n", info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+    HANDLE process = GetCurrentProcess(), thread = GetCurrentThread();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    SymInitialize(process, nullptr, TRUE);
+    CONTEXT context = *info->ContextRecord;
+    STACKFRAME64 frame{};
+    frame.AddrPC = {context.Rip, 0, AddrModeFlat};
+    frame.AddrFrame = {context.Rbp, 0, AddrModeFlat};
+    frame.AddrStack = {context.Rsp, 0, AddrModeFlat};
+    for (int depth = 0; depth < 32 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, thread, &frame, &context, nullptr, SymFunctionTableAccess64,
+                                                   SymGetModuleBase64, nullptr) && frame.AddrPC.Offset; ++depth) {
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256]{};
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 offset = 0;
+        IMAGEHLP_LINE64 line{sizeof(IMAGEHLP_LINE64)};
+        DWORD line_offset = 0;
+        const bool named = SymFromAddr(process, frame.AddrPC.Offset, &offset, symbol);
+        const bool lined = SymGetLineFromAddr64(process, frame.AddrPC.Offset, &line_offset, &line);
+        std::fprintf(stderr, "  %2d %p %s+%llu %s:%lu\n", depth, reinterpret_cast<void*>(frame.AddrPC.Offset), named ? symbol->Name : "?",
+                     static_cast<unsigned long long>(offset), lined ? line.FileName : "", lined ? line.LineNumber : 0);
+    }
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    SetUnhandledExceptionFilter(print_crash);
+    AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* info) -> LONG {
+        const auto code = info->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW) {
+            std::fprintf(stderr, "vectored: %08lX at %p\n", code, info->ExceptionRecord->ExceptionAddress);
+            if (code == EXCEPTION_ACCESS_VIOLATION) print_crash(info);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     try {
         return run(argc, argv);

@@ -114,6 +114,12 @@ struct AiParams {  // every value here is an estimate (推定)
     // dropping from its open rear bay to the floor one after another.
     float dropship_call_range = 60.0f;   // m from the player
     float dropship_call_delay = 2.0f;    // s, uniform 0..this after the call
+    // How many come (3.117, 推定: the encounter scripts that call ships are code): at most
+    // dropship_max_active ships in the air at once, dropship_call_gap s apart, and a ship that
+    // has left comes again only after dropship_return_min..max s.
+    uint32_t dropship_max_active = 2;
+    float dropship_call_gap = 25.0f;     // s between two calls
+    float dropship_return_min = 120.0f, dropship_return_max = 240.0f;  // s
     float dropship_arrive = 129.0f / 30; // s: the arrival clips' length (129 frames at 30 fps)
     float dropship_depart = 153.0f / 30; // s: the departure clips' length
     float dropship_first_exit = 0.6f;    // s after landing
@@ -179,6 +185,7 @@ struct AiDropship {
     std::array<float, 3> position{};   // the spawner node: where the ship lands
     float yaw = 0;
     float start = -1;                  // simulation time the arrival begins; < 0 until called
+    float ready_at = 0;                // simulation time it may be called (again)
     uint32_t variant = 0;              // picks one of the arrival / departure clips
     std::vector<size_t> members;       // agents, in exit order
     std::vector<size_t> squads;        // every squad it carries: spawners at the same coordinates share one ship
@@ -288,6 +295,7 @@ private:
     std::vector<std::vector<size_t>> ground_squad_members_;
     std::vector<float> spawn_retry_at_;
     std::vector<uint8_t> squad_spawned_;          // per squad without a dropship
+    float next_dropship_call_ = 0;                 // simulation time the next ship may be called (3.117)
     size_t alternatives_dropped_ = 0;              // squads left out as another's alternative (3.112)
     mutable std::vector<float> unload_cache_;     // per dropship: unload_seconds, < 0 = not yet
     struct Landing { float time, floor; };
