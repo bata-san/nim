@@ -1,12 +1,14 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/entity_audio.hpp"
+#include "nim/content/object_channels.hpp"
 #include "nim/content/wwise.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -26,6 +28,39 @@ std::array<float, 3> closest_on_segment(std::array<float, 3> p, std::array<float
     if (len2 <= 1e-8f) return a;
     const float t = std::clamp(((p[0] - a[0]) * abx + (p[1] - a[1]) * aby + (p[2] - a[2]) * abz) / len2, 0.0f, 1.0f);
     return {a[0] + t * abx, a[1] + t * aby, a[2] + t * abz};
+}
+
+// The first object state an entity's components read (a known object channel other than the
+// clocks time / game_time: device_power, interaction_filtered, linear_velocity, rain_amount,
+// flicker ...), 0 if none. Their sequences start the entity's loops from these states.
+uint32_t entity_state_channel(PackageManager& pm, TagHash entity) {
+    static const uint32_t kTime = fnv1("time"), kGameTime = fnv1("game_time");
+    std::vector<uint8_t> ed;
+    try {
+        ed = pm.read(entity);
+    } catch (...) {
+        return 0;
+    }
+    std::set<uint32_t> listed;
+    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+        uint32_t c;
+        std::memcpy(&c, ed.data() + o, 4);
+        if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+        const Entry* ce = pm.entry(TagHash(c));
+        if (!ce || ce->type != 8 || ce->reference != 0x8080BADBu) continue;
+        std::vector<uint8_t> cd;
+        try {
+            cd = pm.read(TagHash(c));
+        } catch (...) {
+            continue;
+        }
+        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+            uint32_t v;
+            std::memcpy(&v, cd.data() + q, 4);
+            if (v != kTime && v != kGameTime && object_channel_name(v)) return v;
+        }
+    }
+    return 0;
 }
 }  // namespace
 
@@ -109,7 +144,15 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
                 const auto* entry = entity ? pm.entry(*entity) : nullptr;
                 if (entry && entry->type == 8 && entry->reference == 0x8080BAAD) {
                     const auto [events, first] = object_events.try_emplace(entity->value);
-                    if (first) events->second = load_entity_sounds(pm, std::span(&*entity, 1), true).loops;
+                    if (first) {
+                        events->second = load_entity_sounds(pm, std::span(&*entity, 1), true).loops;
+                        // Loops of entities with object state are started by that state (not simulated): left out.
+                        if (!events->second.empty())
+                            if (const uint32_t state = entity_state_channel(pm, *entity)) {
+                                out.gated_loops[state] += events->second.size();
+                                events->second.clear();
+                            }
+                    }
                     const std::array pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
                     if (std::ranges::all_of(pos, [](float v) { return std::isfinite(v); })) {
                         for (const auto event : events->second) {
