@@ -756,17 +756,17 @@ ID3D12Resource* GameLighting::render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl
     auto& e = ext_;
     const uint8_t pp = ext::Postprocess;
     const float f = p.dof_focus;
-    e.set(kDof, 0x30, 0.35f * f);
-    e.set(kDof, 0x34, 0.7f * f);
-    e.set(kDof, 0x38, 1.5f * f);
-    e.set(kDof, 0x3C, 4.0f * f);
-    e.set(kDof, 0x40, 1.0f);
-    e.set(kDof, 0x44, 1.0f);
+    e.set(kDof, 0x30, 0.25f * f);
+    e.set(kDof, 0x34, 0.6f * f);
+    e.set(kDof, 0x38, 2.0f * f);
+    e.set(kDof, 0x3C, 8.0f * f);
+    e.set(kDof, 0x40, 0.5f);
+    e.set(kDof, 0x44, 0.5f);
     e.set(kDof, 0x60, float4{0.5f, 0.5f, 1, 1});
     e.set(kDof, 0x70, float4{0, 0, 0, 1});  // no radial blur
     e.set(kDof, 0x80, float4{1, 1, 0, 0});
-    e.note_estimate(std::format("depth of field: focus {:.1f} m; near full blur 0.35x / sharp 0.7x, far sharp 1.5x / full blur 4x "
-                                "the focus, max |coc| 1, blur size 1 (13 px), no radial blur, 12-texel tiles", f),
+    e.note_estimate(std::format("depth of field: focus {:.1f} m; near full blur 0.25x / sharp 0.6x, far sharp 2x / full blur 8x "
+                                "the focus, max |coc| 0.5 (6.5 px), no radial blur, 12-texel tiles", f),
                     "engine depth of field settings (extern 0x37) are code; the cinematic passes are the game's");
     // No screen distortion offsets: the image is already distorted.
     e.set_texture(kBloomDistortion, 0x00, black_.Get());
