@@ -2,6 +2,7 @@
 #include "nim/content/animation.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
+#include "nim/render/dlss.hpp"
 #include "nim/render/gpu.hpp"
 
 #include <array>
@@ -110,10 +111,12 @@ class GBuffer {
 public:
     static constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     static constexpr DXGI_FORMAT kDepthSrvFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    void resize(Gpu& gpu, uint32_t w, uint32_t h);
+    void resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w = 0, uint32_t out_h = 0);
     void release(Gpu& gpu);
     uint32_t width() const { return w_; }
     uint32_t height() const { return h_; }
+    uint32_t output_width() const { return out_w_; }
+    uint32_t output_height() const { return out_h_; }
 
     ComPtr<ID3D12Resource> rt[4], depth, lit, decal_normals;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[4]{}, lit_rtv{}, null_rtv{}, dsv{}, dsv_ro{};  // dsv_ro: read-only depth (transparents)
@@ -123,7 +126,7 @@ public:
 
 private:
     ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_;
-    uint32_t w_ = 0, h_ = 0;
+    uint32_t w_ = 0, h_ = 0, out_w_ = 0, out_h_ = 0;
 };
 
 // ---- Static mesh rendered with the game's own G-buffer shaders -------------------------------
@@ -702,6 +705,7 @@ struct LightingParams {
     // resolved against the previous frames with the engine's resolve_taa. Replaces fxaa when it runs.
     bool temporal_aa = true;
     bool dlaa = false;
+    DlssMode dlss_mode = DlssMode::Off;
     // Cinematic depth of field (with post only): the engine's v2_dof_cinematic_* passes, focused at
     // dof_focus metres of view depth (> 0). The focus ranges and blur size are estimates.
     // Vignette (with post only): the engine's draw_vignette; its strength and radii are estimates.

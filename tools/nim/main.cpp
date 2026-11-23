@@ -1933,9 +1933,15 @@ public:
 
     // Runs at the top of a frame, before any UI references GPU resources.
     void apply_pending(Gpu& g) {
-        if (view_w && view_h && (view_w != gb.width() || view_h != gb.height())) {
-            g.wait_idle();
-            gb.resize(g, view_w, view_h);
+        if (view_w && view_h) {
+            const DlssMode active_dlss = (game_ready && light.mode == ViewMode::Lit && light.post && light.temporal_aa && Dlss::built())
+                ? (light.dlss_mode != DlssMode::Off ? light.dlss_mode : (light.dlaa ? DlssMode::DLAA : DlssMode::Off))
+                : DlssMode::Off;
+            const auto [rw, rh] = Dlss::render_size(view_w, view_h, active_dlss);
+            if (rw != gb.width() || rh != gb.height() || view_w != gb.output_width() || view_h != gb.output_height()) {
+                g.wait_idle();
+                gb.resize(g, rw, rh, view_w, view_h);
+            }
         }
         if (auto r = worker.take(false)) {
             const bool expected = loading && *loading == r->tag;
@@ -3749,9 +3755,16 @@ public:
             ImGui::Checkbox("被写界深度 (DoF, estimated)", &light.depth_of_field);
             if (Dlss::built()) {
                 ImGui::BeginDisabled(!light.temporal_aa);
-                ImGui::Checkbox("NVIDIA DLAA", &light.dlaa);
+                static constexpr const char* kDlssLabels[] = {
+                    "Off", "DLAA (Native)", "Quality (67%)", "Balanced (58%)", "Performance (50%)", "Ultra Performance (33%)"
+                };
+                int mode_idx = int(light.dlss_mode != DlssMode::Off ? light.dlss_mode : (light.dlaa ? DlssMode::DLAA : DlssMode::Off));
+                if (ImGui::Combo("NVIDIA DLSS", &mode_idx, kDlssLabels, int(std::size(kDlssLabels)))) {
+                    light.dlss_mode = DlssMode(mode_idx);
+                    light.dlaa = (light.dlss_mode == DlssMode::DLAA);
+                }
                 ImGui::EndDisabled();
-                if (light.temporal_aa && light.dlaa && !game_lighting.dlaa_status().empty())
+                if (light.temporal_aa && (light.dlss_mode != DlssMode::Off || light.dlaa) && !game_lighting.dlaa_status().empty())
                     ImGui::TextDisabled("%s", game_lighting.dlaa_status().c_str());
             }
             ImGui::SliderFloat(ui::tr(ui::S::ChromaticAberration), &light.chromatic_aberration, 0.0f, 1.0f, "%.2f");

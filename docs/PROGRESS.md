@@ -1981,6 +1981,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - NVIDIA DLSS SDK を使ったネイティブ解像度の DLAA をオプションで接続。GUI はポストプロセスで TAA を有効にし「NVIDIA DLAA」を選択。nimshade は `--dlaa`。SDK なしのビルドを維持し、GPU またはドライバーが対応しないときは TAA を使用する。
 - NGX に線形 HDR、逆 Z 深度、現在から過去への画面 UV の動き (画素換算)、Halton ジッター、プリ露出を渡す。深度と動きは元のコピー技法で R32F / RG16F に変換する。通常の DoF・トーンマップ・画面上の UI は再構成の後。DLSS の低解像度アップスケールは別サイズの HDR と表示バッファが必要なため未接続。
 - SDK の Windows x64 リポジトリを取得し、CMake の `-DNIM_DLSS_SDK=<SDKのルート>` を指定する。ビルドが公式配布の DLL を実行ファイルと同じディレクトリにコピーする。実装・検証に使用した NVIDIA DLSS のリビジョンは `9981c63`。
+- **DLSS Super Resolution (Quality 67% / Balanced 58% / Performance 50% / Ultra Performance 33%)** を追加 (RTX 20/30/40/50 全世代対応): `GBuffer::resize(w, h, out_w, out_h)` で G-buffer・ライティング・ポストプロセスを内部解像度 (`render_size`) で描画し、DLSS で表示解像度 (`out_w × out_h`) へアップスケールした後にトーンマップ・出力パスをフル解像度で実行する。ジッタ位相数も倍率に応じて 8〜32 に自動拡張。GUI に `NVIDIA DLSS` コンボボックス、`nimshade` に `--dlss off|dlaa|quality|balanced|performance|ultra` を追加。
 - 半透明の反射プローブキャッシュはカリング後の詰め替えインデックスではなく元の配置 ID を使う。移動する俳優や装備は現在のワールド変換から、描画順とプローブを計算する。メッシュ内の相互に交差する面や、二層 FX 式の実行は未対応。
 - 発光はネイティブの遅延シェーディングが読む `Frame +0x28` で強度を調整する。GUI の「自己発光の強さ」の既定は 1.35、nimshade の `--emissive-gain` は 0〜3 (既定 1)。材質の発光マスクや FX 自体の式には手を加えていない。
 - 検証: SDK あり・なしの Release で CTest 2/2。RTX 4080 の Outpost と低温アーカイブで DLAA が稼働し、D3D12 デバッグログ 0 B。WARP では TAA で画像を書き出した。低温の封鎖扉で 17 個の反射プローブ、Outpost で assault を含む AI 描画を確認。Outpost の照明器具の固定露出比較では、発光 1.0 → 1.35 で 1,195 画素が明るくなり、最大差は RGB で 9 階調。

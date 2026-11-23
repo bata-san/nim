@@ -193,6 +193,7 @@ int run(int argc, char** argv) {
     float dof_focus = 0;
     bool shaft_fog_density = false;
     bool dlaa = false;
+    DlssMode dlss_mode = DlssMode::Off;
     float exposure_arg = 1;
     float emissive_gain = 1;
     float output_gamma = 1, output_sharpen = 0, output_grain = 0, chromatic_aberration = 0;
@@ -293,7 +294,17 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-distortion") no_distortion = true;
         else if (args[i] == "--no-post") no_post = true;
         else if (args[i] == "--no-auto-exposure") no_auto_exposure = true;
-        else if (args[i] == "--dlaa") dlaa = true;
+        else if (args[i] == "--dlaa") { dlaa = true; dlss_mode = DlssMode::DLAA; }
+        else if (args[i] == "--dlss" && i + 1 < args.size()) {
+            const std::string m = args[++i];
+            if (m == "off") dlss_mode = DlssMode::Off;
+            else if (m == "dlaa") dlss_mode = DlssMode::DLAA;
+            else if (m == "quality") dlss_mode = DlssMode::Quality;
+            else if (m == "balanced") dlss_mode = DlssMode::Balanced;
+            else if (m == "performance") dlss_mode = DlssMode::Performance;
+            else if (m == "ultra") dlss_mode = DlssMode::UltraPerformance;
+            else throw std::runtime_error("unknown --dlss mode (off|dlaa|quality|balanced|performance|ultra)");
+        }
         else if (args[i] == "--emissive-gain" && i + 1 < args.size()) {
             emissive_gain = std::stof(args[++i]);
             if (!std::isfinite(emissive_gain) || emissive_gain < 0 || emissive_gain > 3)
@@ -1090,11 +1101,13 @@ int run(int argc, char** argv) {
     }
 
     GBuffer gb;
-    gb.resize(gpu, width, height);
+    const auto [render_w, render_h] = (dlss_mode != DlssMode::Off && !no_post && !no_taa)
+        ? Dlss::render_size(width, height, dlss_mode) : std::pair{width, height};
+    gb.resize(gpu, render_w, render_h, width, height);
     LightingPass lighting;
     lighting.init(gpu);
     std::println("bounds center ({:.3f},{:.3f},{:.3f}) radius {:.3f}", scene.center().x, scene.center().y, scene.center().z, scene.radius());
-    View view = frame_sphere(scene.center(), scene.radius() * camera_scale, width, height);
+    View view = frame_sphere(scene.center(), scene.radius() * camera_scale, render_w, render_h);
     // Match the interactive map camera: unlimited range must not move the near
     // plane tens of metres away or clip the geometry around an explicit eye.
     if (is_map) view.near_z = 0.05f;
@@ -1131,9 +1144,10 @@ int run(int argc, char** argv) {
     lp.interior_fog = !no_interior_fog;
     lp.authored_interior_fog = authored_interior_fog;
     lp.fog_density_scale = fog_density_scale;
-    if (dlaa && !Dlss::built()) throw std::runtime_error("--dlaa requires a build with NIM_DLSS_SDK");
-    if (dlaa && (no_post || no_taa)) throw std::runtime_error("--dlaa requires post processing and temporal jitter");
-    lp.dlaa = dlaa;
+    if (dlss_mode != DlssMode::Off && !Dlss::built()) throw std::runtime_error("--dlss/--dlaa requires a build with NIM_DLSS_SDK");
+    if (dlss_mode != DlssMode::Off && (no_post || no_taa)) throw std::runtime_error("--dlss/--dlaa requires post processing and temporal jitter");
+    lp.dlaa = (dlss_mode == DlssMode::DLAA);
+    lp.dlss_mode = dlss_mode;
     lp.emissive_gain = emissive_gain;
     lp.output_gamma = output_gamma;
     lp.output_sharpen = output_sharpen;
@@ -1370,7 +1384,7 @@ int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         std::println("view tables: {} unique, {} reused", gpu.transient_table_count(), gpu.transient_table_hits());
-        if (dlaa) std::println("DLAA: {}", gl.dlaa_status());
+        if (dlss_mode != DlssMode::Off) std::println("DLSS: {}", gl.dlaa_status());
         if (lp.post && gl.post_ready())
             std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
         if (lp.ssao && gl.ambient_occlusion()) {
@@ -1482,7 +1496,7 @@ int run(int argc, char** argv) {
             auto mask = gpu.read_texture(gl.shadow_mask(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 1);
             std::vector<uint8_t> rgba(mask.size() * 4);
             for (size_t i = 0; i < mask.size(); ++i) rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = mask[i], rgba[i * 4 + 3] = 255;
-            write_png(out_dir / "sun_shadow_mask.png", width, height, rgba);
+            write_png(out_dir / "sun_shadow_mask.png", gb.width(), gb.height(), rgba);
         }
         for (const auto& n : gl.notes()) std::println("  {}", n);
     }
