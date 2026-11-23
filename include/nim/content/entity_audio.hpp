@@ -31,6 +31,6 @@ struct EntitySounds {
     const std::vector<TagHash>* find(uint16_t kind, uint32_t name, uint32_t value) const;
 };
 // Needs the hash64 index (PackageManager::build_hash64_index).
-EntitySounds load_entity_sounds(PackageManager& pm, std::span<const TagHash> entities, bool include_close_loops = false);
+EntitySounds load_entity_sounds(PackageManager& pm, std::span<const TagHash> entities);
 
 }  // namespace nim

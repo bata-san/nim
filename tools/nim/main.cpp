@@ -1659,9 +1659,6 @@ public:
     std::unique_ptr<media::AmbientAudioPlayer> ambient_audio;
     bool ambient_audio_enabled = true;
     float ambient_audio_volume = 0.75f;
-    std::unique_ptr<media::MapObjectAudioPlayer> object_audio;
-    bool object_audio_enabled = true;
-    float object_audio_volume = 0.75f;
     // Sounds of the AI actors and dropships (3.90): cues gathered by update_ai, played each frame.
     std::unique_ptr<media::EntityAudioPlayer> entity_audio;
     bool entity_audio_enabled = true;
@@ -1756,7 +1753,6 @@ public:
             map = MapView{};
             map_scene = false;
             if (ambient_audio) ambient_audio->clear();
-            if (object_audio) object_audio->clear();
             game_lighting.clear_lights(gpu);
             game_lighting.clear_cubemaps(gpu);
             game_lighting.clear_atmosphere(), map_atmosphere.reset();
@@ -2009,7 +2005,6 @@ public:
         map.particles_set = false;
         map.audio_set = false;
         if (ambient_audio) ambient_audio->clear();
-        if (object_audio) object_audio->clear();
         particles.release(gpu);
         const bool whole = map.radius >= MapView::kUnlimited;
         map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
@@ -2084,8 +2079,6 @@ public:
             if (auto* eng = audio_engine()) {
                 if (!ambient_audio) ambient_audio = std::make_unique<media::AmbientAudioPlayer>(*eng);
                 ambient_audio->set_map(*pm, pr.audio);
-                if (!object_audio) object_audio = std::make_unique<media::MapObjectAudioPlayer>(*eng);
-                object_audio->set_map(*pm, pr.audio);
             }
         }
         if (added) {
@@ -2289,7 +2282,6 @@ public:
     std::vector<int> weather_states;
     bool heat_cascade_enabled = false; // keep the user's selection when changing maps/views
     RainOcclusion rain;
-    float weather_rain = 0;  // the chosen weather's rain_amount (0: none); object rain sounds play above 0
 
     void apply_weather() {
         std::map<uint32_t, float> channels;
@@ -2304,10 +2296,6 @@ public:
                 for (const auto& [slot, v] : weather_values(*on)) channels[slot] = v;
         scene.set_global_channels(channels);
         game_lighting.set_global_channels(channels);
-        weather_rain = 0;
-        if (map_weather)
-            if (const auto s = map_weather->registry.slots.find(0x9C4DE32Eu); s != map_weather->registry.slots.end())  // fnv1("rain_amount")
-                if (const auto v = channels.find(s->second); v != channels.end()) weather_rain = v->second;
     }
     std::string weather_state_label(const WeatherState& st) const {
         std::string s = map_weather->name(st.name);
@@ -2777,9 +2765,6 @@ public:
                 else
                     ambient_audio->update({}, {}, light.frame_delta_time, 0.0f, false);
             }
-            if (object_audio)
-                object_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
-                                     light.frame_delta_time, object_audio_volume, object_audio_enabled && map_scene, weather_rain);
             if (entity_audio) {
                 entity_audio->update(entity_cues, entity_stopped, entity_emitters, {vm.eye.x, vm.eye.y, vm.eye.z},
                                      {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time, entity_audio_volume,
@@ -3695,12 +3680,6 @@ public:
                 ImGui::SliderFloat("環境音量", &ambient_audio_volume, 0.0f, 1.5f, "%.2f");
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("再生中: %zu ボイス / %zu 音源", ambient_audio->active_voices(), ambient_audio->emitter_count());
-            }
-            if (map_scene && object_audio && object_audio->source_count()) {
-                ImGui::Checkbox("オブジェクト音を再生", &object_audio_enabled);
-                ImGui::BeginDisabled(!object_audio_enabled);
-                ImGui::SliderFloat("オブジェクト音量", &object_audio_volume, 0.0f, 1.5f, "%.2f");
-                ImGui::EndDisabled();
             }
             if (map_scene && entity_audio && ai.sim) {
                 ImGui::SeparatorText("敵・船の音");

@@ -3496,79 +3496,6 @@ int cmd_tag_audio(PackageManager& pm, TagHash root, int depth) {
 
 // Every hash64 reference (u64 at a 4-byte step that resolves to a tag) in an entity and its
 // components: where an entity's child entities, models and items are named.
-// Where each placed object loop (MapAudio::objects) is named: per (tag class, class of the array
-// the reference sits in), the number of placements. The array class is that of the nearest
-// 8080BFCD array header before the reference.
-int cmd_object_audio_survey(PackageManager& pm, const MapAudio& audio) {
-    pm.build_hash64_index();
-    std::map<uint32_t, std::map<uint32_t, size_t>> loops;  // entity -> event -> placements
-    for (const auto& o : audio.objects) ++loops[o.entity.value][o.event.value];
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<size_t, std::set<uint32_t>>> where;  // (tag class, array class, key) -> placements, events
-    for (const auto& [entity, events] : loops) {
-        std::set<uint32_t> seen;
-        std::function<void(TagHash, int)> walk = [&](TagHash t, int level) {
-            if (!seen.insert(t.value).second) return;
-            const Entry* e = pm.entry(t);
-            if (!e || e->type != 8) return;
-            std::vector<uint8_t> d;
-            try { d = pm.read(t); } catch (...) { return; }
-            auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, d.data() + o, 4); return v; };
-            for (size_t o = 0; o + 8 <= d.size(); o += 4) {
-                uint64_t v;
-                std::memcpy(&v, d.data() + o, 8);
-                uint32_t ev = 0;
-                if (events.contains(u32(o))) ev = u32(o);
-                else if (o % 8 == 0 && (v >> 32) && v != ~0ull)
-                    if (const auto r = pm.resolve64(v); r && events.contains(r->value)) ev = r->value;
-                if (!ev) continue;
-                uint32_t array = 0, key = 0;
-                for (size_t b = o; b >= 4 && o - b < 0x400; b -= 4)
-                    if (u32(b) == 0x8080BFCD && b + 0x10 <= d.size()) { array = u32(b + 0x0C); break; }
-                // The enclosing keyed map (8080AF61 / 8080AF67 style {u64 key, u64 count, u64 rel}): the entry whose range covers o.
-                for (size_t b = 0; b + 0x10 <= d.size(); b += 4) {
-                    if (u32(b) != 0x8080BFCD) continue;
-                    const uint32_t n = u32(b + 4), cls = u32(b + 0x0C);
-                    if (cls != 0x8080AF61 && cls != 0x8080AF67) continue;
-                    for (uint32_t i = 0; i < n; ++i) {
-                        const size_t en = b + 0x14 + size_t(i) * 0x18;
-                        if (en + 0x18 > d.size()) break;
-                        const size_t target = en + 0x10 + u32(en + 0x10);
-                        const size_t next = i + 1 < n ? en + 0x18 + 0x10 + u32(en + 0x18 + 0x10) : d.size();
-                        if (o >= target && o < next) key = 0x10000u | u32(en);
-                    }
-                }
-                auto& w = where[{e->reference, array, key}];
-                w.first += events.at(ev);
-                w.second.insert(ev);
-            }
-            if (level >= 2) return;
-            for (size_t o = 0; o + 4 <= d.size(); o += 4) {
-                const uint32_t v = u32(o);
-                if (v < 0x80800000u || v == ~0u || seen.contains(v)) continue;
-                const Entry* c = pm.entry(TagHash(v));
-                if (c && c->type == 8 && c->reference != 0x8080B128 && c->reference != 0x8080BADB) walk(TagHash(v), level + 1);
-            }
-        };
-        const auto d = pm.read(TagHash(entity));
-        for (size_t o = 0; o + 4 <= d.size(); o += 4) {
-            uint32_t v;
-            std::memcpy(&v, d.data() + o, 4);
-            if (const Entry* c = v >= 0x80800000u ? pm.entry(TagHash(v)) : nullptr; c && c->type == 8 && c->reference == 0x8080BADB) walk(TagHash(v), 0);
-        }
-    }
-    std::vector<std::pair<size_t, std::tuple<uint32_t, uint32_t, uint32_t>>> order;
-    for (const auto& [k, v] : where) order.push_back({v.first, k});
-    std::ranges::sort(order, std::greater{});
-    for (const auto& [n, k] : order) {
-        const auto& [cls, array, key] = k;
-        std::string evs;
-        for (const auto e : where[k].second | std::views::take(6)) evs += " " + TagHash(e).str();
-        std::println("  tag class {:08X} array {:08X} key {}: {} placements, {} events:{}", cls, array,
-                     key ? std::format("{:X}", key & 0xFFFF) : std::string("-"), n, where[k].second.size(), evs);
-    }
-    return 0;
-}
-
 int cmd_entity_h64(PackageManager& pm, TagHash entity) {
     pm.build_hash64_index();
     std::vector<TagHash> tags{entity};
@@ -4201,27 +4128,18 @@ int main(int argc, char** argv) {
             std::println("map {}: {} emitters ({} point, {} polyline, {} global), {} unique events ({} with WEM, {} without), {} unique WEMs",
                          bubble.str(), audio.emitters.size(), audio.point_emitters, audio.polyline_emitters, audio.global_emitters,
                          audio.unique_events, audio.events_with_wems, audio.events_without_wems, audio.unique_wems);
-            if (std::ranges::find(args, std::string("--survey")) != args.end()) return cmd_object_audio_survey(pm, audio);
-            std::println("object audio: {} placed looping emitters ({} rain sounds, played only while the weather sets rain_amount)", audio.objects.size(),
-                         std::ranges::count_if(audio.objects, [](const MapObjectSound& o) { return o.rain; }));
-            std::println("  left out: {} loops an event starts (named only in reaction tables 8080AF57 / 8080AF59); one of a component's alternatives at {} placements", audio.event_loops.size(), audio.alternative_picks);
-            {
-                // Per entity and event: placements, the event's reach.
-                std::map<std::pair<uint32_t, uint32_t>, std::pair<size_t, float>> by;
-                for (const auto& em : audio.objects) {
-                    auto& [n, d] = by[{em.entity.value, em.event.value}];
-                    ++n, d = em.max_distance;
-                }
-                std::vector<std::pair<size_t, std::pair<uint32_t, uint32_t>>> order;
-                for (const auto& [k, v] : by) order.push_back({v.first, k});
-                std::ranges::sort(order, std::greater{});
-                for (const auto& [n, k] : order)
-                    std::println("  entity {} event {}: {} placements, max distance {:.1f} m", TagHash(k.first).str(), TagHash(k.second).str(), n,
-                                 by[k].second);
-            }
             size_t shown = 0;
+            // --near X,Y,Z,R: every emitter within R m of the point (else the first 12).
+            std::optional<std::array<float, 4>> near_pt;
+            for (size_t i = 2; i + 1 < args.size(); ++i)
+                if (args[i] == "--near") {
+                    std::array<float, 4> v{};
+                    if (std::sscanf(args[i + 1].c_str(), "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4) near_pt = v;
+                }
             for (const auto& em : audio.emitters) {
-                if (em.wems.empty() || shown >= 12) continue;
+                if (near_pt) {
+                    if (em.distance_to({(*near_pt)[0], (*near_pt)[1], (*near_pt)[2]}) > (*near_pt)[3]) continue;
+                } else if (em.wems.empty() || shown >= 12) continue;
                 std::println("  {} event {} ({:08X}) pos ({:.1f} {:.1f} {:.1f}) r={:.1f} gain={:.2f} wems={} first={}",
                              em.polyline ? "poly" : em.global ? "glob" : "pt  ", em.event.str(), em.event_id,
                              em.position[0], em.position[1], em.position[2], em.radius, em.gain, em.wems.size(), em.wems[0].str());

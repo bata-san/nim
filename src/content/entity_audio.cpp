@@ -104,7 +104,7 @@ const std::vector<TagHash>* EntitySounds::find(uint16_t kind, uint32_t name, uin
     return nullptr;
 }
 
-EntitySounds load_entity_sounds(PackageManager& pm, std::span<const TagHash> entities, bool include_close_loops) {
+EntitySounds load_entity_sounds(PackageManager& pm, std::span<const TagHash> entities) {
     EntitySounds out;
     std::unordered_set<uint32_t> seen, named;
     std::function<void(TagHash, int)> walk = [&](TagHash t, int level) {
@@ -161,7 +161,7 @@ EntitySounds load_entity_sounds(PackageManager& pm, std::span<const TagHash> ent
             const auto ev = load_wwise_event(pm, TagHash(v));
             if (!ev.stop_id || ev.stop_id == kNoCondition || !ev.bank->events.contains(ev.stop_id)) continue;
             // Beds only: a long stream heard from afar (the short, close loops are state FX).
-            if (include_close_loops ? ev.longest < 2 || ev.max_distance <= 1 : ev.longest < 8 || ev.max_distance < 40) continue;
+            if (ev.longest < 8 || ev.max_distance < 40) continue;
             WwisePlayState state;
             const auto voices = wwise_play_event(*ev.bank, ev.play_id, state);
             if (std::ranges::any_of(voices, [](const WwiseVoice& w) { return w.loops == 0 || w.repeat; })) out.loops.push_back(TagHash(v));

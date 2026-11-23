@@ -5,7 +5,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <set>
 #include <vector>
 
 namespace nim {
@@ -34,24 +33,7 @@ struct MapAudioEmitter {
     float distance_to(std::array<float, 3> p) const;
 };
 
-struct MapObjectSound {
-    TagHash entity, event;
-    std::array<float, 3> position{};
-    float max_distance = 0;
-    // The entity's components read the world channel rain_amount: the loop is a rain sound,
-    // played only while the weather sets rain (docs/PROGRESS.md 3.109).
-    bool rain = false;
-};
-
 struct MapAudio {
-    // Loops of placed entities (docs/PROGRESS.md 3.107 / 3.108), except those an event starts:
-    // audio events the entity names only inside its reaction tables (8080AF57 / 8080AF59, keyed by
-    // event), listed in `event_loops`. Loops of the FX sequences play while the object is near.
-    // The loops one component names are alternatives (推定): one of them per placement, picked from
-    // the position (`alternative_picks` counts the placements where there was a choice).
-    std::vector<MapObjectSound> objects;
-    std::set<uint32_t> event_loops;
-    size_t alternative_picks = 0;
     std::vector<MapAudioEmitter> emitters;
     size_t point_emitters = 0;
     size_t polyline_emitters = 0;
