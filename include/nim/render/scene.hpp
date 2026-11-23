@@ -699,6 +699,10 @@ struct LightingParams {
     bool vignette = false;
     bool depth_of_field = false;
     bool dof_edges_only = false;
+    float chromatic_aberration = 0.0f;
+    float output_gamma = 1.0f;  // exponent applied to the final SDR image
+    float output_sharpen = 0.0f;
+    float output_grain = 0.0f;
     float dof_focus = 0;
 };
 

@@ -191,6 +191,7 @@ int run(int argc, char** argv) {
     float dof_focus = 0;
     bool shaft_fog_density = false;
     float exposure_arg = 1;
+    float output_gamma = 1, output_sharpen = 0, output_grain = 0, chromatic_aberration = 0;
     bool assume_lights_on = true;
     std::optional<V3> eye_arg, look_arg;
     float sun_arg = -1, sky_arg = -1;
@@ -311,6 +312,18 @@ int run(int argc, char** argv) {
             if (!std::isfinite(fog_density_scale) || fog_density_scale < 0 || fog_density_scale > 1)
                 throw std::runtime_error("--fog-density-scale expects a number in [0, 1]");
         }
+        else if ((args[i] == "--output-gamma" || args[i] == "--sharpen" || args[i] == "--grain" || args[i] == "--chromatic-aberration") && i + 1 < args.size()) {
+            const auto flag = args[i];
+            const float value = std::stof(args[++i]);
+            const float min = flag == "--output-gamma" ? 0.5f : 0.0f;
+            const float max = flag == "--output-gamma" ? 2.0f : flag == "--grain" ? 0.1f : 1.0f;
+            if (!std::isfinite(value) || value < min || value > max)
+                throw std::runtime_error(std::format("{} expects a number in [{}, {}]", flag, min, max));
+            if (flag == "--output-gamma") output_gamma = value;
+            else if (flag == "--sharpen") output_sharpen = value;
+            else if (flag == "--grain") output_grain = value;
+            else chromatic_aberration = value;
+        }
         else if (args[i] == "--interior-fog") authored_interior_fog = true;
         else if (args[i] == "--no-interior-fog") no_interior_fog = true;
         else if (args[i] == "--no-assumed-light-state") assume_lights_on = false;
@@ -341,7 +354,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--vignette] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -1023,6 +1036,10 @@ int run(int argc, char** argv) {
     lp.interior_fog = !no_interior_fog;
     lp.authored_interior_fog = authored_interior_fog;
     lp.fog_density_scale = fog_density_scale;
+    lp.output_gamma = output_gamma;
+    lp.output_sharpen = output_sharpen;
+    lp.output_grain = output_grain;
+    lp.chromatic_aberration = chromatic_aberration;
     lp.assume_lights_on = assume_lights_on;
     lp.froxel_fog = !no_froxels;
     lp.froxel_noise = !no_froxel_noise;

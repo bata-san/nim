@@ -158,6 +158,16 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     Gpu::barrier(cl, density_volume, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto& density = p.froxel_noise ? (shadowed ? froxel_density_noise_ : froxel_density_noise_no_sun_)
                                   : (shadowed ? froxel_density_ : froxel_density_no_sun_);
+    // The native density TFX divides by the maximum exterior density. Keep only
+    // its compute input above zero so the GUI's clear setting can leave indoor fog independent.
+    constexpr size_t kExteriorDensity = 0x0F;
+    const bool clear_exterior = p.fog_density_scale == 0 && kExteriorDensity < ext_.channels.size();
+    float authored_exterior = 0;
+    if (clear_exterior) {
+        authored_exterior = ext_.channels[kExteriorDensity][0];
+        ext_.channels[kExteriorDensity][0] = 0.0001f;
+        ext_.note_estimate("froxel exterior density floor = 0.0001/km", "native density TFX divides by the maximum exterior density");
+    }
     constexpr size_t kInteriorDensity = 0xAB;  // both density and in-scatter TFX read fog_density_interior
     const bool suppress_interior = covered && !p.authored_interior_fog && kInteriorDensity < ext_.channels.size();
     float4 authored_density{};
@@ -174,6 +184,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     auto& inscatter = shadowed ? froxel_inscatter_ : froxel_inscatter_no_sun_;
     inscatter.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
     if (suppress_interior) ext_.channels[kInteriorDensity] = authored_density;
+    if (clear_exterior) ext_.channels[kExteriorDensity][0] = authored_exterior;
     finite_constants(inscatter);
     Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     if (covered) Gpu::barrier(cl, overhead_->mask.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

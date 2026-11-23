@@ -19,6 +19,7 @@ constexpr float kSdrTonemapMode = 4.0f;
 constexpr uint8_t kBloomDistortion = 0x38; // bloom_initial_downsample's signed offset inputs
 constexpr uint32_t kDistortedHdrRtv = 11;
 constexpr uint32_t kDofRtv = 3 * 4 + 9;  // first post RTV slot of the depth of field (after bloom, TAA, lens, line)
+constexpr uint32_t kOutputSdrRtv = kDofRtv + 10;
 constexpr uint8_t kDof = 0x37;           // the depth of field settings the engine fills
 
 float4 distortion_uv_scale(uint32_t w, uint32_t h) {
@@ -117,6 +118,8 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         vignette.blend_state = 8;  // premultiplied alpha: white * (1 - a) (the stage's blend, estimate)
         load(vignette_, "draw_vignette", vignette);
     }
+    load(output_gamma_, "gamma_control", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
+    load(output_sharpen_, "scaler_cas_post_sharpen", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
     load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
     load(grading_convert_, "color_grading_convert_to_volume_texture_sdr", {});
     Texture black;
@@ -125,7 +128,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDofRtv + 10};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kOutputSdrRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -144,6 +147,9 @@ void GameLighting::release_post(Gpu& gpu) {
         r->Reset();
     vignette_.release(gpu);
     screen_overlay_.Reset();
+    output_gamma_.release(gpu);
+    output_sharpen_.release(gpu);
+    output_sdr_.Reset();
     for (auto& r : bloom_line_) r.Reset();
     ae_columns_rt_.Reset();
     grading_strip_.Reset();
@@ -266,6 +272,8 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 0;
     }
     taa_valid_ = false;
+    if (output_gamma_.loaded() || output_sharpen_.loaded())
+        output_sdr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kOutputSdrRtv);
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ae_fence_ = {};
@@ -611,19 +619,67 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     const bool vignette = p.vignette && vignette_.loaded() && screen_overlay_;
     e.set_texture(kScreenArea, 0x58, vignette ? render_vignette(gpu, cl, scopes) : unshadowed_.Get());
     e.set(kScreenArea, 0x90, float4{float(kGradingSize), 0, 0, 0});
-    e.set(kScreenArea, 0x170, float4{0, 1, 0, 0});  // chromatic aberration ramps (none)
-    e.set(kScreenArea, 0x180, float4{0, 1, 0, 0});
+    // The native tonemap samples red/blue at opposite radial offsets. Each ramp is
+    // (start radius, end radius, start value, end value): first shift, then mix weight.
+    e.set(kScreenArea, 0x170, float4{0.15f, 0.65f, 0, 0.012f * p.chromatic_aberration});
+    e.set(kScreenArea, 0x180, float4{0.15f, 0.65f, 0, p.chromatic_aberration > 0 ? 1.0f : 0.0f});
+    if (p.chromatic_aberration > 0)
+        e.note_estimate(std::format("chromatic aberration = {:g}", p.chromatic_aberration), "viewer-defined radial ramps");
     e.set(kScreenArea, 0x190, float4{1, 1, 0, 0});
     e.set(kScreenArea, 0x1A0, kSdrTonemapMode);
-    ext_.note_estimate("tonemap: screen_area_global_lut3d mode 4 (the curve whose constants the technique carries), hue / highlight options 0, no chromatic aberration",
+    ext_.note_estimate("tonemap: screen_area_global_lut3d mode 4 (the curve whose constants the technique carries), hue / highlight options 0",
                        "engine screen_area settings (extern 0x1E) not in game data");
     ext_.note_estimate("grading: native SDR LUT from no layers and an identity matrix",
                        "grading layer data (scope color_grading_ubershader) source not found");
     if (!vignette)
         ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay not drawn");
-    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
     const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    // Route resolved SDR through zero, one or two native output passes. With just
+    // one pass, resolve into the scratch image so that pass can write directly to lit.
+    auto* lit = gb.lit.Get();
+    auto* scratch = output_sdr_.Get();
+    const bool sharpen = scratch && (p.output_sharpen > 0 || p.output_grain > 0) && output_sharpen_.loaded();
+    const bool gamma = scratch && p.output_gamma != 1 && output_gamma_.loaded();
+    const bool resolve_to_scratch = sharpen != gamma;
+    auto* resolved = resolve_to_scratch ? scratch : lit;
+    const auto scratch_rtv = rtv(kOutputSdrRtv);
+    const auto resolve_rtv = resolve_to_scratch ? scratch_rtv : gb.lit_rtv;
+    if (!resolve_to_scratch || aa)
+        Gpu::barrier(cl, lit, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (resolve_to_scratch)
+        Gpu::barrier(cl, scratch, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto finish_sdr = [&] {
+        constexpr uint8_t kScaler = 0x48, kGamma = 0x49;
+        auto* source = resolved;
+        auto apply = [&](GamePipeline& pipeline) {
+            auto* output = source == lit ? scratch : lit;
+            const auto output_rtv = output == lit ? gb.lit_rtv : scratch_rtv;
+            Gpu::barrier(cl, output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cl->OMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+            viewport(cl, w_, h_);
+            pipeline.draw(gpu, cl, e, scopes);
+            end(output);
+            source = output;
+        };
+        if (sharpen) {
+            // CAS uses a four-neighbour negative weight; cap it below the singularity at 0.25.
+            e.set(pp, 0xC0, float4{p.output_sharpen * 0.2f, 0, 0, 0});
+            e.note_estimate(std::format("output CAS = {:g}, grain = {:g}", p.output_sharpen, p.output_grain),
+                            "viewer-defined scaler strength and noise weights");
+            e.set(kScaler, 0x20, float4{p.output_grain, 0, 0, 1.0f - p.output_grain});
+            e.set_texture(kScaler, 0x00, source);
+            apply(output_sharpen_);
+            e.set_texture(kScaler, 0x00, nullptr);
+        }
+        if (gamma) {
+            e.note_estimate(std::format("output gamma exponent = {:g}", p.output_gamma), "viewer display setting");
+            e.set(kGamma, 0x08, p.output_gamma);
+            e.set_texture(kGamma, 0x00, source);
+            apply(output_gamma_);
+            e.set_texture(kGamma, 0x00, nullptr);
+        }
+    };
     if (!taa) taa_valid_ = false;
     if (taa) {
         const float current_exposure = e.frame_constants()[1][0];
@@ -636,11 +692,11 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         ext_.note_estimate("taa: fade history by exposure difference, zero at one stop",
                            "history is tonemapped; native exposure rejection settings are unknown");
         if (k == 0) {
-            cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+            cl->OMSetRenderTargets(1, &resolve_rtv, FALSE, nullptr);
             viewport(cl, w_, h_);
             post_tonemap_.draw(gpu, cl, e, scopes);
-            end(gb.lit.Get());
-            e.set_texture(pp, 0x00, gb.lit.Get());
+            end(resolved);
+            e.set_texture(pp, 0x00, resolved);
             e.set(pp, 0x50, size4(w_, h_));
             e.set(pp, 0xC0, float4{1, 1, 1, 1});
             begin(taa_history_[cur].Get(), 3 * kBloomLevels + 2 + cur, w_, h_);
@@ -650,6 +706,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             taa_current_ = cur;
             taa_history_exposure_ = current_exposure;
             taa_valid_ = true;
+            finish_sdr();
             return;
         }
         // Tonemap into the resolve's input, resolve it against the history into the other history
@@ -692,11 +749,11 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(pp, 0x00, taa_history_[cur].Get());
         e.set(pp, 0x50, size4(w_, h_));
         e.set(pp, 0xC0, float4{1, 1, 1, 1});
-        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        cl->OMSetRenderTargets(1, &resolve_rtv, FALSE, nullptr);
         viewport(cl, w_, h_);
         taa_copy_.draw(gpu, cl, e, scopes);
     } else if (!aa) {
-        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        cl->OMSetRenderTargets(1, &resolve_rtv, FALSE, nullptr);
         viewport(cl, w_, h_);
         post_tonemap_.draw(gpu, cl, e, scopes);
     } else {
@@ -715,7 +772,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         post_pack_luma_.draw(gpu, cl, e, scopes);
         e.set_texture(pp, 0x00, nullptr);
         end(post_ldr_.Get());
-        Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (!resolve_to_scratch)
+            Gpu::barrier(cl, lit, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         // Extern 0x33: the input at +0x00; at +0x50..+0x58 FXAA 3.11's subpixel amount, edge threshold and
         // minimum edge threshold (cb0[3..5].x).
         constexpr uint8_t kAntialias = 0x33;
@@ -725,10 +783,11 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set(kAntialias, 0x58, 0.0833f);
         ext_.note_estimate("fxaa: subpixel 0.75, edge threshold 0.166, minimum 0.0833 (extern 0x33 +0x50..+0x58)",
                            "engine anti-aliasing settings not in game data: the FXAA 3.11 quality defaults");
-        cl->OMSetRenderTargets(1, &gb.lit_rtv, FALSE, nullptr);
+        cl->OMSetRenderTargets(1, &resolve_rtv, FALSE, nullptr);
         fxaa_.draw(gpu, cl, e, scopes);
     }
-    Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    end(resolved);
+    finish_sdr();
 }
 
 // draw_vignette (PS 80A74994) into the screen overlay the tonemap multiplies by. From the pixel

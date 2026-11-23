@@ -3584,6 +3584,10 @@ public:
             ImGui::SameLine();
             ImGui::Checkbox("FXAA", &light.antialias);
             ImGui::Checkbox("被写界深度 (DoF, estimated)", &light.depth_of_field);
+            ImGui::SliderFloat(ui::tr(ui::S::ChromaticAberration), &light.chromatic_aberration, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat(ui::tr(ui::S::OutputGamma), &light.output_gamma, 0.5f, 2.0f, "%.2f");
+            ImGui::SliderFloat(ui::tr(ui::S::OutputSharpen), &light.output_sharpen, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat(ui::tr(ui::S::OutputGrain), &light.output_grain, 0.0f, 0.1f, "%.3f");
             ImGui::SameLine();
             ImGui::Checkbox("周辺減光", &light.vignette);
             ImGui::SetItemTooltip("ゲームの v2_dof_cinematic パス。焦点はカメラの注視点 (焦点範囲・ぼけの大きさは推定)");

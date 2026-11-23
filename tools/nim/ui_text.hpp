@@ -330,6 +330,10 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(FroxelFog, "フロクセル大気", "Froxel fog", "프록셀 대기")                                                         \
     X(InteriorFog, "屋内フォグ", "Interior fog", "실내 안개") \
     X(FogDensityScale, "大気の霧の濃さ", "Atmospheric fog density", "대기 안개 밀도") \
+    X(ChromaticAberration, "色収差", "Chromatic aberration", "색수차") \
+    X(OutputGamma, "出力ガンマ", "Output gamma", "출력 감마") \
+    X(OutputSharpen, "シャープネス", "Sharpening", "선명도") \
+    X(OutputGrain, "画面ノイズ", "Screen grain", "화면 노이즈") \
     X(FroxelFogTip, "ゲームの密度計算・散乱積分CS。格子の解像度・距離・時間履歴は推定",                                    \
       "The game's density and scattering-integration compute shaders. Grid resolution, distance and history estimated",  \
       "게임의 밀도 계산·산란 적분 CS. 격자 해상도·거리·시간 히스토리는 추정")                                               \

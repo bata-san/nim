@@ -675,6 +675,8 @@ private:
     ID3D12Resource* render_vignette(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     GamePipeline vignette_;
     ComPtr<ID3D12Resource> screen_overlay_;
+    GamePipeline output_gamma_, output_sharpen_;
+    ComPtr<ID3D12Resource> output_sdr_;
     // prepare (full-res CoC), 12-texel tile max (horizontal, vertical), neighbourhood max,
     // half-res downsample (colour + CoC), gather, fill blur, full-res combine.
     GamePipeline dof_prepare_, dof_tile_h_, dof_tile_v_, dof_neighbor_, dof_down_, dof_apply_, dof_blur_, dof_combine_;
