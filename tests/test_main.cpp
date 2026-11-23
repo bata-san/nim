@@ -6,6 +6,7 @@
 #include "nim/content/usm.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
+#include "nim/content/tfx.hpp"
 #include "nim/content/weather.hpp"
 #include "nim/content/wwise.hpp"
 #include "nim/core/binary.hpp"
@@ -643,6 +644,22 @@ int main() {
             CHECK(walkable && around);
         }
         CHECK(!ps.find_path({2, 2, 0}, {8, 2, 3}, 0.3f));  // no floor at that height
+    }
+
+    // Material candidates are selected by the most specific matching tag groups.
+    {
+        DynamicModelMaterials material;
+        material.technique_map = {{3, 0, 0}};
+        material.techniques = {TagHash(0x80A4BABD), TagHash(0x80A4BAEA), TagHash(0x80A4BACF)};
+        material.part_tags = {{{1, 5}}, {{2, 6}}};
+        material.technique_conditions = {{}, {0}, {0, 1}};
+        const std::pair<uint32_t, uint32_t> base[] = {{1, 7}};
+        const std::pair<uint32_t, uint32_t> elite[] = {{1, 5}};
+        const std::pair<uint32_t, uint32_t> elite_unit[] = {{1, 5}, {2, 6}};
+        CHECK(material.technique(0, 2, base) == TagHash(0x80A4BABD));
+        CHECK(material.technique(0, 2, elite) == TagHash(0x80A4BAEA));
+        CHECK(material.technique(0, 0, elite_unit) == TagHash(0x80A4BACF));
+        CHECK(material.technique(0, 2) == TagHash(0x80A4BACF));
     }
 
     // Map ambient audio emitter geometry (point, polyline segment, global).

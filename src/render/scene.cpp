@@ -986,7 +986,7 @@ bool vs_reads_typed_buffers(const std::vector<uint8_t>& vs) {
 
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials,
                                    int permutation, const ChannelValues* channels, PrepareCache* cache,
-                                   const RegionPermutations* regions) {
+                                   const RegionPermutations* regions, std::span<const std::pair<uint32_t, uint32_t>> spawn_tags) {
     PreparedMesh out;
     if (cache) {
         std::lock_guard lk(*cache->mutex);
@@ -1190,7 +1190,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                     if (hidden[k]) continue;
                     // The entity's material variant wins over the part's own technique (goriath binds both,
                     // the variant last).
-                    TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm) : TagHash();
+                    TagHash tech = materials ? materials->technique(dp.variant_shader_index, perm, spawn_tags) : TagHash();
                     if (tech.is_none()) tech = dp.technique;
                     if (tech.is_none()) {
                         if (dp.variant_shader_index != 0xFFFF)
@@ -1311,10 +1311,11 @@ void prepare_distance_field_preview(PreparedMesh& mesh) {
 PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
                                     const ModelAssemblyIndex& assemblies, int permutation,
-                                    const ChannelValues* channels, PrepareCache* cache, const RegionPermutations* regions) {
+                                    const ChannelValues* channels, PrepareCache* cache, const RegionPermutations* regions,
+                                    std::span<const std::pair<uint32_t, uint32_t>> spawn_tags) {
     auto prepare = [&](TagHash tag, int variant) {
         const auto it = materials.find(tag.value);
-        auto mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache, regions);
+        auto mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache, regions, spawn_tags);
         prepare_distance_field_preview(mesh);
         return mesh;
     };
@@ -3491,7 +3492,8 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     std::vector<PoseMap> actor_matrices(actors_.size());
     for (size_t a = 0; a < actors_.size(); ++a)
         if (actors_[a].rows)
-            for (const auto& pose : actors_[a].poses) actor_matrices[a][pose.model] = matrices_of(pose);
+            for (const auto& pose : actors_[a].poses)
+                if (!pose.bones.empty()) actor_matrices[a][pose.model] = matrices_of(pose);
     struct Job { BufferSet* set; const std::vector<Mat>* mats; uint32_t* dst; };
     std::vector<Job> jobs;
     const D3D12_RANGE none{0, 0};
@@ -3717,13 +3719,25 @@ std::optional<float> StaticMeshScene::actor_lowest(uint32_t actor, const std::ve
 
 void StaticMeshScene::set_actor(uint32_t actor, const std::optional<std::array<float, 12>>& rows, std::vector<ModelSkinPose> poses) {
     auto& a = actors_.at(actor);
-    a.previous = a.rows && rows ? a.rows : rows;  // first visible frame: no motion
+    const bool was_visible = a.rows.has_value();
     a.rows = rows;
     a.poses = std::move(poses);
     for (const auto index : a.sets) {
         auto& set = sets_[index];
         set.instances = rows ? 1 : 0;
-        if (rows) set.placements.assign(1, *rows);
+        if (!rows) continue;
+        auto world = *rows;
+        const auto pose = std::ranges::find(a.poses, set.model, &ModelSkinPose::model);
+        if (pose != a.poses.end() && pose->placement) {
+            const auto object = transform_rows(*pose->placement);
+            for (size_t r = 0; r < 12; r += 4) {
+                for (size_t c = 0; c < 4; ++c)
+                    world[r + c] = (*rows)[r] * object[c] + (*rows)[r + 1] * object[4 + c] + (*rows)[r + 2] * object[8 + c];
+                world[r + 3] += (*rows)[r + 3];
+            }
+        }
+        set.actor_previous_rows = was_visible && !set.placements.empty() ? set.placements.front() : world;
+        set.placements.assign(1, world);
     }
     skin_dirty_ = skinned_;
 }
@@ -3752,8 +3766,8 @@ void StaticMeshScene::bind_actor_constants(Gpu& gpu) {
                 cb[first + 2] = {p[2], p[6], p[10], 0};
                 cb[first + 3] = {p[3], p[7], p[11], 1};
             };
-            put(0, *a.rows);
-            put(8, a.previous ? *a.previous : *a.rows);
+            put(0, set.placements.front());
+            put(8, set.actor_previous_rows);
             const auto alloc = gpu.dynamic(sizeof(PlacementConstants));
             std::memcpy(alloc.cpu, &constants, sizeof(PlacementConstants));
             set.object_cb.gpu = alloc.gpu;

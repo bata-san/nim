@@ -138,6 +138,14 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
             }
         }
         const RegionPermutations* regions = c.regions ? &*c.regions : nullptr;
+        const auto defaults = entity_material_defaults(pm, motion.entity);
+        auto apply_defaults = [&](PreparedMesh& mesh) {
+            auto apply = [&](PreparedMesh& part) {
+                for (const auto& [key, value] : defaults) part.channel_defaults.insert_or_assign(key, value);
+            };
+            apply(mesh);
+            for (auto& part : mesh.attachments) apply(part);
+        };
         auto models = entity_dynamic_models(pm, motion.entity, sources);
         if (models.empty()) throw std::runtime_error("the entity names no dynamic model");
         // The assembly root (the model the Models tab assembles the body, head and gear around).
@@ -159,7 +167,8 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
         if (motion.idle) want(*motion.idle);
         std::string why;
         for (const auto model : models) {
-            auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions);
+            auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions, tags);
+            apply_defaults(mesh);
             if (mesh.no_drawable) {
                 why += std::format("{}{}: nothing drawable", why.empty() ? "" : "; ", model.str());
                 continue;
@@ -198,7 +207,8 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
                 return skinned;
             };
             for (const auto model : models) {
-                auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions);
+                auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions, tags);
+                apply_defaults(mesh);
                 if (mesh.no_drawable || !fits(mesh)) continue;
                 PreviewAnimation anim;
                 anim.model = mesh.tag;
@@ -247,8 +257,14 @@ ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& s
                     if (!gun.no_drawable) {
                         gun.attachments.clear();  // sights and other mods: not posed here
                         c.weapon_model = gun.tag;
-                        c.weapon_bones = std::max<size_t>(gun.bone_count, 1);
                         c.grip_bone = int32_t(grip - skeleton.hashes.begin());
+                        if (const auto rig = sources.rigs.find(gun.tag.value); rig != sources.rigs.end() && !rig->second.skeleton.is_none()) {
+                            const auto weapon = load_skeleton(pm, rig->second.skeleton);
+                            constexpr uint32_t kHandle = 0xC410084A;  // fnv1("b_handle")
+                            const auto handle = std::ranges::find(weapon.hashes, kHandle);
+                            if (handle != weapon.hashes.end())
+                                c.weapon_from_handle = inverse(weapon.bind[size_t(handle - weapon.hashes.begin())]);
+                        }
                         PreparedMesh mesh = *c.mesh;
                         mesh.attachments.push_back(std::move(gun));
                         c.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
@@ -479,7 +495,7 @@ std::vector<ModelSkinPose> actor_poses(const ActorCharacter& c, const AiAgent& a
     if (!c.weapon_model.is_none() && c.grip_bone >= 0 && !poses.empty() && size_t(c.grip_bone) < poses.front().bones.size() &&
         size_t(c.grip_bone) < c.binding->skeleton.bind.size()) {
         const BoneTransform grip = poses.front().bones[size_t(c.grip_bone)] * c.binding->skeleton.bind[size_t(c.grip_bone)];
-        poses.push_back({c.weapon_model, std::vector<BoneTransform>(c.weapon_bones, grip), {}});
+        poses.push_back({c.weapon_model, {}, grip * c.weapon_from_handle});
     }
     return poses;
 }

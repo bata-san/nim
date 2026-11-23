@@ -283,7 +283,8 @@ PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
 // `regions` (an entity's spawned permutations, 3.96) leaves out the part groups of other permutations.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
                                    int permutation = -1, const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr,
-                                   const RegionPermutations* regions = nullptr);
+                                   const RegionPermutations* regions = nullptr,
+                                   std::span<const std::pair<uint32_t, uint32_t>> spawn_tags = {});
 // Either of the above, by the tag's class.
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr,
                           const ChannelValues* channels = nullptr);
@@ -291,7 +292,8 @@ PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
                                     const ModelAssemblyIndex& assemblies, int permutation = -1,
                                     const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr,
-                                    const RegionPermutations* regions = nullptr);
+                                    const RegionPermutations* regions = nullptr,
+                                    std::span<const std::pair<uint32_t, uint32_t>> spawn_tags = {});
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
                                                           TagHash preferred = {}, std::span<const ClipInfo> related = {},
@@ -508,6 +510,7 @@ private:
         TagHash model;
         V3 skin_scale, skin_offset, skin_pack_offset;
         float skin_range = 1;
+        std::array<float, 12> actor_previous_rows{};
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
         bool skin_posed = false;
@@ -534,7 +537,7 @@ private:
     };
     struct Actor {
         std::vector<uint32_t> sets;
-        std::optional<std::array<float, 12>> rows, previous;
+        std::optional<std::array<float, 12>> rows;
         std::vector<ModelSkinPose> poses;
     };
     std::vector<Actor> actors_;

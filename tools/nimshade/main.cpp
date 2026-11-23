@@ -668,9 +668,9 @@ int run(int argc, char** argv) {
                     std::println("  region permutations: entry {:08X} ({} ties), {} parts of other permutations left out", c.regions->entry,
                                  c.regions->ties, c.mesh ? c.mesh->region_hidden_parts : 0);
                 if (c.weapon)
-                    std::println("  weapon: weapon_type {:08X} entity {} model entity {} model {} ({} bones) at bone {}", c.weapon->weapon_type,
+                    std::println("  weapon: weapon_type {:08X} entity {} model entity {} model {} at hand bone {}", c.weapon->weapon_type,
                                  c.weapon->weapon.str(), c.weapon->visual.str(), c.weapon_model.is_none() ? "-" : c.weapon_model.str(),
-                                 c.weapon_bones, c.grip_bone);
+                                 c.grip_bone);
             }
             AiParams params;
             params.player_invisible = !ai_visible;

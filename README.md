@@ -28,6 +28,15 @@ cmake --build build --config Release
 
 ## Viewer (GUI)
 
+Download the Windows ZIP from [Releases](https://github.com/bata-san/nim/releases) and extract it
+to a writable folder. Keep `nim-update.ps1` next to `nim.exe`. Enable automatic update checks
+under **Settings → About**, or use **Check for updates now**. Updates install after nim exits and
+take effect on the next launch.
+
+The repository is private. The updater uses an existing Git Credential Manager login with access
+to the repository, or a `NIM_GITHUB_TOKEN` environment variable with repository Contents read
+permission.
+
 ```
 build/Release/nim.exe                 # opens the Steam install automatically
 build/Release/nim.exe 80A878C8        # ...and shows this static mesh (or dynamic model)

@@ -70,7 +70,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr const char* kVersion = "0.3.1";
+constexpr const char* kVersion = NIM_VERSION;
 constexpr ImU32 kGreen = IM_COL32(201, 254, 0, 255);  // Marathon green
 constexpr uint32_t kThumbSize = 256;
 
@@ -186,6 +186,7 @@ std::string format_bytes(uint64_t b) {
 struct Prefs {
     ui::Lang lang = ui::Lang::Ja;
     bool sidebar_open = true;
+    bool auto_update = false;
 };
 Prefs g_prefs;
 
@@ -196,11 +197,41 @@ void load_prefs() {
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
         if (line.rfind("language=", 0) == 0) ui::parse_lang(line.substr(9), g_prefs.lang);
         else if (line.rfind("sidebar=", 0) == 0) g_prefs.sidebar_open = line.substr(8) != "0";
+        else if (line == "auto_update=1") g_prefs.auto_update = true;
     }
 }
 void save_prefs() {
     std::ofstream f(exe_dir() / "nim_settings.ini", std::ios::trunc);
-    if (f) f << "language=" << ui::code(g_prefs.lang) << "\nsidebar=" << (g_prefs.sidebar_open ? 1 : 0) << "\n";
+    if (f) f << "language=" << ui::code(g_prefs.lang) << "\nsidebar=" << (g_prefs.sidebar_open ? 1 : 0)
+             << "\nauto_update=" << (g_prefs.auto_update ? 1 : 0) << "\n";
+}
+
+HANDLE g_update_process = nullptr;
+
+bool start_update(bool automatic) {
+    if (g_update_process) {
+        if (WaitForSingleObject(g_update_process, 0) == WAIT_TIMEOUT) return true;
+        CloseHandle(g_update_process);
+        g_update_process = nullptr;
+    }
+    const auto dir = exe_dir();
+    const auto script = dir / "nim-update.ps1";
+    if (!fs::is_regular_file(script)) return false;
+    wchar_t system[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
+    const auto shell = fs::path(system) / L"WindowsPowerShell/v1.0/powershell.exe";
+    std::wstring command = std::format(L"\"{}\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\" -Version {} -ViewerPid {}{}",
+                                       shell.wstring(), script.wstring(), to_wide(kVersion), GetCurrentProcessId(),
+                                       automatic ? L" -Automatic" : L"");
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(shell.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, dir.c_str(), &startup, &process)) return false;
+    CloseHandle(process.hThread);
+    g_update_process = process.hProcess;
+    return true;
 }
 
 std::optional<fs::path> pick_folder(HWND owner) {
@@ -3420,6 +3451,26 @@ public:
 
         ImGui::SeparatorText(ui::tr(ui::S::SettingsInfo));
         ImGui::Text("nim %s", kVersion);
+        if (ImGui::Checkbox(ui::tr(ui::S::SettingsAutoUpdate), &g_prefs.auto_update)) {
+            save_prefs();
+            if (g_prefs.auto_update && !start_update(true)) error(ui::tr(ui::S::UpdateUnavailable));
+        }
+        if (ImGui::Button(ui::tr(ui::S::CheckUpdates)) && !start_update(false)) error(ui::tr(ui::S::UpdateUnavailable));
+        static std::string update_state;
+        static std::chrono::steady_clock::time_point next_update_poll;
+        if (const auto now = std::chrono::steady_clock::now(); now >= next_update_poll) {
+            std::ifstream status(exe_dir() / "nim-update-status.txt");
+            update_state.clear();
+            std::getline(status, update_state);
+            next_update_poll = now + std::chrono::milliseconds(500);
+        }
+        if (update_state == "auth") ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateAuth));
+        else if (update_state.starts_with("ready ")) ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateReady));
+        else if (update_state == "current") ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateCurrent));
+        else if (update_state.starts_with("error ") || update_state == "running")
+            ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateUnavailable));
+        else if (update_state == "checking" || update_state.starts_with("downloading "))
+            ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateChecking));
         ImGui::Text("%s", ui::trf(ui::S::SettingsGpu, gpu.adapter_name()).c_str());
         ImGui::Text("%s", ui::trf(ui::S::SettingsVram, format_bytes(gpu.vram_usage()), format_bytes(gpu.vram_budget())).c_str());
         ImGui::Text("%s", ui::trf(ui::S::SettingsFonts, ui::tr(g_fonts.from_game ? ui::S::FontsGame : ui::S::FontsSystem)).c_str());
@@ -5628,7 +5679,7 @@ int run(const std::wstring& cmdline) {
         uint64_t frequency = 1;
         app->gpu.queue()->GetTimestampFrequency(&frequency);
         g_prof.set_frequency(frequency);
-    }
+    } else if (g_prefs.auto_update && !start_update(true)) app->error(ui::tr(ui::S::UpdateUnavailable));
 
     uint64_t frame = 0;
     bool done = false;
@@ -5761,6 +5812,7 @@ int run(const std::wstring& cmdline) {
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdline, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     int r = run(std::wstring(L"nim ") + cmdline);
+    if (g_update_process) CloseHandle(g_update_process);
     CoUninitialize();
     return r;
 }

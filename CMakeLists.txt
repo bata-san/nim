@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nim LANGUAGES CXX VERSION 0.3.1)
+project(nim LANGUAGES CXX VERSION 0.3.2)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -103,6 +103,11 @@ target_include_directories(nim PRIVATE ${IMGUI_DIR})
 file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
 target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2)
+target_compile_definitions(nim PRIVATE NIM_VERSION="${PROJECT_VERSION}")
+add_custom_command(TARGET nim POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/tools/nim/nim-update.ps1"
+          "$<TARGET_FILE_DIR:nim>/nim-update.ps1"
+  VERBATIM)
 if(NIM_DLSS_SDK)
   foreach(viewer IN ITEMS nim nimshade)
     add_custom_command(TARGET ${viewer} POST_BUILD

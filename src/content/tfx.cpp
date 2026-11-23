@@ -210,10 +210,31 @@ DynamicModel load_dynamic_model(PackageManager& pm, TagHash tag) {
     return m;
 }
 
-TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation) const {
+TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation,
+                                        std::span<const std::pair<uint32_t, uint32_t>> tags) const {
     if (variant == 0xFFFF || variant >= technique_map.size()) return TagHash();
     const Range& r = technique_map[variant];
     if (r.count == 0) return TagHash();
+    if (!tags.empty() && technique_conditions.size() == techniques.size() &&
+        uint64_t(r.start) + r.count <= techniques.size()) {
+        std::optional<size_t> selected;
+        size_t specificity = 0;
+        for (size_t i = r.start; i < size_t(r.start) + r.count; ++i) {
+            const auto& requirements = technique_conditions[i];
+            if (requirements.size() < specificity || techniques[i].is_none()) continue;
+            const bool match = std::ranges::all_of(requirements, [&](uint16_t group) {
+                return group < part_tags.size() && !part_tags[group].empty() &&
+                    std::ranges::all_of(part_tags[group], [&](const auto& constraint) {
+                        return std::ranges::find(tags, constraint) != tags.end();
+                    });
+            });
+            if (match && (!selected || requirements.size() > specificity)) {
+                selected = i;
+                specificity = requirements.size();
+            }
+        }
+        if (selected) return techniques[*selected];
+    }
     const size_t i = size_t(r.start) + permutation % r.count;
     return i < techniques.size() ? techniques[i] : TagHash();
 }
@@ -333,6 +354,34 @@ std::optional<EntityWeapon> entity_weapon(PackageManager& pm, TagHash entity, st
     return out;
 }
 
+namespace {
+using MaterialDefaults = std::map<uint32_t, std::array<float, 4>>;
+
+MaterialDefaults material_defaults(const TagReader& r, size_t definition) {
+    MaterialDefaults result;
+    const auto channels = r.vec_at(definition + 0x120);
+    if (channels.element_class != 0x8080AF86) return result;
+    for (uint64_t c = 0; c < channels.count; ++c) {
+        const size_t at = channels.data + size_t(c) * 0x70;
+        const auto constants = r.vec_at(at + 0x18);
+        if (!constants.count) continue;
+        std::array<float, 4> value{};
+        for (int k = 0; k < 4; ++k) value[k] = r.f32_at(constants.data + k * 4);
+        result[r.u32_at(at)] = value;
+    }
+    return result;
+}
+}
+
+MaterialDefaults entity_material_defaults(PackageManager& pm, TagHash entity) {
+    MaterialDefaults defaults;
+    for_each_component_resource(pm, entity, [&](TagHash, const TagReader& r, size_t base, uint32_t cls) {
+        if (cls == 0x8080AF75) defaults.merge(material_defaults(r, base));
+        return false;
+    });
+    return defaults;
+}
+
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions) {
     constexpr uint32_t kRegion = 0x51E7A18D;       // fnv1("region")
     constexpr uint32_t kPermutation = 0x4C58EF8F;  // fnv1("permutation")
@@ -394,17 +443,8 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
             try {
                 const size_t definition = r.pointer_at(0x18);
                 if (definition >= 4 && definition < bytes.size() && r.u32_at(definition - 4) == 0x8080AF75) {
-                    auto channels = r.vec_at(definition + 0x120);
-                    if (channels.count && channels.element_class == 0x8080AF86) {
-                        Defaults defaults;
-                        for (uint64_t c = 0; c < channels.count; ++c) {
-                            const size_t at = channels.data + size_t(c) * 0x70;
-                            const auto constants = r.vec_at(at + 0x18);  // SExpression at +8, constants at +0x10
-                            if (!constants.count) continue;
-                            std::array<float, 4> value{};
-                            for (int k = 0; k < 4; ++k) value[k] = r.f32_at(constants.data + k * 4);
-                            defaults[r.u32_at(at)] = value;
-                        }
+                    auto defaults = material_defaults(r, definition);
+                    if (!defaults.empty()) {
                         channel_components.emplace(tag.value, std::move(defaults));
                     }
                     continue;
@@ -456,6 +496,29 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                             }
                     } catch (const std::exception&) {
                         m.part_tags.clear();
+                    }
+                    try {
+                        // Each technique has a slice of u16 indices into the component's tag sets.
+                        const auto indices = r.vec_at(base + 0x3F8);
+                        const auto conditions = r.vec_at(base + 0x408);
+                        if (conditions.count == techs.count && conditions.element_class == 0x80808682 &&
+                            indices.element_class == 0x80800006 &&
+                            conditions.data <= bytes.size() && conditions.count <= (bytes.size() - conditions.data) / 4 &&
+                            indices.data <= bytes.size() && indices.count <= (bytes.size() - indices.data) / 2) {
+                            for (size_t i = 0; i < conditions.count; ++i) {
+                                const size_t offset = conditions.data + i * 4;
+                                const auto count = r.u16_at(offset), first = r.u16_at(offset + 2);
+                                if (count && uint64_t(first) + count > indices.count) {
+                                    m.technique_conditions.clear();
+                                    break;
+                                }
+                                auto& groups = m.technique_conditions.emplace_back();
+                                for (uint32_t j = 0; j < count; ++j)
+                                    groups.push_back(r.u16_at(indices.data + size_t(first + j) * 2));
+                            }
+                        }
+                    } catch (const std::exception&) {
+                        m.technique_conditions.clear();
                     }
                     out.emplace(v, std::move(m));
                 } catch (...) {

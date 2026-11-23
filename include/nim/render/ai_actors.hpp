@@ -51,7 +51,7 @@ struct ActorCharacter {
     // bone posed at the body skeleton's b_r_grip (the model's root bone b_handle sits there).
     std::optional<EntityWeapon> weapon;
     TagHash weapon_model;
-    size_t weapon_bones = 0;
+    BoneTransform weapon_from_handle;
     int32_t grip_bone = -1;
     std::string error;  // why it cannot be drawn, if it cannot
 };

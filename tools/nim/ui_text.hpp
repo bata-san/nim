@@ -116,6 +116,13 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(SettingsShowFps, "FPS / VRAM を表示", "Show FPS / VRAM", "FPS / VRAM 표시")                                       \
     X(SettingsSecondLang, "第 2 言語 (ゲームの文字)", "Second language (game text)", "두 번째 언어 (게임 텍스트)")          \
     X(SettingsInfo, "情報", "About", "정보")                                                                            \
+    X(SettingsAutoUpdate, "起動時に更新を確認", "Automatically check for updates", "시작 시 업데이트 확인") \
+    X(CheckUpdates, "今すぐ更新を確認", "Check for updates now", "지금 업데이트 확인") \
+    X(UpdateAuth, "更新に GitHub 認証が必要です。", "GitHub authentication is required for updates.", "업데이트에 GitHub 인증이 필요합니다.") \
+    X(UpdateReady, "更新を取得しました。nim の終了後に適用します。", "Update downloaded. It will install when nim exits.", "nim을 종료하면 업데이트가 설치됩니다.") \
+    X(UpdateCurrent, "最新版を使用しています。", "You are on the latest version.", "최신 버전을 사용 중입니다.") \
+    X(UpdateChecking, "更新を確認しています。", "Checking for updates.", "업데이트를 확인 중입니다.") \
+    X(UpdateUnavailable, "更新できませんでした。", "Could not update nim.", "nim을 업데이트할 수 없습니다.") \
     X(SettingsGpu, "GPU: {}", "GPU: {}", "GPU: {}")                                                                      \
     X(SettingsVram, "VRAM: {} / {}", "VRAM: {} / {}", "VRAM: {} / {}")                                                   \
     X(SettingsFonts, "フォント: {}", "Fonts: {}", "글꼴: {}")                                                            \

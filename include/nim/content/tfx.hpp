@@ -147,7 +147,9 @@ struct DynamicModelMaterials {
     // {name, value} FNV-1 pairs), by part external_identifier: region = body / helmet /
     // assault_shield, permutation = uesc_elite_assault ..., damage, state (docs/PROGRESS.md 3.92).
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> part_tags;
-    TagHash technique(uint16_t variant, uint32_t permutation) const;
+    std::vector<std::vector<uint16_t>> technique_conditions;
+    TagHash technique(uint16_t variant, uint32_t permutation,
+                      std::span<const std::pair<uint32_t, uint32_t>> tags = {}) const;
 };
 
 // Region permutations (docs/PROGRESS.md 3.92): an entity's selector component (class 80804034)
@@ -164,6 +166,7 @@ struct RegionPermutations {
 std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
                                                              std::span<const std::pair<uint32_t, uint32_t>> tags);
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions);
+std::map<uint32_t, std::array<float, 4>> entity_material_defaults(PackageManager& pm, TagHash entity);
 
 // A combatant's weapon (docs/PROGRESS.md 3.93). The entity's weapon table (component resource class
 // 80804656): +0x28 Vec<8080BACC> tag sets ({weapon_type = ...}), +0x190 Vec<8080465E> rows of 0x40
