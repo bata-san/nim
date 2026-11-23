@@ -75,6 +75,17 @@ int main() {
         check(!light_shadow_view(l).has_value(), "a box light was given a spot shadow frustum");
     }
     {
+        // SShadowingLight +0xFC..+0x108 fades: (start, end) ramps from 1 to 0, a reversed pair
+        // (a shaft hidden near the camera) ramps from 0 to 1, (0, 0) never fades.
+        MapLight l;
+        l.fade_distances = {130, 160, 16, 6.3f};
+        check(l.light_fade(100) == 1 && std::abs(l.light_fade(145) - 0.5f) < 1e-5f && l.light_fade(170) == 0, "light fade ramp");
+        check(l.shaft_fade(3) == 0 && l.shaft_fade(20) == 1 && l.shaft_fade(11.15f) > 0.49f && l.shaft_fade(11.15f) < 0.51f,
+              "reversed shaft fade does not fade in with distance");
+        l.fade_distances = {};
+        check(l.light_fade(1e4f) == 1 && l.shaft_fade(0) == 1, "a light without fade distances faded");
+    }
+    {
         ExternStore ext;
         ext.channels.resize(45);
         ext.channels[19] = {7, 8, 9, 10};

@@ -377,6 +377,9 @@ public:
     // render(). `scene_items` changing (a map still loading) discards the maps drawn so far.
     std::vector<SunShadow*> light_shadows_to_render(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, size_t scene_items, size_t budget);
     void set_light_shadows(bool on) { light_shadows_ = on; }
+    // Off: the light records' clip planes, weights and fade distances are not applied (deferred_light
+    // +0x100..+0x130 = (0, 0, 0, 1), +0x150 = 1, +0x160 = 1, as before section 3.91). For comparisons.
+    void set_light_records(bool on) { light_records_ = on; }
     size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
@@ -608,6 +611,10 @@ private:
     // Hands a light's depth map to the deferred_shadow extern (6) for its +0xD8 / +0xE0 technique.
     void bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& ll, const ViewMatrices& vm);
     bool light_shadows_ = true;
+    bool light_records_ = true;
+    // The record's light / shaft fade at the camera (1 with light_records_ off).
+    float light_fade(const MapLight& l, const V3& eye) const;
+    float shaft_fade(const MapLight& l, const V3& eye) const;
     std::vector<std::unique_ptr<GamePipeline>> light_pipelines_;  // two per shader pair: both windings
     std::vector<LocalLight> lights_;
     std::vector<std::string> light_notes_;

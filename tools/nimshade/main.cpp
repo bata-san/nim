@@ -150,6 +150,7 @@ int run(int argc, char** argv) {
     float time_of_day = -1;
     float day_night_state = -1;
     bool no_light_shadows = false;
+    bool no_light_records = false;  // the light records' clip planes, weights and fades off (comparison)
     size_t frame_light_shadows = 0;  // > 0: draw the light maps as the GUI does, this many per whole frame
     bool verify_frame_inputs = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, no_interior_fog = false, print_channels = false;
@@ -210,6 +211,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-light-shadows") no_light_shadows = true;
+        else if (args[i] == "--no-light-records") no_light_records = true;
         else if (args[i] == "--frame-light-shadows" && i + 1 < args.size()) frame_light_shadows = size_t(std::stoul(args[++i]));
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
@@ -326,7 +328,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -1088,6 +1090,7 @@ int run(int argc, char** argv) {
         std::println("GPU memory before lighting: {:.1f} MiB used / {:.1f} MiB budget",
                      double(gpu.vram_usage()) / (1 << 20), double(gpu.vram_budget()) / (1 << 20));
         if (no_light_shadows) gl.set_light_shadows(false);
+        if (no_light_records) gl.set_light_records(false);
         if (frame_light_shadows && !no_light_shadows) {
             // The GUI's frame: sun shadow, a few light maps, G-buffer and lighting in one frame's
             // upload space, repeated until every light on screen has its map.

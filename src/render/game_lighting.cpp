@@ -2921,8 +2921,47 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
     }
     for (const auto& [why, n] : vol_failures) light_notes_.push_back(std::format("{} light shafts left out: {}", n, why));
     if (!lights_.empty())
-        ext_.note_estimate("local lights: deferred_light +0x100..+0x130 = (0,0,0,1) (plane masks off), +0x150 = 1, +0x160 = 1 (fade: fully on)",
-                           "goriath DeferredLight layout; +0x160 (float 0x58) is the output scale of the light PS (cb0[36], saturated), read by 458 of Outpost's 4236 lights");
+        ext_.note_estimate("local lights: deferred_light +0x160 (light) and the shaft intensity fade linearly with the camera distance to the light origin between the record's SShadowingLight +0xFC / +0x100 (light) and +0x104 / +0x108 (shaft) distances; faded-out lights and shafts are not drawn",
+                           "the distances are data (+0x100..+0x15F are the record's SLight +0x00..+0x5F); the fade curve and the distance measure are not in game data");
+}
+
+namespace {
+// Camera distance of a light for its record's fade distances (estimate: to the light's origin).
+float light_distance(const MapLight& l, const V3& eye) {
+    const float dx = l.node[12] - eye.x, dy = l.node[13] - eye.y, dz = l.node[14] - eye.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+// deferred_light +0x100..+0x160 from the light record (SLight +0x00..+0x5F), as the light and shaft
+// techniques read them. +0x100..+0x130: four world-space clip planes, made camera-relative
+// (n . p_rel + d + n . eye); the PS masks with saturate(plane . (p, 1))^exponent, exponents at
+// +0x140, and the techniques read only as many planes as the record has (Outpost: 3517 / 2354 /
+// 1350 / 611 records with planes 0..3 active = 3518 / 2354 / 1350 / 611 apply techniques reading
+// +0x100..+0x130). +0x150: the record's diffuse / specular weight, +0x154 its shadow weight
+// (1 on all of Outpost's shadowing lights), +0x160 the light fade.
+template <class Sink>
+void write_light_record(Sink& sink, const MapLight& l, const V3& eye, bool shadowed, bool records, float light_fade) {
+    if (!records) {
+        for (uint32_t k = 0; k < 4; ++k) sink.set(ext::DeferredLight, 0x100 + 16 * k, float4{0, 0, 0, 1});
+        sink.set(ext::DeferredLight, 0x140, float4{0, 0, 0, 0});
+        sink.set(ext::DeferredLight, 0x150, float4{1, shadowed ? 1.0f : 0.0f, 0, 0});
+        sink.set(ext::DeferredLight, 0x160, 1.0f);
+        return;
+    }
+    for (uint32_t k = 0; k < 4; ++k) {
+        const float* p = &l.params[size_t(k) * 4];
+        sink.set(ext::DeferredLight, 0x100 + 16 * k, float4{p[0], p[1], p[2], p[3] + p[0] * eye.x + p[1] * eye.y + p[2] * eye.z});
+    }
+    sink.set(ext::DeferredLight, 0x140, float4{l.params[16], l.params[17], l.params[18], l.params[19]});
+    sink.set(ext::DeferredLight, 0x150, float4{l.params[20], shadowed ? l.params[21] : 0.0f, l.params[22], l.params[23]});
+    sink.set(ext::DeferredLight, 0x160, light_fade);  // the PS scales both outputs by saturate(+0x160) (cb0[36].x)
+}
+}  // namespace
+
+float GameLighting::light_fade(const MapLight& l, const V3& eye) const {
+    return light_records_ ? l.light_fade(light_distance(l, eye)) : 1.0f;
+}
+float GameLighting::shaft_fade(const MapLight& l, const V3& eye) const {
+    return light_records_ ? l.shaft_fade(light_distance(l, eye)) : 1.0f;
 }
 
 std::optional<ViewMatrices> light_shadow_view(const MapLight& l) {
@@ -2994,6 +3033,7 @@ std::vector<SunShadow*> GameLighting::light_shadows_to_render(Gpu& gpu, ID3D12Gr
     for (auto& ll : lights_) {
         if (out.size() >= budget) break;
         if (!ll.shadow_technique || (ll.shadow && ll.shadow->valid) || frustum.outside(ll.light.lo, ll.light.hi)) continue;
+        if (light_fade(ll.light, vm.eye) <= 0) continue;  // not drawn
         const auto view = light_shadow_view(ll.light);
         if (!view) continue;
         if (!ll.shadow) ll.shadow = std::make_unique<SunShadow>();
@@ -3050,10 +3090,8 @@ void GameLighting::write_light(Sink& sink, const LocalLight& ll, const ViewMatri
             vm.eye.z * relative_to_box.c[2][i];
     sink.set(ext::DeferredLight, 0x40, relative_to_box);
     sink.set(ext::DeferredLight, 0xC0, node_rel);
-    for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
-    sink.set(ext::DeferredLight, 0x150, 1.0f);
-    // +0x154: weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
-    sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
+    // +0x154 is the weight of the shadow term in the shadowing PS (lit = 1 + w * (taps - 1)).
+    write_light_record(sink, l, vm.eye, shadowed, light_records_, light_fade(l, vm.eye));
     if (shadowed) {  // bind_light_shadow's values
         sink.set(6, 0x18, float(ll.shadow->size));
         sink.set(6, 0x1C, float(ll.shadow->size));
@@ -3062,7 +3100,6 @@ void GameLighting::write_light(Sink& sink, const LocalLight& ll, const ViewMatri
         sink.set(6, 0xC0, mul(ll.shadow->vm.vp_abs, from_rel));
         sink.set(6, 0x180, 2.0f);
     }
-    sink.set(ext::DeferredLight, 0x160, 1.0f);  // the PS multiplies both outputs by saturate(+0x160) (cb0[36].x): light fade, fully on
 }
 
 void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes) {
@@ -3081,6 +3118,8 @@ void GameLighting::draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GB
     for (size_t index = 0; index < lights_.size(); ++index) {
         auto& ll = lights_[index];
         if (frustum.outside(ll.light.lo, ll.light.hi) || frustum.tiny(ll.light.lo, ll.light.hi, min_ndc)) continue;
+        // Faded out by its record's distances: the PS would output 0 (saturate(+0x160)).
+        if (light_fade(ll.light, vm.eye) <= 0) continue;
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && ll.shadow_technique;
         if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
         if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
@@ -3158,7 +3197,7 @@ std::vector<GameLighting::GridLight> GameLighting::grid_lights(const ViewMatrice
             const float d = center[a] - std::clamp(center[a], ll.light.lo[a], ll.light.hi[a]);
             d2 += d * d;
         }
-        if (d2 > radius * radius) continue;
+        if (d2 > radius * radius || light_fade(ll.light, vm.eye) <= 0) continue;
         if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
         auto& d = volume_draws_[draws++];
         d.light = index;
@@ -3192,7 +3231,8 @@ std::vector<GameLighting::GridLight> GameLighting::grid_lights(const ViewMatrice
         // saturate(a d + b) as the CS's saturate((end - d) / (end - start)).
         g.end = -b / a;
         g.start = (1 - b) / a;
-        g.intensity = ps[w][0];
+        // The grid CS has no +0x160 input: the light fade scales the intensity.
+        g.intensity = ps[w][0] * light_fade(ll.light, vm.eye);
         // Cone (scale, bias, exponent): saturate(bias + scale cos)^exponent, cos from the +X axis.
         // The CS's cone is linear between cos(inner) and cos(outer); the exponent is dropped.
         const auto& cone = ps[f - 3];
@@ -3347,9 +3387,10 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         ext_.zero_when_missing(ext::Transparent, "transparent pass inputs (atmosphere volumes, coverage weight) not produced: zero");
     if (!ext_.zero_policy(ext::RigidModel)) ext_.zero_when_missing(ext::RigidModel, "rigid model value with no known meaning: zero");
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "volume fog value with no known meaning: zero");
-    ext_.set(ext::VolumeFog, 0xB0, 1.0f);  // cb0[39]: shaft intensity scale
+    ext_.set(ext::VolumeFog, 0xB0, 1.0f);  // cb0[39]: shaft intensity scale (per shaft: its fade)
     ext_.set(ext::VolumeFog, 0xB4, 1.0f);  // cb0[40]: march direction (+1: from the far face toward the eye)
-    ext_.note_estimate("extern 50 +0xB0 = 1 (shaft intensity), +0xB4 = 1 (march direction)", chosen);
+    ext_.note_estimate("extern 50 +0xB0 = shaft fade x light fade (shaft intensity: the PS scales its whole output by it), +0xB4 = 1 (march direction)",
+                       "the fade distances are the record's SShadowingLight +0xFC..+0x108 (1 for collection lights); the destination and the product are estimates");
     // transparent scope (cb2) depends only on Deferred +0x00 and Transparent +0x80..+0xE0, not per-light state.
     const auto q2v = upload(evaluate_scope(transparent_scope_, ScopeStage::Vertex, ext_));
     const auto q2p = upload(evaluate_scope(transparent_scope_, ScopeStage::Pixel, ext_));
@@ -3415,10 +3456,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         sink.set(ext::DeferredLight, 0x40, rel_to_box);
         sink.set(ext::DeferredLight, 0x80, box_to_rel);
         sink.set(ext::DeferredLight, 0xC0, node_rel);
-        for (uint32_t off : {0x100u, 0x110u, 0x120u, 0x130u}) sink.set(ext::DeferredLight, off, float4{0, 0, 0, 1});
-        sink.set(ext::DeferredLight, 0x150, 1.0f);
-        sink.set(ext::DeferredLight, 0x154, shadowed ? 1.0f : 0.0f);
-        sink.set(ext::DeferredLight, 0x160, 1.0f);
+        write_light_record(sink, l, vm.eye, shadowed, light_records_, light_fade(l, vm.eye));
         if (shadowed) {  // bind_light_shadow's values
             sink.set(6, 0x18, float(ll.shadow->size));
             sink.set(6, 0x1C, float(ll.shadow->size));
@@ -3431,6 +3469,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         sink.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
         sink.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
         sink.set(ext::VolumeFog, 0xA0, box_size);                       // cb0[39]: box world-space extents (point light radial falloff)
+        sink.set(ext::VolumeFog, 0xB0, light_fade(l, vm.eye) * shaft_fade(l, vm.eye));  // shaft intensity: the record's fades
         return ll.mirrored;
     };
     const float min_ndc = 12.0f / float(std::max(1u, h_));
@@ -3438,6 +3477,9 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     for (const auto& vl : vol_lights_) {
         LocalLight& ll = lights_[vl.light];
         if (frustum.outside(ll.light.lo, ll.light.hi) || frustum.tiny(ll.light.lo, ll.light.hi, min_ndc, 140.0f)) continue;
+        // The shaft techniques do not read +0x160; their intensity (VolumeFog +0xB0) takes the
+        // record's shaft fade times the light fade (estimate), and a zero one is not drawn.
+        if (light_fade(ll.light, vm.eye) * shaft_fade(ll.light, vm.eye) <= 0) continue;
         const bool shadowed = light_shadows_ && ll.shadow && ll.shadow->valid && vl.shadow_technique;
         if (shadowed && !ext_.zero_policy(6)) ext_.zero_when_missing(6, "deferred shadow value with no known meaning: zero");
         if (volume_draws_.size() <= draws) volume_draws_.resize(draws + 1);
