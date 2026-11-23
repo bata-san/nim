@@ -2926,7 +2926,7 @@ public:
             auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
             const char* kind = light.mode != ViewMode::Lit ? "debug" : "game";
             fs::path file = dir / std::format("{}_{}_{}.png", scene.loaded() ? scene.tag().str() : "empty", kind, stamp);
-            write_png(file, gb.width(), gb.height(), px);
+            write_png(file, gb.output_width(), gb.output_height(), px);
             info(ui::trf(ui::S::LogSaved, to_utf8(file.wstring())));
         } catch (const std::exception& ex) {
             error(ui::trf(ui::S::ErrSave, ex.what()));
@@ -3678,7 +3678,7 @@ public:
         view_h = uint32_t(std::max(16.0f, size.y));
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         auto* dl = ImGui::GetWindowDrawList();
-        if (gb.lit && gb.width() == view_w && gb.height() == view_h) {
+        if (gb.lit && gb.output_width() == view_w && gb.output_height() == view_h) {
             ImGui::Image(ImTextureID(gpu.srv().gpu(gb.srv_first + 5).ptr), size);
             const auto display = ImGui::GetIO().DisplaySize;
             frame_generation_rect_valid = origin.x >= 0 && origin.y >= 0 &&
