@@ -3570,6 +3570,8 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::SSRTip));
             ImGui::Checkbox(ui::tr(ui::S::LightShafts), &light.volumetrics);
             ImGui::SetItemTooltip(ui::tr(ui::S::LightShaftsTip));
+            if (light.volumetrics)
+                ImGui::SliderFloat(ui::tr(ui::S::LightShaftStrength), &light.near_shaft_strength, 0.0f, 1.0f, "%.2f");
             if (map_scene) ImGui::Checkbox("FX (パーティクル)", &fx_enabled);
             ImGui::Checkbox(ui::tr(ui::S::PostProcess), &light.post);
             ImGui::SetItemTooltip(ui::tr(ui::S::PostProcessTip));

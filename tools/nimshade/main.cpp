@@ -154,6 +154,7 @@ int run(int argc, char** argv) {
     size_t frame_light_shadows = 0;  // > 0: draw the light maps as the GUI does, this many per whole frame
     bool verify_frame_inputs = false;
     float fog_density_scale = LightingParams{}.fog_density_scale;
+    float near_shaft_strength = LightingParams{}.near_shaft_strength;
     bool authored_interior_fog = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, no_interior_fog = false, print_channels = false;
     std::optional<TagHash> clip_tag;
@@ -273,6 +274,11 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-sky-objects") no_sky_objects = true;
         else if (args[i] == "--no-ssao") no_ssao = true;
         else if (args[i] == "--no-volumetrics") no_volumetrics = true;
+        else if (args[i] == "--near-shaft-strength" && i + 1 < args.size()) {
+            near_shaft_strength = std::stof(args[++i]);
+            if (!std::isfinite(near_shaft_strength) || near_shaft_strength < 0 || near_shaft_strength > 1)
+                throw std::runtime_error("--near-shaft-strength expects a number in [0, 1]");
+        }
         else if (args[i] == "--shaft-fog-density") shaft_fog_density = true;
         else if (args[i] == "--no-shaft-fog-density") shaft_fog_density = false;
         else if (args[i] == "--no-ssr") no_ssr = true;
@@ -362,7 +368,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -1035,6 +1041,7 @@ int run(int argc, char** argv) {
     lp.optimize = !reference;
     lp.ssao = !no_ssao;
     lp.volumetrics = !no_volumetrics;
+    lp.near_shaft_strength = near_shaft_strength;
     lp.shaft_fog_density = shaft_fog_density;
     lp.ssr = !no_ssr;
     lp.atmosphere = !no_atmosphere;

@@ -676,6 +676,7 @@ struct LightingParams {
     bool ssao = true;
     // Light shafts: the local lights' volumetrics techniques and the engine's blur / upres passes.
     bool volumetrics = true;
+    float near_shaft_strength = 0.25f;  // fades to original strength for distant volumes
     // Reconstructed radial density from the froxels (extern 0x58). Off by default: differentiating
     // the 3D noise-modulated interior froxel transmittance multiplies 5 m noise blobs by ~15x over
     // the authored base shaft density (cb0[30].x), producing blotchy clouds in interior maps.

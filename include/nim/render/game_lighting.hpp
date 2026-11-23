@@ -504,7 +504,7 @@ private:
     // then volumetrics_blur_results and volumetrics_upres_1 add the shafts to the HDR target.
     void render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                             D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& scopes, bool transparent_inputs,
-                            bool use_fog_density);
+                            bool use_fog_density, float strength);
     void pack_shaft_fog(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm);
     Scope rigid_scope_, transparent_scope_, transparent_adv_scope_;
     GamePipeline vol_downsample_, vol_blur_, vol_upres_, vol_assemble_;

@@ -2234,7 +2234,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(0x58, 0x08, nullptr);
     if (shafts_before_transparents) {
         ProfileScope ps_("frame.light.volumetrics");
-        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, true, shaft_fog);
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, true, shaft_fog, p.near_shaft_strength);
     }
     if (transparents) {
         const float4 depth_decode = ext_.get_v(ext::Deferred, 0x00);
@@ -2257,7 +2257,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     }
     if (volumetrics && !shafts_before_transparents) {
         ProfileScope ps_("frame.light.volumetrics");
-        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, false, shaft_fog);
+        render_volumetrics(gpu, cl, gb, vm, hdr, scopes, false, shaft_fog, p.near_shaft_strength);
     }
     Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (p.ssr && ssr_loaded_) keep_ssr_history(cl, vm);
@@ -2418,8 +2418,13 @@ void GameLighting::fill_atmosphere(const LightingParams& p) {
                                "one metre for an undefined fog transition; engine guard unknown");
         }
     };
-    range(0x178, ch(0x10)[0], ch(0x11)[0], "fog_density_lookup_start / _end");
-    range(0x180, ch(0x12)[0], ch(0x13)[0], "fog_inscatter_lookup_start / _end");
+    // Extend the native distance ramps to keep nearby surfaces clear while preserving
+    // the level's long-range density and sky colours. Keep longer authored ranges.
+    constexpr float clear_near = 35.0f, full_fog = 170.0f;
+    range(0x178, std::max(ch(0x10)[0], clear_near), std::max(ch(0x11)[0], full_fog), "fog_density_lookup_start / _end");
+    range(0x180, std::max(ch(0x12)[0], clear_near), std::max(ch(0x13)[0], full_fog), "fog_inscatter_lookup_start / _end");
+    ext_.note_estimate("fog depth ramps extend to at least 35..170 m",
+                       "viewer distance adjustment for foreground visibility; authored fog density and sky colour kept");
     ext_.set(A, 0x190, ch(0x16));  // fog_decay_color for transparent spectral attenuation
     ext_.note_estimate("extern 7 +0x190 = fog_decay_color", copied);
     est(0x1A0, ch(0x17)[0], "fog_decay_scale: the channel after fog_decay_color (+0x190)");
@@ -3346,7 +3351,7 @@ void GameLighting::pack_shaft_fog(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
 //     +0x98 = (depth, depth) as nim's linear depth), added to the HDR target.
 void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm,
                                       D3D12_CPU_DESCRIPTOR_HANDLE hdr, const ScopeBufferFn& full_scopes,
-                                      bool transparent_inputs, bool use_fog_density) {
+                                      bool transparent_inputs, bool use_fog_density, float strength) {
     if (use_fog_density) pack_shaft_fog(gpu, cl, vm);
     const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const auto vb = vol_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -3402,7 +3407,7 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
     if (!ext_.zero_policy(ext::VolumeFog)) ext_.zero_when_missing(ext::VolumeFog, "volume fog value with no known meaning: zero");
     ext_.set(ext::VolumeFog, 0xB0, 1.0f);  // cb0[39]: shaft intensity scale (per shaft: its fade)
     ext_.set(ext::VolumeFog, 0xB4, 1.0f);  // cb0[40]: march direction (+1: from the far face toward the eye)
-    ext_.note_estimate("extern 50 +0xB0 = shaft fade x light fade (shaft intensity: the PS scales its whole output by it), +0xB4 = 1 (march direction)",
+    ext_.note_estimate(std::format("light shafts: near strength {:g}, returning to authored strength at 120 m from the light volume", strength),
                        "the fade distances are the record's SShadowingLight +0xFC..+0x108 (1 for collection lights); the destination and the product are estimates");
     // transparent scope (cb2) depends only on Deferred +0x00 and Transparent +0x80..+0xE0, not per-light state.
     const auto q2v = upload(evaluate_scope(transparent_scope_, ScopeStage::Vertex, ext_));
@@ -3482,7 +3487,14 @@ void GameLighting::render_volumetrics(Gpu& gpu, ID3D12GraphicsCommandList* cl, G
         sink.set(ext::VolumeFog, 0x40, mul(rel_to_box, pixel_to_rel));  // cb0[32..35]: (pixel, depth) -> box
         sink.set(ext::VolumeFog, 0x80, rel_to_box.c[3]);                // cb0[38]: the eye in the box
         sink.set(ext::VolumeFog, 0xA0, box_size);                       // cb0[39]: box world-space extents (point light radial falloff)
-        sink.set(ext::VolumeFog, 0xB0, light_fade(l, vm.eye) * shaft_fade(l, vm.eye));  // shaft intensity: the record's fades
+        const V3 nearest{std::clamp(vm.eye.x, l.lo[0], l.hi[0]),
+                         std::clamp(vm.eye.y, l.lo[1], l.hi[1]),
+                         std::clamp(vm.eye.z, l.lo[2], l.hi[2])};
+        const V3 separation = vm.eye - nearest;
+        const float distance = std::sqrt(dot(separation, separation));
+        const float t = std::clamp((distance - 15.0f) / 105.0f, 0.0f, 1.0f);
+        const float contrast = std::lerp(strength, 1.0f, t * t * (3.0f - 2.0f * t));
+        sink.set(ext::VolumeFog, 0xB0, contrast * light_fade(l, vm.eye) * shaft_fade(l, vm.eye));
         return ll.mirrored;
     };
     const float min_ndc = 12.0f / float(std::max(1u, h_));

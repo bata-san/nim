@@ -297,6 +297,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(LogAiReady, "AI: {} 体、ドローン {}、描画枠 {} (読込 {:.1f} 秒、配置 {:.1f} 秒)", "AI: {} agents, {} drones, {} actor slots (read {:.1f} s, set up {:.1f} s)", "AI: {} 체, 드론 {}, 표시 슬롯 {} (읽기 {:.1f} 초, 배치 {:.1f} 초)") \
     X(ErrAi, "AI を準備できません: {}", "Cannot prepare the AI: {}", "AI 를 준비할 수 없습니다: {}") \
     X(LightShafts, "ライトシャフト", "Light shafts", "라이트 샤프트")                                                    \
+    X(LightShaftStrength, "近距離の光芒の強さ", "Near light shaft intensity", "근거리 라이트 샤프트 강도") \
     X(LightShaftsTip, "ライトの volumetrics 技法 → blur → upres (霧密度スライスは生成元未特定のため 0 = 推定)",          \
       "Light volumetrics technique, blur, upres (the fog-density slice has no known source, so 0 = estimated)",           \
       "라이트 volumetrics 기법 → blur → upres (안개 밀도 슬라이스의 원천이 불명확해 0 = 추정)")                              \
