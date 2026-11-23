@@ -3678,10 +3678,11 @@ public:
         view_h = uint32_t(std::max(16.0f, size.y));
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         auto* dl = ImGui::GetWindowDrawList();
-        if (gb.lit && gb.output_width() == view_w && gb.output_height() == view_h) {
+        if (gb.lit) {
             ImGui::Image(ImTextureID(gpu.srv().gpu(gb.srv_first + 5).ptr), size);
             const auto display = ImGui::GetIO().DisplaySize;
-            frame_generation_rect_valid = origin.x >= 0 && origin.y >= 0 &&
+            frame_generation_rect_valid = gb.output_width() == view_w && gb.output_height() == view_h &&
+                origin.x >= 0 && origin.y >= 0 &&
                 origin.x + float(view_w) <= display.x && origin.y + float(view_h) <= display.y;
             if (frame_generation_rect_valid) {
                 frame_generation_x = uint32_t(origin.x);
