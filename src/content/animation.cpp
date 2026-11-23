@@ -1464,7 +1464,7 @@ void pose_skeleton(const Skeleton& sk, const AnimationRig& rig, const AnimationC
         if (all) break;
     }
     if (rig.component.value == 0x80B80983u &&
-        (clip.tag.value == 0x80A9714Au || clip.tag.value == 0x80A97171u) &&
+        (clip.tag.value == 0x80A9714Au || clip.tag.value == 0x80A97171u || clip.tag.value == 0x80A97148u) &&
         sk.size() == 107) {
         // With no cloth simulation, use the authored hanging shape of the four cape
         // chains at rest. They follow the posed pelvis, so the cape stays attached.

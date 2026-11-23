@@ -339,7 +339,7 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
         case 0x0C: vm.binary([](float4 a, float4 b) { return float4{a[0], b[0], b[1], b[2]}; }); break;
         case 0x0D: vm.binary([](float4 a, float4 b) { return float4{a[0], a[1], b[0], b[1]}; }); break;
         case 0x0E: vm.binary([](float4 a, float4 b) { return float4{a[0], a[1], a[2], b[0]}; }); break;
-        case 0x0F: vm.binary([](float4 c, float4 x) {
+        case 0x0F: vm.binary([](float4 x, float4 c) {
             float4 r;
             for (int i = 0; i < 4; ++i) r[i] = (c[0] * x[i] + c[1]) * x[i] * x[i] + (c[2] * x[i] + c[3]);
             return r;

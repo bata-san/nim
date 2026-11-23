@@ -527,46 +527,34 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         // The character's own clips first; what it lacks comes from the shared family (推定: the
         // motion graph's choice is not decoded).
         set.locomotion = !own.locomotion.empty() ? own.locomotion : borrowed.locomotion;
-        // The Compiler (80A97147) hovers rather than walking with foot root motion; its 3.6 KB
-        // 80A9714A clip is a minimal additive layer, whereas 80A97153 (90 frames, 50 KB, cyclic)
-        // is its full-body authored idle stance. Pair it with its authored hover/glide clips (推定).
+        set.turns = !own.turns.empty() ? own.turns : borrowed.turns;
+        set.idle = own_idle ? own_idle : borrowed_idle;
+        // The Compiler (80A97147) hovers rather than walking with foot root motion.
+        // Motion graph 80B80986 node 1 ("idle", 6FB760FF) has two sequences:
+        //   seq 0 = 80A97171 (45f, additive — 15 Hz bone-7 head/neck tremor)
+        //   seq 1 = 80A97148 (31f, static, full-body — calm upright idle pose, 0 stretch)
+        // own_idle picked 80A97171 because it is longer, causing severe neck trembling and a
+        // hit-flinch appearance. Use seq 1 (80A97148) for idle and calm hover so the neck stays
+        // steady and the lower cape does not billow.
         if (entity.value == 0x80A97147u) {
             try {
-                const AnimationClip idle = load_animation_clip(pm, TagHash(0x80A97153u));
+                const AnimationClip idle = load_animation_clip(pm, TagHash(0x80A97148u));
                 if (idle.frame_count > 1) {
                     MotionClip m;
-                    m.clip = TagHash(0x80A97153u);
+                    m.clip = TagHash(0x80A97148u);
                     m.seconds = float(idle.frame_count - 1) / fps;
                     m.cyclic = true;
                     m.authored = true;
                     set.idle = m;
+                    if (set.locomotion.empty()) {
+                        m.speed = 1.6f;
+                        m.direction = {1.0f, 0.0f};
+                        set.locomotion.push_back(m);
+                    }
                 }
             } catch (...) {
             }
         }
-        if (entity.value == 0x80A97147u && set.locomotion.empty()) {
-            auto add_hover = [&](uint32_t tag_val, float speed, bool cyclic) {
-                try {
-                    const AnimationClip c = load_animation_clip(pm, TagHash(tag_val));
-                    if (c.frame_count > 1) {
-                        MotionClip m;
-                        m.clip = TagHash(tag_val);
-                        m.speed = speed;
-                        m.direction = {1.0f, 0.0f};
-                        m.seconds = float(c.frame_count - 1) / fps;
-                        m.cyclic = cyclic;
-                        m.authored = true;
-                        set.locomotion.push_back(m);
-                    }
-                } catch (...) {
-                }
-            };
-            add_hover(0x80A97160u, 1.0f, true);   // calm hover drift
-            add_hover(0x80A9715Au, 1.8f, true);   // forward hover glide
-            add_hover(0x80A97149u, 3.3f, false);  // forward surge
-        }
-        set.turns = !own.turns.empty() ? own.turns : borrowed.turns;
-        set.idle = own_idle ? own_idle : borrowed_idle;
         set.borrowed = (own.locomotion.empty() && !borrowed.locomotion.empty() ? 1 : 0) +
                        (own.turns.empty() && !borrowed.turns.empty() ? 2 : 0) + (!own_idle && set.idle ? 4 : 0);
         for (const auto& m : set.locomotion) {
