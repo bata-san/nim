@@ -689,6 +689,10 @@ struct LightingParams {
     bool post = true;
     bool auto_exposure = true;
     bool bloom = true;
+    // Bloom weight of bright pixels (3.111, estimate): the initial downsample's luminance curve
+    // weights a pixel by 1 + bloom_highlight * (its luminance after exposure), so light sources and
+    // glowing FX spread while the dim surfaces keep the linear bloom. 0 = linear only.
+    float bloom_highlight = 2.0f;
     // Anti-aliasing with the engine's fxaa pass over the tonemapped image (with post only).
     bool antialias = true;
     // Temporal anti-aliasing (with post only): a jittered view each frame (GameLighting::temporal_view)

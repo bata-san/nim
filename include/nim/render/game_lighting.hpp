@@ -548,6 +548,11 @@ private:
     void render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists
     ComPtr<ID3D12Resource> hdr_;
+
+public:
+    ID3D12Resource* hdr_target() const { return hdr_.Get(); }  // diagnostics (PIXEL_SHADER_RESOURCE after render)
+
+private:
     GamePipeline distortion_depth_downsample_, distortion_resolve_;
     ComPtr<ID3D12Resource> distortion_, distortion_depth_, distortion_view_depth_, distorted_hdr_;
     ComPtr<ID3D12DescriptorHeap> distortion_dsv_;

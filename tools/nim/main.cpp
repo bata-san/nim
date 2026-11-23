@@ -6,6 +6,7 @@
 // the UI itself is set in the game's fonts, read from the user's install at startup.
 #include "media.hpp"
 #include "frame_generation.hpp"
+#include "frame_profile.hpp"
 #include "ui_text.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
@@ -1133,6 +1134,11 @@ private:
                 if (selection_changed) {
                     const auto tables = req.activity.is_none() ? std::vector<TagHash>{} : load_activity_node_tables(*pm, req.activity, req.bubble_name, req.activity_map);
                     layout = load_map_layout(*pm, req.bubble, tables);
+                    try {  // DCON FX and the lockdown ships, left out by user decision (3.111)
+                        pm->build_hash64_index();
+                        hide_scripted_nodes(*pm, *layout, req.activity);
+                    } catch (const std::exception&) {
+                    }
                     layout_activity = req.activity;
                     layout_activity_map = req.activity_map;
                     entities.reset();
@@ -1191,7 +1197,12 @@ private:
                 for (size_t i = 0; i < decals.size(); ++i) jobs.push_back(decal_start + i);
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
-                    const auto all = load_map_lights(*pm, *layout);
+                    auto all = load_map_lights(*pm, *layout);
+                    try {  // the lights the map's FX carry (3.111), shown with the FX
+                        pm->build_hash64_index();
+                        for (auto& l : load_map_fx_lights(*pm, *layout)) all.push_back(std::move(l));
+                    } catch (const std::exception&) {
+                    }
                     for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
                 } catch (const std::exception&) {
                     // a map whose node tables cannot be read is drawn without local lights
@@ -1349,6 +1360,8 @@ struct Window {
     std::vector<RECT> caption_hot;
 };
 Window g_win;
+nimview::FrameProfile g_prof;  // NIM_BENCH (3.111)
+using Prof = nimview::FrameProfile;
 FrameGeneration g_frame_generation;
 bool g_frame_generation_requested = false, g_frame_generation_proxy = false;
 
@@ -1955,6 +1968,7 @@ public:
         }
         publish_thumbnail(g);
         try {
+            const auto ps = g_prof.scope(Prof::Stream);
             stream_map(g);
         } catch (const std::exception& ex) {
             stop_map();
@@ -2045,14 +2059,8 @@ public:
         }
         if (pr.lights && !map.lights_set) {
             map.lights_set = true;
-            std::vector<const MapLight*> ptrs;
-            for (const auto& l : *pr.lights) ptrs.push_back(&l);
             map_lights = pr.lights;  // kept alive while the lighting refers to it
-            try {
-                game_lighting.set_lights(*pm, g, ptrs);
-            } catch (const std::exception& ex) {
-                ++map_add_failures[std::string("local lights: ") + std::string(ex.what()).substr(0, 100)];
-            }
+            apply_map_lights(g);
             if (pr.cubemaps) {
                 std::vector<const MapCubemap*> cps;
                 for (const auto& c : *pr.cubemaps) cps.push_back(&c);
@@ -2228,14 +2236,23 @@ public:
         const ViewMatrices vm = make_view(current_view());
         const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};
         if (!ai.enabled) {
-            ai.actors.update(scene, *ai.sim, eye, 0, -1);  // hidden, simulation paused
+            {
+                const auto ps = g_prof.scope(Prof::AiActors);
+                ai.actors.update(scene, *ai.sim, eye, 0, -1);  // hidden, simulation paused
+            }
             take_actor_sounds();
             return;
         }
         const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
         ai.sim->set_player_invisible(!ai.visible);
-        ai.sim->step(dt, eye);
-        ai.actors.update(scene, *ai.sim, eye, dt, ai.range);
+        {
+            const auto ps = g_prof.scope(Prof::AiSim);
+            ai.sim->step(dt, eye);
+        }
+        {
+            const auto ps = g_prof.scope(Prof::AiActors);
+            ai.actors.update(scene, *ai.sim, eye, dt, ai.range);
+        }
         take_actor_sounds();
     }
     void take_actor_sounds() {
@@ -2273,6 +2290,20 @@ public:
 
     std::map<std::string, size_t> map_add_failures;
     std::shared_ptr<const std::vector<MapLight>> map_lights;
+    bool map_lights_fx = true;  // the FX lights (MapLight::fx) are in the lighting
+    // The map's local lights, with the FX's own lights only while FX are shown (3.111).
+    void apply_map_lights(Gpu& g) {
+        if (!map_lights) return;
+        std::vector<const MapLight*> ptrs;
+        for (const auto& l : *map_lights)
+            if (!l.fx || fx_enabled) ptrs.push_back(&l);
+        map_lights_fx = fx_enabled;
+        try {
+            game_lighting.set_lights(*pm, g, ptrs);
+        } catch (const std::exception& ex) {
+            ++map_add_failures[std::string("local lights: ") + std::string(ex.what()).substr(0, 100)];
+        }
+    }
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
     bool entity_preview_active = false;
@@ -2736,7 +2767,11 @@ public:
 
     void record(ID3D12GraphicsCommandList* cl) {
         if (!gb.lit) return;
-        update_animation(ImGui::GetIO().DeltaTime);
+        g_prof.gpu_mark(Prof::GStart);
+        {
+            const auto ps = g_prof.scope(Prof::Anim);
+            update_animation(ImGui::GetIO().DeltaTime);
+        }
         const float material_dt = material_playing ? ImGui::GetIO().DeltaTime * material_speed : 0;
         material_time += material_dt;
         scene.set_material_frame(material_time, material_dt);
@@ -2748,6 +2783,7 @@ public:
         light.dof_focus = cam.distance;
         try {
             const bool game_view = game_ready && light.mode == ViewMode::Lit;
+            auto prepare_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Prepare);
             if (game_ready) {
                 if (game_view) game_lighting.prepare_frame(gpu, gb, light);
                 else game_lighting.update_global_channels(light);
@@ -2758,6 +2794,8 @@ public:
             }
             const View camera = current_view();
             ViewMatrices vm = game_view ? game_lighting.temporal_view(camera, light) : make_view(camera);
+            prepare_scope.reset();
+            auto audio_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Audio);
             if (ambient_audio) {
                 if (map_scene)
                     ambient_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
@@ -2771,25 +2809,39 @@ public:
                                      entity_audio_enabled && map_scene);
                 entity_cues.clear(), entity_stopped.clear();
             }
+            audio_scope.reset();
             SunShadow* shadow = nullptr;
+            auto sun_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::SunShadow);
             if (shadows && light.mode == ViewMode::Lit && game_ready) {
                 if (!sun_shadow.depth) sun_shadow.resize(gpu, 4096);
                 sun_shadow.fit_view(game_lighting.sun_toward(light), vm.eye, cam.target, scene.center(), scene.radius(), map_scene);
                 scene.render_sun_shadow(gpu, cl, sun_shadow, map_scene);
                 shadow = &sun_shadow;
             }
+            sun_scope.reset();
+            g_prof.gpu_mark(Prof::GSunShadow);
+            auto light_shadow_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::LightShadow);
             // Shadowing local lights: a couple of depth maps per frame for the lights on screen,
             // once the map is complete (a growing scene would discard them again).
             game_lighting.set_light_shadows(shadows);
             if (shadows && light.mode == ViewMode::Lit && game_ready && map_scene && !map.streaming && scene.loaded())
                 for (SunShadow* s : game_lighting.light_shadows_to_render(gpu, cl, vm, scene.item_count(), 2)) scene.render_shadow(gpu, cl, *s);
+            light_shadow_scope.reset();
+            auto rain_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Rain);
             if (map_scene && !map.streaming && scene.loaded() && (!rain.valid || rain.items != scene.item_count())) {
                 if (!rain.mask) rain.resize(gpu, 4096);
                 scene.render_rain_occlusion(gpu, cl, rain, scene.center(), scene.radius());
             }
             scene.set_rain_occlusion(map_scene && rain.valid ? &rain : nullptr);
             game_lighting.set_overhead_occlusion(map_scene && rain.valid ? &rain : nullptr);
-            scene.render_gbuffer(gpu, cl, gb, vm);
+            rain_scope.reset();
+            g_prof.gpu_mark(Prof::GLightShadow);
+            {
+                const auto ps = g_prof.scope(Prof::GBuffer);
+                scene.render_gbuffer(gpu, cl, gb, vm);
+            }
+            g_prof.gpu_mark(Prof::GGBuffer);
+            auto lighting_scope = std::optional<Prof::Scope>(std::in_place, g_prof, Prof::Lighting);
             if (light.mode == ViewMode::Lit) {
                 if (!game_ready) throw std::runtime_error("Original game lighting is unavailable; no substitute renderer");
                 GameLighting::TransparentFn transparents;
@@ -2807,6 +2859,8 @@ public:
                 if (g_frame_generation_proxy && !map.streaming && map_scene && scene.loaded() && frame_generation_rect_valid)
                     g_frame_generation.tag(cl, gb, camera, vm, frame_generation_x, frame_generation_y);
             } else lighting.render(gpu, cl, gb, vm, light);
+            lighting_scope.reset();
+            g_prof.gpu_mark(Prof::GLighting);
             render_error.clear();
         } catch (const std::exception& ex) {
             if (render_error != ex.what()) error(ui::trf(ui::S::ErrRenderStopped, ex.what()));
@@ -3611,7 +3665,10 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::LightShaftsTip));
             if (light.volumetrics)
                 ImGui::SliderFloat(ui::tr(ui::S::LightShaftStrength), &light.near_shaft_strength, 0.0f, 1.0f, "%.2f");
-            if (map_scene) ImGui::Checkbox("FX (パーティクル)", &fx_enabled);
+            if (map_scene && ImGui::Checkbox("FX (パーティクル)", &fx_enabled) && map.lights_set && map_lights_fx != fx_enabled) {
+                gpu.wait_idle();  // the lights' pipelines and shadow maps are in use by frames in flight
+                apply_map_lights(gpu);
+            }
             ImGui::Checkbox(ui::tr(ui::S::PostProcess), &light.post);
             ImGui::SetItemTooltip(ui::tr(ui::S::PostProcessTip));
             ImGui::BeginDisabled(!light.post);
@@ -3620,6 +3677,8 @@ public:
             ImGui::SameLine();
             ImGui::Checkbox(ui::tr(ui::S::Bloom), &light.bloom);
             ImGui::SetItemTooltip(ui::tr(ui::S::BloomTip));
+            ImGui::SliderFloat(ui::tr(ui::S::BloomHighlight), &light.bloom_highlight, 0.0f, 6.0f, "%.1f");
+            ImGui::SetItemTooltip(ui::tr(ui::S::BloomHighlightTip));
             ImGui::SliderFloat(ui::tr(ui::S::EmissiveGain), &light.emissive_gain, 0.0f, 3.0f, "%.2f");
             if (g_frame_generation.built()) {
                 if (ImGui::Checkbox("NVIDIA DLSS Frame Generation (2x)", &g_frame_generation_requested) &&
@@ -5372,6 +5431,94 @@ public:
     }
 };
 
+// ---- NIM_BENCH: unattended frame-time measurement (tools/nim/frame_profile.hpp, 3.111) -------------
+struct BenchDriver {
+    uint32_t frames = 0, settle = 240, settled = 0;
+    std::optional<V3> eye, look;
+    float radius = -1;
+    bool ai = false, vsync = false, done = false;
+    fs::path out;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    std::string waiting_for;
+
+    static std::optional<V3> vec(const char* name) {
+        const char* v = std::getenv(name);
+        V3 r{};
+        if (!v || std::sscanf(v, "%f,%f,%f", &r.x, &r.y, &r.z) != 3) return std::nullopt;
+        return r;
+    }
+    void init() {
+        const char* f = std::getenv("NIM_BENCH");
+        if (!f || !*f) return;
+        frames = uint32_t(std::max(0, std::atoi(f)));
+        if (!frames) return;
+        eye = vec("NIM_BENCH_EYE"), look = vec("NIM_BENCH_LOOK");
+        if (const char* r = std::getenv("NIM_BENCH_RADIUS")) radius = float(std::atof(r));
+        if (const char* a = std::getenv("NIM_BENCH_AI")) ai = a[0] == '1';
+        if (const char* v = std::getenv("NIM_BENCH_VSYNC")) vsync = v[0] == '1';
+        if (const char* st = std::getenv("NIM_BENCH_SETTLE")) settle = uint32_t(std::max(0, std::atoi(st)));
+        const char* o = std::getenv("NIM_BENCH_OUT");
+        out = o && *o ? fs::path(to_wide(o)) : exe_dir() / "nim_bench.txt";
+    }
+    bool active() const { return frames && !done; }
+    void configure(App& app) {
+        if (radius >= 0) app.map.radius = radius <= 0 ? App::MapView::kUnlimited : radius;
+        app.ai.enabled = ai;
+    }
+    void place_camera(App& app) const {
+        if (!eye || !look) return;
+        const V3 d = *eye - *look;
+        const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (len <= 0) return;
+        app.cam.target = *look;
+        app.cam.distance = len;
+        app.cam.yaw = std::atan2(d.y, d.x);
+        app.cam.pitch = std::asin(std::clamp(d.z / len, -1.0f, 1.0f));
+    }
+    bool ready(const App& app) {
+        if (!app.map_scene) return waiting_for = "map", false;
+        if (app.map.streaming || !app.scene.loaded()) return waiting_for = "map streaming", false;
+        if (ai && !app.ai.sim && !app.ai.failed) return waiting_for = "ai", false;
+        return true;
+    }
+    // Before the frame's UI: advances the phases. Returns true once the report is written.
+    bool tick(App& app) {
+        if (!active()) return false;
+        place_camera(app);
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (!g_prof.collecting) {
+            if (!ready(app)) {
+                if (waited > 600) return finish(app, "timed out waiting for " + waiting_for);
+                return false;
+            }
+            if (settled++ < settle) return false;
+            g_prof.collecting = true;
+            return false;
+        }
+        if (g_prof.frames() >= frames) return finish(app, {});
+        return false;
+    }
+    bool finish(App& app, const std::string& failure) {
+        done = true;
+        g_prof.collecting = false;
+        std::string r = std::format("nim {} benchmark: {}\n", kVersion, app.gpu.adapter_name());
+        if (!failure.empty()) r += "FAILED: " + failure + "\n";
+        r += std::format("map {} ({}), radius {}, viewport {}x{}, ai {} ({} agents), present {}, {} settle frames\n",
+                         app.map.bubble.str(), app.map.name, app.map.radius >= App::MapView::kUnlimited ? 0.0f : app.map.radius,
+                         app.gb.width(), app.gb.height(), ai ? "on" : "off", app.ai.sim ? app.ai.sim->agents().size() : 0,
+                         vsync ? "vsync" : "uncapped", settle);
+        if (eye && look)
+            r += std::format("camera eye {:.1f},{:.1f},{:.1f} look {:.1f},{:.1f},{:.1f}\n", eye->x, eye->y, eye->z, look->x, look->y,
+                             look->z);
+        const auto [statics, lod0, entities] = app.scene.visibility_counts();
+        r += std::format("scene: {} meshes, {} instances; visible {} static ({} LOD0), {} entity\n", app.scene.mesh_count(),
+                         app.scene.instance_count(), statics, lod0, entities);
+        r += g_prof.report();
+        std::ofstream(out, std::ios::binary) << r;
+        return true;
+    }
+};
+
 int run(const std::wstring& cmdline) {
     ImGui_ImplWin32_EnableDpiAwareness();
     const float scale = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
@@ -5475,6 +5622,16 @@ int run(const std::wstring& cmdline) {
         if (t >= 0 && t < TabCount) app->tab = Tab(t);
     }
 
+    BenchDriver bench;
+    bench.init();
+    if (bench.active()) {
+        bench.configure(*app);
+        g_prof.init(app->gpu.device());
+        uint64_t frequency = 1;
+        app->gpu.queue()->GetTimestampFrequency(&frequency);
+        g_prof.set_frequency(frequency);
+    }
+
     uint64_t frame = 0;
     bool done = false;
     while (!done) {
@@ -5498,8 +5655,17 @@ int run(const std::wstring& cmdline) {
         }
 
         const uint32_t fi = uint32_t(frame % Gpu::kFramesInFlight);
-        WaitForSingleObjectEx(g_win.waitable, 1000, TRUE);
-        app->gpu.wait(g_win.fence[fi]);
+        if (bench.tick(*app)) {
+            done = true;
+            break;
+        }
+        g_prof.begin_frame();
+        {
+            const auto ps = g_prof.scope(Prof::Wait);
+            WaitForSingleObjectEx(g_win.waitable, 1000, TRUE);
+            app->gpu.wait(g_win.fence[fi]);
+        }
+        g_prof.read_slot(fi);
         app->gpu.begin_frame(fi);
         const bool generation_scene = g_frame_generation_proxy && app->map_scene && !app->map.streaming &&
             app->frame_generation_rect_valid && app->light.mode == ViewMode::Lit && app->scene.loaded() &&
@@ -5507,13 +5673,19 @@ int run(const std::wstring& cmdline) {
         g_frame_generation.set_active(generation_scene);
         g_frame_generation.begin_frame(uint32_t(frame));
         g_frame_generation.mark(FrameGeneration::Marker::simulation_start);
-        app->apply_pending(app->gpu);
+        {
+            const auto ps = g_prof.scope(Prof::Pending);
+            app->apply_pending(app->gpu);
+        }
+        g_prof.subtract(Prof::Pending, g_prof.current(Prof::Stream) + g_prof.current(Prof::AiSim) + g_prof.current(Prof::AiActors));
 
+        std::optional<Prof::Scope> ui_scope(std::in_place, g_prof, Prof::Ui);
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         app->ui();
         ImGui::Render();
+        ui_scope.reset();
 
         if (!app->frame_generation_rect_valid || !app->map_scene || app->map.streaming)
             g_frame_generation.set_active(false);
@@ -5522,12 +5694,14 @@ int run(const std::wstring& cmdline) {
         auto* cl = g_win.list.Get();
         check_hr(g_win.alloc[fi]->Reset(), "allocator Reset");
         check_hr(cl->Reset(g_win.alloc[fi].Get(), nullptr), "list Reset");
+        g_prof.set_list(cl, fi);
         try {
             app->record_uploads(cl, fi);
             if (app->viewport_visible) app->record(cl);
         } catch (const std::exception& ex) {
             app->error(ui::trf(ui::S::ErrRender, ex.what()));
         }
+        std::optional<Prof::Scope> submit_scope(std::in_place, g_prof, Prof::Submit);
         const UINT bb = g_win.swapchain->GetCurrentBackBufferIndex();
         Gpu::barrier(cl, g_win.back[bb].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const float clear[4] = {0.016f, 0.016f, 0.016f, 1};
@@ -5537,12 +5711,18 @@ int run(const std::wstring& cmdline) {
         cl->SetDescriptorHeaps(1, heaps);
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);
         Gpu::barrier(cl, g_win.back[bb].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        g_prof.gpu_mark(Prof::GUi);
+        g_prof.resolve();
         check_hr(cl->Close(), "Close");
         ID3D12CommandList* lists[] = {cl};
         app->gpu.queue()->ExecuteCommandLists(1, lists);
+        submit_scope.reset();
         g_frame_generation.mark(FrameGeneration::Marker::render_end);
         g_frame_generation.mark(FrameGeneration::Marker::present_start);
-        const HRESULT present = g_win.swapchain->Present(1, 0);
+        std::optional<Prof::Scope> present_scope(std::in_place, g_prof, Prof::Present);
+        const bool uncapped = bench.active() && !bench.vsync;
+        const HRESULT present = g_win.swapchain->Present(uncapped ? 0 : 1, uncapped && g_win.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        present_scope.reset();
         g_frame_generation.mark(FrameGeneration::Marker::present_end);
         g_frame_generation.after_present();
         if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) {
@@ -5562,6 +5742,7 @@ int run(const std::wstring& cmdline) {
         g_win.fence[fi] = app->gpu.signal();
         ++frame;
         app->after_frame();
+        g_prof.end_frame();
     }
 
     app->gpu.wait_idle();

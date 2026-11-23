@@ -309,7 +309,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(AutoExposureTip, "autoexposure_sample_columns の読み戻し (キー値・適応速度は推定)。露出スライダーは補正",           \
       "Reads back autoexposure_sample_columns (key value and adaptation speed estimated). The exposure slider corrects", \
       "autoexposure_sample_columns를 되읽습니다 (키 값·적응 속도는 추정). 노출 슬라이더는 보정합니다")                         \
-    X(Bloom, "ブルーム", "Bloom", "블룸")                                                                               \
+    X(Bloom, "ブルーム", "Bloom", "블룸")                                                                                   X(BloomHighlight, "ブルームの光源強調 (推定)", "Bloom highlight weight (estimated)", "블룸 하이라이트 강조 (추정)")     X(BloomHighlightTip, "明るい画素ほど強くにじませる (FX・照明)。0 で線形", "Brighter pixels (FX, lights) spread more; 0 = linear", "밝은 픽셀(FX·조명)일수록 더 번짐. 0 = 선형") \
     X(BloomTip, "ゲームの縮小・ガウスぼかし・加算パス (強さ・カーネルは推定)",                                            \
       "The game's downsample, Gaussian blur and additive passes (strength and kernel estimated)",                        \
       "게임의 축소·가우시안 흐림·가산 패스 (강도·커널은 추정)")                                                              \

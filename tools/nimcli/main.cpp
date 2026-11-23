@@ -1265,6 +1265,110 @@ int cmd_map_shaders(PackageManager& pm, TagHash bubble) {
 // ones that place a dynamic model (survey for entities / gimmicks).
 // The placed entities (map nodes -> 8080BAAD) whose components name particle systems (808081E8),
 // with the resource class that holds each reference.
+// Lights held by the components (8080BADB) of placed entities (8080BAAD), as opposed to the
+// node's own inline light components that load_map_lights reads (docs/PROGRESS.md 3.111).
+int cmd_map_entity_lights(PackageManager& pm, TagHash bubble, TagHash activity) {
+    pm.build_hash64_index();
+    MapLayout map;
+    for (const auto& m : list_activity_maps(pm))
+        if (m.activity == activity && m.bubble == bubble) {
+            map = load_map_layout(pm, bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+            break;
+        }
+    struct Found { std::vector<std::pair<uint32_t, bool>> lights; };  // light tag, component also holds FX
+    std::unordered_map<uint32_t, Found> cache;
+    std::set<uint32_t> inline_lights;
+    size_t placements = 0, with_fx = 0, without_fx = 0;
+    std::map<uint32_t, size_t> per_light;
+    for (const auto table : map.node_tables) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(table); } catch (...) { continue; }
+        TagReader r(data);
+        const auto list = r.vec_at(0x08);
+        for (uint64_t k = 0; k < list.count; ++k) {
+            const size_t e = list.data + size_t(k) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78));
+            for (int guard = 0; p != e + 0x78 && p >= 4 && p + 0x18 <= data.size() && guard < 64; ++guard) {
+                const TagHash payload = r.tag_at(p + 0x10);
+                if (!payload.is_none()) inline_lights.insert(payload.value);
+                const uint64_t next = r.u64_at(p);
+                if (!next) break;
+                p += size_t(next);
+            }
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            if (!h64 || h64 == ~0ull) continue;
+            const auto ent = pm.resolve64(h64);
+            if (!ent) continue;
+            auto it = cache.find(ent->value);
+            if (it == cache.end()) {
+                Found f;
+                try {
+                    const auto ed = pm.read(*ent);
+                    std::set<uint32_t> seen;
+                    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                        uint32_t c; std::memcpy(&c, ed.data() + o, 4);
+                        if (c < 0x80800000u || c == ~0u || !seen.insert(c).second) continue;
+                        const Entry* ce = pm.entry(TagHash(c));
+                        if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                        const auto cd = pm.read(TagHash(c));
+                        bool fx = false;
+                        std::vector<uint32_t> lights;
+                        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                            uint32_t v; std::memcpy(&v, cd.data() + q, 4);
+                            if (v < 0x80800000u || v == ~0u) continue;
+                            const Entry* pe = pm.entry(TagHash(v));
+                            if (!pe || pe->type != 8) continue;
+                            if (pe->reference == kClassParticleSystem) fx = true;
+                            if ((pe->reference == kClassShadowingLight || pe->reference == kClassLightCollection) &&
+                                std::ranges::find(lights, v) == lights.end()) {
+                                lights.push_back(v);
+                                static std::set<uint32_t> dumped;
+                                if (std::getenv("NIM_DUMP") && dumped.insert(v).second && dumped.size() <= 12) {
+                                    std::print("light {} entity {} component {} +{:X} size {:X}:", TagHash(v).str(), ent->str(), TagHash(c).str(), q, cd.size());
+                                    for (size_t z = q >= 0x70 ? q - 0x70 : 0; z < q + 0x8 && z + 4 <= cd.size(); z += 4) {
+                                        float fv; uint32_t uv; std::memcpy(&fv, cd.data() + z, 4); std::memcpy(&uv, cd.data() + z, 4);
+                                        std::print(" [{:X}]{:08X}/{:g}", z, uv, fv);
+                                    }
+                                    std::println("");
+                                }
+                            }
+                        }
+                        for (uint32_t l : lights) f.lights.push_back({l, fx});
+                    }
+                } catch (...) {}
+                it = cache.emplace(ent->value, std::move(f)).first;
+            }
+            if (it->second.lights.empty()) continue;
+            if (const char* near_at = std::getenv("NIM_NEAR")) {
+                float nx = 0, ny = 0, nz = 0;
+                std::sscanf(near_at, "%f,%f,%f", &nx, &ny, &nz);
+                const float px = r.f32_at(e + 0x10), py = r.f32_at(e + 0x14), pz = r.f32_at(e + 0x18);
+                if (std::hypot(px - nx, py - ny, pz - nz) < 60)
+                    for (auto [l, fx] : it->second.lights)
+                        std::println("near: light {} fx {} entity {} at ({:.1f}, {:.1f}, {:.1f})", TagHash(l).str(), fx, ent->str(), px, py, pz);
+            }
+            ++placements;
+            for (auto [l, fx] : it->second.lights) {
+                (fx ? with_fx : without_fx)++;
+                ++per_light[l];
+            }
+        }
+    }
+    size_t also_inline = 0;
+    for (const auto& [l, n] : per_light) also_inline += inline_lights.contains(l);
+    std::println("placements with entity-component lights: {}; light placements {} (component with FX {}, without {}); "
+                 "distinct lights {} ({} also placed inline)", placements, with_fx + without_fx, with_fx, without_fx,
+                 per_light.size(), also_inline);
+    size_t shown = 0;
+    for (const auto& [l, n] : per_light) {
+        if (shown++ >= 40) break;
+        const Entry* le = pm.entry(TagHash(l));
+        std::println("  {} class {:08X} x{}", TagHash(l).str(), le ? le->reference : 0, n);
+    }
+    return 0;
+}
+
 int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
     pm.build_hash64_index();
     MapLayout map;
@@ -1326,7 +1430,42 @@ int cmd_map_fx(PackageManager& pm, TagHash bubble, TagHash activity) {
             for (uint32_t s : it->second) ++systems[s];
             const char* want = std::getenv("NIM_FX_SYSTEM");  // list every placement holding this system
             const bool listed = want && std::ranges::any_of(it->second, [&](uint32_t s) { return TagHash(s).str() == want; });
-            if (placements <= 20 || listed)
+            if (const char* want_module = std::getenv("NIM_MODULE")) {  // placements whose entity has a script of that module
+                static std::unordered_map<uint32_t, std::string> entity_modules;
+                auto [mit, fresh] = entity_modules.try_emplace(ent->value);
+                if (fresh) {
+                    try {
+                        const auto ed = pm.read(*ent);
+                        for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                            uint32_t c; std::memcpy(&c, ed.data() + o, 4);
+                            const Entry* ce = TagHash(c).is_pkg_ref() ? pm.entry(TagHash(c)) : nullptr;
+                            if (!ce || ce->type != 8 || ce->reference != 0x8080BADB) continue;
+                            const auto cd = pm.read(TagHash(c));
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t w; std::memcpy(&w, cd.data() + q, 4);
+                                const Entry* de = TagHash(w).is_pkg_ref() ? pm.entry(TagHash(w)) : nullptr;
+                                if (!de || de->type != 8 || de->reference != 0x80800000) continue;
+                                const auto dd = pm.read(TagHash(w));
+                                const std::string text(dd.begin(), dd.end());
+                                if (const auto at = text.find("bs\\"); at != std::string::npos) mit->second += std::string(text.c_str() + at) + " ";
+                            }
+                        }
+                    } catch (...) {}
+                }
+                if (mit->second.find(want_module) != std::string::npos) {
+                    std::print("  module ent {} pos ({:.1f} {:.1f} {:.1f}) [{}]:", ent->str(), r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18), mit->second);
+                    for (uint32_t s : it->second) std::print(" {}", TagHash(s).str());
+                    std::println("");
+                }
+            } else if (const char* near_at = std::getenv("NIM_NEAR")) {  // placements within 40 m of x,y,z
+                float nx = 0, ny = 0, nz = 0, nr = 40;
+                std::sscanf(near_at, "%f,%f,%f,%f", &nx, &ny, &nz, &nr);
+                if (std::hypot(r.f32_at(e + 0x10) - nx, r.f32_at(e + 0x14) - ny, r.f32_at(e + 0x18) - nz) < nr) {
+                    std::print("  near ent {} pos ({:.1f} {:.1f} {:.1f}):", ent->str(), r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18));
+                    for (uint32_t s : it->second) std::print(" {}", TagHash(s).str());
+                    std::println("");
+                }
+            } else if (placements <= 20 || listed)
                 std::println("  node {} ent {} pos ({:.1f} {:.1f} {:.1f}) systems {}", table.str(), ent->str(), r.f32_at(e + 0x10),
                              r.f32_at(e + 0x14), r.f32_at(e + 0x18), it->second.size());
         }
@@ -1883,6 +2022,34 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
         if (!verbose && o.placements.size() > 4) l += std::format(" ... {} in all", o.placements.size());
         std::println("  {} {}:{}", o.component.str(), o.module, l);
     }
+    if (const char* want = std::getenv("NIM_MODULE")) {  // a module's objects: placed entities and links, 2 deep
+        std::function<void(size_t, int, std::set<size_t>&)> show = [&](size_t k, int depth, std::set<size_t>& seen) {
+            if (!seen.insert(k).second) return;
+            const auto& o = g.scripts[k];
+            std::println("{:{}}{} {} slot {:016X}", "", depth * 2 + 2, o.component.str(), o.module, o.slot);
+            for (const auto& [off, p] : o.placements)
+                std::println("{:{}}+0x{:X} place ent {} model {} ({:.1f} {:.1f} {:.1f}) id {:016X}", "", depth * 2 + 4, off, p.entity.str(),
+                             p.model.is_none() ? "-" : p.model.str(), p.position[0], p.position[1], p.position[2], p.id);
+            for (const auto& [off, l] : o.links) {
+                std::println("{:{}}+0x{:X} link {} {}", "", depth * 2 + 4, off, g.scripts[l].component.str(), g.scripts[l].module);
+                if (depth < 2) show(l, depth + 1, seen);
+            }
+        };
+        for (size_t k = 0; k < g.scripts.size(); ++k)
+            if (g.scripts[k].module.find(want) != std::string::npos) {
+                std::set<size_t> seen;
+                show(k, 0, seen);
+                // Objects outside it that link to what it links to (e.g. a ship spawner sharing a lockdown's parts).
+                for (const auto& [off, c] : g.scripts[k].links)
+                    for (size_t x = 0; x < g.scripts.size(); ++x)
+                        if (x != k && std::ranges::any_of(g.scripts[x].links, [&](const auto& l) { return l.second == c; })) {
+                            std::println("    co-linker of {}: {} {}", g.scripts[c].component.str(), g.scripts[x].component.str(), g.scripts[x].module);
+                            for (const auto& [o2, p] : g.scripts[x].placements)
+                                std::println("      +0x{:X} place ent {} model {} ({:.1f} {:.1f} {:.1f})", o2, p.entity.str(),
+                                             p.model.is_none() ? "-" : p.model.str(), p.position[0], p.position[1], p.position[2]);
+                        }
+            }
+    }
     std::println("script components of the package family by module:");
     for (const auto& [m, n] : g.modules) std::println("  {:5} {}", n, m);
     if (json) {
@@ -2260,15 +2427,20 @@ int cmd_map_near(PackageManager& pm, TagHash bubble, float x, float y, float rad
     return 0;
 }
 
-int cmd_map_entity_models(PackageManager& pm, TagHash bubble) {
+int cmd_map_entity_models(PackageManager& pm, TagHash bubble, TagHash activity) {
     pm.build_hash64_index();
     const auto materials = index_dynamic_model_materials(pm);
-    const MapEntities me = load_map_entities(pm, load_map_layout(pm, bubble), materials);
+    std::vector<TagHash> tables;
+    if (!activity.is_none())
+        for (const auto& m : list_activity_maps(pm))
+            if (m.activity == activity && m.bubble == bubble) tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+    const MapEntities me = load_map_entities(pm, load_map_layout(pm, bubble, tables), materials);
     std::println("{} node tables, {} nodes, {} entities, {} placements with a model, {} models", me.node_tables, me.nodes, me.entities,
                  me.placements, me.models.size());
     std::map<size_t, std::pair<size_t, std::string>> stage_models;  // render stage -> (models, samples)
     for (const auto& m : me.models) {
-        std::print("  {} x{}  first at ({:.1f} {:.1f} {:.1f})", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11]);
+        std::print("  {} x{}  first at ({:.1f} {:.1f} {:.1f}) top {:.1f}", m.mesh.str(), m.rows.size(), m.rows[0][3], m.rows[0][7], m.rows[0][11],
+                   std::ranges::max(m.rows, {}, [](const auto& r) { return r[11]; })[11]);
         try {
             const DynamicModel dm = load_dynamic_model(pm, m.mesh);
             std::set<size_t> stages;
@@ -2740,6 +2912,50 @@ int cmd_find(PackageManager& pm, uint32_t cls) {
     return 0;
 }
 
+// Placed entities of a map selection having a component whose resource class (+0x10) is CLASS,
+// with their node positions (exploration, 3.111).
+int cmd_map_component_class(PackageManager& pm, TagHash bubble, TagHash activity, uint32_t want) {
+    pm.build_hash64_index();
+    std::vector<TagHash> tables;
+    if (!activity.is_none())
+        for (const auto& m : list_activity_maps(pm))
+            if (m.activity == activity && m.bubble == bubble) tables = load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+    const MapLayout map = load_map_layout(pm, bubble, tables);
+    std::unordered_map<uint32_t, bool> has;
+    for (const auto table : map.node_tables) {
+        std::vector<uint8_t> data;
+        try { data = pm.read(table); } catch (...) { continue; }
+        TagReader r(data);
+        const auto list = r.vec_at(0x08);
+        for (uint64_t k = 0; k < list.count; ++k) {
+            const size_t e = list.data + size_t(k) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            if (!h64 || h64 == ~0ull) continue;
+            const auto ent = pm.resolve64(h64);
+            if (!ent) continue;
+            auto [it, fresh] = has.try_emplace(ent->value, false);
+            if (fresh) {
+                try {
+                    const auto ed = pm.read(*ent);
+                    for (size_t o = 0; o + 4 <= ed.size() && !it->second; o += 4) {
+                        uint32_t c; std::memcpy(&c, ed.data() + o, 4);
+                        const Entry* ce = TagHash(c).is_pkg_ref() ? pm.entry(TagHash(c)) : nullptr;
+                        if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
+                        const auto d = pm.read(TagHash(c));
+                        BinaryReader br(d);
+                        const uint64_t q = d.size() >= 0x18 ? br.u64_at(0x10) : 0;
+                        if (q && 0x10 + q >= 4 && 0x10 + q < d.size() && br.u32_at(0x10 + size_t(q) - 4) == want) it->second = true;
+                    }
+                } catch (...) {}
+            }
+            if (it->second)
+                std::println("  ent {} node {:016X} ({:.1f} {:.1f} {:.1f})", ent->str(), r.u64_at(e + 0x70), r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18));
+        }
+    }
+    return 0;
+}
+
 // Component tags (8080BADB) by the classes of their two resources (0x10, 0x18).
 // An entity's components (tags of class 8080BADB it references) with their class pair (+0x10 / +0x18).
 int cmd_entity_components(PackageManager& pm, TagHash entity, bool verbose = false) {
@@ -3084,6 +3300,29 @@ int cmd_skin(PackageManager& pm, TagHash tag, int only_part) {
 }
 
 // Each part's bind-pose bounds (decoded positions over its index range), technique, stage, LOD.
+// The materials of a dynamic model's entity component: technique map ranges, the techniques of
+// every permutation and the parts using each variant (docs/PROGRESS.md 3.113).
+int cmd_model_materials(PackageManager& pm, TagHash tag) {
+    const auto all = index_dynamic_model_materials(pm);
+    const auto it = all.find(tag.value);
+    if (it == all.end()) { std::println("no component materials for {}", tag.str()); return 1; }
+    const auto& m = it->second;
+    std::println("component {} permutations {} default {} map {} techniques {}", m.component.str(), m.permutation_count,
+                 m.default_permutation, m.technique_map.size(), m.techniques.size());
+    DynamicModel model = load_dynamic_model(pm, tag);
+    for (size_t v = 0; v < m.technique_map.size(); ++v) {
+        const auto& rg = m.technique_map[v];
+        size_t parts = 0, indices = 0;
+        for (const auto& mesh : model.meshes)
+            for (const auto& part : mesh.parts)
+                if (part.variant_shader_index == v) ++parts, indices += part.index_count;
+        std::string t;
+        for (uint32_t k = 0; k < rg.count; ++k) t += " " + m.techniques[rg.start + k].str();
+        std::println("  variant {:3} count {} start {:3} unk8 {:08X} parts {:3} idx {:7}:{}", v, rg.count, rg.start, rg.unk8, parts, indices, t);
+    }
+    return 0;
+}
+
 int cmd_parts(PackageManager& pm, TagHash tag, bool raw) {
     DynamicModel m = load_dynamic_model(pm, tag);
     const auto bytes = raw ? pm.read(tag) : std::vector<uint8_t>{};
@@ -4274,6 +4513,7 @@ int main(int argc, char** argv) {
         if (cmd == "tag-class-refs" && args.size() >= 2) return cmd_tag_class_refs(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? parse_hex(args[2]) : 0);
         if (cmd == "motion-banks") return cmd_motion_banks(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
+        if (cmd == "model-materials" && args.size() >= 2) return cmd_model_materials(pm, TagHash(parse_hex(args[1])));
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
         if (cmd == "mesh-slice" && args.size() >= 3) {
             float b[4];
@@ -4324,6 +4564,10 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+        if (cmd == "map-component-class" && args.size() >= 4)
+            return cmd_map_component_class(pm, TagHash(parse_hex(args[1])), TagHash(parse_hex(args[2])), parse_hex(args[3]));
+        if (cmd == "map-entity-lights" && args.size() >= 3)
+            return cmd_map_entity_lights(pm, TagHash(parse_hex(args[1])), TagHash(parse_hex(args[2])));
         if (cmd == "map-fx" && args.size() >= 2)
             return cmd_map_fx(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? TagHash(parse_hex(args[2])) : TagHash{});
         if (cmd == "class-refs" && args.size() >= 2) return cmd_class_refs(pm, parse_hex(args[1]));
@@ -4346,7 +4590,7 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
+        if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? TagHash(parse_hex(args[2])) : TagHash{});
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "h64-graph" && args.size() >= 2) return cmd_h64_graph(pm, args[1]);
         if (cmd == "motion-sets" && args.size() >= 3) return cmd_motion_sets(pm, TagHash(parse_hex(args[1])), TagHash(parse_hex(args[2])));

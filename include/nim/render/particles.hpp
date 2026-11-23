@@ -75,6 +75,8 @@ private:
     std::unique_ptr<Scope> view_scope_, transparent_scope_, grid_scope_;
     std::vector<std::string> notes_;
     size_t gated_ = 0;  // placements left out: their sequence waits on an unset exfil activation
+    size_t turret_ = 0;
+    size_t device_ = 0;  // placements left out: their sequence reads device_position (kChannelDevicePosition)  // placements left out: a turret's behaviour FX (MapParticle::gate = kChannelTurret)
 };
 
 }  // namespace nim

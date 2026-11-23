@@ -2866,6 +2866,10 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
         }
     }
     for (const auto& [why, n] : failures) light_notes_.push_back(std::format("{} lights left out: {}", n, why));
+    if (const auto fx = std::ranges::count_if(lights_, [](const LocalLight& ll) { return ll.light.fx; }))
+        ext_.note_estimate(std::format("{} FX lights: SLight +0x50 weights (1, 1, 0, 0), unused clip planes, at the holding node", fx),
+                           "the FX sequence writes these while it plays (not decoded); the authored map lights' weights, "
+                           "full colour at the start of the fade (+0x58 = 0); a named attachment point is not resolved (3.111)");
     choose_light_state();
     // Light shafts: the same per-shader pipeline sharing, four quarter-resolution targets added
     // into (far, near, slices 0-3, slices 4-7). The techniques also read the rigid_model,

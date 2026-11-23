@@ -17,6 +17,7 @@
 #include <string>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nim {
@@ -91,6 +92,10 @@ struct MapLayout {
     std::vector<TagHash> decal_collections;
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
+    // Nodes (id at node +0x70) nim leaves out by user decision (3.111), filled by hide_scripted_nodes:
+    std::unordered_set<uint64_t> hidden_nodes;     // not drawn at all: model, FX and lights
+    std::unordered_set<uint64_t> hidden_fx_nodes;  // their FX (particles and FX lights) not run
+    bool hidden(uint64_t node, bool fx) const { return hidden_nodes.contains(node) || (fx && hidden_fx_nodes.contains(node)); }
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
 std::vector<MapDecal> load_map_decals(PackageManager& pm, const MapLayout& map);
@@ -128,6 +133,8 @@ struct MapLight {
     // reversed on some (start > end: the shaft fades in with distance). Collection lights have
     // no such fields: all 0.
     std::array<float, 4> fade_distances{};
+    // A light an FX sequence carries (load_map_fx_lights): drawn with the map's FX only.
+    bool fx = false;
     // The light's fade (deferred_light +0x160) and its shaft's fade at a camera distance
     // (estimate: saturate((end - d) / (end - start)), linear; 1 where start == end).
     float light_fade(float distance) const { return fade_at(fade_distances[0], fade_distances[1], distance); }
@@ -369,6 +376,17 @@ struct MapGameplay {
 // Needs the hash64 index (PackageManager::build_hash64_index).
 MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity);
 
+// Script-placed nodes nim hides by user decision (3.111, 2026-11-23), from the gameplay scripts of
+// `activity` (none: of every activity using map.bubble):
+//  - DCON: every node a script object of a dcon module (pf_dcon.bs, dcon_combiner.bs,
+//    pf_dcon_extraction_machine.bs) places, itself or through the objects it links to (2 deep):
+//    their FX are not run (MapLayout::hidden_fx_nodes; the device models stay).
+//  - lockdown ships: the nodes lockdown.bs objects place (Dire Marsh: 80B08991 at z = 109), and
+//    those placed by a spawner linking to the parts of a room_lockdown_system.bs (Outpost: 80B0D412
+//    over the room at (87, 144)): not drawn at all (MapLayout::hidden_nodes).
+// Returns the number of nodes hidden. Needs the hash64 index.
+size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity = {});
+
 // ---- particle systems (FX) ----------------------------------------------------------------
 // A GPU particle system (808081E8, 64 bytes): +0x00 its definition (808081EF: header floats at
 // +0x128 / +0x134 and an FX expression program not decoded), then techniques: +0x04
@@ -393,11 +411,26 @@ struct MapParticle {
     TagHash system;
     std::array<float, 12> rows;  // rotation * scale | translation
     // An object channel the holding component's sequence reads (the exfil device's
-    // exfil_activation_progress), 0 if none: the systems play on that run-time state.
+    // exfil_activation_progress, a device's device_position), or kChannelTurret for a turret's FX,
+    // 0 if none: the systems play on that run-time state.
     uint32_t gate = 0;
 };
 inline constexpr uint32_t kChannelExfilActivationProgress = 0x4AE64998;  // fnv1("exfil_activation_progress")
+// An entity whose components name the object channel "turret" (the showcase turrets): its FX are the
+// turret's aiming laser and shots, which play on its behaviour (3.111). MapParticle::gate = this.
+inline constexpr uint32_t kChannelTurret = 0x9F6DB313;  // fnv1("turret")
+// A device's FX component whose sequence reads device_position (e.g. 80B0DD90's red laser 80B0DD71)
+// plays on the device's run-time state, like the exfil device (3.111). MapParticle::gate = this.
+inline constexpr uint32_t kChannelDevicePosition = 0x6D408B83;  // fnv1("device_position")
 std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout& map);
+// The lights the same FX components carry (docs/PROGRESS.md 3.111): a placed entity's component
+// (8080BADB) that names particle systems also lists its lights as sequence records
+// {80808323, u32 attachment name hash (fnv1 "" = the entity origin), u32 index << 16, u32 flags,
+// 0, 0, f32, f32, FFFF0023, FF, light tag} with the light an SShadowingLight (80808557) or an
+// SLightCollection (8080854B). Each light is placed at the holding node (MapLight::fx = true);
+// components gated on exfil_activation_progress are left out like their systems.
+// `attached` counts the lights with a named attachment, placed at the node (estimate).
+std::vector<MapLight> load_map_fx_lights(PackageManager& pm, const MapLayout& map, size_t* attached = nullptr);
 // The particle systems of an entity's shield component (docs/PROGRESS.md 3.88, 推定): the
 // components (8080BADB) whose sequence reads an object channel named *shield* (the UESC assault's
 // assault_shield_recent_damage) and names particle systems. The assault's are cube mesh

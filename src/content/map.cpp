@@ -227,6 +227,7 @@ std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map) 
         for (uint64_t i = 0; i < nodes.count; ++i) {
             const size_t e = nodes.data + size_t(i) * 0x90;
             if (e + 0x90 > data.size()) break;
+            if (map.hidden(r.u64_at(e + 0x70), false)) continue;  // hide_scripted_nodes (3.111)
             const Mat node = quat_transform(r.f32_at(e), r.f32_at(e + 4), r.f32_at(e + 8), r.f32_at(e + 12), r.f32_at(e + 0x10),
                                             r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C));
             // Components: a list of inline records (type at -4, next relative pointer at +0, payload at +0x10).
@@ -1036,6 +1037,7 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
             for (uint64_t k = 0; k < nodes.count; ++k) {
                 const size_t e = nodes.data + size_t(k) * 0x90;
                 if (e + 0x90 > data.size()) break;
+                if (map.hidden(r.u64_at(e + 0x70), false)) continue;  // hide_scripted_nodes (3.111)
                 ++out.nodes;
                 const uint64_t h64 = r.u64_at(e + 0x30);
                 if (!h64 || h64 == ~0ull) continue;
@@ -1512,6 +1514,56 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     return out;
 }
 
+size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity) {
+    std::vector<TagHash> activities;
+    if (!activity.is_none()) activities.push_back(activity);
+    else
+        for (const auto& m : list_activity_maps(pm))
+            if (m.bubble == map.bubble && std::ranges::find(activities, m.activity) == activities.end()) activities.push_back(m.activity);
+    const size_t before = map.hidden_nodes.size() + map.hidden_fx_nodes.size();
+    // The room-lockdown script also links doors and gameplay nodes. Match the ship
+    // placements by entity so those other objects are not removed with it.
+    for (TagHash table : map.node_tables) {
+        const auto data = pm.read(table);
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t i = 0; i < nodes.count; ++i) {
+            const size_t entry = nodes.data + size_t(i) * 0x90;
+            if (entry + 0x90 > data.size()) break;
+            const uint64_t id = r.u64_at(entry + 0x70);
+            if (id == 0 || id == ~0ull) continue;
+            const auto entity = pm.resolve64(r.u64_at(entry + 0x30));
+            if (entity && (entity->value == 0x80B08991 || entity->value == 0x80B0D412))
+                map.hidden_nodes.insert(id);
+        }
+    }
+    for (const TagHash a : activities) {
+        const MapGameplay g = load_map_gameplay(pm, a);
+        auto place_all = [&](size_t k, std::unordered_set<uint64_t>& into) {
+            for (const auto& [off, p] : g.scripts[k].placements)
+                if (p.id) into.insert(p.id);
+        };
+        for (size_t k = 0; k < g.scripts.size(); ++k) {
+            const std::string& m = g.scripts[k].module;
+            if (m.find("dcon") != std::string::npos) {
+                // The device and what it links to (its native placers), two links deep.
+                std::vector<size_t> at{k};
+                std::set<size_t> seen{k};
+                for (int depth = 0; depth <= 2 && !at.empty(); ++depth) {
+                    std::vector<size_t> next;
+                    for (const size_t x : at) {
+                        place_all(x, map.hidden_fx_nodes);
+                        for (const auto& [off, l] : g.scripts[x].links)
+                            if (seen.insert(l).second) next.push_back(l);
+                    }
+                    at = std::move(next);
+                }
+            }
+        }
+    }
+    return map.hidden_nodes.size() + map.hidden_fx_nodes.size() - before;
+}
+
 ParticleSystem load_particle_system(PackageManager& pm, TagHash tag) {
     const Entry* e = pm.entry(tag);
     if (!e || e->type != 8 || e->reference != kClassParticleSystem)
@@ -1567,6 +1619,7 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
         for (uint64_t k = 0; k < nodes.count; ++k) {
             const size_t e = nodes.data + size_t(k) * 0x90;
             if (e + 0x90 > data.size()) break;
+            if (map.hidden(r.u64_at(e + 0x70), true)) continue;  // hide_scripted_nodes (3.111)
             const uint64_t h64 = r.u64_at(e + 0x30);
             if (!h64 || h64 == ~0ull) continue;
             const auto ent = pm.resolve64(h64);
@@ -1580,6 +1633,7 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
                         const auto ed = pm.read(*ent);
                         std::set<uint32_t> listed;
                         std::map<uint32_t, uint32_t> found;  // system -> gate
+                        bool turret = false;
                         for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
                             uint32_t c;
                             std::memcpy(&c, ed.data() + o, 4);
@@ -1592,6 +1646,8 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
                                 uint32_t v;
                                 std::memcpy(&v, cd.data() + q, 4);
                                 if (v == kChannelExfilActivationProgress) gate = v;
+                                else if (v == kChannelDevicePosition && !gate) gate = v;
+                                if (v == kChannelTurret) turret = true;
                             }
                             for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
                                 uint32_t v;
@@ -1605,6 +1661,8 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
                             }
                         }
                         systems.assign(found.begin(), found.end());
+                        if (turret)
+                            for (auto& sg : systems) sg.second = kChannelTurret;
                     } catch (...) {
                     }
                 }
@@ -1615,6 +1673,128 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             for (const auto& [s, gate] : it->second) out.push_back({TagHash(s), rows, gate});
         }
     }
+    return out;
+}
+
+// An FX light's SLight +0x00..+0x5F are all zero in the record: the FX sequence writes them while
+// it plays. The values nim runs it with (estimate, listed by GameLighting::set_lights): unused clip
+// planes (0, 0, -1, 500000) with exponent 0 as on the authored map lights, and the weights
+// +0x50 = (1, 1, 0, 0): diffuse / specular 1 and shadow 1 as on 4,175 of Outpost's map lights,
+// +0x58 = 0 (the FX light PS 80AA4075 fades its colour by cubic(+0x58) from 1 at 0 to 0 at 1).
+static void fill_fx_light_record(MapLight& l) {
+    l.fx = true;
+    if (std::ranges::any_of(l.params, [](float v) { return v != 0; })) return;
+    for (size_t k = 0; k < 4; ++k) l.params[k * 4 + 2] = -1, l.params[k * 4 + 3] = 500000;
+    l.params[20] = 1, l.params[21] = 1;
+}
+
+std::vector<MapLight> load_map_fx_lights(PackageManager& pm, const MapLayout& map, size_t* attached) {
+    constexpr uint32_t kSequenceLight = 0x80808323, kFnvEmpty = 0x811C9DC5;
+    struct EntityLight {
+        TagHash tag;
+        bool named = false;
+    };
+    std::vector<MapLight> out;
+    size_t named = 0;
+    std::unordered_map<uint32_t, std::vector<EntityLight>> entity_lights;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> light_bytes;
+    for (const auto table : map.node_tables) {
+        std::vector<uint8_t> data;
+        try {
+            data = pm.read(table);
+        } catch (...) {
+            continue;
+        }
+        TagReader r(data);
+        const auto nodes = r.vec_at(0x08);
+        for (uint64_t k = 0; k < nodes.count; ++k) {
+            const size_t e = nodes.data + size_t(k) * 0x90;
+            if (e + 0x90 > data.size()) break;
+            if (map.hidden(r.u64_at(e + 0x70), true)) continue;  // hide_scripted_nodes (3.111)
+            const uint64_t h64 = r.u64_at(e + 0x30);
+            if (!h64 || h64 == ~0ull) continue;
+            const auto ent = pm.resolve64(h64);
+            if (!ent) continue;
+            auto it = entity_lights.find(ent->value);
+            if (it == entity_lights.end()) {
+                std::vector<EntityLight> lights;
+                const Entry* ee = pm.entry(*ent);
+                if (ee && ee->type == 8 && ee->reference == 0x8080BAAD) {
+                    try {
+                        const auto ed = pm.read(*ent);
+                        std::set<uint32_t> listed;
+                        bool turret = false;
+                        for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+                            uint32_t c;
+                            std::memcpy(&c, ed.data() + o, 4);
+                            if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+                            const Entry* ce = pm.entry(TagHash(c));
+                            if (!ce || ce->type != 8 || ce->reference != kClassComponent) continue;
+                            const auto cd = pm.read(TagHash(c));
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t v;
+                                std::memcpy(&v, cd.data() + q, 4);
+                                if (v == kChannelTurret) turret = true;
+                            }
+                            bool fx = false, gated = false;
+                            std::vector<EntityLight> found;
+                            for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+                                uint32_t v;
+                                std::memcpy(&v, cd.data() + q, 4);
+                                if (v == kChannelExfilActivationProgress || v == kChannelDevicePosition) gated = true;
+                                if (v < 0x80800000u || v == ~0u) continue;
+                                const Entry* pe = pm.entry(TagHash(v));
+                                if (!pe || pe->type != 8) continue;
+                                if (pe->reference == kClassParticleSystem) fx = true;
+                                if (pe->reference != kClassShadowingLight && pe->reference != kClassLightCollection) continue;
+                                // The sequence's light record ends with the light tag.
+                                if (q < 0x28) continue;
+                                uint32_t cls, name;
+                                std::memcpy(&cls, cd.data() + q - 0x28, 4);
+                                std::memcpy(&name, cd.data() + q - 0x24, 4);
+                                if (cls != kSequenceLight) continue;
+                                if (std::ranges::none_of(found, [&](const EntityLight& l) { return l.tag.value == v; }))
+                                    found.push_back({TagHash(v), name != kFnvEmpty});
+                            }
+                            if (!fx || gated) continue;
+                            for (const auto& l : found)
+                                if (std::ranges::none_of(lights, [&](const EntityLight& x) { return x.tag == l.tag; })) lights.push_back(l);
+                        }
+                        if (turret) lights.clear();  // the turret's FX are left out (kChannelTurret)
+                    } catch (...) {
+                    }
+                }
+                it = entity_lights.emplace(ent->value, std::move(lights)).first;
+            }
+            if (it->second.empty()) continue;
+            const Mat node = quat_transform(r.f32_at(e), r.f32_at(e + 4), r.f32_at(e + 8), r.f32_at(e + 12), r.f32_at(e + 0x10),
+                                            r.f32_at(e + 0x14), r.f32_at(e + 0x18), r.f32_at(e + 0x1C));
+            for (const auto& el : it->second) {
+                try {
+                    auto& bytes = light_bytes[el.tag.value];
+                    if (bytes.empty()) bytes = pm.read(el.tag);
+                    TagReader lr(bytes);
+                    const Entry* le = pm.entry(el.tag);
+                    if (le->reference == kClassShadowingLight) {
+                        out.push_back(read_light(lr, 0, 0xD4, node, el.tag, true));
+                        fill_fx_light_record(out.back());
+                        named += el.named;
+                    } else {
+                        const auto lights = lr.vec_at(0x30), transforms = lr.vec_at(0x40);
+                        for (uint64_t i = 0; i < lights.count && i < transforms.count; ++i) {
+                            out.push_back(read_light(lr, lights.data + size_t(i) * 0x100, 0xC4,
+                                                     mat_mul(node, read_quat_transform(lr, transforms.data + size_t(i) * 0x20)), el.tag, false));
+                            fill_fx_light_record(out.back());
+                            named += el.named;
+                        }
+                    }
+                } catch (...) {
+                    // A light whose data cannot be read is left out.
+                }
+            }
+        }
+    }
+    if (attached) *attached = named;
     return out;
 }
 

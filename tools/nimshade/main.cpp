@@ -169,7 +169,7 @@ int run(int argc, char** argv) {
     float map_radius = 120;
     bool shadows = true;
     uint32_t map_texture_cap = 0;  // full resolution
-    bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false, no_fx = false;
+    bool no_lights = false, no_cubemaps = false, no_entities = false, no_sky_objects = false, no_fx = false, no_fx_lights = false;
     float fx_radius = -1;
     TagHash shield_entity;  // --shield-fx ENTITY: its shield component's particle systems at the posed b_shield bone (needs --clip)
     std::optional<size_t> probe_index;
@@ -188,6 +188,7 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_distortion = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
+    std::optional<float> bloom_highlight;
     bool dof = false, vignette = false;
     float dof_focus = 0;
     bool shaft_fog_density = false;
@@ -274,6 +275,7 @@ int run(int argc, char** argv) {
         }
         else if (args[i] == "--ai-sound-log" && i + 1 < args.size()) ai_sound_log = std::stof(args[++i]);
         else if (args[i] == "--no-fx") no_fx = true;
+        else if (args[i] == "--no-fx-lights") no_fx_lights = true;
         else if (args[i] == "--shield-fx" && i + 1 < args.size()) shield_entity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--fx-radius" && i + 1 < args.size()) fx_radius = std::stof(args[++i]);
         else if (args[i] == "--verify-frame-inputs") verify_frame_inputs = true;
@@ -298,6 +300,7 @@ int run(int argc, char** argv) {
                 throw std::runtime_error("--emissive-gain expects a number in [0, 3]");
         }
         else if (args[i] == "--no-bloom") no_bloom = true;
+        else if (args[i] == "--bloom-highlight" && i + 1 < args.size()) bloom_highlight = std::stof(args[++i]);
         else if (args[i] == "--no-aa") no_aa = true;
         else if (args[i] == "--no-taa") no_taa = true;
         else if (args[i] == "--dof") dof = true;
@@ -374,7 +377,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ship-view EX,EY,EZ,TX,TY,TZ] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-fx-lights] [--bloom-highlight K] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ship-view EX,EY,EZ,TX,TY,TZ] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -424,6 +427,9 @@ int run(int argc, char** argv) {
             std::println("activity_view {} map[{}]: {} selected phase/ambient node tables", selected_activity.str(), selected_activity_map, activity_tables.size());
         } else std::println("map_view: bubble node tables only");
         MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
+        pm.build_hash64_index();
+        hide_scripted_nodes(pm, map, selected_activity);  // DCON FX and the lockdown ships (3.111)
+        std::println("hidden by script: {} nodes, FX of {} nodes", map.hidden_nodes.size(), map.hidden_fx_nodes.size());
         is_map = true;
         // Without --eye / --look, the camera stands at the activity's first player start (estimate).
         const auto starts = find_map_starts(pm, map);
@@ -519,6 +525,13 @@ int run(int argc, char** argv) {
         const auto terrain = map_terrain_region(map, focus, map_radius);
         if (!no_lights) {
             map_lights = load_map_lights(pm, map);
+            if (!no_fx && !no_fx_lights) {  // the lights the map's FX carry (3.111)
+                pm.build_hash64_index();
+                size_t attached = 0;
+                auto fx_lights = load_map_fx_lights(pm, map, &attached);
+                std::println("fx lights: {} ({} with a named attachment, placed at the node: estimate)", fx_lights.size(), attached);
+                for (auto& l : fx_lights) map_lights.push_back(std::move(l));
+            }
             region_lights = map_light_region(map_lights, focus, map_radius);
             std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
         }
@@ -1136,6 +1149,7 @@ int run(int argc, char** argv) {
     lp.post = !no_post;
     lp.auto_exposure = !no_auto_exposure;
     lp.bloom = !no_bloom;
+    if (bloom_highlight) lp.bloom_highlight = *bloom_highlight;
     lp.antialias = !no_aa;
     lp.temporal_aa = !no_taa;
     // Depth of field: focused on the look point unless a distance is given.
@@ -1572,6 +1586,7 @@ int run(int argc, char** argv) {
             if (!f) throw std::runtime_error("lighting dump failed");
         };
         save("lighting-depth.bin", depth);
+        save("lighting-hdr.bin", gpu.read_texture(gl.hdr_target(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-motion.bin", gpu.read_texture(gb.rt[3].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, 8));
         save("lighting-diffuse.bin", gpu.read_texture(gl.light_buffer(0), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));
         save("lighting-specular.bin", gpu.read_texture(gl.light_buffer(1), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 8));

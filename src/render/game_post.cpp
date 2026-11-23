@@ -479,9 +479,12 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         e.set_texture(pp, 0x00, hdr_.Get());
         e.set(pp, 0x50, size4(l0.w, l0.h));
         e.set(pp, 0x60, size4(w_, h_));
-        // Linear initial downsample (weight = 1): avoids quadratic L^2 blowout on bright lights.
-        e.set(pp, 0xC0, float4{0.0f, 0.0f, 1.0f, 0.0f});
-        ext_.note_estimate("bloom: initial downsample curve (extern 38 +0xC0) = 1 (linear, no threshold)", engine);
+        // Weight 1 + k * (L * exposure): linear for dim surfaces, more for highlights (FX, lamps).
+        // No L^2 term, which blew bright lights out.
+        const float highlight = std::max(p.bloom_highlight, 0.0f);
+        e.set(pp, 0xC0, float4{0.0f, highlight * exposure_, 1.0f, 0.0f});
+        ext_.note_estimate(std::format("bloom: initial downsample curve (extern 38 +0xC0) = 1 + {:g} * exposed luminance", highlight),
+                           "engine post setting (not in game data); weights highlights such as glowing FX above the dim surfaces (3.111)");
         begin(l0.down.Get(), 0, l0.w, l0.h);
         bloom_initial_.draw(gpu, cl, e, scopes);
         e.set_texture(kBloomDistortion, 0x00, nullptr);

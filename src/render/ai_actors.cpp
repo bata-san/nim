@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "nim/core/package_manager.hpp"
+#include "nim/core/parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -777,15 +778,29 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         s.agent = *wanted[s.character].begin();
         wanted[s.character].erase(wanted[s.character].begin());
     }
+    struct PosedActor {
+        std::vector<ModelSkinPose> poses;
+        std::vector<V3> points;
+    };
+    std::vector<PosedActor> posed(slots_.size());
+    WorkerPool::instance().parallel_for(slots_.size(), [&](size_t i) {
+        auto& slot = slots_[i];
+        if (!slot.agent) return;
+        auto& result = posed[i];
+        result.poses = actor_poses(characters_[slot.character], agents[*slot.agent], slot.anim, dt);
+        if (!result.poses.empty()) result.points = scene.actor_points(slot.actor, result.poses, 4);
+    }, 4);
+
     shown_ = 0;
     checks_.clear();
-    for (auto& s : slots_) {
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        auto& s = slots_[i];
         if (!s.agent) {
             scene.set_actor(s.actor, std::nullopt);
             continue;
         }
         const auto& a = agents[*s.agent];
-        auto poses = actor_poses(characters_[s.character], a, s.anim, dt);
+        auto& [poses, points] = posed[i];
         if (poses.empty()) {
             scene.set_actor(s.actor, std::nullopt);
             continue;
@@ -827,7 +842,6 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
             const float c = std::cos(sd.yaw), sn = std::sin(sd.yaw);
             rows[3] = sd.position[0] + c * lx - sn * ly, rows[7] = sd.position[1] + sn * lx + c * ly, rows[11] = sd.position[2] + lz;
         }
-        const auto points = scene.actor_points(s.actor, poses, 4);
         if (!points.empty()) {
             const float lowest = std::ranges::min(points, {}, &V3::z).z;
             // Leaving a dropship: the path's own height (falling from the ship, then the floor); riding: the seat.

@@ -100,12 +100,23 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     grid_scope_ = std::make_unique<Scope>(load_scope(pm, globals.scope("player_centered_cascaded_grid")));
     std::unordered_map<uint32_t, int> index;  // system tag -> systems_ index, -1 = failed
     gated_ = 0;
+    turret_ = 0;
+    device_ = 0;
     std::optional<std::vector<std::vector<InputElement>>> layouts;  // read on the first mesh particle
     for (const auto& p : placements) {
         // The exfil device's FX component plays on exfil_activation_progress. With no activation
         // state supplied the device is inactive (as its materials, scene.cpp), so they do not run.
         if (p.gate == kChannelExfilActivationProgress) {
             ++gated_;
+            continue;
+        }
+        // A turret's FX (its aiming laser and shots) play on its behaviour, not while it idles (3.111).
+        if (p.gate == kChannelTurret) {
+            ++turret_;
+            continue;
+        }
+        if (p.gate == kChannelDevicePosition) {
+            ++device_;
             continue;
         }
         auto [it, fresh] = index.try_emplace(p.system.value, -1);
@@ -344,6 +355,14 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
         ext.set(kParticle, 0x144, 1.0f);
         ext.note_estimate("particle draw fade = 1, except Perimeter mist 80B0D19F near the camera",
                           "isolated this emitter as the corridor washout; fade in from 50 to 95 m until its sequencer is decoded");
+        if (device_)
+            ext.note_estimate(std::format("{} particle placements of devices not run: device_position = 0", device_),
+                              "their component's sequence reads device_position (e.g. the red laser 80B0DD71 of 80B0DD90); no device state "
+                              "was supplied, so the device rests (3.111)");
+        if (turret_)
+            ext.note_estimate(std::format("{} particle placements of turrets not run", turret_),
+                              "their entity names the object channel turret: the aiming laser and shots start with the turret's behaviour, "
+                              "which is not simulated, so an idle turret shows none (3.111)");
         if (gated_)
             ext.note_estimate(std::format("{} particle placements of exfil devices not run: exfil_activation_progress = 0", gated_),
                               "their component's sequence reads exfil_activation_progress; no activation state was supplied, so the device is inactive");
