@@ -2150,7 +2150,7 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
   - 環境音に短時間 RMS (-24 dBFS) / ピーク (-12 dBFS) の音量リミッター (`measure_pcm_level` / `limit_ambient_gain`) と Wwise バンクの再生規則を適用。
   - 敵のアーマーデカール (`flags & 8`, PS `80A4ACE1`) を `pipeline_cache_` キーで分離し深度バイアスを適用。
   - Compiler のケープ (`80A9707E`, PS `80A96FC2`) の微細法線スケールを抑えて滑らかな質感へ調整 (推定)。
-- **検証**: Windows Release ビルド (`build/Release/`、DLSS/Streamline SDK 込み)、`nim_tests`、`nim_render_tests`、Outpost 確認描画 (`nimshade`) を実施。
+- **検証**: Windows Release ビルド (`build/Release/`、DLSS/Streamline SDK 込み)、`nim_tests`、`nim_render_tests`、Outpost 確認描画 (`nimshade`) を実施。`v0.3.7` として公開。
 
 ## 4. 既知の未解決・注意
 - 通常のビルド先は `build/`。シェーダー調査には `tools/re/dump.sh` と `tools/re/decomp.py` を使用する。過去の個別解析スクリプトと検証出力はプロジェクト外へ整理した。`tools/re/` の旧スクリプトは Git 履歴からも参照できる。
