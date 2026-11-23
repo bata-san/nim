@@ -70,6 +70,9 @@ struct ActorDropship {
     std::vector<AnimationClip> arrivals, departures;
     std::vector<uint32_t> departure_frames;  // per departure: its last frame away from the origin
     std::optional<AnimationClip> open;
+    // The inner rear panel (bone 3, 80ACA682: 11 frames, its only track) folds down 90 degrees into a
+    // ramp; no clip plays it with the others, so it is layered on while the ship unloads (3.111).
+    std::optional<AnimationClip> ramp;
     // Each spawner entity (3.90) has its own sound table, and the names in it are the events of one
     // arrival and one departure clip: that pair is its ship's (-1: none matched, the variant picks).
     struct Spawner {
@@ -134,7 +137,7 @@ public:
     void clear() {
         drone_kinds_.clear(), drone_kind_.clear(), drone_slots_.clear();
         slots_.clear(), characters_.clear(), by_character_.clear(), ship_slots_.clear(), ship_ = {};
-        sounds_.clear(), stopped_.clear(), emitters_.clear(), shown_emitters_.clear(), ship_frames_.clear(), dropship_entity_.clear();
+        sounds_.clear(), stopped_.clear(), emitters_.clear(), shown_emitters_.clear(), ship_frames_.clear(), dropship_entity_.clear(), ramp_clips_.clear();
     }
     size_t ships_shown() const { return ships_shown_; }
     // Each drawable character's clearance from walls: how far its feet reach from its centre in
@@ -188,6 +191,8 @@ private:
     std::vector<std::pair<uint64_t, std::array<float, 3>>> emitters_;
     std::unordered_set<uint64_t> shown_emitters_, now_shown_;
     std::unordered_map<size_t, std::pair<const AnimationClip*, float>> ship_frames_;  // per dropship
+    std::unordered_map<size_t, std::array<float, 12>> ship_body_;
+    std::unordered_map<const AnimationClip*, AnimationClip> ramp_clips_;  // per ship clip: it with the ramp's tracks held at one frame  // per drawn dropship: its body bone's skin rows (ship space), for riders
     std::vector<uint32_t> dropship_entity_;  // per dropship: its spawner node's entity (0: unknown)
     std::vector<ActorCharacter> drone_kinds_;          // per drawable drone entity
     std::vector<std::optional<size_t>> drone_kind_;    // per AiSimulation drone -> drone_kinds_

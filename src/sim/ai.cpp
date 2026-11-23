@@ -296,6 +296,7 @@ std::vector<AiSimulation::GroundNeed> AiSimulation::uncovered() const {
 void AiSimulation::add_ground_patch(WalkGrid patch) {
     if (patch.w) patches_.push_back(std::move(patch));
     grid_index_dirty_ = true;
+    unload_cache_.clear();
 }
 
 void AiSimulation::set_character_radius(size_t character, float radius) {
@@ -561,14 +562,23 @@ std::vector<AiEstimate> ai_estimates(const AiParams& p) {
         {"drone_speed", p.drone_speed, "m/s along the patrol spline, back and forth"},
         {"drone_scan_range", p.drone_scan_range, "m, all around"},
         {"movement", 0, "straight lines inside firing areas; no navmesh was found, so walls are ignored"},
-        {"spawn", 0, "squads without a dropship spawn at once at their positions (member i at position i mod n)"},
+        {"spawn", 0, "squads without a dropship spawn at their positions (member i at position i mod n) when the player comes within spawn_range"},
+        {"spawn_range", p.spawn_range, "m from the player to a squad's spawn points at which it appears (the engine's encounter scripts are code)"},
+        {"despawn_range", p.despawn_range, "m: a squad is removed when the player and all its members are farther; a dropship's squad once its ship has left (the ship comes again)"},
+        {"partial_walk", 3, "m: a patrol point behind an obstacle sends the agent to the farthest open point along the straight line (3 m or more) instead of waiting for a path search"},
+        {"dropship_seats", 10, "members ride in the bay two abreast (y +-0.6 m), 0.9 m apart from x -4.6 m forward (ten seats); the bay floor (2.0 m) and the ramp (top face 2.65 m, x -5.4..-7.8) are the ship model's, the seats are not data"},
+        {"dropship_bay_walk", p.dropship_bay_walk, "m/s from the seat down the ramp to the jump point"},
+        {"dropship_jump_x", p.dropship_jump_x, "m (ship space): the point on the ramp it jumps from, behind the outer door's lowest edge"},
+        {"dropship_ramp", 11, "frames: the inner panel's clip (80ACA682) folds the ramp down from the start of unloading and back up from the start of the departure, at the clip rate; no clip plays it with the ship's others"},
+        {"dropship_jump_back", p.dropship_jump_back, "m/s backwards off the ramp; the fall is free (9.81 m/s2), in the idle pose (no jump clip found)"},
+        {"dropship_jump_up", p.dropship_jump_up, "m/s up off the ramp"},
         {"dropship_call_range", p.dropship_call_range, "m: a dropship squad's ship is called when the player comes this close to its spawner (the engine's encounter trigger is script code)"},
         {"dropship_call_delay", p.dropship_call_delay, "s, uniform random delay after the call"},
         {"dropship_arrive", p.dropship_arrive, "s: arrival clip length at the 30 fps clip rate"},
         {"dropship_depart", p.dropship_depart, "s: departure clip length at 30 fps"},
         {"dropship_first_exit", p.dropship_first_exit, "s after landing until the first member walks out"},
         {"dropship_exit_interval", p.dropship_exit_interval, "s between members"},
-        {"dropship_exit_walk", p.dropship_exit_walk, "s walking 3 m away after the drop; the drop itself falls freely (9.81 m/s2) from the hovering ship's bay (its origin, the spawner node) to the floor below: the highest walk-grid surface under it, else the floor of the squad's nearest firing area below it"},
+        {"dropship_exit_walk", p.dropship_exit_walk, "s walking 3 m away after the drop; the drop itself falls freely (9.81 m/s2) from the hovering ship's open rear (the bay floor, dropship_bay_height above the spawner node) to the floor below the landing point: the highest walk-grid surface under it, else the floor of the squad's nearest firing area below it"},
         {"dropship_linger", p.dropship_linger, "s the bay stays open after the last member"},
         {"path_search", 8, "path searches per second over all agents: Dijkstra over a 0.5 m lattice of floor-following walks (steps up to 0.45 m), 1500 lattice points, within 40 m; the goal is a random reached point of the squad's areas; paths string-pulled (the engine's navigation is not in game data)"},
         {"walk_grid", 0, "patrol points and straight paths only over open floor: a top-down depth render of the map's geometry between the floor and 2 m above it, eroded by 0.3 m (no navmesh found)"},
@@ -603,6 +613,7 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
         areas_.push_back(std::move(a));
     }
     squad_areas_.resize(g.squads.size());
+    squad_spawned_.assign(g.squads.size(), 0);
     for (size_t s = 0; s < g.squads.size(); ++s)
         if (const auto o = g.squads[s].objective)
             for (const auto a : g.objectives[*o].firing_areas)
@@ -645,11 +656,16 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
             a.position = p.position;
             a.position[0] += 0.8f * float(m / sq.positions.size());  // members sharing a position stand apart
             a.goal = a.position;
+            a.home = a.position;
             a.yaw = angle(rng_);
+            a.active = false;  // spawned by distance (step_spawns) or by its ship
             if (ship) {
-                a.active = false;
                 a.dropship = ship;
                 a.position = dropships_[*ship].position;
+                // Bay seats (推定): two abreast from the rear, 0.9 m apart; members past ten
+                // wait for a seat (step_dropships).
+                const size_t k = dropships_[*ship].members.size() % 10;
+                a.seat = {-4.6f + 0.9f * float(k / 2), k % 2 ? 0.6f : -0.6f, params_.dropship_bay_height};
                 dropships_[*ship].members.push_back(agents_.size());
             }
             const std::string& name = g.characters[a.character].name_estimate;
@@ -679,6 +695,7 @@ void AiSimulation::set_walk_grid(size_t firing_area, WalkGrid grid) {
     if (grids_.size() < areas_.size()) grids_.resize(areas_.size());
     grids_.at(firing_area) = std::move(grid);
     grid_index_dirty_ = true;
+    unload_cache_.clear();
 }
 
 // A random open point of the squad's firing areas that a straight walk from `from` reaches
@@ -722,6 +739,25 @@ void AiSimulation::choose_goal(AiAgent& a) {
             a.goal = p;
             ++path_stats_.straight;
             return;
+        }
+        // Blocked on the way (3.111, 推定): the farthest open point along the line that a straight
+        // walk reaches, 3 m away or more, so the agent moves on without waiting for a path search.
+        if (attempt < 6) {  // the first few points only (each tries up to 8 walks)
+            const float dx = p[0] - a.position[0], dy = p[1] - a.position[1], len = std::hypot(dx, dy);
+            bool partial = false;
+            for (float t = 0.85f; t >= 0.15f && !partial; t -= 0.1f) {
+                if (len * t < 3.0f) break;
+                std::array<float, 3> q{a.position[0] + dx * t, a.position[1] + dy * t, a.position[2]};
+                const auto z = ground(q[0], q[1], a.position[2]);
+                if (!z) continue;
+                q[2] = *z;
+                if (open_at(q[0], q[1], q[2], r) && path_clear(a.position, q, r)) {
+                    a.goal = q;
+                    ++path_stats_.partial;
+                    partial = true;
+                }
+            }
+            if (partial) return;
         }
         if (searched) continue;
         if (search_budget_ < 1) {
@@ -891,14 +927,77 @@ float AiSimulation::floor_below(size_t squad, float x, float y, float z) const {
     return best.value_or(z);
 }
 
+// A member's way out of the bay (3.111, 推定): from its seat along the bay floor and down the
+// folded ramp (rising to its top face between x -5.0 and -5.4 in ship space) to dropship_jump_x at
+// dropship_bay_walk, a jump off the ramp (backwards and up) falling freely (9.81 m/s2) to the floor
+// below the landing point, then 2 s walking 3 m further back.
+AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgent& a, float t) const {
+    constexpr float kLip = -5.0f, kRamp = -5.4f, kG = 9.81f;  // the floor rises to the ramp's top between them
+    const float kEdge = params_.dropship_jump_x;
+    const float walk = std::max(0.0f, (a.seat[0] - kEdge) / params_.dropship_bay_walk);
+    const float bay = params_.dropship_lip_height;  // the jump starts from the lip
+    ExitPose p;
+    if (t < walk) {
+        const float x = a.seat[0] - params_.dropship_bay_walk * t;
+        const float lip = std::clamp((kLip - x) / (kLip - kRamp), 0.0f, 1.0f);
+        p.at = {x, a.seat[1], a.seat[2] + lip * (params_.dropship_lip_height - a.seat[2])};
+        p.velocity = {-params_.dropship_bay_walk, 0, 0};
+        return p;
+    }
+    // The floor under where it lands (ship space z), from the drop height.
+    const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+    auto floor_at = [&](float x) {
+        const float wx = d.position[0] + c * x - s * a.seat[1], wy = d.position[1] + s * x + c * a.seat[1];
+        return floor_below(d.squad, wx, wy, d.position[2] + bay) - d.position[2];
+    };
+    auto fall_time = [&](float floor) {
+        const float up = params_.dropship_jump_up, h = bay - floor;
+        return (up + std::sqrt(std::max(0.0f, up * up + 2 * kG * h))) / kG;
+    };
+    float floor = floor_at(kEdge - 1.0f);
+    float fall = fall_time(floor);
+    floor = floor_at(kEdge - params_.dropship_jump_back * fall);
+    fall = fall_time(floor);
+    const float land = kEdge - params_.dropship_jump_back * fall;
+    const float tj = t - walk;
+    if (tj < fall) {
+        p.at = {kEdge - params_.dropship_jump_back * tj, a.seat[1], bay + params_.dropship_jump_up * tj - 0.5f * kG * tj * tj};
+        p.velocity = {};  // the idle pose in the air (no jump clip found)
+        p.airborne = true;
+        return p;
+    }
+    const float w = std::clamp((tj - fall) / params_.dropship_exit_walk, 0.0f, 1.0f);
+    p.at = {land - 3.0f * w, a.seat[1], floor};
+    p.velocity = {w < 1 ? -3.0f / params_.dropship_exit_walk : 0.0f, 0, 0};
+    p.leaving = w < 1;
+    return p;
+}
+
 float AiSimulation::exit_seconds(const AiDropship& d) const {
-    const float h = std::max(0.0f, d.position[2] - floor_below(d.squad, d.position[0], d.position[1], d.position[2]));
-    return std::sqrt(2 * h / 9.81f) + params_.dropship_exit_walk;
+    // The longest way out of any member (the rear seats walk least, the front seats most).
+    float longest = 0;
+    for (const auto m : d.members) {
+        const auto& a = agents_[m];
+        float lo = 0, hi = 60;
+        if (exit_pose(d, a, hi).leaving) continue;
+        for (int i = 0; i < 20; ++i) {
+            const float mid = 0.5f * (lo + hi);
+            (exit_pose(d, a, mid).leaving ? lo : hi) = mid;
+        }
+        longest = std::max(longest, hi);
+    }
+    return longest;
 }
 
 float AiSimulation::unload_seconds(const AiDropship& d) const {
-    const float n = float(std::max<size_t>(d.members.size(), 1));
-    return params_.dropship_first_exit + (n - 1) * params_.dropship_exit_interval + exit_seconds(d) + params_.dropship_linger;
+    // Cached per ship (the floor below it only changes when grids or patches are added).
+    const size_t i = size_t(&d - dropships_.data());
+    if (unload_cache_.size() != dropships_.size()) unload_cache_.assign(dropships_.size(), -1.0f);
+    if (unload_cache_[i] < 0) {
+        const float n = float(std::max<size_t>(d.members.size(), 1));
+        unload_cache_[i] = params_.dropship_first_exit + (n - 1) * params_.dropship_exit_interval + exit_seconds(d) + params_.dropship_linger;
+    }
+    return unload_cache_[i];
 }
 
 AiDropshipState AiSimulation::dropship_state(size_t i) const {
@@ -922,44 +1021,45 @@ void AiSimulation::call_all_dropships() {
         if (d.start < 0) d.start = time_;
 }
 
-// Dropships (3.71, 推定 timing): called by the player's distance; members leave the landed ship one
-// by one, dropping from the open rear of the hovering ship to the floor below and walking off.
+// Dropships (3.71 / 3.111, 推定 timing): called by the player's distance. The members ride in the
+// bay from the arrival on (AiAgent::riding, drawn on the ship by the renderer); after landing they
+// leave one by one: along the bay to the open rear, a jump off it to the floor below, a walk off.
 void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) {
     for (size_t i = 0; i < dropships_.size(); ++i) {
         auto& d = dropships_[i];
         if (d.start < 0 && dist2d(d.position, player) < params_.dropship_call_range)
             d.start = time_ + std::uniform_real_distribution<float>(0, params_.dropship_call_delay)(rng_);
         const auto state = dropship_state(i);
-        if (state.phase != AiDropshipPhase::Unloading && state.phase != AiDropshipPhase::Departing && state.phase != AiDropshipPhase::Gone)
-            continue;
+        if (state.phase == AiDropshipPhase::Waiting) continue;
         const float since_landing = (time_ - d.start) - params_.dropship_arrive;
         const float c = std::cos(d.yaw), s = std::sin(d.yaw);
+        auto world = [&](const std::array<float, 3>& p) {
+            return std::array<float, 3>{d.position[0] + c * p[0] - s * p[1], d.position[1] + s * p[0] + c * p[1], d.position[2] + p[2]};
+        };
         for (size_t k = 0; k < d.members.size(); ++k) {
             auto& a = agents_[d.members[k]];
-            if (a.active && a.exit < 0) continue;
+            if (a.active && a.exit < 0) continue;  // out and patrolling
             const float t = since_landing - params_.dropship_first_exit - float(k) * params_.dropship_exit_interval;
-            if (t < 0) continue;
-            const float lateral = (float(k % 3) - 1) * 1.3f;
-            const float x0 = -4.5f;  // under the open rear of the bay (ship space)
-            if (!a.active) {
-                a.active = true;
-                a.exit_floor = floor_below(d.squad, d.position[0] + c * x0 - s * lateral, d.position[1] + s * x0 + c * lateral, d.position[2]);
+            if (t < 0) {
+                // In the bay, facing the rear; past ten members, once the member ten ahead has left its seat.
+                if (state.phase != AiDropshipPhase::Arriving && state.phase != AiDropshipPhase::Unloading) continue;
+                a.riding = k < 10 || agents_[d.members[k - 10]].active;
+                a.position = world(a.seat);
+                a.yaw = wrap_angle(d.yaw + kPi);
+                a.velocity = {};
+                a.motion = MotionChoice{};
+                a.motion_time += dt;
+                continue;
             }
-            // Ship space: dropped from the hovering ship's bay (its origin height) straight down,
-            // then a walk 3 m further back, three abreast (1.3 m apart).
-            const float h = std::max(0.0f, d.position[2] - a.exit_floor);
-            const float fall = std::sqrt(2 * h / 9.81f);
-            const float walk = std::clamp((t - fall) / params_.dropship_exit_walk, 0.0f, 1.0f);
-            const float x = x0 - 3.0f * walk;
-            const float z = t < fall ? d.position[2] - 0.5f * 9.81f * t * t : a.exit_floor;
-            const std::array<float, 3> before = a.position;
-            a.position = {d.position[0] + c * x - s * lateral, d.position[1] + s * x + c * lateral, z};
+            a.riding = false;
+            a.active = true;
+            const auto p = exit_pose(d, a, t);
+            a.position = world(p.at);
             a.yaw = wrap_angle(d.yaw + kPi);
-            a.velocity = t < fall ? std::array<float, 3>{} : std::array<float, 3>{(a.position[0] - before[0]) / std::max(dt, 1e-4f),
-                                                                                (a.position[1] - before[1]) / std::max(dt, 1e-4f), 0};
-            if (walk >= 1) {
+            a.exit_floor = d.position[2] + p.at[2];
+            a.velocity = {c * p.velocity[0], s * p.velocity[0], 0};
+            if (!p.leaving) {
                 a.exit = -1;
-                a.position[2] = a.exit_floor;
                 a.goal = a.position;
                 a.velocity = {};
                 a.wait = std::uniform_real_distribution<float>(0.5f, params_.wait_min)(rng_);
@@ -970,9 +1070,68 @@ void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) 
     }
 }
 
+void AiSimulation::spawn(AiAgent& a) {
+    a.active = true;
+    a.riding = false;
+    a.exit = -1;
+    a.position = a.home;
+    a.goal = a.home;
+    a.path.clear();
+    a.path_next = 0;
+    a.velocity = {};
+    a.awareness = 0;
+    a.alert = AiAlert::Unaware;
+    a.sees_player = false;
+    a.motion = MotionChoice{};
+    a.motion_time = 0;
+    a.wait = std::uniform_real_distribution<float>(0, params_.wait_max)(rng_);
+}
+
+// Spawning by distance (3.111, 推定: the engine's encounter scripts are code): squads appear when the
+// player comes within spawn_range of their spawn points and are removed when the player and all
+// their members are beyond despawn_range. A dropship squad's ship is reset once it has left and
+// its members are far, so it comes again.
+void AiSimulation::step_spawns(const std::array<float, 3>& player) {
+    auto far = [&](const std::array<float, 3>& p) {
+        return std::hypot(p[0] - player[0], p[1] - player[1], p[2] - player[2]) > params_.despawn_range;
+    };
+    std::vector<float> nearest(g_.squads.size(), 1e30f);
+    std::vector<uint8_t> members_far(g_.squads.size(), 1);
+    for (const auto& a : agents_) {
+        nearest[a.squad] = std::min(nearest[a.squad], std::hypot(a.home[0] - player[0], a.home[1] - player[1], a.home[2] - player[2]));
+        if (a.active && !far(a.position)) members_far[a.squad] = 0;
+    }
+    for (size_t s = 0; s < g_.squads.size(); ++s) {
+        if (!squad_spawned_[s] && nearest[s] < params_.spawn_range) {
+            squad_spawned_[s] = 1;
+            for (auto& a : agents_)
+                if (a.squad == s && !a.dropship) spawn(a), ++path_stats_.spawned;
+        } else if (squad_spawned_[s] && nearest[s] > params_.despawn_range && members_far[s]) {
+            squad_spawned_[s] = 0;
+            for (auto& a : agents_)
+                if (a.squad == s && !a.dropship) a.active = false, ++path_stats_.despawned;
+        }
+    }
+    for (size_t i = 0; i < dropships_.size(); ++i) {
+        auto& d = dropships_[i];
+        if (d.start < 0 || dropship_state(i).phase != AiDropshipPhase::Gone || !far(d.position)) continue;
+        if (std::ranges::any_of(d.members, [&](size_t m) { return agents_[m].active && !far(agents_[m].position); })) continue;
+        d.start = -1;
+        for (const auto m : d.members) {
+            auto& a = agents_[m];
+            path_stats_.despawned += a.active;
+            a.active = false;
+            a.riding = false;
+            a.exit = -1;
+            a.position = d.position;
+        }
+    }
+}
+
 void AiSimulation::step(float dt, const std::array<float, 3>& player) {
     time_ += dt;
     search_budget_ = std::min(search_budget_ + dt * 8, 2.0f);  // 8 path searches per simulated second
+    step_spawns(player);
     step_dropships(dt, player);
     const float cos_half = std::cos(params_.fov_degrees * 0.5f * kPi / 180.0f);
     for (auto& a : agents_) {

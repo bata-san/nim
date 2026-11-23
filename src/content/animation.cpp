@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -312,6 +313,35 @@ AnimationRig load_animation_rig(PackageManager& pm, TagHash component) {
         const size_t node = nodes.data + size_t(i) * 72;
         const int16_t chain_end = int16_t(r.u16_at(node + 0x2C)), chain_root = int16_t(r.u16_at(node + 0x2E));
         rig.ik_root.push_back(chain_root >= 0 && chain_end == int16_t(rig.skeleton_bone.back()) ? chain_root : int16_t(-1));
+    }
+    // Vehicle rigs (two or three object-space root nodes, the rest parent-relative: dropships, the
+    // scan drone) list their nodes parents first, but their clips' tracks follow the skeleton's bone
+    // order (estimate). Read through the node order, the dropship 80ACB23A's door track turned the
+    // whole rear hull 65 degrees and its door stayed shut; in bone order the door opens and the front
+    // gear folds, and fewer of these rigs' clips stretch bones (`nimcli animaudit`). Weapon rigs (none
+    // or one object-space node) stretch more in bone order and keep the node order
+    // (docs/PROGRESS.md 3.111). Reorder the node records into bone order so every consumer agrees.
+    const size_t n = rig.size();
+    std::vector<int32_t> node_of(n, -1);
+    const auto object_nodes = std::ranges::count(rig.object_space, uint8_t(1));
+    bool permutation = object_nodes >= 2 && object_nodes <= 3;
+    for (size_t i = 0; i < n && permutation; ++i) {
+        const size_t b = rig.skeleton_bone[i];
+        if (b >= n || node_of[b] >= 0) permutation = false;
+        else node_of[b] = int32_t(i);
+    }
+    if (permutation && !std::ranges::equal(rig.skeleton_bone, std::views::iota(uint16_t(0), uint16_t(n)))) {
+        AnimationRig sorted = rig;
+        for (size_t b = 0; b < n; ++b) {
+            const size_t i = size_t(node_of[b]);
+            sorted.skeleton_bone[b] = uint16_t(b);
+            sorted.object_space[b] = rig.object_space[i];
+            sorted.bind_relative[b] = rig.bind_relative[i];
+            sorted.default_pose[b] = rig.default_pose[i];
+            sorted.ik_root[b] = rig.ik_root[i];
+            std::copy_n(rig.node_layout.begin() + i * 72, 72, sorted.node_layout.begin() + b * 72);
+        }
+        rig = std::move(sorted);
     }
     return rig;
 }

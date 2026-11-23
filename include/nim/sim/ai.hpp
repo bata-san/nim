@@ -120,6 +120,23 @@ struct AiParams {  // every value here is an estimate (推定)
     float dropship_exit_interval = 0.8f; // s between members
     float dropship_exit_walk = 2.0f;     // s walking away from the drop point (3 m)
     float dropship_linger = 1.5f;        // s open after the last member is out
+    // The members ride in the bay (3.111): seats two abreast, then each walks to the open rear
+    // and down the ramp, jumping off it backwards and up and falling to the floor below. The bay
+    // floor and the ramp are the ship model's own (80ACA5E7: upward faces of bone 2 at z 2.0 for
+    // x -4..0, |y| < 2; the inner rear panel, bone 3, folds down about its foot at x -5.41, z 2.39
+    // into a ramp whose top face lies at z 2.65 out to x -7.8; the outer door, bone 10, swings up
+    // over it, 1.2 m above the ramp at x -6.4). Where on the ramp they jump is an estimate.
+    float dropship_bay_height = 2.0f;    // m: the bay floor above the ship's origin
+    float dropship_lip_height = 2.65f;   // m: the ramp's top face, where the jump starts
+    float dropship_jump_x = -6.6f;       // m (ship space): the point on the ramp it jumps from
+    float dropship_bay_walk = 2.0f;      // m/s to the rear edge
+    float dropship_jump_back = 1.8f;     // m/s backwards off the edge
+    float dropship_jump_up = 1.5f;       // m/s up off the edge
+    // Spawning by distance (3.111): a squad appears at its spawn points when the player comes
+    // within spawn_range of them, and is removed when the player and all its members are farther
+    // than despawn_range (dropship squads: once their ship has left; the ship comes again).
+    float spawn_range = 100.0f;          // m
+    float despawn_range = 150.0f;        // m
 };
 struct AiEstimate {
     std::string name;
@@ -144,8 +161,11 @@ struct AiAgent {
     bool sees_player = false;
     MotionChoice motion;
     float motion_time = 0;             // s into the current clip
-    bool active = true;                // false until spawned (dropship squads wait for their ship)
+    bool active = true;                // false until spawned (by distance, or its dropship) and after despawning
+    bool riding = false;               // in its dropship's bay, not yet out (drawn on the ship; not active)
+    std::array<float, 3> home{};       // where it spawns
     std::optional<size_t> dropship;    // AiSimulation::dropships
+    std::array<float, 3> seat{};       // its place in the ship's bay (ship space, x forward, z up from the origin)
     float exit = -1;                   // s into the drop from the ship's bay (>= 0 while leaving it)
     float exit_floor = 0;              // z of the floor it drops to
     std::vector<std::array<float, 3>> path;  // waypoints to the goal (A*, 3.73); empty: straight
@@ -224,7 +244,7 @@ public:
     // none when b is not reached within `max_nodes` lattice points.
     std::optional<std::vector<std::array<float, 3>>> find_path(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius,
                                                                size_t max_nodes = 3000) const;
-    struct PathStats { size_t straight = 0, found = 0, failed = 0, deferred = 0; };
+    struct PathStats { size_t straight = 0, partial = 0, found = 0, failed = 0, deferred = 0, spawned = 0, despawned = 0; };
     const PathStats& path_stats() const { return path_stats_; }
 
 private:
@@ -260,6 +280,14 @@ private:
     std::vector<AiDrone> drones_;
     std::vector<AiDropship> dropships_;
     void step_dropships(float dt, const std::array<float, 3>& player);
+    void step_spawns(const std::array<float, 3>& player);
+    void spawn(AiAgent& a);
+    std::vector<uint8_t> squad_spawned_;          // per squad without a dropship
+    mutable std::vector<float> unload_cache_;     // per dropship: unload_seconds, < 0 = not yet
+    // A member's drop from the bay (ship space): x, z and its velocity at `t` s after it starts
+    // walking out, and whether it is still leaving (false once it has walked off).
+    struct ExitPose { std::array<float, 3> at; std::array<float, 3> velocity; bool airborne = false, leaving = true; };
+    ExitPose exit_pose(const AiDropship& d, const AiAgent& a, float t) const;
     float unload_seconds(const AiDropship& d) const;
     float floor_below(size_t squad, float x, float y, float z) const;
     float exit_seconds(const AiDropship& d) const;

@@ -208,6 +208,7 @@ int run(int argc, char** argv) {
     std::string ai_subject_name;  // --ai-subject TEXT: --ai-frame / --ai-strip only consider characters whose name contains it
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
+    std::array<float, 6> ai_ship_view{-24, 12, 5, -5, 0, 2};  // --ai-ship-view: strip eye and target in ship space (x forward, z up)
     bool ai_ground_audit = false;  // --ai-ground-audit: every drawable agent posed in turn, its sink and body overlap
     float ai_sound_log = 0;  // --ai-sound-log S: the nearest dropship called, S s of actor sounds listed (3.90)
     std::optional<size_t> ai_subject;
@@ -266,6 +267,11 @@ int run(int argc, char** argv) {
         else if (args[i] == "--ai-subject" && i + 1 < args.size()) ai_subject_name = args[++i];
         else if (args[i] == "--ai-dropship-strip" && i + 1 < args.size()) ai_ship_strip = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--ai-ground-audit") ai_ground_audit = true;
+        else if (args[i] == "--ai-ship-view" && i + 1 < args.size()) {
+            auto& v = ai_ship_view;
+            if (std::sscanf(args[++i].c_str(), "%f,%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+                throw std::runtime_error("--ai-ship-view ex,ey,ez,tx,ty,tz");
+        }
         else if (args[i] == "--ai-sound-log" && i + 1 < args.size()) ai_sound_log = std::stof(args[++i]);
         else if (args[i] == "--no-fx") no_fx = true;
         else if (args[i] == "--shield-fx" && i + 1 < args.size()) shield_entity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
@@ -368,7 +374,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ship-view EX,EY,EZ,TX,TY,TZ] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -655,6 +661,7 @@ int run(int argc, char** argv) {
             }
             AiParams params;
             params.player_invisible = !ai_visible;
+            if (ai_ground_audit) params.spawn_range = params.despawn_range = 1e9f;  // every squad present (the audit poses each)
             ai_sim = std::make_unique<AiSimulation>(*ai_gameplay, params, 1, motions);
             const V3 eye = eye_arg ? *eye_arg : V3{focus[0], focus[1], focus[2]};
             const std::array<float, 3> player{eye.x, eye.y, eye.z};
@@ -688,8 +695,26 @@ int run(int argc, char** argv) {
             const auto ts = std::chrono::steady_clock::now();
             for (float t = 0; t < ai_time; t += 0.1f) ai_sim->step(0.1f, player);
             const auto& ps = ai_sim->path_stats();
-            std::println("ai steps: {:.0f}s simulated in {:.2f}s; goals: {} straight, {} by path search, {} without a path, {} deferred", ai_time,
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), ps.straight, ps.found, ps.failed, ps.deferred);
+            std::println("ai steps: {:.0f}s simulated in {:.2f}s; goals: {} straight, {} partial, {} by path search, {} without a path, {} deferred; "
+                         "{} spawned, {} despawned", ai_time, std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count(), ps.straight,
+                         ps.partial, ps.found, ps.failed, ps.deferred, ps.spawned, ps.despawned);
+            {
+                // Agents that stayed put (3.111): why, by the simulation's own conditions.
+                size_t active = 0, still = 0, no_area = 0, no_motion = 0, other = 0;
+                for (size_t k = 0; k < ai_sim->agents().size(); ++k) {
+                    const auto& a = ai_sim->agents()[k];
+                    if (!a.active) continue;
+                    ++active;
+                    if (std::hypot(a.position[0] - ai_start[k][0], a.position[1] - ai_start[k][1]) > 1.5f) continue;
+                    ++still;
+                    const auto ob = ai_gameplay->squads[a.squad].objective;
+                    if (!ob || ai_gameplay->objectives[*ob].firing_areas.empty()) ++no_area;
+                    else if (a.character < ai_sim->motions().size() && ai_sim->motions()[a.character].locomotion.empty()) ++no_motion;
+                    else ++other;
+                }
+                std::println("ai stayed within 1.5 m: {} of {} active ({} without firing areas, {} without locomotion, {} other)", still, active,
+                             no_area, no_motion, other);
+            }
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
             for (const auto& sq : ai_gameplay->squads)
                 if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
@@ -698,8 +723,20 @@ int run(int argc, char** argv) {
                     for (const auto& sp : ship.spawners)
                         std::println("ai dropship spawner {}: {} named sounds, {} loops; arrival {}, departure {}", sp.entity.str(),
                                      sp.sounds ? sp.sounds->by_name.size() : 0, sp.sounds ? sp.sounds->loops.size() : 0, sp.arrival, sp.departure);
-                    std::println("ai dropship {}: {} arrivals, {} departures{}{}", p->model.str(), ship.arrivals.size(), ship.departures.size(),
-                                 ship.error.empty() ? "" : ", ", ship.error);
+                    std::println("ai dropship {}: {} arrivals, {} departures, ramp {}{}{}", p->model.str(), ship.arrivals.size(), ship.departures.size(),
+                                 ship.ramp ? ship.ramp->tag.str() : "-", ship.error.empty() ? "" : ", ", ship.error);
+                    if (ship.binding && ship.open) {
+                        // The open pose (3.111): the outer door (bone 10) and the front gear (9) turn, the
+                        // hull (7) does not; the pitch of each bone's skin about the ship's y axis.
+                        const auto poses = ship.binding->poses(*ship.open, 0);
+                        std::string pitch;
+                        for (const size_t b : {size_t(7), size_t(9), size_t(10)})
+                            if (b < poses.front().bones.size()) {
+                                const auto r = transform_rows(poses.front().bones[b]);
+                                pitch += std::format(" bone {} {:.0f} deg", b, std::atan2(r[2], r[0]) * 57.29578f);
+                            }
+                        std::println("ai dropship open pose:{}", pitch);
+                    }
                     ai_actors.build_dropships(gpu, scene, layouts, std::move(ship), 3);
                     break;
                 }
@@ -732,8 +769,8 @@ int run(int argc, char** argv) {
                 // Behind the ship's rear bay and to its side, looking at the exit.
                 const float c = std::cos(d.yaw), s = std::sin(d.yaw);
                 auto at = [&](float x, float y, float z) { return V3{d.position[0] + c * x - s * y, d.position[1] + s * x + c * y, d.position[2] + z}; };
-                eye_arg = at(-24, 12, 5);
-                look_arg = at(-5, 0, 2);
+                eye_arg = at(ai_ship_view[0], ai_ship_view[1], ai_ship_view[2]);
+                look_arg = at(ai_ship_view[3], ai_ship_view[4], ai_ship_view[5]);
                 ai_sim->call_dropship(*ai_ship);
                 std::println("ai dropship strip: ship {} at ({:.1f} {:.1f} {:.1f}) yaw {:.2f}, {} members", *ai_ship, d.position[0], d.position[1],
                              d.position[2], d.yaw, d.members.size());
@@ -1361,10 +1398,14 @@ int run(int argc, char** argv) {
             write_png(out_dir / std::format("ship_{:02}.png", k), width, height,
                       gpu.read_texture(gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4));
             const auto state = ai_sim->dropship_state(*ai_ship);
-            size_t out = 0;
-            for (const auto m : ai_sim->dropships()[*ai_ship].members) out += ai_sim->agents()[m].active;
-            std::println("ship {}: phase {} {:.2f}s, {} of {} members out, {} ships drawn, {} actors", k, int(state.phase), state.seconds, out,
-                         ai_sim->dropships()[*ai_ship].members.size(), ai_actors.ships_shown(), ai_actors.shown());
+            size_t out = 0, riding = 0;
+            for (const auto m : ai_sim->dropships()[*ai_ship].members) out += ai_sim->agents()[m].active, riding += ai_sim->agents()[m].riding;
+            std::string heights;
+            for (const auto m : ai_sim->dropships()[*ai_ship].members)
+                if (ai_sim->agents()[m].active && ai_sim->agents()[m].exit >= 0) heights += std::format(" {:.1f}", ai_sim->agents()[m].position[2]);
+            std::println("ship {}: phase {} {:.2f}s, {} riding, {} of {} members out (leaving at z{}), {} ships drawn, {} actors", k, int(state.phase),
+                         state.seconds, riding, out, ai_sim->dropships()[*ai_ship].members.size(), heights.empty() ? " -" : heights,
+                         ai_actors.ships_shown(), ai_actors.shown());
         }
         // --ai-strip: the camera follows the agent from its side, one frame per 0.1 s.
         for (uint32_t k = 0; ai_sim && ai_subject && k < ai_strip; ++k) {

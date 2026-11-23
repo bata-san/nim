@@ -336,6 +336,11 @@ ActorDropship prepare_actor_dropship(PackageManager& pm, const ActorSources& sou
         // from the origin in any clip).
         for (const auto& info : anim->clips) {
             AnimationClip clip = load_animation_clip(pm, info.tag);
+            // A clip of one moving part alone (the inner rear panel) is the ramp.
+            if (clip.rotations.size() == 1 && clip.rotations.front().frames.size() > 1 && !d.ramp) {
+                d.ramp = std::move(clip);
+                continue;
+            }
             const auto track = std::ranges::find_if(clip.translations, [](const auto& t) { return t.bone == 1 && !t.frames.empty(); });
             if (track == clip.translations.end() || clip.translations.size() < 2) continue;
             auto length = [](const std::array<float, 3>& v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
@@ -633,6 +638,7 @@ void AiActors::update_drones(StaticMeshScene& scene, const AiSimulation& sim, st
 
 void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim, std::array<float, 3> eye, float range) {
     ships_shown_ = 0;
+    ship_body_.clear();
     if (ship_slots_.empty()) return;
     if (range < 0) {  // hidden
         for (const auto slot : ship_slots_) scene.set_actor(slot, std::nullopt);
@@ -674,7 +680,34 @@ void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim,
         const float frame = std::clamp(seconds * kClipFps, 0.0f, last);
         const float c = std::cos(d.yaw), s = std::sin(d.yaw);
         const std::array<float, 12> rows{c, -s, 0, d.position[0], s, c, 0, d.position[1], 0, 0, 1, d.position[2]};
-        auto poses = ship_.binding->poses(*clip, frame);
+        // The ramp folds down as the ship starts unloading and back up as it leaves (3.111, estimate:
+        // the clip's own 30 fps from the phase's start).
+        const AnimationClip* posed = clip;
+        if (ship_.ramp) {
+            const float ramp_last = float(std::max(ship_.ramp->frame_count, 1u) - 1);
+            const float ramp_frame = state.phase == AiDropshipPhase::Unloading   ? std::min(seconds * kClipFps, ramp_last)
+                                     : state.phase == AiDropshipPhase::Departing ? std::max(ramp_last - seconds * kClipFps, 0.0f)
+                                                                                 : 0.0f;
+            auto [it, fresh] = ramp_clips_.try_emplace(clip);
+            AnimationClip& layered = it->second;
+            if (fresh) {
+                layered = *clip;
+                auto drop = [&](auto& tracks, const auto& from) {
+                    std::erase_if(tracks, [&](const auto& t) { return std::ranges::any_of(from, [&](const auto& r) { return r.bone == t.bone; }); });
+                    for (const auto& r : from) tracks.push_back({r.bone, {r.frames.front()}});
+                };
+                drop(layered.rotations, ship_.ramp->rotations);
+                drop(layered.translations, ship_.ramp->translations);
+                drop(layered.scales, ship_.ramp->scales);
+            }
+            std::vector<BoneTransform> held(ship_.binding->rig.size());
+            sample_clip(*ship_.ramp, ramp_frame, held);
+            for (auto& t : layered.rotations)
+                if (t.bone < held.size() && std::ranges::any_of(ship_.ramp->rotations, [&](const auto& r) { return r.bone == t.bone; }))
+                    t.frames = {held[t.bone].rotation};
+            posed = &layered;
+        }
+        auto poses = ship_.binding->poses(*posed, frame);
         // Sounds (3.90): the clip's events passed since the last frame (from its start when the
         // clip just began), the component loops when the ship appears, at the flying root node.
         const size_t index = list[k].second;
@@ -687,6 +720,8 @@ void AiActors::update_dropships(StaticMeshScene& scene, const AiSimulation& sim,
         }
         emitters_.push_back({emitter, at});
         now_shown_.insert(emitter);
+        // The body bone (2, under the flying root) carries the bay: riders move with it (3.111).
+        if (bones.size() > 2) ship_body_[index] = transform_rows(bones[2]);
         if (spawner && spawner->sounds) {
             const auto& sounds = *spawner->sounds;
             emit_loops(sounds, emitter);
@@ -715,7 +750,9 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
     std::vector<std::vector<std::pair<float, size_t>>> nearby(characters_.size());
     for (size_t i = 0; i < agents.size(); ++i) {
         const auto& a = agents[i];
-        if (!a.active || a.character >= by_character_.size() || !by_character_[a.character]) continue;
+        // Riders (3.111): in the bay of a drawn ship.
+        const bool rider = a.riding && a.dropship && ship_body_.contains(*a.dropship);
+        if ((!a.active && !rider) || a.character >= by_character_.size() || !by_character_[a.character]) continue;
         const float d = std::hypot(a.position[0] - eye[0], a.position[1] - eye[1], a.position[2] - eye[2]);
         if (d <= range) nearby[*by_character_[a.character]].push_back({d, i});
     }
@@ -779,13 +816,26 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         // (within 0.15 m of the lowest) goes below the surface under that point (a step or slope
         // up to 0.5 m above the floor under the agent), eased at 12/s.
         auto rows = actor_rows(a);
+        // A rider stands on its seat on the ship's body as the ship flies in (3.111).
+        const auto body = a.riding && a.dropship ? ship_body_.find(*a.dropship) : ship_body_.end();
+        if (body != ship_body_.end()) {
+            const auto& sd = sim.dropships()[*a.dropship];
+            const auto& b = body->second;
+            const auto& p = a.seat;
+            const float lx = b[0] * p[0] + b[1] * p[1] + b[2] * p[2] + b[3], ly = b[4] * p[0] + b[5] * p[1] + b[6] * p[2] + b[7],
+                        lz = b[8] * p[0] + b[9] * p[1] + b[10] * p[2] + b[11];
+            const float c = std::cos(sd.yaw), sn = std::sin(sd.yaw);
+            rows[3] = sd.position[0] + c * lx - sn * ly, rows[7] = sd.position[1] + sn * lx + c * ly, rows[11] = sd.position[2] + lz;
+        }
         const auto points = scene.actor_points(s.actor, poses, 4);
         if (!points.empty()) {
             const float lowest = std::ranges::min(points, {}, &V3::z).z;
-            // Leaving a dropship: the path's own height (falling from the ship, then the floor).
-            const float floor = a.exit >= 0 ? a.position[2] : sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
-            float target = floor - lowest - a.position[2];
-            if (a.exit < 0)
+            // Leaving a dropship: the path's own height (falling from the ship, then the floor); riding: the seat.
+            const float floor = body != ship_body_.end() ? rows[11]
+                              : a.exit >= 0           ? a.position[2]
+                                                      : sim.ground(a.position[0], a.position[1], a.position[2]).value_or(a.position[2]);
+            float target = floor - lowest - rows[11];
+            if (a.exit < 0 && !a.riding)
                 for (const auto& p : points) {
                     if (p.z > lowest + 0.15f) continue;
                     const float x = rows[0] * p.x + rows[1] * p.y + rows[3], y = rows[4] * p.x + rows[5] * p.y + rows[7];

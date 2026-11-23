@@ -1510,6 +1510,20 @@ int cmd_motion_graph(PackageManager& pm, TagHash component, bool list_bank = fal
 
 int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
     pm.build_hash64_index();
+    // The parameter table's named clips (3.91), with the names guessed from a short list.
+    if (const auto data = entity_motion_data(pm, entity)) {
+        std::unordered_map<uint32_t, std::string> guess;
+        for (const char* n : {"idle_slow", "idle", "idle_fast", "fall", "falling", "fall_loop", "jump", "jump_start", "jump_up", "jump_down",
+                              "land", "landing", "land_hard", "land_soft", "drop", "airborne", "in_air", "dropship_exit", "exit", "spawn",
+                              "spawn_in", "melee", "grenade_launch", "fire", "reload", "death", "stagger", "flinch", "walk", "run", "sprint"})
+            guess[fnv1(n)] = n;
+        for (const auto& [name, clips] : data->named) {
+            std::string list;
+            for (const auto c : clips) list += " " + c.str();
+            const auto g = guess.find(name);
+            std::println("named {:08X} {}:{}", name, g == guess.end() ? "?" : g->second, list);
+        }
+    }
     const auto bytes = pm.read(entity);
     TagReader r(bytes);
     const auto comps = r.vec_at(0x08);
@@ -2779,6 +2793,9 @@ int cmd_clip(PackageManager& pm, TagHash tag, int frame) {
     std::println("clip {} codec {} frames {} bones {} name {:08X}  tracks: rotation {} translation {} scale {}", tag.str(),
                  clip_codec_name(c.codec), c.frame_count, c.bone_count, c.name_hash, c.rotations.size(),
                  c.translations.size(), c.scales.size());
+    for (const auto& g : c.bone_groups) std::println("  group {:08X} bones {}", g.hash, g.bones);
+    for (const auto& e : c.events)
+        std::println("  event frame {:3} kind {} class {:08X} name {:08X} value {:08X}", e.frame, e.kind, e.cls, e.name, e.value);
     auto at = [&](size_t n) { return std::min<size_t>(size_t(std::max(frame, 0)), n - 1); };
     for (const auto& t : c.rotations) {
         const auto& q = t.frames[at(t.frames.size())];
@@ -2884,6 +2901,35 @@ int cmd_clips(PackageManager& pm, uint32_t bones) {
 }
 
 // Skin weights of a dynamic model's meshes.
+// Heights of a dynamic model's vertices (bind pose, model space) inside an x/y box, in 0.1 m bins,
+// with the upward-facing ones counted apart: where floors are (3.111, the dropship's bay).
+int cmd_mesh_slice(PackageManager& pm, TagHash tag, float x0, float x1, float y0, float y1) {
+    DynamicModel m = load_dynamic_model(pm, tag);
+    std::map<int, std::pair<size_t, size_t>> bins;
+    std::map<uint16_t, size_t> up_bones;  // the bone of the upward-facing vertices (skinned meshes)
+    for (const auto& d : m.meshes) {
+        VertexBuffer vb0 = load_vertex_buffer(pm, d.vertex0);
+        SkinWeights w;
+        if (!d.skinning.is_none()) w = decode_skin_weights(vb0, load_vertex_buffer(pm, d.skinning));
+        for (size_t v = 0; v + 1 <= vb0.data.size() / vb0.stride; ++v) {
+            int16_t q[4], n[4];
+            std::memcpy(q, vb0.data.data() + v * vb0.stride, 8);
+            std::memcpy(n, vb0.data.data() + v * vb0.stride + 8, 8);
+            float p[3];
+            for (int a = 0; a < 3; ++a) p[a] = float(q[a]) / 32767.0f * m.model_scale[a] + m.model_offset[a];
+            if (p[0] < x0 || p[0] > x1 || p[1] < y0 || p[1] > y1) continue;
+            auto& b = bins[int(std::floor(p[2] * 10))];
+            ++b.first;
+            const bool up = float(n[2]) / 32767.0f > 0.9f;
+            b.second += up;
+            if (up && v < w.bones.size()) ++up_bones[w.bones[v][0]];
+        }
+    }
+    for (const auto& [z, n] : bins) std::println("z {:5.1f}: {:5} vertices, {:5} facing up", z / 10.0, n.first, n.second);
+    for (const auto& [bone, n] : up_bones) std::println("facing up on bone {}: {}", bone, n);
+    return 0;
+}
+
 int cmd_skin(PackageManager& pm, TagHash tag, int only_part) {
     DynamicModel m = load_dynamic_model(pm, tag);
     for (size_t i = 0; i < m.meshes.size(); ++i) {
@@ -3004,6 +3050,7 @@ int cmd_parts(PackageManager& pm, TagHash tag, bool raw) {
 int cmd_rig(PackageManager& pm, TagHash tag) {
     AnimationRig rig = load_animation_rig(pm, tag);
     std::println("rig {} bones {}", tag.str(), rig.size());
+    for (const auto& g : rig.bone_groups) std::println("  group {:08X} bones {}", g.hash, g.bones);
     for (size_t i = 0; i < rig.size(); ++i) {
         const auto& t = rig.default_pose[i];
         std::println("{:3} -> skeleton {:3}  {:6}  rot ({:6.3f},{:6.3f},{:6.3f},{:6.3f}) pos ({:7.4f},{:7.4f},{:7.4f})", i,
@@ -3084,6 +3131,30 @@ int cmd_objaudit(PackageManager& pm) {
 
 // Every skinned dynamic model: whether it has a skeleton, a rig and clips, and for each rig the
 // share of its clips that stretch bones (a wrong rig binding or pose composition).
+// Rigs whose node order differs from their skeleton's bone order, by how many nodes are
+// object space (mechanisms have at most three).
+int cmd_rig_order(PackageManager& pm) {
+    pm.build_hash64_index();
+    const auto materials = index_dynamic_model_materials(pm);
+    const auto rigs = index_model_skeletons(pm, materials, nullptr);
+    std::set<std::pair<uint32_t, uint32_t>> seen;
+    for (const auto& [model, b] : rigs) {
+        if (b.rig.is_none() || !seen.insert({b.skeleton.value, b.rig.value}).second) continue;
+        try {
+            const auto rig = load_animation_rig(pm, b.rig);
+            const auto sk = load_skeleton(pm, b.skeleton);
+            size_t moved = 0;
+            for (size_t i = 0; i < rig.size(); ++i) moved += rig.skeleton_bone[i] != i;
+            if (!moved) continue;
+            std::println("rig {} skeleton {} model {:08X}: {} nodes, {} bones, {} object space, {} out of order", b.rig.str(), b.skeleton.str(), model,
+                         rig.size(), sk.size(), std::ranges::count(rig.object_space, uint8_t(1)), moved);
+        } catch (const std::exception& e) {
+            std::println("rig {}: {}", b.rig.str(), e.what());
+        }
+    }
+    return 0;
+}
+
 int cmd_animaudit(PackageManager& pm) {
     pm.build_hash64_index();
     const auto materials = index_dynamic_model_materials(pm);
@@ -4096,6 +4167,7 @@ int main(int argc, char** argv) {
         if (cmd == "rig" && args.size() >= 2) return cmd_rig(pm, TagHash(parse_hex(args[1])));
         if (cmd == "skeletons") return cmd_skeletons(pm);
         if (cmd == "animaudit") return cmd_animaudit(pm);
+        if (cmd == "rig-order") return cmd_rig_order(pm);
         if (cmd == "objaudit") return cmd_objaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clip-tracks" && args.size() >= 3) return cmd_clip_tracks(pm, TagHash(parse_hex(args[1])), args[2]);
@@ -4103,6 +4175,11 @@ int main(int argc, char** argv) {
         if (cmd == "motion-banks") return cmd_motion_banks(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "clips") return cmd_clips(pm, args.size() >= 2 ? uint32_t(std::stoul(args[1])) : 0);
         if (cmd == "parts" && args.size() >= 2) return cmd_parts(pm, TagHash(parse_hex(args[1])), args.size() > 2 && args[2] == "-v");
+        if (cmd == "mesh-slice" && args.size() >= 3) {
+            float b[4];
+            if (std::sscanf(args[2].c_str(), "%f,%f,%f,%f", &b[0], &b[1], &b[2], &b[3]) != 4) throw std::runtime_error("mesh-slice TAG x0,x1,y0,y1");
+            return cmd_mesh_slice(pm, TagHash(parse_hex(args[1])), b[0], b[1], b[2], b[3]);
+        }
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])), args.size() > 2 ? std::stoi(args[2]) : -1);
         if (cmd == "entity-components" && args.size() >= 2)
             return cmd_entity_components(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-v");

@@ -506,6 +506,7 @@ int main() {
         auto run = [&](bool invisible, std::array<float, 3> player, float seconds) {
             nim::AiParams prm;
             prm.player_invisible = invisible;
+            prm.spawn_range = prm.despawn_range = 1e9f;  // present wherever the player is
             nim::AiSimulation sim(g, prm, 7);
             for (int i = 0; i < int(seconds * 10); ++i) sim.step(0.1f, player);
             return sim.agents();
@@ -529,6 +530,52 @@ int main() {
         CHECK(e[0].alert == nim::AiAlert::Alerted);
         CHECK(!nim::ai_estimates(nim::AiParams{}).empty());
 
+        // Spawning by distance (3.111): absent while the player is far, present near, removed
+        // again far away, back at the spawn point on return.
+        {
+            nim::AiSimulation sp(g, nim::AiParams{}, 7);
+            for (int i = 0; i < 10; ++i) sp.step(0.1f, {1000, 0, 0});
+            CHECK(!sp.agents()[0].active && !sp.agents()[1].active);
+            for (int i = 0; i < 100; ++i) sp.step(0.1f, {5, 60, 0});
+            CHECK(sp.agents()[0].active && sp.agents()[1].active);
+            for (int i = 0; i < 10; ++i) sp.step(0.1f, {1000, 0, 0});
+            CHECK(!sp.agents()[0].active && sp.path_stats().despawned == 2);
+            sp.step(0.1f, {5, 60, 0});
+            CHECK(sp.agents()[0].active && sp.agents()[0].position == sp.agents()[0].home);
+        }
+        // A dropship squad (3.111): the members ride in the bay while the ship arrives, then leave
+        // one by one off its rear onto the floor below and patrol.
+        {
+            nim::MapGameplay gd = g;
+            nim::MapSquad ds;
+            ds.objective = 0;
+            ds.members = {0, 0, 0};
+            nim::MapGameplayPoint sp;
+            sp.position = {5, 5, 10};
+            sp.rotation = {0, 0, 0, 1};
+            sp.model = nim::TagHash(0x80ACA5E7u);
+            ds.positions = {sp};
+            gd.squads = {ds};
+            nim::AiSimulation sd(gd, nim::AiParams{}, 7);
+            CHECK(sd.dropships().size() == 1 && sd.dropships()[0].members.size() == 3);
+            sd.step(0.1f, {1000, 0, 0});
+            CHECK(sd.dropship_state(0).phase == nim::AiDropshipPhase::Waiting && !sd.agents()[0].riding);
+            sd.call_dropship(0);
+            sd.step(0.1f, {1000, 0, 0});
+            CHECK(sd.dropship_state(0).phase == nim::AiDropshipPhase::Arriving);
+            CHECK(sd.agents()[0].riding && !sd.agents()[0].active && std::abs(sd.agents()[0].position[2] - 12.0f) < 1e-3f);
+            float lowest_airborne = 1e9f;
+            bool behind = true;
+            for (int i = 0; i < 200; ++i) {  // the player near (a far one would see the squad despawn once the ship is gone)
+                sd.step(0.1f, {5, 60, 0});
+                for (const auto& a : sd.agents())
+                    if (a.active && a.exit >= 0) lowest_airborne = std::min(lowest_airborne, a.position[2]), behind = behind && a.position[0] < 2.5f;  // rear of the ship (origin x 5)
+            }
+            CHECK(lowest_airborne < 0.01f);
+            CHECK(behind);
+            for (const auto& a : sd.agents()) CHECK(a.active && !a.riding && a.exit < 0 && std::abs(a.position[2]) < 0.01f);
+        }
+
         // Walk grids (3.72): room to the nearest blocked cell, paths that follow the floor up
         // steps of at most 0.45 m, and bodies kept apart by their radii.
         nim::WalkGrid wg;
@@ -539,7 +586,9 @@ int main() {
         wg.set_free(free);
         CHECK(std::abs(wg.room[20 * 40 + 21] - 0.125f) < 1e-4f && std::abs(wg.room[20 * 40 + 24] - 0.875f) < 1e-4f);
         CHECK(!wg.walkable(5.3f, 5.1f, 0.3f) && wg.walkable(6.2f, 5.1f, 0.5f) && !wg.walkable(6.2f, 5.1f, 0.9f));
-        nim::AiSimulation ws(g, nim::AiParams{}, 7);
+        nim::AiParams wide;
+        wide.spawn_range = wide.despawn_range = 1e9f;
+        nim::AiSimulation ws(g, wide, 7);
         auto stepped = wg;
         for (uint32_t r = 0; r < 40; ++r)
             for (uint32_t c = 30; c < 40; ++c) stepped.height[r * 40 + c] = 1.0f;  // a 1 m ledge from x = 7.5
