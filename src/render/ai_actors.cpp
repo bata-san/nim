@@ -124,11 +124,19 @@ template <typename Map> void add_borrowed_clips(PackageManager& pm, const std::v
 }
 
 namespace {
-ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
+ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& sources, const MotionSet& motion,
+                                       std::span<const std::pair<uint32_t, uint32_t>> tags) {
     ActorCharacter c;
     c.entity = motion.entity;
     c.motion = motion;
     try {
+        if (!tags.empty()) {
+            try {
+                c.regions = entity_region_permutations(pm, motion.entity, tags);
+            } catch (const std::exception&) {
+            }
+        }
+        const RegionPermutations* regions = c.regions ? &*c.regions : nullptr;
         auto models = entity_dynamic_models(pm, motion.entity, sources);
         if (models.empty()) throw std::runtime_error("the entity names no dynamic model");
         // The assembly root (the model the Models tab assembles the body, head and gear around).
@@ -150,7 +158,7 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
         if (motion.idle) want(*motion.idle);
         std::string why;
         for (const auto model : models) {
-            auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies);
+            auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions);
             if (mesh.no_drawable) {
                 why += std::format("{}{}: nothing drawable", why.empty() ? "" : "; ", model.str());
                 continue;
@@ -189,7 +197,7 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
                 return skinned;
             };
             for (const auto model : models) {
-                auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies);
+                auto mesh = prepare_entity_preview(pm, model, sources.materials, sources.assemblies, -1, nullptr, nullptr, regions);
                 if (mesh.no_drawable || !fits(mesh)) continue;
                 PreviewAnimation anim;
                 anim.model = mesh.tag;
@@ -221,8 +229,9 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
 }
 }  // namespace
 
-ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion) {
-    ActorCharacter c = prepare_character_model(pm, sources, motion);
+ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion,
+                                       std::span<const std::pair<uint32_t, uint32_t>> tags) {
+    ActorCharacter c = prepare_character_model(pm, sources, motion, tags);
     if (c.binding) {
         try {
             c.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&c.entity, 1)));

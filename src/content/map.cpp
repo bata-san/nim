@@ -1204,6 +1204,12 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
                 TagReader r(d);
                 if (const auto ent = pm.resolve64(r.u64_at(0x60)); ent && is_character(*ent)) {
                     MapCharacter c{item, *ent, {}};
+                    try {
+                        if (const auto tags = r.vec_at(0x130); tags.element_class == 0x8080402D)
+                            for (uint64_t q = 0; q < tags.count; ++q)
+                                c.tags.push_back({r.u32_at(tags.data + size_t(q) * 8), r.u32_at(tags.data + size_t(q) * 8 + 4)});
+                    } catch (const std::exception&) {
+                    }
                     for (size_t o = 0; o + 0x1C <= d.size(); o += 4)
                         if (r.u32_at(o) == 0x80802EC2) {
                             const uint32_t n = std::min(r.u32_at(o + 0x14), 16u);

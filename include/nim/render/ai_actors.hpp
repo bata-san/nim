@@ -46,9 +46,13 @@ struct ActorCharacter {
     bool entity_binding = false;  // bound with the entity's own skeleton and rig (推定)
     std::vector<TagHash> models;  // every dynamic model the entity names, the drawn one first
     std::shared_ptr<const EntitySounds> sounds;  // what its clips and components play (3.90)
+    std::optional<RegionPermutations> regions;  // the permutations its spawn tags select (3.92)
     std::string error;  // why it cannot be drawn, if it cannot
 };
-ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion);
+// `tags`: the spawned character's tags (MapCharacter::tags); they select the model's region
+// permutations (3.92). Empty: every permutation's parts are drawn.
+ActorCharacter prepare_actor_character(PackageManager& pm, const ActorSources& sources, const MotionSet& motion,
+                                       std::span<const std::pair<uint32_t, uint32_t>> tags = {});
 
 // The UESC dropship (3.71): its model and its own animation bank, sorted by the root track
 // (the ship's flight is root motion): arrivals start far away and end at the origin with the rear

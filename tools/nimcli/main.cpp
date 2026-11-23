@@ -1393,6 +1393,120 @@ int cmd_h64_graph(PackageManager& pm, const std::string& prefix) {
 }
 
 // An entity's motion-bank clips and the gait read from their feet (fps 30, 推定).
+// The animation sets (808039DB) of a locomotion component: +0x08 Vec<80803C45> named slots
+// {Vec<80803C4F> layers, u32 name, u16 index, u16 flags}, each layer a Vec<80803C51> of variants
+// {+0x00 Vec<80803C58> {u32 tag category id, u32 tag}, +0x10 Vec<80803C59> {u32 slot, f32
+// cumulative weight}, ..., +0x4C name}; clips by bank index.
+int cmd_motion_sets(PackageManager& pm, TagHash sets_tag, TagHash bank_tag) {
+    pm.build_hash64_index();
+    const auto bank = motion_bank_clips(pm, bank_tag);
+    const auto bytes = pm.read(sets_tag);
+    const TagReader r(bytes);
+    auto clip_text = [&](uint32_t index) {
+        if (index >= bank.size() || bank[index].is_none()) return std::format("#{} ?", index);
+        try {
+            const auto c = load_animation_clip(pm, bank[index]);
+            const float travel = std::hypot(c.root_motion.translation[0], c.root_motion.translation[1]);
+            return std::format("#{} {} f{} t{} move {:.2f}", index, bank[index].str(), c.frame_count, c.bone_count, travel);
+        } catch (const std::exception& e) {
+            return std::format("#{} {} ({})", index, bank[index].str(), e.what());
+        }
+    };
+    const auto sets = r.vec_at(0x08);
+    for (uint64_t s = 0; s < sets.count; ++s) {
+        const size_t e = sets.data + s * 32;
+        std::println("set {} name {:08X} index {} flags {:04X} +18 {:08X}", s, r.u32_at(e + 0x10), r.u16_at(e + 0x14), r.u16_at(e + 0x16),
+                     r.u32_at(e + 0x18));
+        const auto layers = r.vec_at(e);
+        for (uint64_t l = 0; l < layers.count; ++l) {
+            const auto variants = r.vec_at(layers.data + l * 16);
+            std::println("  layer {}", l);
+            for (uint64_t v = 0; v < variants.count; ++v) {
+                const size_t at = variants.data + v * 0x50;
+                std::string cond;
+                const auto conds = r.vec_at(at);
+                for (uint64_t k = 0; k < conds.count; ++k) cond += std::format(" {:02X}:{:08X}", r.u32_at(conds.data + k * 8), r.u32_at(conds.data + k * 8 + 4));
+                std::string raw;
+                for (size_t k = 0x20; k < 0x50; k += 4) raw += std::format(" {:08X}", r.u32_at(at + k));
+                std::println("    variant {} if{} |{}", v, cond.empty() ? " -" : cond, raw);
+                const auto clips = r.vec_at(at + 0x10);
+                for (uint64_t k = 0; k < clips.count; ++k)
+                    std::println("      {} upto {:.3f}", clip_text(r.u32_at(clips.data + k * 8)), r.f32_at(clips.data + k * 8 + 4));
+            }
+        }
+    }
+    return 0;
+}
+
+// The animation graph (80803950) of a motion component (resource 80803936: +0xE8 bank, +0xF4
+// graph): the name table, every node, each selector's sequences (clips by bank index) and its
+// decision rows raw, for reverse engineering the graph's choice of clips.
+int cmd_motion_graph(PackageManager& pm, TagHash component, bool list_bank = false) {
+    pm.build_hash64_index();
+    const auto cb = pm.read(component);
+    const TagReader cr(cb);
+    const size_t resource = 0x18 + size_t(cr.u64_at(0x18));
+    if (cr.u32_at(resource - 4) != 0x80803936) throw std::runtime_error("not a motion component (80803936)");
+    const TagHash bank_tag = cr.tag_at(resource + 0xE8), graph_tag = cr.tag_at(resource + 0xF4);
+    const auto bank = motion_bank_clips(pm, bank_tag);
+    std::println("bank {} ({} clips) graph {}", bank_tag.str(), bank.size(), graph_tag.str());
+    const auto bytes = pm.read(graph_tag);
+    const TagReader r(bytes);
+    auto clip_text = [&](uint32_t index) {
+        if (index >= bank.size() || bank[index].is_none()) return std::format("#{} ?", index);
+        try {
+            const auto c = load_animation_clip(pm, bank[index]);
+            const float travel = std::hypot(c.root_motion.translation[0], c.root_motion.translation[1]);
+            const float yaw = 2 * std::atan2(c.root_motion.rotation[2], c.root_motion.rotation[3]) * 57.29578f;
+            return std::format("#{} {} f{} t{} move {:.2f} yaw {:.0f}", index, bank[index].str(), c.frame_count, c.bone_count, travel, yaw);
+        } catch (const std::exception& e) {
+            return std::format("#{} {} ({})", index, bank[index].str(), e.what());
+        }
+    };
+    if (list_bank) {
+        for (uint32_t i = 0; i < bank.size(); ++i) std::println("bank {}", clip_text(i));
+        return 0;
+    }
+    const auto names = r.vec_at(0x08);
+    std::map<uint32_t, std::vector<uint32_t>> names_of;
+    for (uint64_t i = 0; i < names.count; ++i) names_of[r.u32_at(names.data + i * 8 + 4)].push_back(r.u32_at(names.data + i * 8));
+    const auto nodes = r.vec_at(0x18);
+    for (uint64_t n = 0; n < nodes.count; ++n) {
+        const size_t field = nodes.data + n * 16;
+        const size_t at = field + 8 + size_t(r.u64_at(field + 8));
+        const uint32_t cls = r.u32_at(at - 4);
+        std::string nm;
+        for (const auto h : names_of[uint32_t(n)]) nm += std::format(" {:08X}", h);
+        std::println("node {} kind {} class {:08X} @{:X} names{}", n, r.u32_at(field), cls, at, nm);
+        auto leaves = [&](size_t vec, const char* indent) {
+            const auto l = r.vec_at(vec);
+            for (uint64_t k = 0; k < l.count; ++k)
+                std::println("{}{} w {:.2f}", indent, clip_text(r.u32_at(l.data + k * 8)), r.f32_at(l.data + k * 8 + 4));
+        };
+        if (cls == 0x8080391F) {
+            leaves(at, "    ");
+        } else if (cls == 0x8080391D) {
+            const auto seq = r.vec_at(at), ab16 = r.vec_at(at + 0x10), dec = r.vec_at(at + 0x20), d67 = r.vec_at(at + 0x30);
+            for (uint64_t s = 0; s < seq.count; ++s) {
+                std::println("  seq {}", s);
+                leaves(seq.data + s * 16, "    ");
+            }
+            std::string t;
+            for (uint64_t k = 0; k < ab16.count; ++k) t += std::format(" {:08X}", r.u32_at(ab16.data + k * 8)) + std::format(":{:08X}", r.u32_at(ab16.data + k * 8 + 4));
+            std::println("  ab16{}", t);
+            for (uint64_t k = 0; k < dec.count; ++k) {
+                std::string w;
+                for (int j = 0; j < 9; ++j) w += std::format(" {:08X}", r.u32_at(dec.data + k * 36 + j * 4));
+                std::println("  dec {:2}{}", k, w);
+            }
+            t.clear();
+            for (uint64_t k = 0; k < d67.count; ++k) t += std::format(" {:08X}", r.u32_at(d67.data + k * 4));
+            std::println("  d67{}", t);
+        }
+    }
+    return 0;
+}
+
 int cmd_motion_probe(PackageManager& pm, TagHash entity, bool all = false) {
     pm.build_hash64_index();
     const auto bytes = pm.read(entity);
@@ -3938,6 +4052,8 @@ int main(int argc, char** argv) {
         if (cmd == "map-entity-models" && args.size() >= 2) return cmd_map_entity_models(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-placements" && args.size() >= 2) return cmd_map_placements(pm, TagHash(parse_hex(args[1])));
         if (cmd == "h64-graph" && args.size() >= 2) return cmd_h64_graph(pm, args[1]);
+        if (cmd == "motion-sets" && args.size() >= 3) return cmd_motion_sets(pm, TagHash(parse_hex(args[1])), TagHash(parse_hex(args[2])));
+        if (cmd == "motion-graph" && args.size() >= 2) return cmd_motion_graph(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-b");
         if (cmd == "motion-probe" && args.size() >= 2) return cmd_motion_probe(pm, TagHash(parse_hex(args[1])), args.size() >= 3 && args[2] == "-a");
         if (cmd == "bs-modules") return cmd_bs_modules(pm, args.size() >= 2 ? args[1] : std::string());
         if (cmd == "ai-sim" && args.size() >= 2) {

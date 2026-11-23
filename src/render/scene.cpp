@@ -986,7 +986,8 @@ bool vs_reads_typed_buffers(const std::vector<uint8_t>& vs) {
 } // namespace
 
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials,
-                                   int permutation, const ChannelValues* channels, PrepareCache* cache) {
+                                   int permutation, const ChannelValues* channels, PrepareCache* cache,
+                                   const RegionPermutations* regions) {
     PreparedMesh out;
     if (cache) {
         std::lock_guard lk(*cache->mutex);
@@ -1106,7 +1107,17 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
         //   nearly the same index count are one piece's alternates (colour variants such as the
         //   recruit's blue / red neck, or the same triangles under another external identifier).
         //   Only the lowest external identifier is drawn; how the game picks one is not decoded.
+        // - Region permutations (3.92): with the spawned character's permutations known, a part whose
+        //   group (external identifier) names other permutations of its region is not drawn (the
+        //   UESC assault's wide shield is the boss's; elite and miniboss carry the narrow one).
         std::vector<char> hidden(mesh.parts.size(), 0);
+        if (regions && materials)
+            for (size_t k = 0; k < mesh.parts.size(); ++k)
+                if (const uint16_t g = mesh.parts[k].external_identifier;
+                    g < materials->part_tags.size() && !part_group_visible(materials->part_tags[g], *regions)) {
+                    hidden[k] = 1;
+                    ++out.region_hidden_parts;
+                }
         {
             auto bounds = [&](const DynamicMeshPart& part) {
                 std::array<float, 6> bb{1e9f, 1e9f, 1e9f, -1e9f, -1e9f, -1e9f};
@@ -1141,6 +1152,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                 std::vector<std::pair<size_t, std::array<float, 6>>> seen;
                 for (size_t k = first; k < last; ++k) {
                     const auto& part = mesh.parts[k];
+                    if (hidden[k]) continue;
                     if (glyph_techniques.contains(part.technique.value) && !(part.flags & 0x380)) {
                         hidden[k] = 1;
                         continue;
@@ -1300,10 +1312,10 @@ void prepare_distance_field_preview(PreparedMesh& mesh) {
 PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
                                     const ModelAssemblyIndex& assemblies, int permutation,
-                                    const ChannelValues* channels, PrepareCache* cache) {
+                                    const ChannelValues* channels, PrepareCache* cache, const RegionPermutations* regions) {
     auto prepare = [&](TagHash tag, int variant) {
         const auto it = materials.find(tag.value);
-        auto mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache);
+        auto mesh = prepare_dynamic_model(pm, tag, it == materials.end() ? nullptr : &it->second, variant, channels, cache, regions);
         prepare_distance_field_preview(mesh);
         return mesh;
     };

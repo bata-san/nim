@@ -218,6 +218,74 @@ TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation)
     return i < techniques.size() ? techniques[i] : TagHash();
 }
 
+std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
+                                                             std::span<const std::pair<uint32_t, uint32_t>> tags) {
+    const auto bytes = pm.read(entity);
+    const TagReader r(bytes);
+    const auto comps = r.vec_at(0x08);
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
+        if (!e || e->type != 8 || e->reference != kClassComponent) continue;
+        try {
+            const auto cb = pm.read(c);
+            const TagReader cr(cb);
+            const uint64_t rel = cr.u64_at(0x18);
+            if (rel == 0 || 0x18 + rel < 4 || 0x18 + rel >= cb.size()) continue;
+            const size_t base = 0x18 + size_t(rel);
+            if (cr.u32_at(base - 4) != 0x80804034) continue;
+            const auto regions = cr.vec_at(base + 0xE8);
+            const auto entries = cr.vec_at(base + 0xF8);
+            if (regions.element_class != 0x80800070 || entries.element_class != 0x80804033) continue;
+            RegionPermutations out;
+            out.selector = c;
+            std::optional<size_t> best;
+            uint64_t best_conditions = 0;
+            for (uint64_t i = 0; i < entries.count; ++i) {
+                const size_t at = entries.data + size_t(i) * 0x30;
+                const auto conditions = cr.vec_at(at + 0x10);
+                bool hold = true;
+                for (uint64_t q = 0; q < conditions.count && hold; ++q) {
+                    const std::pair<uint32_t, uint32_t> want{cr.u32_at(conditions.data + size_t(q) * 8),
+                                                             cr.u32_at(conditions.data + size_t(q) * 8 + 4)};
+                    hold = std::ranges::find(tags, want) != tags.end();
+                }
+                if (!hold) continue;
+                if (!best || conditions.count > best_conditions) {
+                    best = at, best_conditions = conditions.count, out.ties = 0;
+                } else if (conditions.count == best_conditions) {
+                    ++out.ties;
+                }
+            }
+            if (!best) return std::nullopt;
+            out.entry = cr.u32_at(*best + 4);
+            const auto permutations = cr.vec_at(*best + 0x20);
+            for (uint64_t q = 0; q < std::min(permutations.count, regions.count); ++q)
+                out.region_permutation.push_back({cr.u32_at(regions.data + size_t(q) * 4), cr.u32_at(permutations.data + size_t(q) * 4)});
+            return out;
+        } catch (const std::exception&) {
+        }
+    }
+    return std::nullopt;
+}
+
+bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions) {
+    constexpr uint32_t kRegion = 0x51E7A18D;       // fnv1("region")
+    constexpr uint32_t kPermutation = 0x4C58EF8F;  // fnv1("permutation")
+    bool names_permutation = false, constrained = false;
+    for (const auto& [k, v] : group_tags) names_permutation |= k == kPermutation;
+    if (!names_permutation) return true;
+    for (const auto& [k, region] : group_tags) {
+        if (k != kRegion) continue;
+        for (const auto& [r, permutation] : regions.region_permutation) {
+            if (r != region) continue;
+            constrained = true;
+            if (std::ranges::find(group_tags, std::pair{kPermutation, permutation}) != group_tags.end()) return true;
+        }
+    }
+    return !constrained;  // a region the selector does not list is not narrowed down
+}
+
 std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm) {
     // Offsets inside SDynamicModelComponent (goriath): model 0x234, technique map 0x3D8,
     // techniques 0x418. The struct sits somewhere inside the component tag, so find it by its
@@ -313,6 +381,18 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                             break;
                         }
                     m.default_permutation = m.permutation_count > 2 ? m.permutation_count - 1 : 0;
+                    try {
+                        if (const auto groups = r.vec_at(base + 0x28); groups.element_class == 0x8080BACC)
+                            for (uint64_t k = 0; k < groups.count; ++k) {
+                                auto& set = m.part_tags.emplace_back();
+                                const auto pairs = r.vec_at(groups.data + size_t(k) * 0x18 + 8);
+                                if (pairs.element_class != 0x8080BAD0) continue;
+                                for (uint64_t q = 0; q < pairs.count; ++q)
+                                    set.push_back({r.u32_at(pairs.data + size_t(q) * 8), r.u32_at(pairs.data + size_t(q) * 8 + 4)});
+                            }
+                    } catch (const std::exception&) {
+                        m.part_tags.clear();
+                    }
                     out.emplace(v, std::move(m));
                 } catch (...) {
                 }

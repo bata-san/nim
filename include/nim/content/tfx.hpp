@@ -143,8 +143,27 @@ struct DynamicModelMaterials {
     // Placed by an exfil device: a component of its entity reads exfil_activation_progress. Its
     // run-time object state (shader_int, ...) is then the device's inactive state.
     bool exfil_device = false;
+    // Tag sets of the model's part groups (component +0x28 Vec<8080BACC>, each a Vec<8080BAD0> of
+    // {name, value} FNV-1 pairs), by part external_identifier: region = body / helmet /
+    // assault_shield, permutation = uesc_elite_assault ..., damage, state (docs/PROGRESS.md 3.92).
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> part_tags;
     TagHash technique(uint16_t variant, uint32_t permutation) const;
 };
+
+// Region permutations (docs/PROGRESS.md 3.92): an entity's selector component (class 80804034)
+// lists regions (+0xE8 Vec<u32>) and entries (+0xF8 Vec<80804033>, 0x30 bytes: f32 weight,
+// u32 name, +0x10 Vec<8080BAD0> conditions, +0x20 Vec<u32> permutation per region). The entry
+// whose conditions all hold in the spawned character's tags gives each region its permutation;
+// a part group naming permutations is drawn only when its region's permutation is among them.
+struct RegionPermutations {
+    TagHash selector;   // the entity component holding the table
+    uint32_t entry = 0;  // the chosen entry's name
+    std::vector<std::pair<uint32_t, uint32_t>> region_permutation;
+    size_t ties = 0;     // other entries as specific as the chosen one whose conditions also hold
+};
+std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
+                                                             std::span<const std::pair<uint32_t, uint32_t>> tags);
+bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions);
 // Model tag -> materials, from one pass over every component tag (a few seconds).
 std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_materials(PackageManager& pm);
 

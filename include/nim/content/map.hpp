@@ -285,6 +285,9 @@ struct MapGameplayPoint {
 struct MapCharacter {
     TagHash item, entity;
     std::vector<uint32_t> labels;
+    // +0x130 Vec<8080402D> {name, value} FNV-1 pairs: the tags the entity spawns with, e.g.
+    // type = elite, unit_type = assault, weapon_type = ... (they pick its model permutation, 3.92).
+    std::vector<std::pair<uint32_t, uint32_t>> tags;
     // 推定: the squad member slot name most often given to this character in squads that spawn only
     // it, without "_core" / "_N" (e.g. uesc_assault_elite_lmg_uesc). No name string is stored with
     // the descriptor; empty when no such squad exists.

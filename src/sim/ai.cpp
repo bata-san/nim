@@ -1,6 +1,7 @@
 #include "nim/sim/ai.hpp"
 
 #include "nim/content/animation.hpp"
+#include "nim/content/object_channels.hpp"
 #include "nim/core/tag_reader.hpp"
 
 #include <algorithm>
@@ -403,6 +404,14 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             std::vector<float> locomotion_head;
             std::vector<Stand> stands;  // clips that stand still (cyclic or played back and forth)
         } own, borrowed;
+        // The animation data (3.91): the locomotion parameter table names the stances the engine
+        // plays ("idle_slow"), and the action graph's clips (melee, fire, grenade launch, ...) are
+        // actions, never an idle.
+        std::optional<EntityMotionData> data;
+        try {
+            data = entity_motion_data(pm, entity);
+        } catch (const std::exception&) {
+        }
         for (const auto tag : entity_motion_clips(pm, entity)) {
             AnimationClip clip;
             try {
@@ -438,7 +447,9 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
             // An idle is a full-body stance: clips whose foot targets sit at the origin (the recruit's
             // 80A4AB6C, 173 frames) are layers without a stance of their own.
             if (planted && gait.speed < 0.15f && gait.lift < 0.08f && gait.seconds >= (gait.cyclic ? 0.5f : 1.0f)) {
-                into->stands.push_back({MotionClip{tag, gait.seconds, 0, {}, gait.cyclic}, head_height(clip)});
+                // With the animation data, only the parameter table's stances that no action plays.
+                if (!data || (data->parameter_clips.contains(tag.value) && !data->action_clips.contains(tag.value)))
+                    into->stands.push_back({MotionClip{tag, gait.seconds, 0, {}, gait.cyclic}, head_height(clip)});
                 continue;
             }
             if (!gait.cyclic) continue;
@@ -455,7 +466,13 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         // 80A4AA6B at 1.14 m, against 1.42-1.49 m walking and running upright). A clip is upright
         // when its head is within 0.12 m of the highest head among the same clips' locomotion. The
         // idle is the longest upright loop, else the longest upright clip played back and forth.
-        auto pick_idle = [](Found& f) -> std::optional<MotionClip> {
+        // With the animation data the idle is the parameter table's "idle_slow" when this body can
+        // play it (its own clip, or a shared one planted at this ankle height), else the longest
+        // stance of the table no action plays; the posture is the data's (no upright filter).
+        const std::vector<TagHash>* idle_slow = nullptr;
+        if (data)
+            if (const auto it = data->named.find(fnv1("idle_slow")); it != data->named.end()) idle_slow = &it->second;
+        auto pick_idle = [&](Found& f) -> std::optional<MotionClip> {
             std::optional<float> upright;
             if (!f.locomotion_head.empty()) {
                 upright = *std::ranges::max_element(f.locomotion_head);
@@ -463,6 +480,12 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
                 for (size_t k = 0; k < f.locomotion.size(); ++k)
                     if (*upright - f.locomotion_head[k] <= 0.12f) kept.push_back(f.locomotion[k]);
                 f.locomotion = std::move(kept);
+            }
+            if (data) {
+                upright.reset();
+                if (idle_slow)
+                    for (const auto& c : f.stands)
+                        if (std::ranges::find(*idle_slow, c.clip.clip) != idle_slow->end()) return c.clip;
             }
             const Stand* best = nullptr;
             for (const auto& c : f.stands) {

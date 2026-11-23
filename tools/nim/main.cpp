@@ -2114,7 +2114,7 @@ public:
                 }
                 first[ch.entity.value] = out.motions.size();
                 out.motions.push_back(build_motion_set(pm, ch.entity, kClipFps));
-                out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back()));
+                out.characters.push_back(prepare_actor_character(pm, sources, out.motions.back(), ch.tags));
             }
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes; its sounds
             // (3.90) from every such node's entity.

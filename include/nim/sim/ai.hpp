@@ -55,8 +55,12 @@ struct MotionSet {
 // Reads the entity's skeleton, rig and motion-bank clips and measures each clip's gait at `fps`
 // (推定: the clip rate is not decoded; speeds come from the clips' root motion where they have it).
 // Locomotion: cyclic, 0.6 m/s or faster, foot lift 0.1..0.6 m. Idle: slower than 0.15 m/s, foot lift under 0.08 m; the longest loop
-// (0.5 s or more), else the longest clip that does not loop (1 s or more, played back and forth). Both keep the upright posture: the
-// head within 0.12 m of the highest head among the locomotion clips (crouched moves and idles are left out, 推定).
+// (0.5 s or more), else the longest clip that does not loop (1 s or more, played back and forth). Locomotion keeps the upright
+// posture: the head within 0.12 m of the highest head among the locomotion clips (crouched moves are left out, 推定).
+// Idle candidates come from the entity's motion data (entity_motion_data, docs/PROGRESS.md 3.91): clips of its parameter table
+// that no action-graph node plays (the graph's clips are actions such as melee or grenade_launch). The parameter table's
+// "idle_slow" clip is the idle when it is a candidate; otherwise the longest candidate (推定). Without the data, the upright filter
+// above also applies to idles.
 // Characters with no locomotion clip hold their position in the simulation (推定).
 MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps);
 struct MotionChoice {

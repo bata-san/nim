@@ -681,6 +681,23 @@ int main() {
         CHECK(std::abs(c.eval(5) - 0.5f) < 1e-4f && std::abs(c.eval(-1) - 1) < 1e-4f && std::abs(c.eval(20)) < 1e-4f);
     }
 
+    // Region permutations (docs/PROGRESS.md 3.92), with the UESC assault's part groups.
+    {
+        constexpr uint32_t region = 0x51E7A18D, perm = 0x4C58EF8F, state = 0x5266EA90;
+        constexpr uint32_t body = 0x6DFE676D, shield = 0xF039E932;
+        constexpr uint32_t elite = 0x8972D719, miniboss = 0xBA4C51BA, boss = 0x57C84687;
+        RegionPermutations elite_assault;
+        elite_assault.region_permutation = {{body, elite}, {0x45E82E50, elite}, {0x9D4305AE, elite}, {shield, elite}, {0x78241582, 0x98322C53}};
+        const std::vector<std::pair<uint32_t, uint32_t>> wide = {{state, 0xF85655BE}, {region, shield}, {perm, boss}};
+        const std::vector<std::pair<uint32_t, uint32_t>> narrow = {{state, 0xF85655BE}, {region, shield}, {perm, miniboss}, {perm, elite}};
+        const std::vector<std::pair<uint32_t, uint32_t>> plain_body = {{region, body}};
+        const std::vector<std::pair<uint32_t, uint32_t>> unlisted = {{region, 0x0411CDC4}, {perm, boss}};
+        CHECK(!part_group_visible(wide, elite_assault));
+        CHECK(part_group_visible(narrow, elite_assault));
+        CHECK(part_group_visible(plain_body, elite_assault));
+        CHECK(part_group_visible(unlisted, elite_assault));
+    }
+
     if (g_failures) return 1;
     std::puts("all tests passed");
     return 0;

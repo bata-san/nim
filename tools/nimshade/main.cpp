@@ -594,12 +594,15 @@ int run(int argc, char** argv) {
                 }
                 first[ch.entity.value] = motions.size();
                 motions.push_back(build_motion_set(pm, ch.entity, 30.0f));
-                characters.push_back(prepare_actor_character(pm, sources, motions.back()));
+                characters.push_back(prepare_actor_character(pm, sources, motions.back(), ch.tags));
                 const auto& c = characters.back();
                 std::string models;
                 for (const auto m : c.models) models += " " + m.str();
                 std::println("ai character {} {}: model {} clips {} (entity models{}) {}", ch.entity.str(), ch.name_estimate,
                              c.model.is_none() ? "-" : c.model.str(), c.clips.size(), models, c.error);
+                if (c.regions)
+                    std::println("  region permutations: entry {:08X} ({} ties), {} parts of other permutations left out", c.regions->entry,
+                                 c.regions->ties, c.mesh ? c.mesh->region_hidden_parts : 0);
             }
             AiParams params;
             params.player_invisible = !ai_visible;

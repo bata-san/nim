@@ -192,6 +192,7 @@ struct PreparedMesh {
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no parts supported by the connected passes
     bool inferred_dynamic_lod = false;  // alternates of one piece: only the lowest external identifier drawn
+    size_t region_hidden_parts = 0;     // parts of other region permutations left out (3.92)
     bool distance_field_preview = false; // preview-only material state and camera framing
     bool inferred_transparent_stage = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement
@@ -279,15 +280,18 @@ PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
 // material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_poses.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
+// `regions` (an entity's spawned permutations, 3.92) leaves out the part groups of other permutations.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
-                                   int permutation = -1, const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
+                                   int permutation = -1, const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr,
+                                   const RegionPermutations* regions = nullptr);
 // Either of the above, by the tag's class.
 PreparedMesh prepare_mesh(PackageManager& pm, TagHash tag, const DynamicModelMaterials* materials = nullptr,
                           const ChannelValues* channels = nullptr);
 PreparedMesh prepare_entity_preview(PackageManager& pm, TagHash model,
                                     const std::unordered_map<uint32_t, DynamicModelMaterials>& materials,
                                     const ModelAssemblyIndex& assemblies, int permutation = -1,
-                                    const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr);
+                                    const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr,
+                                    const RegionPermutations* regions = nullptr);
 std::optional<PreviewAnimation> prepare_preview_animation(PackageManager& pm, const PreparedMesh& mesh,
                                                           const ModelRigIndex& rigs, std::span<const ClipInfo> clips,
                                                           TagHash preferred = {}, std::span<const ClipInfo> related = {},

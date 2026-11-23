@@ -1495,6 +1495,83 @@ std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity) {
 
 std::vector<TagHash> motion_bank_clips(PackageManager& pm, TagHash bank) { return read_motion_bank(pm, bank); }
 
+std::optional<EntityMotionData> entity_motion_data(PackageManager& pm, TagHash entity) {
+    EntityMotionData out;
+    const auto bytes = pm.read(entity);
+    TagReader r(bytes);
+    const auto comps = r.vec_at(0x08);
+    for (uint64_t k = 0; k < comps.count; ++k) {
+        const TagHash c(r.u32_at(comps.data + size_t(k) * 12));
+        const Entry* e = c.is_pkg_ref() ? pm.entry(c) : nullptr;
+        if (!e || e->type != 8 || e->reference != kClassComponent) continue;
+        try {
+            const auto cb = pm.read(c);
+            TagReader cr(cb);
+            const auto [resource, cls] = resource_at(cr, 0x18);
+            if (cls == 0x80803936 && out.graph.is_none()) {
+                out.bank = cr.tag_at(resource + 0xE8);
+                out.character_tag = cr.u32_at(resource + 0xF0);
+                out.graph = cr.tag_at(resource + 0xF4);
+            } else if (cls == 0x8080397B && out.parameters.is_none()) {
+                const TagHash p = cr.tag_at(resource + 0x178);
+                const Entry* pe = p.is_pkg_ref() ? pm.entry(p) : nullptr;
+                if (pe && pe->reference == 0x80803B54) out.parameters = p;
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    if (out.bank.is_none() || out.graph.is_none() || out.parameters.is_none()) return std::nullopt;
+    out.bank_clips = read_motion_bank(pm, out.bank);
+    auto clip_of = [&](uint32_t index) { return index < out.bank_clips.size() ? out.bank_clips[index] : TagHash(); };
+    // Parameter table: kind 0x16 rows are clip sets.
+    {
+        const auto pb = pm.read(out.parameters);
+        const TagReader p(pb);
+        const auto rows = p.vec_at(0x08);
+        for (uint64_t i = 0; i < rows.count; ++i) {
+            const size_t row = rows.data + size_t(i) * 24;
+            if ((p.u32_at(row + 4) & 0xFF) != 0x16) continue;
+            const size_t at = row + 8 + size_t(p.u64_at(row + 8));
+            if (at < 4 || at + 16 > pb.size() || p.u32_at(at - 4) != 0x80803B5B) continue;
+            const auto clips = p.vec_at(at);
+            if (clips.element_class != 0x80803C5E) continue;
+            auto& named = out.named[p.u32_at(row)];
+            for (uint64_t k = 0; k < clips.count; ++k)
+                if (const TagHash t = clip_of(p.u16_at(clips.data + size_t(k) * 4)); !t.is_none()) {
+                    named.push_back(t);
+                    out.parameter_clips.insert(t.value);
+                }
+        }
+    }
+    // Action graph: every leaf (80803924 {u32 bank index, f32 weight}) of every node, single-clip
+    // nodes (8080391F) and selectors (8080391D, Vec<80803922> sequences of leaves).
+    {
+        const auto gb = pm.read(out.graph);
+        const TagReader g(gb);
+        auto leaves = [&](size_t vec) {
+            const auto l = g.vec_at(vec);
+            if (l.element_class != 0x80803924) return;
+            for (uint64_t k = 0; k < l.count; ++k)
+                if (const TagHash t = clip_of(g.u32_at(l.data + size_t(k) * 8)); !t.is_none()) out.action_clips.insert(t.value);
+        };
+        const auto nodes = g.vec_at(0x18);
+        for (uint64_t n = 0; n < nodes.count; ++n) {
+            const size_t field = nodes.data + size_t(n) * 16;
+            const size_t at = field + 8 + size_t(g.u64_at(field + 8));
+            if (at < 4 || at + 16 > gb.size()) continue;
+            const uint32_t cls = g.u32_at(at - 4);
+            if (cls == 0x8080391F) {
+                leaves(at);
+            } else if (cls == 0x8080391D) {
+                const auto seq = g.vec_at(at);
+                if (seq.element_class != 0x80803922) continue;
+                for (uint64_t s = 0; s < seq.count; ++s) leaves(seq.data + size_t(s) * 16);
+            }
+        }
+    }
+    return out;
+}
+
 std::optional<AnimationClip> map_clip_groups(const AnimationClip& clip, const AnimationRig& rig) {
     if (clip.bone_groups.empty() || rig.bone_groups.empty()) return std::nullopt;
     std::vector<int32_t> to(clip.bone_count, -1);

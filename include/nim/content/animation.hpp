@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nim {
@@ -194,6 +195,24 @@ void pose_skeleton(const Skeleton& skeleton, const AnimationRig& rig, const Anim
 std::vector<TagHash> entity_motion_clips(PackageManager& pm, TagHash entity);
 // The clips of one motion bank (80803BE9; rows of 8080AE00 wide hashes), none for unresolved rows.
 std::vector<TagHash> motion_bank_clips(PackageManager& pm, TagHash bank);
+
+// What an entity's animation components say about its clips (the UESC robots; 3.91):
+// - the motion component (resource 80803936): +0xE8 bank, +0xF0 the character's tag in the
+//   character category of the tag tree 8080ACBF (uesc_recruit = fnv1("uesc_recruit"), ...), +0xF4
+//   the action graph 80803950, whose named nodes ("melee", "fire_1", "grenade_launch", "idle", ...)
+//   pick clips by tags for actions;
+// - the locomotion component (resource 8080397B): +0x170 bank, +0x178 the named parameter table
+//   80803B54 (rows {u32 name, u32 kind, rel pointer}; kind 0x16 = clips 80803B5B whose +0x00
+//   Vec<80803C5E> holds {u16 bank index, u16}), e.g. "idle_slow".
+struct EntityMotionData {
+    TagHash bank, graph, parameters;
+    uint32_t character_tag = 0;
+    std::vector<TagHash> bank_clips;                           // bank order
+    std::unordered_map<uint32_t, std::vector<TagHash>> named;  // parameter table: name -> clips
+    std::unordered_set<uint32_t> parameter_clips;              // every clip the parameter table holds
+    std::unordered_set<uint32_t> action_clips;                 // every clip a node of the action graph plays
+};
+std::optional<EntityMotionData> entity_motion_data(PackageManager& pm, TagHash entity);
 // Rebinds a clip authored for another rig of the same family by bone group: each clip group
 // (AnimationClip::bone_groups, hash and node count, in track order) whose hash and count a group of
 // `rig` has moves onto that group's nodes; tracks of groups the rig lacks are dropped and those rig
