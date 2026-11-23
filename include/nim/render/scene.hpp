@@ -693,6 +693,7 @@ struct LightingParams {
     // Temporal anti-aliasing (with post only): a jittered view each frame (GameLighting::temporal_view)
     // resolved against the previous frames with the engine's resolve_taa. Replaces fxaa when it runs.
     bool temporal_aa = true;
+    bool dlaa = false;
     // Cinematic depth of field (with post only): the engine's v2_dof_cinematic_* passes, focused at
     // dof_focus metres of view depth (> 0). The focus ranges and blur size are estimates.
     // Vignette (with post only): the engine's draw_vignette; its strength and radii are estimates.
@@ -700,6 +701,7 @@ struct LightingParams {
     bool depth_of_field = false;
     bool dof_edges_only = false;
     float chromatic_aberration = 0.0f;
+    float emissive_gain = 1.0f;
     float output_gamma = 1.0f;  // exponent applied to the final SDR image
     float output_sharpen = 0.0f;
     float output_grain = 0.0f;

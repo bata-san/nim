@@ -331,6 +331,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(InteriorFog, "屋内フォグ", "Interior fog", "실내 안개") \
     X(FogDensityScale, "大気の霧の濃さ", "Atmospheric fog density", "대기 안개 밀도") \
     X(ChromaticAberration, "色収差", "Chromatic aberration", "색수차") \
+    X(EmissiveGain, "自己発光の強さ", "Emissive intensity", "자체 발광 강도") \
     X(OutputGamma, "出力ガンマ", "Output gamma", "출력 감마") \
     X(OutputSharpen, "シャープネス", "Sharpening", "선명도") \
     X(OutputGrain, "画面ノイズ", "Screen grain", "화면 노이즈") \

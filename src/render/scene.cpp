@@ -3278,13 +3278,21 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             if (!item_instances(it)) continue;
             const auto& set = sets_[it.buffers];
             if (it.dynamic) {
+                if (set.actor >= 0 && !actors_[size_t(set.actor)].rows) continue;
                 const auto c = set.model_center;
                 auto placement = [&](uint32_t i) {
                     if (!set.sky_order.empty()) {
                         enqueue(it, i, set.sky_order[i], {}, true);
                         return;
                     }
-                    const auto& p = set.placements[i];
+                    if (set.equipment) {
+                        const auto p = transform_point(*set.equipment->current, {c.x, c.y, c.z});
+                        const V3 pos{p[0], p[1], p[2]};
+                        enqueue(it, i, dot(pos - vm.eye, vm.fwd), pos);
+                        return;
+                    }
+                    const auto& p = set.actor >= 0
+                        ? *actors_[size_t(set.actor)].rows : set.placements[i];
                     const V3 pos{p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3],
                                  p[4] * c.x + p[5] * c.y + p[6] * c.z + p[7],
                                  p[8] * c.x + p[9] * c.y + p[10] * c.z + p[11]};
@@ -3328,11 +3336,18 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             if (it.object_reflection) {
                 size_t probe = 0;
                 if (!entry.sky) {
-                    const uint32_t group = it.dynamic ? it.buffers : sets_[it.buffers].cull;
-                    const uint64_t key = (uint64_t(it.dynamic) << 63) | (uint64_t(group) << 32) | entry.instance;
-                    const auto [slot, first] = transparent_probe_cache_.try_emplace(key, 0);
-                    if (first) slot->second = lighting->transparent_probe_at(entry.centre);
-                    probe = slot->second;
+                    const auto& set = sets_[it.buffers];
+                    if (set.actor >= 0 || set.equipment) {
+                        probe = lighting->transparent_probe_at(entry.centre);
+                    } else {
+                        const uint32_t group = it.dynamic ? it.buffers : set.cull;
+                        // Packed visible indices change with culling and LOD. Use the stable placement ID.
+                        const uint32_t placement = it.dynamic ? entry.instance : cull_groups_[group].visible_indices[entry.instance];
+                        const uint64_t key = (uint64_t(it.dynamic) << 63) | (uint64_t(group) << 32) | placement;
+                        const auto [slot, first] = transparent_probe_cache_.try_emplace(key, 0);
+                        if (first) slot->second = lighting->transparent_probe_at(entry.centre);
+                        probe = slot->second;
+                    }
                 }
                 const auto [slot, first] = reflection_bindings.try_emplace(probe);
                 if (first) {

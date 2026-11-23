@@ -1543,7 +1543,7 @@ public:
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
-    LightingParams light{.vignette = true, .depth_of_field = true, .output_gamma = 0.85f};
+    LightingParams light{.vignette = true, .depth_of_field = true, .emissive_gain = 1.35f, .output_gamma = 0.85f};
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;
@@ -3579,11 +3579,19 @@ public:
             ImGui::SameLine();
             ImGui::Checkbox(ui::tr(ui::S::Bloom), &light.bloom);
             ImGui::SetItemTooltip(ui::tr(ui::S::BloomTip));
+            ImGui::SliderFloat(ui::tr(ui::S::EmissiveGain), &light.emissive_gain, 0.0f, 3.0f, "%.2f");
             ImGui::Checkbox("TAA", &light.temporal_aa);
             ImGui::SetItemTooltip(ui::tr(ui::S::TAATip));
             ImGui::SameLine();
             ImGui::Checkbox("FXAA", &light.antialias);
             ImGui::Checkbox("被写界深度 (DoF, estimated)", &light.depth_of_field);
+            if (Dlss::built()) {
+                ImGui::BeginDisabled(!light.temporal_aa);
+                ImGui::Checkbox("NVIDIA DLAA", &light.dlaa);
+                ImGui::EndDisabled();
+                if (light.temporal_aa && light.dlaa && !game_lighting.dlaa_status().empty())
+                    ImGui::TextDisabled("%s", game_lighting.dlaa_status().c_str());
+            }
             ImGui::SliderFloat(ui::tr(ui::S::ChromaticAberration), &light.chromatic_aberration, 0.0f, 1.0f, "%.2f");
             ImGui::SliderFloat(ui::tr(ui::S::OutputGamma), &light.output_gamma, 0.5f, 2.0f, "%.2f");
             ImGui::SliderFloat(ui::tr(ui::S::OutputSharpen), &light.output_sharpen, 0.0f, 1.0f, "%.2f");

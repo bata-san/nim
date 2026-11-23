@@ -20,6 +20,7 @@ constexpr uint8_t kBloomDistortion = 0x38; // bloom_initial_downsample's signed 
 constexpr uint32_t kDistortedHdrRtv = 11;
 constexpr uint32_t kDofRtv = 3 * 4 + 9;  // first post RTV slot of the depth of field (after bloom, TAA, lens, line)
 constexpr uint32_t kOutputSdrRtv = kDofRtv + 10;
+constexpr uint32_t kDlaaDepthRtv = kOutputSdrRtv + 1, kDlaaMotionRtv = kDlaaDepthRtv + 1;
 constexpr uint8_t kDof = 0x37;           // the depth of field settings the engine fills
 
 float4 distortion_uv_scale(uint32_t w, uint32_t h) {
@@ -118,6 +119,10 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
         vignette.blend_state = 8;  // premultiplied alpha: white * (1 - a) (the stage's blend, estimate)
         load(vignette_, "draw_vignette", vignette);
     }
+    if (Dlss::built()) {
+        load(dlaa_copy_depth_, "copy_texture", {DXGI_FORMAT_R32_FLOAT, false});
+        load(dlaa_copy_motion_, "copy_texture", {DXGI_FORMAT_R16G16_FLOAT, false});
+    }
     load(output_gamma_, "gamma_control", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
     load(output_sharpen_, "scaler_cas_post_sharpen", {DXGI_FORMAT_R8G8B8A8_UNORM, false});
     load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
@@ -128,7 +133,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kOutputSdrRtv + 1};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDlaaMotionRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -150,6 +155,11 @@ void GameLighting::release_post(Gpu& gpu) {
     output_gamma_.release(gpu);
     output_sharpen_.release(gpu);
     output_sdr_.Reset();
+    dlss_.release(gpu);
+    dlaa_copy_depth_.release(gpu);
+    dlaa_copy_motion_.release(gpu);
+    dlaa_depth_.Reset();
+    dlaa_motion_.Reset();
     for (auto& r : bloom_line_) r.Reset();
     ae_columns_rt_.Reset();
     grading_strip_.Reset();
@@ -272,6 +282,11 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 0;
     }
     taa_valid_ = false;
+    dlss_.resize(gpu);
+    if (dlaa_copy_depth_.loaded() && dlaa_copy_motion_.loaded()) {
+        dlaa_depth_ = target(w, h, DXGI_FORMAT_R32_FLOAT, kDlaaDepthRtv);
+        dlaa_motion_ = target(w, h, DXGI_FORMAT_R16G16_FLOAT, kDlaaMotionRtv);
+    }
     if (output_gamma_.loaded() || output_sharpen_.loaded())
         output_sdr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kOutputSdrRtv);
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -608,6 +623,28 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 
+    bool dlaa = false;
+    if (p.dlaa && temporal_aa_on(p) && dlaa_depth_ && dlaa_motion_ && dlss_.prepare(gpu, cl, w_, h_)) {
+        // Copy the two native inputs to the formats specified by NGX, preserving device depth and motion XY.
+        e.set(pp, 0x50, size4(w_, h_));
+        e.set(pp, 0xC0, float4{1, 1, 1, 1});
+        e.set_texture(pp, 0x00, gb.depth.Get(), GBuffer::kDepthSrvFormat);
+        begin(dlaa_depth_.Get(), kDlaaDepthRtv, w_, h_);
+        dlaa_copy_depth_.draw(gpu, cl, e, scopes);
+        end(dlaa_depth_.Get());
+        e.set_texture(pp, 0x00, gb.rt[3].Get());
+        begin(dlaa_motion_.Get(), kDlaaMotionRtv, w_, h_);
+        dlaa_copy_motion_.draw(gpu, cl, e, scopes);
+        end(dlaa_motion_.Get());
+        e.set_texture(pp, 0x00, nullptr);
+        if (auto* result = dlss_.evaluate(cl, image, dlaa_depth_.Get(), dlaa_motion_.Get(),
+                                         dlaa_jitter_x_, dlaa_jitter_y_, e.frame_constants()[1][0],
+                                         p.frame_delta_time, dlaa_reset_)) {
+            image = result;
+            dlaa = true;
+        }
+    }
+    if (!dlaa) dlss_.reset_history();
     if (p.depth_of_field && p.dof_focus > 0 && dof_ready() && dof_out_) image = render_dof(gpu, cl, image, p, scopes);
 
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
@@ -633,8 +670,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                        "grading layer data (scope color_grading_ubershader) source not found");
     if (!vignette)
         ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay not drawn");
-    const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
-    const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    const bool taa = !dlaa && temporal_aa_on(p) && post_ldr_ && taa_history_[0];
+    const bool aa = !dlaa && !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
     // Route resolved SDR through zero, one or two native output passes. With just
     // one pass, resolve into the scratch image so that pass can write directly to lit.
     auto* lit = gb.lit.Get();
@@ -933,6 +970,8 @@ bool GameLighting::temporal_aa_on(const LightingParams& p) const {
 // motion and the history lines up with the frame's pixel centres.
 ViewMatrices GameLighting::temporal_view(const View& v, const LightingParams& p) {
     if (!temporal_aa_on(p)) {
+        dlss_.reset_history();
+        dlaa_reset_ = true;
         taa_prev_valid_ = false;
         return make_view(v);
     }
@@ -948,6 +987,10 @@ ViewMatrices GameLighting::temporal_view(const View& v, const LightingParams& p)
     View cur = v;
     cur.jitter_x = halton(i, 2) - 0.5f;
     cur.jitter_y = halton(i, 3) - 0.5f;
+    dlaa_jitter_x_ = cur.jitter_x;
+    dlaa_jitter_y_ = cur.jitter_y;
+    const V3 jump = cur.eye - taa_prev_view_.eye;
+    dlaa_reset_ = !taa_prev_valid_ || dot(jump, jump) > 32.0f * 32.0f;
     ViewMatrices vm = make_view(cur);
     if (taa_prev_valid_) {
         View prev = taa_prev_view_;

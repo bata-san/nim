@@ -5,6 +5,7 @@
 // and the shared cbuffers (cb12 view, cb13 frame) come from the render globals' scopes.
 #include "nim/content/map.hpp"
 #include "nim/render/scene.hpp"
+#include "nim/render/dlss.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -473,6 +474,7 @@ public:
     // runs, with the previous frame's view (same jitter) for the G-buffer's motion vectors. Call
     // once per rendered frame and use the result for the G-buffer and render().
     ViewMatrices temporal_view(const View& v, const LightingParams& p);
+    const std::string& dlaa_status() const { return dlss_.status(); }
     bool temporal_aa_on(const LightingParams& p) const;
 
 private:
@@ -676,6 +678,11 @@ private:
     GamePipeline vignette_;
     ComPtr<ID3D12Resource> screen_overlay_;
     GamePipeline output_gamma_, output_sharpen_;
+    Dlss dlss_;
+    GamePipeline dlaa_copy_depth_, dlaa_copy_motion_;
+    ComPtr<ID3D12Resource> dlaa_depth_, dlaa_motion_;
+    float dlaa_jitter_x_ = 0, dlaa_jitter_y_ = 0;
+    bool dlaa_reset_ = true;
     ComPtr<ID3D12Resource> output_sdr_;
     // prepare (full-res CoC), 12-texel tile max (horizontal, vertical), neighbourhood max,
     // half-res downsample (colour + CoC), gather, fill blur, full-res combine.

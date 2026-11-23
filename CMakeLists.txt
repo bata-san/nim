@@ -57,6 +57,7 @@ add_library(nim_render STATIC
   src/render/scene.cpp
   src/render/game_lighting.cpp
   src/render/game_post.cpp
+  src/render/dlss.cpp
   src/render/game_sky_ambient.cpp
   src/render/game_froxels.cpp
   src/render/game_ssr.cpp
@@ -66,6 +67,23 @@ add_library(nim_render STATIC
 )
 target_link_libraries(nim_render PUBLIC nim_core d3d12 dxgi d3dcompiler)
 target_link_libraries(nimcli PRIVATE nim_render)
+
+set(NIM_DLSS_SDK "" CACHE PATH "Optional NVIDIA DLSS SDK root")
+if(NIM_DLSS_SDK)
+  set(NIM_NGX_LIBS "${NIM_DLSS_SDK}/lib/Windows_x86_64")
+  if(NOT EXISTS "${NIM_DLSS_SDK}/include/nvsdk_ngx_helpers_d3d.h" OR
+     NOT EXISTS "${NIM_NGX_LIBS}/x64/nvsdk_ngx_s.lib" OR
+     NOT EXISTS "${NIM_NGX_LIBS}/rel/nvngx_dlss.dll")
+    message(FATAL_ERROR "NIM_DLSS_SDK must point to the NVIDIA DLSS SDK with Windows x64 libraries")
+  endif()
+  target_compile_definitions(nim_render PRIVATE NIM_WITH_DLSS=1)
+  target_include_directories(nim_render SYSTEM PRIVATE "${NIM_DLSS_SDK}/include")
+  target_link_libraries(nim_render PRIVATE
+    optimized "${NIM_NGX_LIBS}/x64/nvsdk_ngx_s.lib"
+    debug "${NIM_NGX_LIBS}/x64/nvsdk_ngx_s_dbg.lib")
+else()
+  target_compile_definitions(nim_render PRIVATE NIM_WITH_DLSS=0)
+endif()
 
 # ---- nimshade: headless shading test -----------------------------------------
 add_executable(nimshade tools/nimshade/main.cpp)
@@ -85,6 +103,14 @@ target_include_directories(nim PRIVATE ${IMGUI_DIR})
 file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
 target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2)
+if(NIM_DLSS_SDK)
+  foreach(viewer IN ITEMS nim nimshade)
+    add_custom_command(TARGET ${viewer} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NIM_NGX_LIBS}/rel/nvngx_dlss.dll"
+              "$<TARGET_FILE_DIR:${viewer}>/nvngx_dlss.dll"
+      VERBATIM)
+  endforeach()
+endif()
 
 # ---- tests -------------------------------------------------------------------
 enable_testing()

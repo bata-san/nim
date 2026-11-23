@@ -190,7 +190,9 @@ int run(int argc, char** argv) {
     bool dof = false, vignette = false;
     float dof_focus = 0;
     bool shaft_fog_density = false;
+    bool dlaa = false;
     float exposure_arg = 1;
+    float emissive_gain = 1;
     float output_gamma = 1, output_sharpen = 0, output_grain = 0, chromatic_aberration = 0;
     bool assume_lights_on = true;
     std::optional<V3> eye_arg, look_arg;
@@ -277,6 +279,12 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-distortion") no_distortion = true;
         else if (args[i] == "--no-post") no_post = true;
         else if (args[i] == "--no-auto-exposure") no_auto_exposure = true;
+        else if (args[i] == "--dlaa") dlaa = true;
+        else if (args[i] == "--emissive-gain" && i + 1 < args.size()) {
+            emissive_gain = std::stof(args[++i]);
+            if (!std::isfinite(emissive_gain) || emissive_gain < 0 || emissive_gain > 3)
+                throw std::runtime_error("--emissive-gain expects a number in [0, 3]");
+        }
         else if (args[i] == "--no-bloom") no_bloom = true;
         else if (args[i] == "--no-aa") no_aa = true;
         else if (args[i] == "--no-taa") no_taa = true;
@@ -354,7 +362,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -1036,6 +1044,10 @@ int run(int argc, char** argv) {
     lp.interior_fog = !no_interior_fog;
     lp.authored_interior_fog = authored_interior_fog;
     lp.fog_density_scale = fog_density_scale;
+    if (dlaa && !Dlss::built()) throw std::runtime_error("--dlaa requires a build with NIM_DLSS_SDK");
+    if (dlaa && (no_post || no_taa)) throw std::runtime_error("--dlaa requires post processing and temporal jitter");
+    lp.dlaa = dlaa;
+    lp.emissive_gain = emissive_gain;
     lp.output_gamma = output_gamma;
     lp.output_sharpen = output_sharpen;
     lp.output_grain = output_grain;
@@ -1270,6 +1282,7 @@ int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.notes().size() && k < 20; ++k) std::println("  scene: {}", scene.notes()[k]);
         std::println("frame use: {} descriptors, {:.1f} MB upload", gpu.transient_used(), double(gpu.dynamic_used()) / (1 << 20));
         std::println("view tables: {} unique, {} reused", gpu.transient_table_count(), gpu.transient_table_hits());
+        if (dlaa) std::println("DLAA: {}", gl.dlaa_status());
         if (lp.post && gl.post_ready())
             std::println("post: exposure {:.3f} (scene luminance {:.4f}), bloom {}", gl.exposure(), gl.scene_luminance(), lp.bloom ? "on" : "off");
         if (lp.ssao && gl.ambient_occlusion()) {

@@ -1763,6 +1763,9 @@ void GameLighting::fill_externs(GBuffer& gb, const ViewMatrices& vm, const Light
     ext_.set(ext::Frame, 0x14, p.delta_time);
     // exposure_scale: the auto exposure (post) times the viewer's compensation.
     ext_.set(ext::Frame, 0x1C, exposure_);
+    ext_.set(ext::Frame, 0x28, p.emissive_gain);  // exposure_illum_relative in the original deferred shading
+    ext_.note_estimate(std::format("emissive gain = {:g}", p.emissive_gain),
+                       "viewer setting for Frame +0x28; game runtime value unknown");
     estimate_engine_frame(ext_, p.time, p.delta_time);
     // +0x10: the time of day in days (goriath: time_of_day / 3600 s); the shading fog reads the
     // density LUT's time column with it.
