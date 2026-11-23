@@ -278,16 +278,20 @@ void GBuffer::release(Gpu& gpu) {
     depth.Reset();
     lit.Reset();
     decal_normals.Reset();
-    w_ = h_ = 0;
+    w_ = h_ = out_w_ = out_h_ = 0;
 }
 
-void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
+void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
     w = std::max(1u, w);
     h = std::max(1u, h);
-    if (w == w_ && h == h_ && lit) return;
+    out_w = out_w ? std::max(1u, out_w) : w;
+    out_h = out_h ? std::max(1u, out_h) : h;
+    if (w == w_ && h == h_ && out_w == out_w_ && out_h == out_h_ && lit) return;
     release(gpu);
     w_ = w;
     h_ = h;
+    out_w_ = out_w;
+    out_h_ = out_h;
     ID3D12Device* dev = gpu.device();
     if (!rtv_heap_) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 6};
@@ -322,7 +326,7 @@ void GBuffer::resize(Gpu& gpu, uint32_t w, uint32_t h) {
     dev->CreateShaderResourceView(depth.Get(), &sd, gpu.srv().cpu(srv_first + 4));
 
     D3D12_CLEAR_VALUE lc{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
-    lit = gpu.texture2d(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    lit = gpu.texture2d(out_w_, out_h_, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &lc);
     lit_rtv = {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(4) * inc};
     dev->CreateRenderTargetView(lit.Get(), nullptr, lit_rtv);

@@ -478,7 +478,7 @@ public:
     bool temporal_aa_on(const LightingParams& p) const;
 
 private:
-    void resize(Gpu& gpu, uint32_t w, uint32_t h);
+    void resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w = 0, uint32_t out_h = 0);
     void fill_externs(GBuffer& gb, const ViewMatrices& vm, const LightingParams& p, bool shadowed);
 
     RenderGlobals globals_;
@@ -567,7 +567,7 @@ private:
     ComPtr<ID3D12Resource> shadow_mask_;  // R8: the resolved sun shadow (viewer estimate)
     uint32_t env_srv_ = UINT32_MAX;
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
-    uint32_t w_ = 0, h_ = 0;
+    uint32_t w_ = 0, h_ = 0, out_w_ = 0, out_h_ = 0;
 
     void draw_lights(Gpu& gpu, ID3D12GraphicsCommandList* cl, const GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     // A light volume draw of this frame: its extern writes (recorded in order, so each sees the
@@ -667,7 +667,7 @@ private:
     // exposure (autoexposure_sample_columns read back to the CPU) and the tonemap / grading pass
     // screen_area_global_lut3d into the 8-bit output.
     void load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope* const> scopes);
-    void resize_post(Gpu& gpu, uint32_t w, uint32_t h);
+    void resize_post(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h);
     void release_post(Gpu& gpu);
     void generate_grading_lut(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     void update_exposure(Gpu& gpu, const LightingParams& p);

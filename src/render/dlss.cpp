@@ -2,14 +2,49 @@
 
 #if NIM_WITH_DLSS
 #include <nvsdk_ngx_helpers_d3d.h>
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <format>
+#else
+#include <algorithm>
+#include <cmath>
 #endif
 
 namespace nim {
 
 Dlss::~Dlss() { shutdown(); }
 bool Dlss::built() { return NIM_WITH_DLSS != 0; }
+
+const char* Dlss::mode_name(DlssMode mode) {
+    switch (mode) {
+    case DlssMode::DLAA: return "DLAA";
+    case DlssMode::Quality: return "Quality";
+    case DlssMode::Balanced: return "Balanced";
+    case DlssMode::Performance: return "Performance";
+    case DlssMode::UltraPerformance: return "Ultra Performance";
+    default: return "Off";
+    }
+}
+
+std::pair<uint32_t, uint32_t> Dlss::render_size(uint32_t out_w, uint32_t out_h, DlssMode mode) {
+    float scale = 1.0f;
+    switch (mode) {
+    case DlssMode::Quality: scale = 1.0f / 1.5f; break;
+    case DlssMode::Balanced: scale = 1.0f / 1.724f; break;
+    case DlssMode::Performance: scale = 0.5f; break;
+    case DlssMode::UltraPerformance: scale = 1.0f / 3.0f; break;
+    default: return {out_w, out_h};
+    }
+    if (out_w < 256 || out_h < 144) return {out_w, out_h};
+    auto round_even = [](uint32_t v, uint32_t lo, uint32_t hi) {
+        v = std::clamp(v, lo, hi);
+        return (v & ~1u) ? (v & ~1u) : v;
+    };
+    const uint32_t rw = round_even(uint32_t(std::lround(float(out_w) * scale)), 256u, out_w);
+    const uint32_t rh = round_even(uint32_t(std::lround(float(out_h) * scale)), 144u, out_h);
+    return {rw, rh};
+}
 
 void Dlss::resize(Gpu& gpu) {
 #if NIM_WITH_DLSS
@@ -22,6 +57,8 @@ void Dlss::resize(Gpu& gpu) {
     (void)gpu;
 #endif
     output_.Reset();
+    in_w_ = in_h_ = out_w_ = out_h_ = 0;
+    mode_ = DlssMode::Off;
     history_ = false;
     creation_failed_ = false;
 }
@@ -45,8 +82,10 @@ void Dlss::release(Gpu& gpu) {
     status_.clear();
 }
 
-bool Dlss::prepare(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t width, uint32_t height) {
+bool Dlss::prepare(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t in_w, uint32_t in_h,
+                   uint32_t out_w, uint32_t out_h, DlssMode mode) {
 #if NIM_WITH_DLSS
+    if (mode == DlssMode::Off) return false;
     if (!attempted_) {
         attempted_ = true;
         std::error_code ec;
@@ -56,33 +95,45 @@ bool Dlss::prepare(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t width, uint
             std::filesystem::create_directories(data, ec);
         }
         if (ec) {
-            status_ = "DLAA could not create its NGX data directory";
+            status_ = "DLSS could not create its NGX data directory";
             return false;
         }
         const auto init = NVSDK_NGX_D3D12_Init_with_ProjectID(
             "aedc444d-de0e-4c32-845e-3ecdf4c643be", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "nim 0.3",
             data.c_str(), gpu.device());
         if (NVSDK_NGX_FAILED(init)) {
-            status_ = std::format("DLAA NGX initialization failed (0x{:08X})", unsigned(init));
+            status_ = std::format("DLSS NGX initialization failed (0x{:08X})", unsigned(init));
             return false;
         }
         device_ = gpu.device();
         int available = 0;
         if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&parameters_)) ||
             NVSDK_NGX_FAILED(parameters_->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available)) || !available) {
-            status_ = "DLAA is unavailable on this GPU, driver or SDK runtime";
+            status_ = "DLSS is unavailable on this GPU, driver or SDK runtime";
             return false;
         }
         supported_ = true;
     }
-    if (!supported_ || creation_failed_) return false;
-    // NGX has a minimum input size. Keep native TAA for small viewports.
-    if (width < 256 || height < 144) return false;
-    if (feature_) return true;
+    if (!supported_) return false;
+    if (in_w < 256 || in_h < 144 || out_w < in_w || out_h < in_h) return false;
+    if (feature_ && in_w == in_w_ && in_h == in_h_ && out_w == out_w_ && out_h == out_h_ && mode == mode_) return true;
+    if (feature_) resize(gpu);
+    if (creation_failed_) return false;
+    auto perf_quality = [](DlssMode m) {
+        switch (m) {
+        case DlssMode::Quality: return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+        case DlssMode::Balanced: return NVSDK_NGX_PerfQuality_Value_Balanced;
+        case DlssMode::Performance: return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+        case DlssMode::UltraPerformance: return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+        default: return NVSDK_NGX_PerfQuality_Value_DLAA;
+        }
+    };
     NVSDK_NGX_DLSS_Create_Params params{};
-    params.Feature.InWidth = params.Feature.InTargetWidth = width;
-    params.Feature.InHeight = params.Feature.InTargetHeight = height;
-    params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    params.Feature.InWidth = in_w;
+    params.Feature.InHeight = in_h;
+    params.Feature.InTargetWidth = out_w;
+    params.Feature.InTargetHeight = out_h;
+    params.Feature.InPerfQualityValue = perf_quality(mode);
     params.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
@@ -90,15 +141,20 @@ bool Dlss::prepare(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint32_t width, uint
     const auto result = NGX_D3D12_CREATE_DLSS_EXT(cl, 1, 1, &feature_, parameters_, &params);
     if (NVSDK_NGX_FAILED(result)) {
         creation_failed_ = true;
-        status_ = std::format("DLAA creation failed (0x{:08X})", unsigned(result));
+        status_ = std::format("DLSS {} creation failed (0x{:08X})", mode_name(mode), unsigned(result));
         return false;
     }
-    output_ = gpu.texture2d(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    in_w_ = in_w;
+    in_h_ = in_h;
+    out_w_ = out_w;
+    out_h_ = out_h;
+    mode_ = mode;
+    output_ = gpu.texture2d(out_w, out_h, DXGI_FORMAT_R16G16B16A16_FLOAT,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
     return true;
 #else
-    (void)gpu; (void)cl; (void)width; (void)height;
+    (void)gpu; (void)cl; (void)in_w; (void)in_h; (void)out_w; (void)out_h; (void)mode;
     status_ = "This build has no NVIDIA NGX SDK";
     return false;
 #endif
@@ -108,7 +164,6 @@ ID3D12Resource* Dlss::evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
                               ID3D12Resource* motion, float jitter_x, float jitter_y, float pre_exposure,
                               float delta_seconds, bool reset) {
 #if NIM_WITH_DLSS
-    const auto size = output_->GetDesc();
     NVSDK_NGX_D3D12_DLSS_Eval_Params params{};
     params.Feature.pInColor = color;
     params.Feature.pInOutput = output_.Get();
@@ -116,9 +171,9 @@ ID3D12Resource* Dlss::evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     params.pInMotionVectors = motion;
     params.InJitterOffsetX = jitter_x;
     params.InJitterOffsetY = jitter_y;
-    params.InRenderSubrectDimensions = {unsigned(size.Width), size.Height};
-    params.InMVScaleX = float(size.Width);
-    params.InMVScaleY = float(size.Height); // Tiger RT3 already stores previous minus current in screen UVs.
+    params.InRenderSubrectDimensions = {in_w_, in_h_};
+    params.InMVScaleX = float(in_w_);
+    params.InMVScaleY = float(in_h_); // Tiger RT3 already stores previous minus current in screen UVs.
     params.InPreExposure = pre_exposure;
     params.InFrameTimeDeltaInMsec = delta_seconds * 1000;
     params.InReset = reset || !history_;
@@ -134,7 +189,13 @@ ID3D12Resource* Dlss::evaluate(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     Gpu::barrier(cl, depth, compute, read);
     Gpu::barrier(cl, color, compute, read);
     history_ = NVSDK_NGX_SUCCEED(result);
-    status_ = history_ ? "NVIDIA DLAA active" : std::format("DLAA evaluation failed (0x{:08X})", unsigned(result));
+    if (history_) {
+        status_ = (in_w_ == out_w_ && in_h_ == out_h_)
+            ? std::format("NVIDIA DLAA active ({}x{})", out_w_, out_h_)
+            : std::format("NVIDIA DLSS {} active ({}x{} -> {}x{})", mode_name(mode_), in_w_, in_h_, out_w_, out_h_);
+    } else {
+        status_ = std::format("DLSS {} evaluation failed (0x{:08X})", mode_name(mode_), unsigned(result));
+    }
     return history_ ? output_.Get() : nullptr;
 #else
     (void)cl; (void)color; (void)depth; (void)motion; (void)jitter_x; (void)jitter_y;

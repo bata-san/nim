@@ -222,7 +222,7 @@ void GameLighting::generate_grading_lut(Gpu& gpu, ID3D12GraphicsCommandList* cl,
     grading_lut_ = std::move(lut);
 }
 
-void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
+void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
     if (!post_rtv_heap_) return;
     ID3D12Device* dev = gpu.device();
     const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -288,7 +288,7 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         dlaa_motion_ = target(w, h, DXGI_FORMAT_R16G16_FLOAT, kDlaaMotionRtv);
     }
     if (output_gamma_.loaded() || output_sharpen_.loaded())
-        output_sdr_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kOutputSdrRtv);
+        output_sdr_ = target(out_w, out_h, DXGI_FORMAT_R8G8B8A8_UNORM, kOutputSdrRtv);
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     for (auto& r : ae_readback_) r = gpu.buffer(pitch, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     ae_fence_ = {};
@@ -629,8 +629,13 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 
+    const DlssMode dlss_mode = p.dlss_mode != DlssMode::Off ? p.dlss_mode : (p.dlaa ? DlssMode::DLAA : DlssMode::Off);
+    const bool upscaling = (out_w_ != w_ || out_h_ != h_);
+    if (upscaling && p.depth_of_field && p.dof_focus > 0 && dof_ready() && dof_out_)
+        image = render_dof(gpu, cl, image, p, scopes);
     bool dlaa = false;
-    if (p.dlaa && temporal_aa_on(p) && dlaa_depth_ && dlaa_motion_ && dlss_.prepare(gpu, cl, w_, h_)) {
+    if (dlss_mode != DlssMode::Off && temporal_aa_on(p) && dlaa_depth_ && dlaa_motion_ &&
+        dlss_.prepare(gpu, cl, w_, h_, out_w_, out_h_, dlss_mode)) {
         // Copy the two native inputs to the formats specified by NGX, preserving device depth and motion XY.
         e.set(pp, 0x50, size4(w_, h_));
         e.set(pp, 0xC0, float4{1, 1, 1, 1});
@@ -651,7 +656,26 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         }
     }
     if (!dlaa) dlss_.reset_history();
-    if (p.depth_of_field && p.dof_focus > 0 && dof_ready() && dof_out_) image = render_dof(gpu, cl, image, p, scopes);
+    if (!upscaling && p.depth_of_field && p.dof_focus > 0 && dof_ready() && dof_out_)
+        image = render_dof(gpu, cl, image, p, scopes);
+
+    // Output passes (tonemap, CAS sharpen, gamma) run at display resolution (out_w_ x out_h_).
+    // When DLSS Super Resolution is active, update View dimensions in cb12 so SV_Position-based
+    // fullscreen passes map 0..1 across the upscaled output.
+    D3D12_GPU_VIRTUAL_ADDRESS out_view_cb = 0;
+    if (upscaling) {
+        e.set(ext::View, 0x00, float(out_w_));
+        e.set(ext::View, 0x04, float(out_h_));
+        const auto view_out = evaluate_scope(view_scope_, ScopeStage::Pixel, e);
+        const auto a = gpu.dynamic(view_out.size() * sizeof(float4));
+        std::memcpy(a.cpu, view_out.data(), view_out.size() * sizeof(float4));
+        out_view_cb = a.gpu;
+        e.set(ext::View, 0x00, float(w_));
+        e.set(ext::View, 0x04, float(h_));
+    }
+    const ScopeBufferFn out_scopes = [&](ShaderStage stage, uint32_t reg) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        return (out_view_cb && reg == 12) ? out_view_cb : scopes(stage, reg);
+    };
 
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
     // LUT at +0x30, then out = LUT * t2 (+0x58) + t1 (+0x50).
@@ -676,8 +700,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                        "grading layer data (scope color_grading_ubershader) source not found");
     if (!vignette)
         ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay not drawn");
-    const bool taa = !dlaa && temporal_aa_on(p) && post_ldr_ && taa_history_[0];
-    const bool aa = !dlaa && !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
+    const bool taa = !dlaa && !upscaling && temporal_aa_on(p) && post_ldr_ && taa_history_[0];
+    const bool aa = !dlaa && !upscaling && !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
     // Route resolved SDR through zero, one or two native output passes. With just
     // one pass, resolve into the scratch image so that pass can write directly to lit.
     auto* lit = gb.lit.Get();
@@ -700,8 +724,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             const auto output_rtv = output == lit ? gb.lit_rtv : scratch_rtv;
             Gpu::barrier(cl, output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             cl->OMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-            viewport(cl, w_, h_);
-            pipeline.draw(gpu, cl, e, scopes);
+            viewport(cl, out_w_, out_h_);
+            pipeline.draw(gpu, cl, e, out_scopes);
             end(output);
             source = output;
         };
@@ -797,8 +821,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         taa_copy_.draw(gpu, cl, e, scopes);
     } else if (!aa) {
         cl->OMSetRenderTargets(1, &resolve_rtv, FALSE, nullptr);
-        viewport(cl, w_, h_);
-        post_tonemap_.draw(gpu, cl, e, scopes);
+        viewport(cl, out_w_, out_h_);
+        post_tonemap_.draw(gpu, cl, e, out_scopes);
     } else {
         // Reuse the final output for luma until FXAA writes the resolved colour.
         const auto ldr_rtv = rtv(3 * kBloomLevels + 1);
@@ -989,7 +1013,10 @@ ViewMatrices GameLighting::temporal_view(const View& v, const LightingParams& p)
         }
         return r;
     };
-    const uint32_t i = uint32_t(taa_index_++ % 8) + 1;
+    const uint32_t phases = (out_w_ > w_ && w_ > 0)
+        ? std::clamp(uint32_t(std::ceil(8.0f * float(out_w_ * out_w_) / float(w_ * w_))), 8u, 32u)
+        : 8u;
+    const uint32_t i = uint32_t(taa_index_++ % phases) + 1;
     View cur = v;
     cur.jitter_x = halton(i, 2) - 0.5f;
     cur.jitter_y = halton(i, 3) - 0.5f;

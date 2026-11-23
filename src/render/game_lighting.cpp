@@ -1511,7 +1511,9 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
     gpu.flush();
 }
 
-void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
+void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
+    out_w = out_w ? out_w : w;
+    out_h = out_h ? out_h : h;
     froxel_history_valid_ = false;
     // Conditional extern bindings may still reference the targets about to be released. Own
     // this invalidation here so headless callers and GUI callers have the same resize contract.
@@ -1617,7 +1619,9 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h) {
         {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + 9 * inc});
     w_ = w;
     h_ = h;
-    resize_post(gpu, w, h);
+    out_w_ = out_w;
+    out_h_ = out_h;
+    resize_post(gpu, w, h, out_w, out_h);
 }
 
 std::array<float4, 16> frame_constants(float, float, const ExternStore& ext) {
@@ -1972,7 +1976,8 @@ void GameLighting::set_global_channels(const std::map<uint32_t, float>& values) 
 }
 
 void GameLighting::prepare_frame(Gpu& gpu, const GBuffer& gb, const LightingParams& p) {
-    if (gb.width() != w_ || gb.height() != h_) resize(gpu, gb.width(), gb.height());
+    if (gb.width() != w_ || gb.height() != h_ || gb.output_width() != out_w_ || gb.output_height() != out_h_)
+        resize(gpu, gb.width(), gb.height(), gb.output_width(), gb.output_height());
     update_global_channels(p);
     update_exposure(gpu, p);
 }
