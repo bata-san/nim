@@ -1543,7 +1543,7 @@ public:
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
-    LightingParams light{.vignette = true, .output_gamma = 0.85f};
+    LightingParams light{.vignette = true, .depth_of_field = true, .output_gamma = 0.85f};
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;

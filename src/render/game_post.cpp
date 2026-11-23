@@ -868,7 +868,8 @@ ID3D12Resource* GameLighting::render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl
     // applies a signed radial CoC independently of the depth-based CoC.
     const float depth_weight = p.dof_edges_only ? 0.0f : std::clamp((f - 4.0f) / 4.0f, 0.0f, 1.0f);
     const float depth_coc = max_coc * depth_weight;
-    const float edge_coc = max_coc * (1.0f - depth_weight);
+    constexpr float max_edge_coc = 0.18f;
+    const float edge_coc = max_edge_coc * (1.0f - depth_weight);
     e.set(kDof, 0x40, depth_coc);
     e.set(kDof, 0x44, depth_coc);
     e.set(kDof, 0x60, float4{0.5f, 0.5f, 1, 1});
