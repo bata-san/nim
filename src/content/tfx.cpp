@@ -215,9 +215,10 @@ TagHash DynamicModelMaterials::technique(uint16_t variant, uint32_t permutation,
     if (variant == 0xFFFF || variant >= technique_map.size()) return TagHash();
     const Range& r = technique_map[variant];
     if (r.count == 0) return TagHash();
-    // Range +8 is the first condition row (§3.117): ranges that repeat a layout share rows (UESC
-    // 80B80192 variants 0/1 both start at row 0, 2/5 at 10, 3/4 at 100; the recruit's 1/3 at 15).
-    const size_t first = r.unk8;
+    // Condition rows run parallel to the techniques but may stop early (§3.117: UESC 80B80192 has
+    // 110 rows for 220 techniques). Read by +8 instead, the assault's boss and miniboss bodies
+    // swapped (the warden and commander colours).
+    const size_t first = r.start;
     if (!tags.empty() && uint64_t(first) + r.count <= technique_conditions.size() &&
         uint64_t(r.start) + r.count <= techniques.size()) {
         // 871AC0EA is the "any" value: rows pair each named combination with an any-row, so a

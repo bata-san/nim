@@ -3331,10 +3331,10 @@ int cmd_model_materials(PackageManager& pm, TagHash tag, std::span<const std::pa
         for (uint32_t k = 0; k < rg.count; ++k) t += " " + m.techniques[rg.start + k].str();
         std::println("  variant {:3} count {} start {:3} unk8 {:08X} parts {:3} idx {:7}:{}", v, rg.count, rg.start, rg.unk8, parts, indices, t);
         if (!tags.empty()) std::println("    selected for the given tags: {}", m.technique(uint16_t(v), m.default_permutation, tags).str());
-        if (uint64_t(rg.unk8) + rg.count <= m.technique_conditions.size())
+        if (uint64_t(rg.start) + rg.count <= m.technique_conditions.size())
             for (uint32_t k = 0; k < rg.count; ++k) {
                 std::string c;
-                for (const uint16_t g : m.technique_conditions[rg.unk8 + k]) {
+                for (const uint16_t g : m.technique_conditions[rg.start + k]) {
                     c += std::format(" [{}:", g);
                     if (g < m.part_tags.size())
                         for (const auto& [a, b] : m.part_tags[g]) c += std::format(" {:08X}={:08X}", a, b);
