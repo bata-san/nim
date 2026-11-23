@@ -1,7 +1,6 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/dialogue.hpp"
 #include "nim/content/entity_audio.hpp"
-#include "nim/content/object_channels.hpp"
 #include "nim/content/wwise.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/core/tag_reader.hpp"
@@ -9,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -30,37 +31,74 @@ std::array<float, 3> closest_on_segment(std::array<float, 3> p, std::array<float
     return {a[0] + t * abx, a[1] + t * aby, a[2] + t * abz};
 }
 
-// The first object state an entity's components read (a known object channel other than the
-// clocks time / game_time: device_power, interaction_filtered, linear_velocity, rain_amount,
-// flicker ...), 0 if none. Their sequences start the entity's loops from these states.
-uint32_t entity_state_channel(PackageManager& pm, TagHash entity) {
-    static const uint32_t kTime = fnv1("time"), kGameTime = fnv1("game_time");
+// The audio events an entity starts on events: those its components name only inside reaction
+// tables (8080AF57 / 8080AF59, reached from 8080AFBA components: arrays 8080AF61 / 8080AF67 of
+// {u64 event key, actions}, the play-audio actions 80809E50 holding the event's hash64). Events
+// also named elsewhere (the FX sequences of 8080B69A components) are not counted. `component`: for
+// the other events, the component (8080BADB) under which each is first named.
+struct EntityAudioSources {
+    std::set<uint32_t> event_started;
+    std::unordered_map<uint32_t, uint32_t> component;
+};
+EntityAudioSources entity_audio_sources(PackageManager& pm, TagHash entity) {
+    constexpr uint32_t kComponent = 0x8080BADBu, kAudioEvent = 0x8080B128u;
+    constexpr uint32_t kReactions = 0x8080AF57u, kReactionSet = 0x8080AF59u;
+    std::set<uint32_t> in_reactions, elsewhere, seen;
+    EntityAudioSources out;
+    uint32_t root = 0;
+    auto audio = [&](const std::vector<uint8_t>& d, size_t o) -> uint32_t {
+        uint32_t v;
+        std::memcpy(&v, d.data() + o, 4);
+        if (const Entry* c = v >= 0x80800000u && v != ~0u ? pm.entry(TagHash(v)) : nullptr; c && c->type == 8 && c->reference == kAudioEvent)
+            return v;
+        if (o % 8 || o + 8 > d.size()) return 0;
+        uint64_t h;
+        std::memcpy(&h, d.data() + o, 8);
+        if (!(h >> 32) || h == ~0ull) return 0;
+        const auto t = pm.resolve64(h);
+        const Entry* c = t ? pm.entry(*t) : nullptr;
+        return c && c->type == 8 && c->reference == kAudioEvent ? t->value : 0;
+    };
+    std::function<void(TagHash, int)> walk = [&](TagHash t, int level) {
+        if (!seen.insert(t.value).second) return;
+        const Entry* e = pm.entry(t);
+        if (!e || e->type != 8) return;
+        std::vector<uint8_t> d;
+        try {
+            d = pm.read(t);
+        } catch (...) {
+            return;
+        }
+        auto& into = e->reference == kReactions || e->reference == kReactionSet ? in_reactions : elsewhere;
+        for (size_t o = 0; o + 4 <= d.size(); o += 4)
+            if (const uint32_t ev = audio(d, o)) {
+                into.insert(ev);
+                if (&into == &elsewhere) out.component.try_emplace(ev, root);
+            }
+        if (level >= 2) return;
+        for (size_t o = 0; o + 4 <= d.size(); o += 4) {
+            uint32_t v;
+            std::memcpy(&v, d.data() + o, 4);
+            if (v < 0x80800000u || v == ~0u || seen.contains(v)) continue;
+            const Entry* c = pm.entry(TagHash(v));
+            if (c && c->type == 8 && c->reference != kAudioEvent && c->reference != kComponent) walk(TagHash(v), level + 1);
+        }
+    };
     std::vector<uint8_t> ed;
     try {
         ed = pm.read(entity);
     } catch (...) {
-        return 0;
+        return {};
     }
-    std::set<uint32_t> listed;
     for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
-        uint32_t c;
-        std::memcpy(&c, ed.data() + o, 4);
-        if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
-        const Entry* ce = pm.entry(TagHash(c));
-        if (!ce || ce->type != 8 || ce->reference != 0x8080BADBu) continue;
-        std::vector<uint8_t> cd;
-        try {
-            cd = pm.read(TagHash(c));
-        } catch (...) {
-            continue;
-        }
-        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
-            uint32_t v;
-            std::memcpy(&v, cd.data() + q, 4);
-            if (v != kTime && v != kGameTime && object_channel_name(v)) return v;
-        }
+        uint32_t v;
+        std::memcpy(&v, ed.data() + o, 4);
+        if (const Entry* c = v >= 0x80800000u && v != ~0u ? pm.entry(TagHash(v)) : nullptr; c && c->type == 8 && c->reference == kComponent)
+            root = v, walk(TagHash(v), 0);
     }
-    return 0;
+    for (const auto v : in_reactions)
+        if (!elsewhere.contains(v)) out.event_started.insert(v);
+    return out;
 }
 }  // namespace
 
@@ -123,7 +161,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
     };
 
     std::set<uint32_t> polyline_tags, point_tags, global_tags;
-    std::unordered_map<uint32_t, std::vector<TagHash>> object_events;
+    std::unordered_map<uint32_t, std::vector<std::vector<TagHash>>> object_events;  // entity -> loop groups
     std::unordered_map<uint32_t, float> object_distances;
     std::set<std::tuple<uint32_t, std::array<float, 3>>> object_instances;
     for (TagHash table : layout.node_tables) {
@@ -145,17 +183,34 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
                 if (entry && entry->type == 8 && entry->reference == 0x8080BAAD) {
                     const auto [events, first] = object_events.try_emplace(entity->value);
                     if (first) {
-                        events->second = load_entity_sounds(pm, std::span(&*entity, 1), true).loops;
-                        // Loops of entities with object state are started by that state (not simulated): left out.
-                        if (!events->second.empty())
-                            if (const uint32_t state = entity_state_channel(pm, *entity)) {
-                                out.gated_loops[state] += events->second.size();
-                                events->second.clear();
+                        // Loops an event starts (named only in the reaction tables) are left out; the
+                        // others are grouped by the component naming them.
+                        const auto loops = load_entity_sounds(pm, std::span(&*entity, 1), true).loops;
+                        const auto sources = loops.empty() ? EntityAudioSources{} : entity_audio_sources(pm, *entity);
+                        std::map<uint32_t, std::vector<TagHash>> by_component;
+                        for (const auto ev : loops) {
+                            if (sources.event_started.contains(ev.value)) {
+                                out.event_loops.insert(ev.value);
+                                continue;
                             }
+                            const auto c = sources.component.find(ev.value);
+                            by_component[c == sources.component.end() ? 0u : c->second].push_back(ev);
+                        }
+                        for (auto& [c, list] : by_component) events->second.push_back(std::move(list));
                     }
                     const std::array pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
                     if (std::ranges::all_of(pos, [](float v) { return std::isfinite(v); })) {
-                        for (const auto event : events->second) {
+                        // One loop per group and placement (推定: a group's loops are alternatives of
+                        // one sequence; its choice is not decoded, so the position picks one).
+                        uint32_t seed = 0x811C9DC5u;
+                        for (const float v : pos) {
+                            uint32_t b;
+                            std::memcpy(&b, &v, 4);
+                            seed = (seed * 0x01000193u) ^ b;
+                        }
+                        for (const auto& group : events->second) {
+                            const TagHash event = group[seed % group.size()];
+                            if (group.size() > 1) ++out.alternative_picks;
                             if (!object_instances.emplace(event.value, pos).second) continue;
                             auto [distance, fresh] = object_distances.try_emplace(event.value, 0);
                             if (fresh) {

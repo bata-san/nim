@@ -5,7 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <map>
+#include <set>
 #include <vector>
 
 namespace nim {
@@ -41,13 +41,14 @@ struct MapObjectSound {
 };
 
 struct MapAudio {
-    // Loops of placed entities (docs/PROGRESS.md 3.107 / 3.108): only those of entities that read
-    // no object state. The components' sequences (not decoded) start the loops of the others from
-    // their state (device power / lock / position, interaction, motion, rain, light flicker
-    // mode ...), which nim does not simulate, so they are left out: `gated_loops` counts them per
-    // the first state channel found.
+    // Loops of placed entities (docs/PROGRESS.md 3.107 / 3.108), except those an event starts:
+    // audio events the entity names only inside its reaction tables (8080AF57 / 8080AF59, keyed by
+    // event), listed in `event_loops`. Loops of the FX sequences play while the object is near.
+    // The loops one component names are alternatives (推定): one of them per placement, picked from
+    // the position (`alternative_picks` counts the placements where there was a choice).
     std::vector<MapObjectSound> objects;
-    std::map<uint32_t, size_t> gated_loops;
+    std::set<uint32_t> event_loops;
+    size_t alternative_picks = 0;
     std::vector<MapAudioEmitter> emitters;
     size_t point_emitters = 0;
     size_t polyline_emitters = 0;
