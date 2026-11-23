@@ -141,9 +141,15 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
         auto defaults = entity_material_defaults(pm, motion.entity);
         // The Compiler (entity 80A97147, 3.117): run-time channels with no authored default read 1,
         // which dissolved its cape (0EDC1DFF), lit the whole body (charge_progress 7C7E0071) and
-        // blew the cape about (764F77BA, AFBDF744). At rest (推定): cape shown, uncharged, calmest.
-        if (motion.entity.value == 0x80A97147)
-            for (const uint32_t h : {0x0EDC1DFFu, 0x7C7E0071u, 0x764F77BAu, 0xAFBDF744u}) defaults[h] = {0, 0, 0, 0};
+        // blew the cape about (764F77BA, AFBDF744). C6BC8C0E gates the moving surface detail.
+        // At rest (推定): cape shown, uncharged, calmest, with the silver armor variant.
+        if (motion.entity.value == 0x80A97147) {
+            for (const uint32_t h : {0x0EDC1DFFu, 0x7C7E0071u, 0x764F77BAu, 0xAFBDF744u, 0xC6BC8C0Eu, 0x5B7CD2A2u})
+                defaults[h] = {};
+            // The core technique's fade spline is zero at the missing-channel fallback of
+            // 1. A value of 7/8 selects half of the authored green emission at rest.
+            defaults[0x6057A3B9u] = {0.875f, 0, 0, 0};
+        }
         auto apply_defaults = [&](PreparedMesh& mesh) {
             auto apply = [&](PreparedMesh& part) {
                 for (const auto& [key, value] : defaults) part.channel_defaults.insert_or_assign(key, value);

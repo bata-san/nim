@@ -3621,11 +3621,31 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     } done{adding_actor_};
     const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     PreparedMesh root = mesh;
+    bool calm_compiler_cape = false;
+    if (root.tag.value == 0x80A9707Eu) {
+        for (auto& group : root.groups) {
+            auto& ps = group.ps_material;
+            // Both passes threshold the cape hem against a mask. Their TFX expressions
+            // multiply frac(frame time) by this constant to scroll the mask vertically.
+            const auto scroll = ps.shader.value == 0x80A96FC2u ? 0x28u
+                : ps.shader.value == 0x80A9704Eu ? 0x02u : UINT32_MAX;
+            if (scroll < ps.constants.size()) {
+                ps.constants[scroll] = {};
+                calm_compiler_cape = true;
+            }
+        }
+    }
     auto parts = std::move(root.attachments);
     root.attachments.clear();
     const auto prune = [&] { std::erase_if(actors_[id].sets, [&](uint32_t set) { return set >= sets_.size(); }); };
     try {
         add_mesh(gpu, std::move(root), layouts, std::span(&identity, 1));
+        if (calm_compiler_cape)
+            material_externs_->note_estimate("Compiler at rest: fixed hem mask and no moving surface detail",
+                                             "resting values inferred from the cape pixel shaders");
+        if (mesh.tag.value == 0x80A9707Eu)
+            material_externs_->note_estimate("Compiler at rest: silver armor and half-strength green core",
+                                             "0x5B7CD2A2 = 0 and 0x6057A3B9 = 0.875 select the original material paths");
     } catch (...) {
         prune();
         throw;
