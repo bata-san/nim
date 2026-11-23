@@ -72,7 +72,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     }
     const FroxelHistoryView current{volume_projection, vm.eye, vm.fwd, vm.proj.c[3][2],
                                     p.time, p.time_of_day, p.day_night_state,
-                                    p.froxel_noise, shadowed, covered, p.environment};
+                                    p.froxel_noise, shadowed, covered, p.authored_interior_fog, p.environment};
     const auto& previous = froxel_history_view_;
     const V3 motion = current.eye - previous.eye;
     const bool temporal = p.froxel_temporal && !vm.ortho && std::isfinite(current.near_plane) && current.near_plane > 0;
@@ -82,7 +82,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
         current.near_plane == previous.near_plane && current.time_of_day == previous.time_of_day &&
         current.day_night_state == previous.day_night_state && current.noise == previous.noise &&
         current.shadowed == previous.shadowed && current.interior == previous.interior &&
-        current.environment == previous.environment;
+        current.authored_interior_fog == previous.authored_interior_fog && current.environment == previous.environment;
     const uint32_t write_index = froxel_density_index_ ^ 1;
     auto* density_volume = froxel_density_vol_[write_index].Get();
     auto* history = reproject ? froxel_density_vol_[froxel_density_index_].Get() : no_atmosphere_.Get();
@@ -158,6 +158,14 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     Gpu::barrier(cl, density_volume, kRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto& density = p.froxel_noise ? (shadowed ? froxel_density_noise_ : froxel_density_noise_no_sun_)
                                   : (shadowed ? froxel_density_ : froxel_density_no_sun_);
+    constexpr size_t kInteriorDensity = 0xAB;  // both density and in-scatter TFX read fog_density_interior
+    const bool suppress_interior = covered && !p.authored_interior_fog && kInteriorDensity < ext_.channels.size();
+    float4 authored_density{};
+    if (suppress_interior) {
+        auto& channel = ext_.channels[kInteriorDensity];
+        authored_density = channel;
+        channel[0] = channel[1] = 0;
+    }
     density.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, kFroxelDepth);
     finite_constants(density);
     Gpu::barrier(cl, density_volume, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
@@ -165,6 +173,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
     // One xy thread walks the complete depth column in increasing z.
     auto& inscatter = shadowed ? froxel_inscatter_ : froxel_inscatter_no_sun_;
     inscatter.dispatch(gpu, cl, ext_, scopes, width / 8, height / 8, 1);
+    if (suppress_interior) ext_.channels[kInteriorDensity] = authored_density;
     finite_constants(inscatter);
     Gpu::barrier(cl, froxel_vol_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
     if (covered) Gpu::barrier(cl, overhead_->mask.Get(), kRead, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

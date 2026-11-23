@@ -2229,6 +2229,88 @@ int cmd_lights(PackageManager& pm, TagHash bubble) {
     std::map<uint8_t, size_t> world, global;
     std::map<uint8_t, TagHash> global_example;  // one technique per render-global channel
     std::map<uint32_t, std::array<size_t, 2>> light_floats;  // deferred_light (extern 4) float offset -> lights reading it (all, shadowing)
+    // deferred_light reads per technique kind: 0 lighting-apply, 1 shadowed apply, 2 shafts, 3 shadowed shafts
+    std::map<uint32_t, std::array<size_t, 4>> light_reads;
+    size_t fade_examples = 0;
+    for (const auto& l : lights) {
+        const TagHash kinds[4] = {l.technique, l.shadow_technique, l.volumetrics, l.shadow_volumetrics};
+        for (size_t k = 0; k < 4; ++k) {
+            if (kinds[k].is_none()) continue;
+            try {
+                const Technique t = load_technique(pm, kinds[k]);
+                std::set<uint32_t> v;
+                TfxEnvironment env;
+                env.extern_vec4 = [&](uint8_t e, uint8_t i) { if (e == 4) v.insert(uint32_t(i) * 16); return float4{1, 1, 1, 1}; };
+                env.extern_float = [&](uint8_t e, uint8_t i) { if (e == 4) v.insert(uint32_t(i) * 4); return 1.0f; };
+                env.global_channel = [](uint8_t) { return float4{1, 1, 1, 1}; };
+                env.world_channel = [](uint8_t) { return float4{1, 1, 1, 1}; };
+                env.object_channel = [](uint32_t) { return float4{1, 1, 1, 1}; };
+                for (auto which : {ShaderStage::Vertex, ShaderStage::Pixel}) {
+                    const auto& st = t.stage(which);
+                    std::vector<float4> out;
+                    try { evaluate_tfx(st.bytecode, st.constants, st.cbuffer_init, out, env); } catch (const std::exception&) {}
+                }
+                for (uint32_t o : v) ++light_reads[o][k];
+                if (k == 0 && !l.shadowing && v.contains(0x160) && fade_examples < 4) {
+                    ++fade_examples;
+                    std::println("  collection light reading +0x160: {} technique {}", l.source.str(), l.technique.str());
+                }
+            } catch (const std::exception&) {}
+        }
+    }
+    // The light records' SLight +0x00..+0x4F: four world-space clip planes and their exponents.
+    {
+        size_t active[4]{}, used = 0, near_world = 0, near_local = 0, planes_seen = 0, lamp_lit = 0;
+        std::map<std::string, size_t> exponents, weights, tails;
+        for (const auto& l : lights) {
+            bool any = false;
+            for (size_t k = 0; k < 4; ++k) {
+                const float* p = &l.params[k * 4];
+                if (!(std::fabs(p[3]) >= 1e5f || (p[0] == 0 && p[1] == 0 && p[2] == 0))) ++active[k], any = true;
+            }
+            used += any;
+            // The space of the planes: the light's own position seen as world space (node
+            // translation) or as light-local space (origin). An authored clip plane lies near
+            // the lamp, so its signed distance there is small.
+            for (size_t k = 0; k < 4; ++k) {
+                const float* p = &l.params[k * 4];
+                if (std::fabs(p[3]) >= 1e5f || (p[0] == 0 && p[1] == 0 && p[2] == 0)) continue;
+                const float world = p[0] * l.node[12] + p[1] * l.node[13] + p[2] * l.node[14] + p[3], local = p[3];
+                near_world += std::fabs(world) < 8.0f;
+                near_local += std::fabs(local) < 8.0f;
+                lamp_lit += world > -0.5f;
+                ++planes_seen;
+            }
+            ++exponents[std::format("({:g} {:g} {:g} {:g})", l.params[16], l.params[17], l.params[18], l.params[19])];
+            ++weights[std::format("({:g} {:g} {:g} {:g})", l.params[20], l.params[21], l.params[22], l.params[23])];
+            if (l.shadowing) {
+                try {
+                    const auto bytes = pm.read(l.source);
+                    TagReader lr(bytes);
+                    std::string t = std::format("{} w({:g} {:g} {:g} {:g})", l.volumetrics.is_none() ? "noshaft" : "shaft", l.params[20], l.params[21], l.params[22], l.params[23]);
+                    for (size_t o = 0xC0; o + 4 <= bytes.size() && o < 0x110; o += 4)
+                        if (o < 0xCC || o >= 0xF4) t += std::format(" {:g}", lr.f32_at(o));
+                    ++tails[t];
+                } catch (const std::exception&) {}
+            }
+        }
+        std::println("light record clip planes (SLight +0x00..+0x3F, world space): {} lights use some; active plane 0..3: {} {} {} {}", used,
+                     active[0], active[1], active[2], active[3]);
+        std::println("  of {} active planes, within 8 m of the lamp: {} as world space, {} as light-local space; lamp on the lit side (> -0.5 m): {}", planes_seen, near_world,
+                     near_local, lamp_lit);
+        std::vector<std::pair<size_t, std::string>> top;
+        for (const auto& [k, n] : exponents) top.emplace_back(n, k);
+        std::ranges::sort(top, std::greater{});
+        for (size_t i = 0; i < top.size() && i < 10; ++i) std::println("  +0x40 exponents {} x{}", top[i].second, top[i].first);
+        std::println("  ({} distinct exponent vectors)", top.size());
+        for (const auto& [k, n] : weights) std::println("  +0x50 {} x{}", k, n);
+        std::println("  shadowing light tails (+0xC0..+0xC8, +0xF4..+0x10C), {} distinct:", tails.size());
+        size_t shown_tails = 0;
+        for (const auto& [k, n] : tails)
+            if (shown_tails++ < 100) std::println("   {} x{}", k, n);
+    }
+    for (const auto& [off, n] : light_reads)
+        std::println("  deferred_light +0x{:X} read by: apply {}, shadowed apply {}, shafts {}, shadowed shafts {}", off, n[0], n[1], n[2], n[3]);
     size_t failed = 0, shadow_world3 = 0;
     for (const auto& l : lights) {
         try {

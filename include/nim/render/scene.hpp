@@ -192,7 +192,7 @@ struct PreparedMesh {
     bool dynamic = false;  // dynamic model (entity mesh) rather than a static mesh
     bool no_drawable = false;  // dynamic model has no parts supported by the connected passes
     bool inferred_dynamic_lod = false;  // alternates of one piece: only the lowest external identifier drawn
-    size_t region_hidden_parts = 0;     // parts of other region permutations left out (3.92)
+    size_t region_hidden_parts = 0;     // parts of other region permutations left out (3.96)
     bool distance_field_preview = false; // preview-only material state and camera framing
     bool inferred_transparent_stage = false;
     bool animation_equipment = false;  // visible when the active clip supplies a placement
@@ -280,7 +280,7 @@ PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
 // material variants. Skinned meshes are drawn in their bind pose until StaticMeshScene::set_skin_poses.
 // `materials` (from index_dynamic_model_materials) supplies the parts with no technique of their
 // own; permutation < 0 = the component's default.
-// `regions` (an entity's spawned permutations, 3.92) leaves out the part groups of other permutations.
+// `regions` (an entity's spawned permutations, 3.96) leaves out the part groups of other permutations.
 PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash model, const DynamicModelMaterials* materials = nullptr,
                                    int permutation = -1, const ChannelValues* channels = nullptr, PrepareCache* cache = nullptr,
                                    const RegionPermutations* regions = nullptr);
@@ -658,6 +658,7 @@ struct LightingParams {
     // Froxel interior classification (extern 81) from the same top-down depth: froxels under geometry
     // take fog_density_interior. The engine's interior visibility map producer is unknown (estimate).
     bool interior_fog = true;
+    bool authored_interior_fog = false;  // keep the interior mask but suppress its density by default
     // Light state channels: render-global channels that map lights read, that default to 0 and that
     // no map data sets (script state: the light group dimmers ECA86879..ECA86870, Marathon Deck's
     // blue fill 07806276, ...). On: each is set to whichever of 0 / 1 lights more of the map's
@@ -691,6 +692,12 @@ struct LightingParams {
     // Temporal anti-aliasing (with post only): a jittered view each frame (GameLighting::temporal_view)
     // resolved against the previous frames with the engine's resolve_taa. Replaces fxaa when it runs.
     bool temporal_aa = true;
+    // Cinematic depth of field (with post only): the engine's v2_dof_cinematic_* passes, focused at
+    // dof_focus metres of view depth (> 0). The focus ranges and blur size are estimates.
+    // Vignette (with post only): the engine's draw_vignette; its strength and radii are estimates.
+    bool vignette = false;
+    bool depth_of_field = false;
+    float dof_focus = 0;
 };
 
 class LightingPass {

@@ -377,6 +377,9 @@ public:
     // render(). `scene_items` changing (a map still loading) discards the maps drawn so far.
     std::vector<SunShadow*> light_shadows_to_render(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ViewMatrices& vm, size_t scene_items, size_t budget);
     void set_light_shadows(bool on) { light_shadows_ = on; }
+    // Off: the light records' clip planes, weights and fade distances are not applied (deferred_light
+    // +0x100..+0x130 = (0, 0, 0, 1), +0x150 = 1, +0x160 = 1, as before section 3.95). For comparisons.
+    void set_light_records(bool on) { light_records_ = on; }
     size_t light_shadows_used() const { return light_shadows_used_; }  // shadowed lights drawn last frame
     size_t volumetric_lights() const { return vol_lights_.size(); }
     size_t volumetrics_drawn() const { return vol_drawn_; }
@@ -608,6 +611,10 @@ private:
     // Hands a light's depth map to the deferred_shadow extern (6) for its +0xD8 / +0xE0 technique.
     void bind_light_shadow(ID3D12GraphicsCommandList* cl, LocalLight& ll, const ViewMatrices& vm);
     bool light_shadows_ = true;
+    bool light_records_ = true;
+    // The record's light / shaft fade at the camera (1 with light_records_ off).
+    float light_fade(const MapLight& l, const V3& eye) const;
+    float shaft_fade(const MapLight& l, const V3& eye) const;
     std::vector<std::unique_ptr<GamePipeline>> light_pipelines_;  // two per shader pair: both windings
     std::vector<LocalLight> lights_;
     std::vector<std::string> light_notes_;
@@ -659,6 +666,21 @@ private:
     void update_exposure(Gpu& gpu, const LightingParams& p);
     void render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const LightingParams& p,
                      const ScopeBufferFn& scopes, bool distorted);
+    // Cinematic depth of field with the engine's v2_dof_cinematic_* passes (docs/PROGRESS.md 3.96):
+    // returns the blurred HDR image, or `image` when the passes are missing.
+    ID3D12Resource* render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl, ID3D12Resource* image, const LightingParams& p,
+                               const ScopeBufferFn& scopes);
+    bool dof_ready() const;
+    // The engine's draw_vignette into the overlay the tonemap multiplies by (docs/PROGRESS.md 3.99).
+    ID3D12Resource* render_vignette(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
+    GamePipeline vignette_;
+    ComPtr<ID3D12Resource> screen_overlay_;
+    // prepare (full-res CoC), 12-texel tile max (horizontal, vertical), neighbourhood max,
+    // half-res downsample (colour + CoC), gather, fill blur, full-res combine.
+    GamePipeline dof_prepare_, dof_tile_h_, dof_tile_v_, dof_neighbor_, dof_down_, dof_apply_, dof_blur_, dof_combine_;
+    ComPtr<ID3D12Resource> dof_coc_, dof_tile_h_rt_, dof_tile_v_rt_, dof_neighbor_rt_, dof_half_, dof_half_coc_, dof_apply_rt_,
+        dof_blur_rt_, dof_out_;
+    uint32_t dof_tw_ = 0, dof_th_ = 0, dof_hw_ = 0, dof_hh_ = 0;
     GamePipeline post_tonemap_, post_tonemap_luma_, post_pack_luma_, fxaa_, bloom_initial_, bloom_down_, bloom_down_finite_, bloom_blur_h_, bloom_blur_v_, bloom_add_, ae_columns_;
     GamePipeline bloom_line_down_, bloom_line_blur_, bloom_line_combine_;
     GamePipeline grading_fill_, grading_convert_;
@@ -766,7 +788,7 @@ private:
         M4 projection;
         V3 eye, forward;
         float near_plane, time, time_of_day, day_night_state;
-        bool noise, shadowed, interior, environment;
+        bool noise, shadowed, interior, authored_interior_fog, environment;
     } froxel_history_view_{};
     // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice
     // depth = near + (far - near) t^(1 / curve).

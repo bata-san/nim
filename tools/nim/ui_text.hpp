@@ -328,6 +328,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
       "The game's sky_lookup_generate_near/far and sky. Fog values mirror the global channels (estimated)",              \
       "게임의 sky_lookup_generate_near/far와 sky. 안개 값은 글로벌 채널의 복사 (추정)")                                      \
     X(FroxelFog, "フロクセル大気", "Froxel fog", "프록셀 대기")                                                         \
+    X(InteriorFog, "屋内フォグ", "Interior fog", "실내 안개") \
     X(FroxelFogTip, "ゲームの密度計算・散乱積分CS。格子の解像度・距離・時間履歴は推定",                                    \
       "The game's density and scattering-integration compute shaders. Grid resolution, distance and history estimated",  \
       "게임의 밀도 계산·산란 적분 CS. 격자 해상도·거리·시간 히스토리는 추정")                                               \

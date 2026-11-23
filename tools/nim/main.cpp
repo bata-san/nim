@@ -1543,7 +1543,7 @@ public:
     bool game_ready = false;
     Engine engine = Engine::Game;
     std::string render_error;
-    LightingParams light;
+    LightingParams light{.vignette = true};
     Camera cam;
     uint32_t view_w = 0, view_h = 0;
     bool viewport_visible = false;
@@ -2718,6 +2718,7 @@ public:
         light.time = material_time;
         light.delta_time = material_dt;
         light.entity_preview = entity_preview_active && !map_scene;
+        light.dof_focus = cam.distance;  // the orbit target is in focus
         try {
             const bool game_view = game_ready && light.mode == ViewMode::Lit;
             if (game_ready) {
@@ -3581,6 +3582,10 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::TAATip));
             ImGui::SameLine();
             ImGui::Checkbox("FXAA", &light.antialias);
+            ImGui::Checkbox("被写界深度 (DoF, estimated)", &light.depth_of_field);
+            ImGui::SameLine();
+            ImGui::Checkbox("周辺減光", &light.vignette);
+            ImGui::SetItemTooltip("ゲームの v2_dof_cinematic パス。焦点はカメラの注視点 (焦点範囲・ぼけの大きさは推定)");
             ImGui::EndDisabled();
             if (light.post && light.auto_exposure && game_ready) ImGui::TextDisabled("%s %.3f", ui::tr(ui::S::Exposure), game_lighting.exposure());
             ImGui::ColorEdit3(ui::tr(ui::S::SunColor), &light.sun_color.x);
@@ -3596,6 +3601,7 @@ public:
             ImGui::SetItemTooltip(ui::tr(ui::S::AtmosphereTip));
             ImGui::Checkbox(ui::tr(ui::S::FroxelFog), &light.froxel_fog);
             ImGui::SetItemTooltip(ui::tr(ui::S::FroxelFogTip));
+            ImGui::Checkbox(ui::tr(ui::S::InteriorFog), &light.authored_interior_fog);
             ImGui::Checkbox(ui::trf(ui::S::MapEnvironment, game_lighting.environment_channels()).c_str(), &light.environment);
             ImGui::SetItemTooltip(ui::tr(ui::S::MapEnvironmentTip));
             ImGui::Checkbox(ui::tr(ui::S::SkyAmbient), &light.sky_ambient);

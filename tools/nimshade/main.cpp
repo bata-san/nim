@@ -150,8 +150,10 @@ int run(int argc, char** argv) {
     float time_of_day = -1;
     float day_night_state = -1;
     bool no_light_shadows = false;
+    bool no_light_records = false;  // the light records' clip planes, weights and fades off (comparison)
     size_t frame_light_shadows = 0;  // > 0: draw the light maps as the GUI does, this many per whole frame
     bool verify_frame_inputs = false;
+    bool authored_interior_fog = false;
     bool no_atmosphere = false, no_environment = false, no_sky_ambient = false, no_overhead_occlusion = false, no_interior_fog = false, print_channels = false;
     std::optional<TagHash> clip_tag;
     TagHash equipment_model;
@@ -184,6 +186,8 @@ int run(int argc, char** argv) {
     bool no_ssao = false, no_volumetrics = false, no_ssr = false;
     bool no_distortion = false;
     bool no_post = false, no_auto_exposure = false, no_bloom = false, no_aa = false, no_taa = false;
+    bool dof = false, vignette = false;
+    float dof_focus = 0;
     bool shaft_fog_density = false;
     float exposure_arg = 1;
     bool assume_lights_on = true;
@@ -210,6 +214,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-shadows") shadows = false;
         else if (args[i] == "--no-lights") no_lights = true;
         else if (args[i] == "--no-light-shadows") no_light_shadows = true;
+        else if (args[i] == "--no-light-records") no_light_records = true;
         else if (args[i] == "--frame-light-shadows" && i + 1 < args.size()) frame_light_shadows = size_t(std::stoul(args[++i]));
         else if (args[i] == "--no-cubemaps") no_cubemaps = true;
         else if (args[i] == "--probe-index" && i + 1 < args.size()) probe_index = std::stoull(args[++i]);
@@ -273,6 +278,9 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-bloom") no_bloom = true;
         else if (args[i] == "--no-aa") no_aa = true;
         else if (args[i] == "--no-taa") no_taa = true;
+        else if (args[i] == "--dof") dof = true;
+        else if (args[i] == "--vignette") vignette = true;
+        else if (args[i] == "--dof-focus" && i + 1 < args.size()) dof = true, dof_focus = std::stof(args[++i]);
         else if (args[i] == "--exposure" && i + 1 < args.size()) exposure_arg = std::stof(args[++i]);
         else if ((args[i] == "--eye" || args[i] == "--look") && i + 1 < args.size()) {
             V3 v{};
@@ -297,6 +305,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--no-environment") no_environment = true;
         else if (args[i] == "--no-sky-ambient") no_sky_ambient = true;
         else if (args[i] == "--no-overhead-occlusion") no_overhead_occlusion = true;
+        else if (args[i] == "--interior-fog") authored_interior_fog = true;
         else if (args[i] == "--no-interior-fog") no_interior_fog = true;
         else if (args[i] == "--no-assumed-light-state") assume_lights_on = false;
         else if (args[i] == "--print-channels") print_channels = true;
@@ -326,7 +335,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--no-interior-fog] [--no-assumed-light-state] [--print-channels] [--no-aa] [--no-taa] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dof] [--dof-focus M] [--vignette] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -1006,6 +1015,7 @@ int run(int argc, char** argv) {
     lp.sky_ambient = !no_sky_ambient;
     lp.overhead_occlusion = !no_overhead_occlusion;
     lp.interior_fog = !no_interior_fog;
+    lp.authored_interior_fog = authored_interior_fog;
     lp.assume_lights_on = assume_lights_on;
     lp.froxel_fog = !no_froxels;
     lp.froxel_noise = !no_froxel_noise;
@@ -1018,6 +1028,11 @@ int run(int argc, char** argv) {
     lp.bloom = !no_bloom;
     lp.antialias = !no_aa;
     lp.temporal_aa = !no_taa;
+    // Depth of field: focused on the look point unless a distance is given.
+    lp.depth_of_field = dof;
+    lp.vignette = vignette;
+    lp.dof_focus = dof_focus > 0 ? dof_focus : std::sqrt(dot(view.target - view.eye, view.target - view.eye));
+    if (dof) std::println("depth of field: focus {:.1f} m", lp.dof_focus);
     lp.exposure = exposure_arg;
     auto shadow_pass = [&](ID3D12GraphicsCommandList* list, const LightingParams& p) {
         if (!shadows) return;
@@ -1126,6 +1141,7 @@ int run(int argc, char** argv) {
         std::println("GPU memory before lighting: {:.1f} MiB used / {:.1f} MiB budget",
                      double(gpu.vram_usage()) / (1 << 20), double(gpu.vram_budget()) / (1 << 20));
         if (no_light_shadows) gl.set_light_shadows(false);
+        if (no_light_records) gl.set_light_records(false);
         if (frame_light_shadows && !no_light_shadows) {
             // The GUI's frame: sun shadow, a few light maps, G-buffer and lighting in one frame's
             // upload space, repeated until every light on screen has its map.
@@ -1622,7 +1638,7 @@ int run(int argc, char** argv) {
                 if (pixels.size() != plane * vd.DepthOrArraySize * 8) throw std::runtime_error("Incomplete froxel volume readback");
                 const auto* data = reinterpret_cast<const uint16_t*>(pixels.data());
                 float previous_min = 1;
-                const bool no_interior = ext.get_v(81, 0x10) == float4{};
+                const bool no_interior = !lp.authored_interior_fog || ext.get_v(81, 0x10) == float4{};
                 for (uint32_t z = 0; z < vd.DepthOrArraySize; ++z) {
                     float slice_min = 1;
                     for (size_t xy = 0; xy < plane; ++xy) {
@@ -1632,7 +1648,7 @@ int run(int argc, char** argv) {
                             if (!std::isfinite(v) || v < 0 || (c < 2 && v > 1.002f))
                                 throw std::runtime_error("Invalid froxel transmittance / in-scatter");
                             if (no_interior && c == 1 && std::abs(v - 1) > 0.002f)
-                                throw std::runtime_error("Indoor fog was integrated without an interior height map");
+                                throw std::runtime_error("Indoor fog was integrated while suppressed or without an interior height map");
                         }
                         const float transmittance = half(data[n]);
                         if (z && transmittance > half(data[n-plane*4]) + 0.002f)

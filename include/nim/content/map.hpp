@@ -115,11 +115,28 @@ struct MapLight {
     TagHash volumetrics;               // light shaft technique (SShadowingLight +0xDC, collection light +0xC8)
     std::array<float, 16> node{};      // light local -> world (node / collection transform)
     std::array<float, 16> light_space{};  // unit cube (NDC) -> light local, projective
-    std::array<float, 20> params{};    // SLight +0x00..+0x4F: two clip planes, two more, plane exponents
+    // SLight +0x00..+0x5F, copied to deferred_light +0x100..+0x15F: four world-space clip planes
+    // (n, d) at +0x00..+0x3F (unused ones (0, 0, -1, 500000)), their exponents at +0x40 and the
+    // diffuse / shadow weights at +0x50 (+0x150 / +0x154).
+    std::array<float, 24> params{};
     std::array<float, 3> lo{}, hi{};   // world bounds of the light volume
     bool shadowing = false;
     TagHash shadow_technique;          // SShadowingLight +0xD8: lighting_apply with the shadow map
     TagHash shadow_volumetrics;        // SShadowingLight +0xE0: light shafts with the shadow map
+    // SShadowingLight +0xFC..+0x108: camera distances (light fade start, end, shaft fade start,
+    // end); (0, 0) for none. The shaft pair is set only on lights with a shaft (+0xDC) and is
+    // reversed on some (start > end: the shaft fades in with distance). Collection lights have
+    // no such fields: all 0.
+    std::array<float, 4> fade_distances{};
+    // The light's fade (deferred_light +0x160) and its shaft's fade at a camera distance
+    // (estimate: saturate((end - d) / (end - start)), linear; 1 where start == end).
+    float light_fade(float distance) const { return fade_at(fade_distances[0], fade_distances[1], distance); }
+    float shaft_fade(float distance) const { return fade_at(fade_distances[2], fade_distances[3], distance); }
+    static float fade_at(float start, float end, float d) {
+        if (!(end != start)) return 1.0f;
+        const float f = (end - d) / (end - start);
+        return f < 0 ? 0.0f : f > 1 ? 1.0f : f;
+    }
 };
 std::vector<MapLight> load_map_lights(PackageManager& pm, const MapLayout& map);
 // The lights whose volume comes within `radius` of `center`.

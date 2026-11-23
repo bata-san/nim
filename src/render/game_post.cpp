@@ -18,6 +18,8 @@ constexpr uint32_t kGradingSize = 32;   // fixed lattice dimensions in both orig
 constexpr float kSdrTonemapMode = 4.0f;
 constexpr uint8_t kBloomDistortion = 0x38; // bloom_initial_downsample's signed offset inputs
 constexpr uint32_t kDistortedHdrRtv = 11;
+constexpr uint32_t kDofRtv = 3 * 4 + 9;  // first post RTV slot of the depth of field (after bloom, TAA, lens, line)
+constexpr uint8_t kDof = 0x37;           // the depth of field settings the engine fills
 
 float4 distortion_uv_scale(uint32_t w, uint32_t h) {
     // The reference engine uses (0.13281, 0.23611) at 1920x1080, or 255 pixels per axis.
@@ -94,6 +96,27 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     load(bloom_line_combine_, "combined_bloom_line_blur", {f16, false});
     load(ae_columns_, "autoexposure_sample_columns", {DXGI_FORMAT_R32G32B32A32_FLOAT, false});
 
+    {
+        // Cinematic depth of field (v2_dof_cinematic_*). Target formats are estimates: the CoC and
+        // tile maxima are single values, the colour stays HDR.
+        constexpr auto r16 = DXGI_FORMAT_R16_FLOAT;
+        load(dof_prepare_, "v2_dof_cinematic_decode_and_prepare", {r16, false});
+        load(dof_tile_h_, "v2_dof_cinematic_tile_max_horz_12", {r16, false});
+        load(dof_tile_v_, "v2_dof_cinematic_tile_max_vert_12", {r16, false});
+        load(dof_neighbor_, "v2_dof_cinematic_neighbor_max", {r16, false});
+        GamePipeline::Options down{f16, false, {r16}};
+        down.drop_extra_targets = true;  // SV_Target4 is declared but never written
+        load(dof_down_, "v2_dof_cinematic_downsample", down);
+        load(dof_apply_, "v2_dof_cinematic_apply", {f16, false});
+        load(dof_blur_, "v2_dof_cinematic_gaussian_blur", {f16, false});
+        load(dof_combine_, "v2_dof_cinematic_final_combine", {f16, false});
+    }
+    {
+        // The screen overlay the tonemap multiplies by (t2): draw_vignette writes (0, 0, 0, a).
+        GamePipeline::Options vignette{DXGI_FORMAT_R8G8B8A8_UNORM, false};
+        vignette.blend_state = 8;  // premultiplied alpha: white * (1 - a) (the stage's blend, estimate)
+        load(vignette_, "draw_vignette", vignette);
+    }
     load(grading_fill_, "color_grading_fill_using_matrix", {f16, false});
     load(grading_convert_, "color_grading_convert_to_volume_texture_sdr", {});
     Texture black;
@@ -102,7 +125,7 @@ void GameLighting::load_post(PackageManager& pm, Gpu& gpu, std::span<const Scope
     black.data = {0, 0, 0, 0};
     black_ = gpu.texture(black);
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3 * kBloomLevels + 9};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kDofRtv + 10};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&post_rtv_heap_)), "post RTV heap");
 }
 
@@ -115,6 +138,12 @@ void GameLighting::release_post(Gpu& gpu) {
     taa_valid_ = taa_prev_valid_ = false;
     for (auto& l : bloom_) l = {};
     for (GamePipeline* gp : {&bloom_line_down_, &bloom_line_blur_, &bloom_line_combine_}) gp->release(gpu);
+    for (GamePipeline* gp : {&dof_prepare_, &dof_tile_h_, &dof_tile_v_, &dof_neighbor_, &dof_down_, &dof_apply_, &dof_blur_, &dof_combine_})
+        gp->release(gpu);
+    for (ComPtr<ID3D12Resource>* r : {std::addressof(dof_coc_), std::addressof(dof_tile_h_rt_), std::addressof(dof_tile_v_rt_), std::addressof(dof_neighbor_rt_), std::addressof(dof_half_), std::addressof(dof_half_coc_), std::addressof(dof_apply_rt_), std::addressof(dof_blur_rt_), std::addressof(dof_out_)})
+        r->Reset();
+    vignette_.release(gpu);
+    screen_overlay_.Reset();
     for (auto& r : bloom_line_) r.Reset();
     ae_columns_rt_.Reset();
     grading_strip_.Reset();
@@ -213,6 +242,28 @@ void GameLighting::resize_post(Gpu& gpu, uint32_t w, uint32_t h) {
         bloom_line_[0] = target(half, l.h, cv.Format, 3 * kBloomLevels + 6);
         bloom_line_[1] = target(quarter, l.h, cv.Format, 3 * kBloomLevels + 7);
         bloom_line_[2] = target(quarter, l.h, cv.Format, 3 * kBloomLevels + 8);
+    }
+    if (dof_ready()) {
+        // Tiles of 12 full-resolution texels (the _12 tile passes); the gather runs at half resolution.
+        constexpr auto r16 = DXGI_FORMAT_R16_FLOAT, f16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dof_tw_ = (w + 11) / 12;
+        dof_th_ = (h + 11) / 12;
+        dof_hw_ = (w + 1) / 2;
+        dof_hh_ = (h + 1) / 2;
+        dof_coc_ = target(w, h, r16, kDofRtv);
+        dof_tile_h_rt_ = target(dof_tw_, h, r16, kDofRtv + 1);
+        dof_tile_v_rt_ = target(dof_tw_, dof_th_, r16, kDofRtv + 2);
+        dof_neighbor_rt_ = target(dof_tw_, dof_th_, r16, kDofRtv + 3);
+        dof_half_ = target(dof_hw_, dof_hh_, f16, kDofRtv + 4);
+        dof_half_coc_ = target(dof_hw_, dof_hh_, r16, kDofRtv + 5);
+        dof_apply_rt_ = target(dof_hw_, dof_hh_, f16, kDofRtv + 6);
+        dof_blur_rt_ = target(dof_hw_, dof_hh_, f16, kDofRtv + 7);
+        dof_out_ = target(w, h, f16, kDofRtv + 8);
+    }
+    if (vignette_.loaded()) {
+        cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 1;
+        screen_overlay_ = target(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kDofRtv + 9);
+        cv.Color[0] = cv.Color[1] = cv.Color[2] = cv.Color[3] = 0;
     }
     taa_valid_ = false;
     const size_t pitch = (size_t(columns) * 16 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~size_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -387,7 +438,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     auto& e = ext_;
     if (!e.zero_policy(kScreenArea)) e.zero_when_missing(kScreenArea, "screen_area value not set by nim: zero");
     if (!e.zero_policy(ext::Postprocess)) e.zero_when_missing(ext::Postprocess, "postprocess value not set by nim: zero");
-    ID3D12Resource* const image = distorted ? distorted_hdr_.Get() : hdr_.Get();
+    ID3D12Resource* image = distorted ? distorted_hdr_.Get() : hdr_.Get();
     const uint8_t pp = ext::Postprocess;
     constexpr std::string_view engine = "engine post setting (not in game data)";
 
@@ -549,13 +600,16 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 
+    if (p.depth_of_field && p.dof_focus > 0 && dof_ready() && dof_out_) image = render_dof(gpu, cl, image, p, scopes);
+
     // screen_area_global_lut3d (SDR): tonemap curve (mode extern 0x1E +0x1A0), the 32^3 grading
     // LUT at +0x30, then out = LUT * t2 (+0x58) + t1 (+0x50).
     e.set_texture(kScreenArea, 0x00, image);
     e.set_texture(kScreenArea, 0x30, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x38, grading_lut_.Get());
     e.set_texture(kScreenArea, 0x50, bloom_tex);
-    e.set_texture(kScreenArea, 0x58, unshadowed_.Get());
+    const bool vignette = p.vignette && vignette_.loaded() && screen_overlay_;
+    e.set_texture(kScreenArea, 0x58, vignette ? render_vignette(gpu, cl, scopes) : unshadowed_.Get());
     e.set(kScreenArea, 0x90, float4{float(kGradingSize), 0, 0, 0});
     e.set(kScreenArea, 0x170, float4{0, 1, 0, 0});  // chromatic aberration ramps (none)
     e.set(kScreenArea, 0x180, float4{0, 1, 0, 0});
@@ -565,7 +619,8 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
                        "engine screen_area settings (extern 0x1E) not in game data");
     ext_.note_estimate("grading: native SDR LUT from no layers and an identity matrix",
                        "grading layer data (scope color_grading_ubershader) source not found");
-    ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay (vignette / damage) not drawn");
+    if (!vignette)
+        ext_.note_estimate("tonemap t2 (multiplied after the LUT) = white", "screen overlay not drawn");
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     const bool taa = temporal_aa_on(p) && post_ldr_ && taa_history_[0];
     const bool aa = !taa && p.antialias && post_tonemap_luma_.loaded() && post_pack_luma_.loaded() && fxaa_.loaded() && post_ldr_;
@@ -674,6 +729,134 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
         fxaa_.draw(gpu, cl, e, scopes);
     }
     Gpu::barrier(cl, gb.lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+// draw_vignette (PS 80A74994) into the screen overlay the tonemap multiplies by. From the pixel
+// position: q = |(pos - 0.5) * +0x00.zw - +0x00.xy|, an ellipse radius r = A / (sqrt(B^2 - A c) + B) with
+// A = dot(q^2, +0x10.xy), B = dot(q, +0x10.zw), c = +0x20 (r = |q| for (1, 1, 0, 0), c = -1), or a
+// rectangle edge through +0x30; a = (smoothstep(saturate(r * +0x40.x + +0x40.y)) * +0x40.z + +0x40.w)
+// * Postprocess +0xC0.w. Extern 0x29 is engine-filled: the values are estimates.
+ID3D12Resource* GameLighting::render_vignette(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes) {
+    constexpr uint8_t kVignette = 0x29;
+    constexpr float start = 0.35f, end = 0.75f, strength = 0.4f;
+    auto& e = ext_;
+    e.set(kVignette, 0x00, float4{0.5f, 0.5f, 1.0f / float(w_), 1.0f / float(h_)});
+    e.set(kVignette, 0x10, float4{1, 1, 0, 0});
+    e.set(kVignette, 0x20, -1.0f);
+    e.set(kVignette, 0x30, float4{-1, -1, 1, 1});  // the rectangle test never wins (q >= 0)
+    e.set(kVignette, 0x40, float4{1 / (end - start), -start / (end - start), strength, 0});
+    e.set(ext::Postprocess, 0xC0, float4{0, 0, 0, 1});
+    e.note_estimate(std::format("vignette: elliptical in screen uv, from {} to {} radius in normalized screen coordinates, strength {}", start, end, strength),
+                    "draw_vignette is the game's; its settings (extern 0x29) and the overlay blend are engine code");
+    const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv{post_rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + size_t(kDofRtv + 9) * inc};
+    Gpu::barrier(cl, screen_overlay_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float white[4]{1, 1, 1, 1};
+    cl->ClearRenderTargetView(rtv, white, 0, nullptr);
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    viewport(cl, w_, h_);
+    vignette_.draw(gpu, cl, e, scopes);
+    Gpu::barrier(cl, screen_overlay_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    return screen_overlay_.Get();
+}
+
+bool GameLighting::dof_ready() const {
+    for (const GamePipeline* gp : {&dof_prepare_, &dof_tile_h_, &dof_tile_v_, &dof_neighbor_, &dof_down_, &dof_apply_, &dof_blur_, &dof_combine_})
+        if (!gp->loaded()) return false;
+    return true;
+}
+
+// The engine's cinematic depth of field over the HDR image (PS 80A74A31 / 80A74A08 / 80A74A0D /
+// 80A74A12 / 80A74A49 / 80A74A45 / 80A74A4F / 80A74A54). The signed circle of confusion is
+// packed as 0.502 * coc + 0.502 (near < 0, far > 0, |coc| <= 1). Extern 0x37 is the engine's
+// per-view setting block; nim fills it from the focus distance (estimates):
+//   +0x30 / +0x34  near: full blur at / sharp from (view depth, m)   +0x40 near max |coc|
+//   +0x38 / +0x3C  far:  sharp until / full blur at                    +0x44 far max |coc|
+//   +0x60 / +0x70  a radial (screen-edge) minimum blur: centre, scale / near, far, start, end radius
+//   +0x80          blur size: the gather radius is 6.5 * .xy half-resolution texels at |coc| = 1
+ID3D12Resource* GameLighting::render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl, ID3D12Resource* image,
+                                         const LightingParams& p, const ScopeBufferFn& scopes) {
+    ID3D12Device* dev = gpu.device();
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto base = post_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    auto rtv = [&](uint32_t slot) { return D3D12_CPU_DESCRIPTOR_HANDLE{base.ptr + size_t(kDofRtv + slot) * inc}; };
+    struct Target {
+        ID3D12Resource* r;
+        uint32_t slot;
+    };
+    auto pass = [&](GamePipeline& gp, std::initializer_list<Target> targets, uint32_t w, uint32_t h) {
+        D3D12_CPU_DESCRIPTOR_HANDLE handles[2]{};
+        UINT n = 0;
+        for (const Target& t : targets) {
+            Gpu::barrier(cl, t.r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            handles[n++] = rtv(t.slot);
+        }
+        cl->OMSetRenderTargets(n, handles, FALSE, nullptr);
+        viewport(cl, w, h);
+        gp.draw(gpu, cl, ext_, scopes);
+        for (const Target& t : targets)
+            Gpu::barrier(cl, t.r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    auto& e = ext_;
+    const uint8_t pp = ext::Postprocess;
+    const float f = p.dof_focus;
+    e.set(kDof, 0x30, 0.25f * f);
+    e.set(kDof, 0x34, 0.6f * f);
+    e.set(kDof, 0x38, 2.0f * f);
+    e.set(kDof, 0x3C, 8.0f * f);
+    constexpr float max_coc = 0.15f;  // estimated preview cap: about two full-resolution pixels
+    e.set(kDof, 0x40, max_coc);
+    e.set(kDof, 0x44, max_coc);
+    e.set(kDof, 0x60, float4{0.5f, 0.5f, 1, 1});
+    e.set(kDof, 0x70, float4{0, 0, 0, 1});  // no radial blur
+    e.set(kDof, 0x80, float4{1, 1, 0, 0});
+    e.note_estimate(std::format("depth of field: focus {:.1f} m; near full blur 0.25x / sharp 0.6x, far sharp 2x / full blur 8x "
+                                "the focus, max |coc| {:.2f} (about 2 px), no radial blur, 12-texel tiles", f, max_coc),
+                    "engine depth of field settings (extern 0x37) are code; the cinematic passes are the game's");
+    // No screen distortion offsets: the image is already distorted.
+    e.set_texture(kBloomDistortion, 0x00, black_.Get());
+    e.set(kBloomDistortion, 0x20, float4{});
+    const uint32_t w = w_, h = h_;
+
+    e.set(pp, 0x50, size4(w, h));
+    pass(dof_prepare_, {{dof_coc_.Get(), 0}}, w, h);
+
+    e.set_texture(pp, 0x00, dof_coc_.Get());
+    e.set(pp, 0x50, size4(dof_tw_, h));
+    pass(dof_tile_h_, {{dof_tile_h_rt_.Get(), 1}}, dof_tw_, h);
+    e.set_texture(pp, 0x00, dof_tile_h_rt_.Get());
+    e.set(pp, 0x50, size4(dof_tw_, dof_th_));
+    pass(dof_tile_v_, {{dof_tile_v_rt_.Get(), 2}}, dof_tw_, dof_th_);
+    e.set_texture(pp, 0x00, dof_tile_v_rt_.Get());
+    pass(dof_neighbor_, {{dof_neighbor_rt_.Get(), 3}}, dof_tw_, dof_th_);
+
+    // Half resolution: colour and CoC, weighted by the side (near / far) of the tile.
+    e.set_texture(pp, 0x00, image);
+    e.set_texture(pp, 0x08, dof_coc_.Get());
+    e.set_texture(pp, 0x10, dof_neighbor_rt_.Get());
+    e.set(pp, 0x50, size4(dof_hw_, dof_hh_));
+    e.set(pp, 0x60, size4(w, h));
+    pass(dof_down_, {{dof_half_.Get(), 4}, {dof_half_coc_.Get(), 5}}, dof_hw_, dof_hh_);
+
+    e.set_texture(pp, 0x00, dof_half_.Get());
+    e.set_texture(pp, 0x08, dof_neighbor_rt_.Get());
+    e.set_texture(pp, 0x10, dof_half_coc_.Get());
+    e.set(pp, 0x60, size4(dof_hw_, dof_hh_));
+    pass(dof_apply_, {{dof_apply_rt_.Get(), 6}}, dof_hw_, dof_hh_);
+    e.set_texture(pp, 0x00, dof_apply_rt_.Get());
+    pass(dof_blur_, {{dof_blur_rt_.Get(), 7}}, dof_hw_, dof_hh_);
+
+    // Full resolution: a small gather of the sharp image blended into the half-resolution result.
+    e.set_texture(pp, 0x00, image);
+    e.set_texture(pp, 0x08, dof_blur_rt_.Get());
+    e.set_texture(pp, 0x10, dof_neighbor_rt_.Get());
+    e.set_texture(pp, 0x18, dof_coc_.Get());
+    e.set(pp, 0x50, size4(w, h));
+    e.set(pp, 0x60, size4(w, h));
+    pass(dof_combine_, {{dof_out_.Get(), 8}}, w, h);
+    for (uint32_t o : {0x00u, 0x08u, 0x10u, 0x18u}) e.set_texture(pp, o, nullptr);
+    e.set_texture(kBloomDistortion, 0x00, nullptr);
+    return dof_out_.Get();
 }
 
 bool GameLighting::temporal_aa_on(const LightingParams& p) const {
