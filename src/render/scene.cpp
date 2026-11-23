@@ -3694,7 +3694,6 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     PreparedMesh root = mesh;
     bool calm_compiler_cape = false;
-    bool polished_compiler_cape = false;
     if (root.tag.value == 0x80A9707Eu) {
         for (auto& group : root.groups) {
             auto& ps = group.ps_material;
@@ -3706,14 +3705,6 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
                 ps.constants[scroll] = {};
                 calm_compiler_cape = true;
             }
-            if (ps.shader.value == 0x80A96FC2u && ps.constants.size() > 125) {
-                // The cape shader combines a procedural height gradient with
-                // a sampled tangent-space normal. Reduce both fine-scale terms.
-                ps.constants[123][0] *= 0.08f;
-                ps.constants[125][0] *= 0.12f;
-                ps.constants[125][1] *= 0.12f;
-                polished_compiler_cape = true;
-            }
         }
     }
     auto parts = std::move(root.attachments);
@@ -3721,9 +3712,6 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     const auto prune = [&] { std::erase_if(actors_[id].sets, [&](uint32_t set) { return set >= sets_.size(); }); };
     try {
         add_mesh(gpu, std::move(root), layouts, std::span(&identity, 1));
-        if (polished_compiler_cape)
-            material_externs_->note_estimate("Compiler cape: reduced surface normal detail",
-                                             "procedural and texture normal scales inferred from the requested smooth finish");
         if (calm_compiler_cape)
             material_externs_->note_estimate("Compiler at rest: fixed hem mask and no moving surface detail",
                                              "resting values inferred from the cape pixel shaders");

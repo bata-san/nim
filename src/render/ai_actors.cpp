@@ -139,13 +139,20 @@ ActorCharacter prepare_character_model(PackageManager& pm, const ActorSources& s
         }
         const RegionPermutations* regions = c.regions ? &*c.regions : nullptr;
         auto defaults = entity_material_defaults(pm, motion.entity);
-        // The Compiler (entity 80A97147, 3.117): run-time channels with no authored default read 1,
-        // which dissolved its cape (0EDC1DFF), lit the whole body (charge_progress 7C7E0071) and
-        // blew the cape about (764F77BA, AFBDF744). C6BC8C0E gates the moving surface detail.
-        // At rest (推定): cape shown, uncharged, calmest, with the silver armor variant.
+        // The Compiler (entity 80A97147, 3.117/3.122): run-time object channels with no authored
+        // default read 1, which dissolved the cape (0EDC1DFF), lit the body (charge_progress
+        // 7C7E0071, EE29282E, C22D14F8), warped/bloated the cape and wings (764F77BA, AFBDF744,
+        // 5CCDE335, 8694B692), drove procedural surface detail (C6BC8C0E, CB091BBC), and zeroed
+        // is_zero-gated specular tint (EAA8E3CF, D4FB5E33). 4D092067 is inverted (1 - ch) in
+        // 80A96FC2 so 1 keeps the cape smooth at rest; C47DCC9F = 1 skips the clip plane (推定).
         if (motion.entity.value == 0x80A97147) {
-            for (const uint32_t h : {0x0EDC1DFFu, 0x7C7E0071u, 0x764F77BAu, 0xAFBDF744u, 0xC6BC8C0Eu, 0x5B7CD2A2u})
+            for (const uint32_t h : {0x0EDC1DFFu, 0x7C7E0071u, 0x5CCDE335u, 0x764F77BAu, 0xAFBDF744u,
+                                     0xC6BC8C0Eu, 0x4F454736u, 0xEE29282Eu, 0xC22D14F8u, 0xCB091BBCu,
+                                     0xDE53CE63u, 0x8694B692u, 0xEAA8E3CFu, 0xD4FB5E33u, 0xE729F6E8u,
+                                     0xD6FA8024u, 0x5B7CD2A2u})
                 defaults[h] = {};
+            defaults[0x4D092067u] = {1.0f, 1.0f, 1.0f, 1.0f};
+            defaults[0xC47DCC9Fu] = {1.0f, 1.0f, 1.0f, 1.0f};
             // The core technique's fade spline is zero at the missing-channel fallback of
             // 1. A value of 7/8 selects half of the authored green emission at rest.
             defaults[0x6057A3B9u] = {0.875f, 0, 0, 0};
@@ -942,14 +949,14 @@ void AiActors::update(StaticMeshScene& scene, const AiSimulation& sim, std::arra
         }
         // The face indicator (UESC robots, material 80A4B5C4): its state follows the agent's alert.
         if (a.is_compiler) {
-            // Compiler (80A97147): drive its authored charge/agitation/core channels and hover bob
+            // Compiler (80A97147): drive its authored object channels (world center C9A10362,
+            // charge_progress 7C7E0071, shimmer C6BC8C0E, core glow 6057A3B9) and hover bob
             // from compiler_charge (0 at rest -> 1 at peak combat surge, 推定).
             const float c = a.compiler_charge;
             rows[11] += 0.25f * c + 0.06f * std::sin(sim.time() * 2.2f);
             scene.set_actor_channels(s.actor, {
+                {0xC9A10362u, {a.position[0], a.position[1], a.position[2] + 1.5f, 1.0f}},
                 {0x7C7E0071u, {c, c, c, c}},
-                {0x764F77BAu, {c * 0.65f, c * 0.65f, c * 0.65f, c * 0.65f}},
-                {0xAFBDF744u, {c * 0.65f, c * 0.65f, c * 0.65f, c * 0.65f}},
                 {0xC6BC8C0Eu, {c, c, c, c}},
                 {0x6057A3B9u, {0.875f - 0.55f * c, 0, 0, 0}},
             });
