@@ -1553,22 +1553,35 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity)
             for (const auto& [off, p] : g.scripts[k].placements)
                 if (p.id) into.insert(p.id);
         };
+        // Keep cold air / frost hazard FX (cryo_env_hazard.es) visible; hide all other
+        // event/script-driven FX (Compiler aura terminals, dcon, toxic gas, etc.) so they
+        // do not play while idle (user decision, 2026-11-24).
+        std::unordered_set<uint64_t> cold_fx_nodes;
+        auto walk_placements = [&](size_t root, auto&& on_node) {
+            std::vector<size_t> at{root};
+            std::set<size_t> seen{root};
+            for (int depth = 0; depth <= 2 && !at.empty(); ++depth) {
+                std::vector<size_t> next;
+                for (const size_t x : at) {
+                    on_node(x);
+                    for (const auto& [off, l] : g.scripts[x].links)
+                        if (seen.insert(l).second) next.push_back(l);
+                }
+                at = std::move(next);
+            }
+        };
         for (size_t k = 0; k < g.scripts.size(); ++k) {
             const std::string& m = g.scripts[k].module;
-            if (m.find("dcon") != std::string::npos) {
-                // The device and what it links to (its native placers), two links deep.
-                std::vector<size_t> at{k};
-                std::set<size_t> seen{k};
-                for (int depth = 0; depth <= 2 && !at.empty(); ++depth) {
-                    std::vector<size_t> next;
-                    for (const size_t x : at) {
-                        place_all(x, map.hidden_fx_nodes);
-                        for (const auto& [off, l] : g.scripts[x].links)
-                            if (seen.insert(l).second) next.push_back(l);
-                    }
-                    at = std::move(next);
-                }
-            }
+            if (m.find("cryo_env_hazard") != std::string::npos)
+                walk_placements(k, [&](size_t x) { place_all(x, cold_fx_nodes); });
+        }
+        for (size_t k = 0; k < g.scripts.size(); ++k) {
+            const std::string& m = g.scripts[k].module;
+            if (m.empty() || m.starts_with("native ") || m.find("cryo_env_hazard") != std::string::npos) continue;
+            walk_placements(k, [&](size_t x) {
+                for (const auto& [off, p] : g.scripts[x].placements)
+                    if (p.id && !cold_fx_nodes.contains(p.id)) map.hidden_fx_nodes.insert(p.id);
+            });
         }
     }
     return map.hidden_nodes.size() + map.hidden_fx_nodes.size() - before;
@@ -1681,9 +1694,8 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             if (it->second.empty()) continue;
             const auto rows = quat_rows(r, e);
             for (const auto& [s, gate] : it->second) {
-                // The user asked to remove the dark smoke in the Compiler room.
-                // Keep other systems, including the other effects on this same node.
-                if (map.bubble.value == 0x80B385FAu && ent->value == 0x80AA4CE0u && s == 0x80AA4CBFu) continue;
+                // Hide the Compiler room's dark/haze FX entity (80AA4CE0: 80AA4CA0/80AA4CBF/80AA4CDE).
+                if (map.bubble.value == 0x80B385FAu && ent->value == 0x80AA4CE0u) continue;
                 out.push_back({TagHash(s), rows, gate});
             }
         }
