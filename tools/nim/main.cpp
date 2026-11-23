@@ -3473,10 +3473,18 @@ public:
             next_update_poll = now + std::chrono::milliseconds(500);
         }
         if (update_state == "auth") ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateAuth));
-        else if (update_state.starts_with("ready ")) ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateReady));
+        else if (update_state.starts_with("ready ")) {
+            ImGui::TextWrapped("%s (v%s)", ui::tr(ui::S::UpdateReady), update_state.c_str() + 6);
+            if (ImGui::Button(ui::tr(ui::S::UpdateRestart))) {
+                std::ofstream marker(exe_dir() / ".nim-update-relaunch", std::ios::trunc);
+                marker << "1\n";
+                marker.close();
+                PostQuitMessage(0);
+            }
+        }
         else if (update_state == "current") ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateCurrent));
         else if (update_state.starts_with("error ") || update_state == "running")
-            ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateUnavailable));
+            ImGui::TextDisabled("%s (%s)", ui::tr(ui::S::UpdateUnavailable), update_state.c_str());
         else if (update_state == "checking" || update_state.starts_with("downloading "))
             ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateChecking));
         ImGui::Text("%s", ui::trf(ui::S::SettingsGpu, gpu.adapter_name()).c_str());

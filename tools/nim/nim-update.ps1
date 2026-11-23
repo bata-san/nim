@@ -6,10 +6,27 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $dir = $PSScriptRoot
-$viewerPath = Join-Path $dir 'nim.exe'
+$viewerPath = [IO.Path]::GetFullPath((Join-Path $dir 'nim.exe'))
 $statusPath = Join-Path $dir 'nim-update-status.txt'
+$logPath = Join-Path $dir 'nim-update.log'
+$relaunchPath = Join-Path $dir '.nim-update-relaunch'
 $api = 'https://api.github.com/repos/bata-san/nim'
 function Set-Status([string]$value) { [IO.File]::WriteAllText($statusPath, $value) }
+function Write-Log([string]$msg) {
+    try { [IO.File]::AppendAllText($logPath, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg`r`n") } catch {}
+}
+function Replace-WithRetry([string]$source, [string]$destination, [string]$backup) {
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+        try {
+            if ([IO.File]::Exists($destination)) { [IO.File]::Replace($source, $destination, $backup) }
+            else { [IO.File]::Move($source, $destination) }
+            return
+        } catch [IO.IOException], [UnauthorizedAccessException] {
+            if ($attempt -eq 30) { throw }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+}
 
 try {
     $lock = [IO.File]::Open((Join-Path $dir '.nim-update.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
@@ -20,9 +37,10 @@ $phase = 'check'
 try {
     # Open the process handle before querying GitHub, so a reused PID cannot authorize an update.
     $viewer = Get-Process -Id $ViewerPid
-    if ($viewer.Path -ne $viewerPath) { throw 'Unexpected viewer process.' }
+    if ([IO.Path]::GetFullPath($viewer.Path) -ine $viewerPath) { throw "Unexpected viewer process: $($viewer.Path)" }
     $null = $viewer.Handle
     Set-Status 'checking'
+    Write-Log "check start current=$Version pid=$ViewerPid auto=$Automatic"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $token = $env:NIM_GITHUB_TOKEN
     if (!$token) {
@@ -36,7 +54,14 @@ try {
             if ($cred) { $token = $cred.Substring(9) }
         }
     }
-    if (!$token) { Set-Status 'auth'; exit 2 }
+    if (!$token) {
+        $gh = Get-Command gh.exe -CommandType Application -ErrorAction SilentlyContinue
+        if ($gh) {
+            $ghToken = & $gh.Source auth token 2>$null | Select-Object -First 1
+            if ($ghToken) { $token = $ghToken.Trim() }
+        }
+    }
+    if (!$token) { Set-Status 'auth'; Write-Log 'auth: no token'; exit 2 }
     $headers = @{
         Authorization = "Bearer $token"
         'User-Agent' = 'nim-updater'
@@ -47,13 +72,14 @@ try {
     catch {
         if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -in 401,403,404) {
             Set-Status 'auth'
+            Write-Log "auth: HTTP $([int]$_.Exception.Response.StatusCode)"
             exit 2
         }
         throw
     }
-    if ($release.tag_name -notmatch '^v(\d+\.\d+\.\d+)$') { throw 'Invalid release tag.' }
+    if ($release.tag_name -notmatch '^v(\d+\.\d+\.\d+)$') { throw "Invalid release tag: $($release.tag_name)" }
     $next = [version]$Matches[1]
-    if ($next -le $Version) { Set-Status 'current'; exit 0 }
+    if ($next -le $Version) { Set-Status 'current'; Write-Log "current: latest=$next"; exit 0 }
     $asset = @($release.assets | Where-Object { $_.name -ceq "nim-v$next-win64.zip" -and $_.state -eq 'uploaded' })
     if ($asset.Count -ne 1 -or $asset[0].digest -notmatch '^sha256:([0-9a-fA-F]{64})$') { throw 'Invalid release asset.' }
     $digest = $Matches[1]
@@ -62,6 +88,7 @@ try {
 
     $phase = 'download'
     Set-Status "downloading $next"
+    Write-Log "downloading $next ($($asset.size) bytes)"
     $stage = Join-Path $dir ('.nim-update-' + [guid]::NewGuid())
     $null = [IO.Directory]::CreateDirectory($stage)
     $zip = Join-Path $stage 'release.zip'
@@ -102,19 +129,31 @@ try {
         foreach ($name in $files) {
             $entry = $archive.GetEntry($name)
             if (!$entry -and $name -notin $required) { continue }
-            if (!$entry -or $entry.Length -le 0 -or $entry.Length -gt 64MB) { throw 'Invalid package entry.' }
+            if (!$entry -or $entry.Length -le 0 -or $entry.Length -gt 64MB) { throw "Invalid package entry: $name" }
             [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $stage $name))
         }
     } finally { $archive.Dispose() }
 
     Set-Status "ready $next"
+    Write-Log "ready $next; waiting for viewer exit"
     $viewer.WaitForExit()
-    if ($Automatic -and !(Select-String -LiteralPath (Join-Path $dir 'nim_settings.ini') -Pattern '^auto_update=1$' -Quiet)) {
+    Start-Sleep -Milliseconds 250
+    $settingsPath = Join-Path $dir 'nim_settings.ini'
+    if ($Automatic -and (!(Test-Path -LiteralPath $settingsPath) -or !(Select-String -LiteralPath $settingsPath -Pattern '^auto_update=1$' -Quiet))) {
         Set-Status 'cancelled'
+        Write-Log 'cancelled: auto_update disabled'
         exit 0
     }
-    if (Get-Process nim -ErrorAction SilentlyContinue | Where-Object Path -EQ $viewerPath) {
+    # Wait briefly for any other nim.exe instance at the same path to finish closing.
+    for ($w = 0; $w -lt 25; $w++) {
+        $others = @(Get-Process nim -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $viewerPath) })
+        if ($others.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    $others = @(Get-Process nim -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $viewerPath) })
+    if ($others.Count -gt 0) {
         Set-Status 'running'
+        Write-Log 'running: another nim.exe at the same path is still open'
         exit 3
     }
     $phase = 'install'
@@ -125,31 +164,38 @@ try {
             if (![IO.File]::Exists($source)) { continue }
             $destination = Join-Path $dir $name
             $backup = Join-Path $stage "$name.previous"
-            if ([IO.File]::Exists($destination)) { [IO.File]::Replace($source, $destination, $backup) }
-            else { [IO.File]::Move($source, $destination) }
+            Replace-WithRetry $source $destination $backup
             $changed += $name
         }
     } catch {
         $keepBackup = $true
+        Write-Log "install failed: $($_.Exception.Message); rolling back"
         [array]::Reverse($changed)
         foreach ($name in $changed) {
             $destination = Join-Path $dir $name
             $backup = Join-Path $stage "$name.previous"
-            if ([IO.File]::Exists($backup)) { [IO.File]::Replace($backup, $destination, $null) }
-            else { [IO.File]::Delete($destination) }
+            if ([IO.File]::Exists($backup)) { Replace-WithRetry $backup $destination $null }
+            elseif ([IO.File]::Exists($destination)) { [IO.File]::Delete($destination) }
         }
         $keepBackup = $false
         throw
     }
     Set-Status "installed $next"
+    Write-Log "installed $next"
+    if ([IO.File]::Exists($relaunchPath)) {
+        try { [IO.File]::Delete($relaunchPath) } catch {}
+        Write-Log "relaunching $viewerPath"
+        Start-Process -FilePath $viewerPath -WorkingDirectory $dir
+    }
 } catch {
     Set-Status "error $phase"
+    Write-Log "error $phase : $($_.Exception.Message)"
     exit 1
 } finally {
     if (!$keepBackup -and $stage -and (Test-Path -LiteralPath $stage)) {
         # The directory name is generated above. Remove only the known files.
         Get-ChildItem -LiteralPath $stage -File | Remove-Item -ErrorAction SilentlyContinue
-        [IO.Directory]::Delete($stage)
+        try { [IO.Directory]::Delete($stage) } catch {}
     }
     $lock.Dispose()
 }
