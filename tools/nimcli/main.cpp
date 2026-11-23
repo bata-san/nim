@@ -1695,6 +1695,81 @@ int cmd_ai_sim(PackageManager& pm, TagHash activity, float seconds, float dt, st
     return 0;
 }
 
+// Where the squads' location components point (3.112): every 64-bit word of each squad's linked
+// components, looked up in the node ids of every activity's node tables.
+int cmd_squad_links(PackageManager& pm, TagHash activity) {
+    pm.build_hash64_index();
+    const MapGameplay g = load_map_gameplay(pm, activity);
+    std::unordered_map<uint64_t, std::string> where;  // node id -> "activity map"
+    for (const auto& m : list_activity_maps(pm)) {
+        const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+        for (const auto table : layout.node_tables) {
+            std::vector<uint8_t> data;
+            try { data = pm.read(table); } catch (...) { continue; }
+            TagReader r(data);
+            const auto nodes = r.vec_at(0x08);
+            for (uint64_t k = 0; k < nodes.count; ++k) {
+                const size_t e = nodes.data + size_t(k) * 0x90;
+                if (e + 0x90 > data.size()) break;
+                where.try_emplace(r.u64_at(e + 0x70), std::format("{} map {} table {}", m.activity.str(), m.activity_map, table.str()));
+            }
+        }
+    }
+    std::map<std::string, size_t> hits;
+    std::map<std::string, size_t> target_kinds;
+    size_t squads = 0;
+    for (const auto& sq : g.squads) {
+        ++squads;
+        for (const auto& l : g.scripts[sq.script].links) {
+            const auto& t = g.scripts[l.second];
+            ++target_kinds[t.module];
+            if (t.native_class == 0x80805BE0u) continue;
+            const auto d = pm.read(t.component);
+            for (size_t o = 0; o + 8 <= d.size(); o += 4) {
+                uint64_t w;
+                std::memcpy(&w, d.data() + o, 8);
+                if (auto f = where.find(w); f != where.end()) ++hits[t.module + " -> " + f->second];
+            }
+        }
+    }
+    for (size_t k = 0; k < std::min<size_t>(3, g.squads.size()); ++k) {
+        const auto& o = g.scripts[g.squads[k].script];
+        std::println("squad {} component {} slot {:016X} links {}", k, o.component.str(), o.slot, o.links.size());
+        for (const auto& l : o.links) std::println("   link at +0x{:X} -> {} {}", l.first, g.scripts[l.second].component.str(), g.scripts[l.second].module);
+    }
+    {
+        std::map<size_t, std::vector<size_t>> by_group;
+        size_t none = 0;
+        for (size_t k = 0; k < g.squads.size(); ++k) {
+            if (g.squads[k].group) by_group[*g.squads[k].group].push_back(k);
+            else ++none;
+        }
+        std::map<size_t, size_t> hist;
+        for (const auto& [gr, v] : by_group) ++hist[v.size()];
+        std::println("squad groups {} (squads without a group {}); squads per group:", by_group.size(), none);
+        for (const auto& [n, c] : hist) std::println("  {:3} squads: {} groups", n, c);
+        size_t shown = 0;
+        for (const auto& [gr, v] : by_group) {
+            if (v.size() < 3 || shown++ >= 3) continue;
+            const auto& go = g.scripts[gr];
+            std::string names;
+            for (const auto& [off, n] : go.names) names += " " + n;
+            std::println("  group {} {} names:{}", go.component.str(), go.module, names.substr(0, 400));
+            for (const auto k : v) {
+                const auto& sq = g.squads[k];
+                std::println("    squad {} members {} positions {} first ({:.1f} {:.1f} {:.1f})", g.scripts[sq.script].component.str(), sq.members.size(),
+                             sq.positions.size(), sq.positions.empty() ? 0.f : sq.positions[0].position[0],
+                             sq.positions.empty() ? 0.f : sq.positions[0].position[1], sq.positions.empty() ? 0.f : sq.positions[0].position[2]);
+            }
+        }
+    }
+    std::println("{} squads; linked component kinds:", squads);
+    for (const auto& [k, n] : target_kinds) std::println("  {:5} {}", n, k);
+    std::println("node ids found in linked components:");
+    for (const auto& [k, n] : hits) std::println("  {:5} {}", n, k);
+    return 0;
+}
+
 int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const char* json) {
     pm.build_hash64_index();
     const MapGameplay g = load_map_gameplay(pm, activity);
@@ -2720,6 +2795,27 @@ int cmd_entity_components(PackageManager& pm, TagHash entity, bool verbose = fal
     return 0;
 }
 
+// Packages holding AI script components (3.112): squads (80805BE0), objectives (80805B33) and
+// firing areas (8080B0D1) by the native class at +0xAC.
+int cmd_ai_packages(PackageManager& pm) {
+    for (const auto& info : pm.packages()) {
+        Package& p = pm.open(info);
+        size_t sq = 0, ob = 0, fa = 0;
+        for (uint32_t i = 0; i < p.entries().size(); ++i) {
+            const Entry& e = p.entries()[i];
+            if (e.type != 8 || e.reference != 0x8080BADB) continue;
+            std::vector<uint8_t> d;
+            try { d = p.read_entry(i); } catch (...) { continue; }
+            if (d.size() < 0xB0) continue;
+            uint32_t c;
+            std::memcpy(&c, d.data() + 0xAC, 4);
+            sq += c == 0x80805BE0u, ob += c == 0x80805B33u, fa += c == 0x8080B0D1u;
+        }
+        if (sq || ob || fa) std::println("{:04X} {:<40} squads {:4} objectives {:4} firing areas {:4}", info.pkg_id, info.name, sq, ob, fa);
+    }
+    return 0;
+}
+
 int cmd_components(PackageManager& pm, uint32_t want) {
     std::map<std::pair<uint32_t, uint32_t>, size_t> hist;
     for (const auto& info : pm.packages()) {
@@ -2903,7 +2999,7 @@ int cmd_clips(PackageManager& pm, uint32_t bones) {
 // Skin weights of a dynamic model's meshes.
 // Heights of a dynamic model's vertices (bind pose, model space) inside an x/y box, in 0.1 m bins,
 // with the upward-facing ones counted apart: where floors are (3.111, the dropship's bay).
-int cmd_mesh_slice(PackageManager& pm, TagHash tag, float x0, float x1, float y0, float y1) {
+int cmd_mesh_slice(PackageManager& pm, TagHash tag, float x0, float x1, float y0, float y1, int only_bone) {
     DynamicModel m = load_dynamic_model(pm, tag);
     std::map<int, std::pair<size_t, size_t>> bins;
     std::map<uint16_t, size_t> up_bones;  // the bone of the upward-facing vertices (skinned meshes)
@@ -2918,14 +3014,16 @@ int cmd_mesh_slice(PackageManager& pm, TagHash tag, float x0, float x1, float y0
             float p[3];
             for (int a = 0; a < 3; ++a) p[a] = float(q[a]) / 32767.0f * m.model_scale[a] + m.model_offset[a];
             if (p[0] < x0 || p[0] > x1 || p[1] < y0 || p[1] > y1) continue;
-            auto& b = bins[int(std::floor(p[2] * 10))];
+            if (only_bone >= 0 && (v >= w.bones.size() || w.bones[v][0] != only_bone)) continue;
+            auto& b = bins[int(std::floor(p[only_bone >= 0 ? 0 : 2] * 10))];
             ++b.first;
             const bool up = float(n[2]) / 32767.0f > 0.9f;
             b.second += up;
             if (up && v < w.bones.size()) ++up_bones[w.bones[v][0]];
         }
     }
-    for (const auto& [z, n] : bins) std::println("z {:5.1f}: {:5} vertices, {:5} facing up", z / 10.0, n.first, n.second);
+    // With a bone: that bone's vertices by x instead of z.
+    for (const auto& [z, n] : bins) std::println("{} {:5.1f}: {:5} vertices, {:5} facing up", only_bone >= 0 ? "x" : "z", z / 10.0, n.first, n.second);
     for (const auto& [bone, n] : up_bones) std::println("facing up on bone {}: {}", bone, n);
     return 0;
 }
@@ -4168,6 +4266,8 @@ int main(int argc, char** argv) {
         if (cmd == "skeletons") return cmd_skeletons(pm);
         if (cmd == "animaudit") return cmd_animaudit(pm);
         if (cmd == "rig-order") return cmd_rig_order(pm);
+        if (cmd == "ai-packages") return cmd_ai_packages(pm);
+        if (cmd == "squad-links" && args.size() >= 2) return cmd_squad_links(pm, TagHash(parse_hex(args[1])));
         if (cmd == "objaudit") return cmd_objaudit(pm);
         if (cmd == "clip" && args.size() >= 2) return cmd_clip(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 0);
         if (cmd == "clip-tracks" && args.size() >= 3) return cmd_clip_tracks(pm, TagHash(parse_hex(args[1])), args[2]);
@@ -4178,7 +4278,7 @@ int main(int argc, char** argv) {
         if (cmd == "mesh-slice" && args.size() >= 3) {
             float b[4];
             if (std::sscanf(args[2].c_str(), "%f,%f,%f,%f", &b[0], &b[1], &b[2], &b[3]) != 4) throw std::runtime_error("mesh-slice TAG x0,x1,y0,y1");
-            return cmd_mesh_slice(pm, TagHash(parse_hex(args[1])), b[0], b[1], b[2], b[3]);
+            return cmd_mesh_slice(pm, TagHash(parse_hex(args[1])), b[0], b[1], b[2], b[3], args.size() >= 4 ? std::stoi(args[3]) : -1);
         }
         if (cmd == "skin" && args.size() >= 2) return cmd_skin(pm, TagHash(parse_hex(args[1])), args.size() > 2 ? std::stoi(args[2]) : -1);
         if (cmd == "entity-components" && args.size() >= 2)

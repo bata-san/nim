@@ -1107,9 +1107,21 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     };
     std::unordered_map<uint64_t, MapGameplayPoint> by_id;
     TagHash bubble;
-    for (const auto& m : list_activity_maps(pm)) {
-        if (m.activity != activity) continue;
-        bubble = m.bubble;
+    const auto activity_maps = list_activity_maps(pm);
+    for (const auto& m : activity_maps)
+        if (m.activity == activity) bubble = m.bubble;
+    // The activity's own nodes first; then the other activities on the same bubble, whose nodes
+    // only resolve squad locations (3.112: the ambient and TDM activities place none of the squads'
+    // location nodes, the expedition activity does; the squads are the bubble family's).
+    std::vector<const MapEntry*> order;
+    for (const auto& m : activity_maps)
+        if (m.activity == activity) order.push_back(&m);
+    const size_t own_maps = order.size();
+    for (const auto& m : activity_maps)
+        if (m.bubble == bubble && m.activity != activity) order.push_back(&m);
+    for (size_t mi = 0; mi < order.size(); ++mi) {
+        const auto& m = *order[mi];
+        const bool own = mi < own_maps;
         const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
         for (const auto table : layout.node_tables) {
             std::vector<uint8_t> data;
@@ -1123,7 +1135,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
             for (uint64_t k = 0; k < nodes.count; ++k) {
                 const size_t e = nodes.data + size_t(k) * 0x90;
                 if (e + 0x90 > data.size()) break;
-                ++out.nodes;
+                out.nodes += own;
                 MapGameplayPoint pt;
                 for (size_t a = 0; a < 4; ++a) pt.rotation[a] = r.f32_at(e + a * 4);
                 for (size_t a = 0; a < 3; ++a) pt.position[a] = r.f32_at(e + 0x10 + a * 4);
@@ -1141,6 +1153,14 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
                     p += size_t(next);
                 }
                 const uint64_t h64 = r.u64_at(e + 0x30);
+                if (!own) {
+                    if (pt.id && pt.id != ~0ull && !by_id.contains(pt.id)) {
+                        if (h64 && h64 != ~0ull)
+                            if (const auto ent = pm.resolve64(h64)) pt.entity = *ent, pt.model = entity_info(*ent).model;
+                        by_id.emplace(pt.id, std::move(pt));
+                    }
+                    continue;
+                }
                 bool spawn = start;
                 if (h64 && h64 != ~0ull)
                     if (const auto ent = pm.resolve64(h64)) {
@@ -1253,10 +1273,24 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         std::ranges::sort(names);
         return names;
     };
-    // Slot header: 12 bytes shared by every slot instance; the slot's 64-bit id sits 0x20 after it.
-    // Components refer to other slots by that id (a squad to its spawn location, a point group's
-    // owner to the group).
+    // Slot header: 12 bytes, the slot's 64-bit id 0x20 after it. Components refer to other slots by
+    // that id (a squad to its spawn location, a point group's owner to the group). The 12 bytes
+    // differ per map (Outpost 1134D592..., Perimeter 7661882A...): the header is found where it
+    // sits, right after the component's record {u32 kind, u32 its own tag, u32 class, u64 0xB0}
+    // (3.112). The Outpost bytes are the fallback.
     static constexpr uint8_t kSlotHeader[12] = {0x11, 0x34, 0xD5, 0x92, 0x55, 0xC2, 0x5F, 0xC9, 0x98, 0xFB, 0xA8, 0x2E};
+    auto find_header = [](const std::vector<uint8_t>& d, uint32_t own) -> size_t {
+        for (size_t o = 0; o + 16 + 0x28 <= d.size(); o += 4) {
+            uint32_t a;
+            uint64_t b;
+            std::memcpy(&a, d.data() + o, 4);
+            std::memcpy(&b, d.data() + o + 8, 8);
+            if (a == own && b == 0xB0) return o + 16;
+        }
+        const auto it = std::search(d.begin(), d.end(), std::begin(kSlotHeader), std::end(kSlotHeader));
+        return it == d.end() || size_t(it - d.begin()) + 0x28 > d.size() ? SIZE_MAX : size_t(it - d.begin());
+    };
+    std::vector<size_t> header_at;  // per raw component: its slot header offset, or SIZE_MAX
     std::vector<MapScriptObject> all;
     std::vector<std::vector<uint8_t>> raw;
     std::unordered_map<uint64_t, size_t> by_slot;
@@ -1302,11 +1336,12 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
             uint32_t table;
             std::memcpy(&table, d.data() + 0x80, 4);
             obj.names = names_of(table);
-            const auto hdr = std::search(d.begin(), d.end(), std::begin(kSlotHeader), std::end(kSlotHeader));
-            if (hdr != d.end() && size_t(hdr - d.begin()) + 0x28 <= d.size()) {
-                std::memcpy(&obj.slot, &*hdr + 0x20, 8);
+            const size_t hdr = find_header(d, obj.component.value);
+            if (hdr != SIZE_MAX) {
+                std::memcpy(&obj.slot, d.data() + hdr + 0x20, 8);
                 if (obj.slot && obj.slot != ~0ull) by_slot.try_emplace(obj.slot, all.size());
             }
+            header_at.push_back(hdr);
             all.push_back(std::move(obj));
             raw.push_back(std::move(d));
         }
@@ -1351,10 +1386,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
         }
         return {0, 0};
     };
-    auto header = [&](const std::vector<uint8_t>& d) -> size_t {
-        const auto it = std::search(d.begin(), d.end(), std::begin(kSlotHeader), std::end(kSlotHeader));
-        return it == d.end() ? SIZE_MAX : size_t(it - d.begin());
-    };
+    auto header = [&](size_t raw_index) { return header_at[raw_index]; };
     auto rotate = [](const std::array<float, 4>& q, std::array<float, 3> v) {
         const float x = q[0], y = q[1], z = q[2], w = q[3];
         const float tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
@@ -1367,7 +1399,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     for (size_t k = 0; k < out.scripts.size(); ++k) {
         const auto& o = out.scripts[k];
         const auto& d = raw[orig[k]];
-        const size_t hh = header(d);
+        const size_t hh = header(orig[k]);
         if (hh == SIZE_MAX) continue;
         TagReader r(d);
         if (o.native_class == kClassAiFiringArea && hh + 0x194 <= d.size()) {
@@ -1421,7 +1453,7 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
                 const auto& target = out.scripts[l.second];
                 if (target.native_class != kClassPoint || !seen.insert(l.second).second) continue;
                 const auto& pd = raw[orig[l.second]];
-                const size_t ph = header(pd);
+                const size_t ph = header(orig[l.second]);
                 if (ph == SIZE_MAX || ph + 0x8C > pd.size()) continue;
                 TagReader pr(pd);
                 pg.points.push_back({pr.f32_at(ph + 0x80), pr.f32_at(ph + 0x84), pr.f32_at(ph + 0x88)});

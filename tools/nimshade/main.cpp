@@ -715,6 +715,35 @@ int run(int argc, char** argv) {
                 std::println("ai stayed within 1.5 m: {} of {} active ({} without firing areas, {} without locomotion, {} other)", still, active,
                              no_area, no_motion, other);
             }
+            {
+                // Crowding (3.112): the most active agents within 3 m of one agent, and how many
+                // agents have more than 4 others that close.
+                size_t densest = 0, crowded = 0, at = 0;
+                const auto& ag = ai_sim->agents();
+                for (size_t k = 0; k < ag.size(); ++k) {
+                    if (!ag[k].active) continue;
+                    size_t n = 0;
+                    for (size_t j = 0; j < ag.size(); ++j)
+                        n += j != k && ag[j].active && std::hypot(ag[j].position[0] - ag[k].position[0], ag[j].position[1] - ag[k].position[1]) < 3 &&
+                             std::fabs(ag[j].position[2] - ag[k].position[2]) < 2;
+                    crowded += n > 4;
+                    if (n > densest) densest = n, at = k;
+                }
+                if (densest)
+                    std::println("ai crowding: up to {} others within 3 m of agent {} at ({:.1f} {:.1f} {:.1f}) squad {}; {} agents with more than 4", densest,
+                                 at, ag[at].position[0], ag[at].position[1], ag[at].position[2], ag[at].squad, crowded);
+                if (densest) {
+                    std::map<size_t, size_t> squads;
+                    for (const auto& o : ag)
+                        if (o.active && std::hypot(o.position[0] - ag[at].position[0], o.position[1] - ag[at].position[1]) < 3) ++squads[o.squad];
+                    for (const auto& [sq, n] : squads) {
+                        const auto& q = ai_gameplay->squads[sq];
+                        std::println("  squad {} ({}): {} here, {} members, {} positions, group {}, ship {}", sq, ai_gameplay->scripts[q.script].component.str(), n,
+                                     q.members.size(), q.positions.size(), q.group ? ai_gameplay->scripts[*q.group].component.str() : "-",
+                                     std::ranges::any_of(q.positions, [](const auto& p) { return p.model.value == 0x80ACA5E7u; }));
+                    }
+                }
+            }
             // The UESC dropship (3.71): the model of the dropship squads' spawner nodes.
             for (const auto& sq : ai_gameplay->squads)
                 if (const auto p = std::ranges::find(sq.positions, 0x80ACA5E7u, [](const MapGameplayPoint& q) { return q.model.value; });
@@ -780,6 +809,7 @@ int run(int argc, char** argv) {
                 ai_sim->step(0.1f, player);
                 ai_actors.update(scene, *ai_sim, player, 0.1f, ai_range);
             }
+            std::println("ai squads left out as alternatives: {}", ai_sim->alternatives_dropped());
             std::println("ai: {} agents, {} drones after {:.0f}s; {} actor slots, {} shown within {:.0f} m ({:.1f}s)", ai_sim->agents().size(),
                          ai_sim->drones().size(), ai_sim->time(), ai_actors.slots(), ai_actors.shown(), ai_range,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count());

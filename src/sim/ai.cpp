@@ -562,16 +562,18 @@ std::vector<AiEstimate> ai_estimates(const AiParams& p) {
         {"drone_speed", p.drone_speed, "m/s along the patrol spline, back and forth"},
         {"drone_scan_range", p.drone_scan_range, "m, all around"},
         {"movement", 0, "straight lines inside firing areas; no navmesh was found, so walls are ignored"},
-        {"spawn", 0, "squads without a dropship spawn at their positions (member i at position i mod n) when the player comes within spawn_range"},
+        {"spawn", 0, "squads without a dropship spawn at their positions (member i at position i mod n) when the player comes within spawn_range; a member whose node is taken stands on the nearest open floor around it, 0.9 m from the others"},
+        {"spawn_crowd", float(p.spawn_crowd), "active agents within 4 m of a squad's spawn nodes that make it wait to spawn (squads of several groups share staging spots; it spawns once they walk off)"},
+        {"squad_alternatives", 0, "within a squad group, squads sharing a spawn node (or nodes within 2 m) are alternatives (fodder_squad / elite_squad ...): one of them, picked by the seed, spawns"},
         {"spawn_range", p.spawn_range, "m from the player to a squad's spawn points at which it appears (the engine's encounter scripts are code)"},
         {"despawn_range", p.despawn_range, "m: a squad is removed when the player and all its members are farther; a dropship's squad once its ship has left (the ship comes again)"},
         {"partial_walk", 3, "m: a patrol point behind an obstacle sends the agent to the farthest open point along the straight line (3 m or more) instead of waiting for a path search"},
-        {"dropship_seats", 10, "members ride in the bay two abreast (y +-0.6 m), 0.9 m apart from x -4.6 m forward (ten seats); the bay floor (2.0 m) and the ramp (top face 2.65 m, x -5.4..-7.8) are the ship model's, the seats are not data"},
+        {"dropship_seats", 10, "members ride in the bay two abreast (y +-0.6 m), 0.9 m apart from x -4.6 m forward (ten seats); the bay floor (2.0 m) and the ramp (top face 2.45 m, x -5.4..-7.8) are the ship model's, the seats are not data"},
         {"dropship_bay_walk", p.dropship_bay_walk, "m/s from the seat down the ramp to the jump point"},
-        {"dropship_jump_x", p.dropship_jump_x, "m (ship space): the point on the ramp it jumps from, behind the outer door's lowest edge"},
+        {"dropship_jump_x", p.dropship_jump_x, "m (ship space): the point near the ramp's end (x -7.8) it steps off; the walk rises from the floor (2.0 m) to the ramp (2.45 m) between x -4.6 and -5.4, eased"},
         {"dropship_ramp", 11, "frames: the inner panel's clip (80ACA682) folds the ramp down from the start of unloading and back up from the start of the departure, at the clip rate; no clip plays it with the ship's others"},
         {"dropship_jump_back", p.dropship_jump_back, "m/s backwards off the ramp; the fall is free (9.81 m/s2), in the idle pose (no jump clip found)"},
-        {"dropship_jump_up", p.dropship_jump_up, "m/s up off the ramp"},
+        {"dropship_jump_up", p.dropship_jump_up, "m/s up off the ramp's end (a step off that clears it)"},
         {"dropship_call_range", p.dropship_call_range, "m: a dropship squad's ship is called when the player comes this close to its spawner (the engine's encounter trigger is script code)"},
         {"dropship_call_delay", p.dropship_call_delay, "s, uniform random delay after the call"},
         {"dropship_arrive", p.dropship_arrive, "s: arrival clip length at the 30 fps clip rate"},
@@ -619,9 +621,47 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
             for (const auto a : g.objectives[*o].firing_areas)
                 if (!areas_[a].triangles.empty() && areas_[a].cumulative.back() > 0.01f) squad_areas_[s].push_back(a);
     std::uniform_real_distribution<float> angle(-kPi, kPi);
+    // Alternatives (3.112, 推定: the squad groups' choice is script code). A squad group lists squads
+    // such as fodder_squad / fodder_squad_1 / elite_squad that spawn at the same nodes (Outpost
+    // 80AF9E70: five squads on one node); spawning all of them stacked several squads on one
+    // point. Within a group, squads sharing a spawn node (or nodes within 2 m) are alternatives and one of them spawns
+    // (picked by the seed); squads on other nodes, and squads without a group, all spawn.
+    std::vector<char> chosen(g.squads.size(), 1);
+    {
+        std::map<size_t, std::vector<size_t>> by_group;
+        for (size_t s = 0; s < g.squads.size(); ++s)
+            if (g.squads[s].group && !g.squads[s].positions.empty()) by_group[*g.squads[s].group].push_back(s);
+        for (const auto& [group, list] : by_group) {
+            std::vector<size_t> cluster(list.size());
+            for (size_t i = 0; i < list.size(); ++i) cluster[i] = i;
+            auto root = [&](size_t i) {
+                while (cluster[i] != i) i = cluster[i] = cluster[cluster[i]];
+                return i;
+            };
+            for (size_t i = 0; i < list.size(); ++i)
+                for (size_t j = i + 1; j < list.size(); ++j) {
+                    bool shared = false;
+                    for (const auto& p : g.squads[list[i]].positions)
+                        for (const auto& q : g.squads[list[j]].positions)
+                            shared = shared || p.id == q.id ||
+                                     std::hypot(p.position[0] - q.position[0], p.position[1] - q.position[1], p.position[2] - q.position[2]) < 2;
+                    if (shared) cluster[root(i)] = root(j);
+                }
+            std::map<size_t, std::vector<size_t>> members;
+            for (size_t i = 0; i < list.size(); ++i) members[root(i)].push_back(list[i]);
+            for (const auto& [r, squads] : members) {
+                if (squads.size() < 2) continue;
+                const size_t pick = std::uniform_int_distribution<size_t>(0, squads.size() - 1)(rng_);
+                for (size_t i = 0; i < squads.size(); ++i) chosen[squads[i]] = i == pick;
+            }
+        }
+    }
     for (size_t s = 0; s < g.squads.size(); ++s) {
         const auto& sq = g.squads[s];
-        if (sq.positions.empty()) continue;
+        if (sq.positions.empty() || !chosen[s]) {
+            if (sq.positions.empty() == false) ++alternatives_dropped_;
+            continue;
+        }
         // A squad whose spawner is a uesc_dropship_spawner node (its entity's model is the UESC
         // dropship, 80ACA5E7; the spawners sit in the `dropships` containers) arrives by ship.
         std::optional<size_t> ship;
@@ -653,8 +693,7 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
             a.squad = s;
             a.character = sq.members[m];
             const auto& p = sq.positions[m % sq.positions.size()];
-            a.position = p.position;
-            a.position[0] += 0.8f * float(m / sq.positions.size());  // members sharing a position stand apart
+            a.position = p.position;  // members sharing a node stand apart when they spawn (spawn)
             a.goal = a.position;
             a.home = a.position;
             a.yaw = angle(rng_);
@@ -928,18 +967,19 @@ float AiSimulation::floor_below(size_t squad, float x, float y, float z) const {
 }
 
 // A member's way out of the bay (3.111, 推定): from its seat along the bay floor and down the
-// folded ramp (rising to its top face between x -5.0 and -5.4 in ship space) to dropship_jump_x at
+// folded ramp (rising to its top face between x -4.6 and -5.4 in ship space) to dropship_jump_x at
 // dropship_bay_walk, a jump off the ramp (backwards and up) falling freely (9.81 m/s2) to the floor
 // below the landing point, then 2 s walking 3 m further back.
 AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgent& a, float t) const {
-    constexpr float kLip = -5.0f, kRamp = -5.4f, kG = 9.81f;  // the floor rises to the ramp's top between them
+    constexpr float kLip = -4.6f, kRamp = -5.4f, kG = 9.81f;  // the floor rises to the ramp's top between them
     const float kEdge = params_.dropship_jump_x;
     const float walk = std::max(0.0f, (a.seat[0] - kEdge) / params_.dropship_bay_walk);
     const float bay = params_.dropship_lip_height;  // the jump starts from the lip
     ExitPose p;
     if (t < walk) {
         const float x = a.seat[0] - params_.dropship_bay_walk * t;
-        const float lip = std::clamp((kLip - x) / (kLip - kRamp), 0.0f, 1.0f);
+        const float u = std::clamp((kLip - x) / (kLip - kRamp), 0.0f, 1.0f);
+        const float lip = u * u * (3 - 2 * u);  // eased, no kink at either end
         p.at = {x, a.seat[1], a.seat[2] + lip * (params_.dropship_lip_height - a.seat[2])};
         p.velocity = {-params_.dropship_bay_walk, 0, 0};
         return p;
@@ -966,9 +1006,13 @@ AiSimulation::ExitPose AiSimulation::exit_pose(const AiDropship& d, const AiAgen
         p.airborne = true;
         return p;
     }
+    // Away from the drop point, fanned out by seat (3.112, 推定): the seat's row goes 1.2 m further
+    // back per row and its side 2.4 m out, so a shipload does not stand on two spots.
+    const float row = std::round((a.seat[0] + 4.6f) / 0.9f);
+    const float dx = -3.0f - 1.2f * std::fmod(row, 3.0f), dy = a.seat[1] * 4.0f - a.seat[1];
     const float w = std::clamp((tj - fall) / params_.dropship_exit_walk, 0.0f, 1.0f);
-    p.at = {land - 3.0f * w, a.seat[1], floor};
-    p.velocity = {w < 1 ? -3.0f / params_.dropship_exit_walk : 0.0f, 0, 0};
+    p.at = {land + dx * w, a.seat[1] + dy * w, floor};
+    p.velocity = {w < 1 ? dx / params_.dropship_exit_walk : 0.0f, w < 1 ? dy / params_.dropship_exit_walk : 0.0f, 0};
     p.leaving = w < 1;
     return p;
 }
@@ -1075,7 +1119,27 @@ void AiSimulation::spawn(AiAgent& a) {
     a.riding = false;
     a.exit = -1;
     a.position = a.home;
-    a.goal = a.home;
+    // Not on top of another (3.112, 推定): the nearest open floor around the node, in rings 0.9 m
+    // apart, at least 0.9 m from every active agent.
+    auto free_at = [&](const std::array<float, 3>& p) {
+        for (const auto& o : agents_)
+            if (&o != &a && o.active && std::hypot(o.position[0] - p[0], o.position[1] - p[1]) < 0.9f && std::fabs(o.position[2] - p[2]) < 2)
+                return false;
+        return true;
+    };
+    if (!free_at(a.position)) {
+        bool placed = false;
+        for (int ring = 1; ring <= 4 && !placed; ++ring)
+            for (int k = 0; k < 6 * ring && !placed; ++k) {
+                const float t = 2 * kPi * float(k) / float(6 * ring), r = 0.9f * float(ring);
+                std::array<float, 3> p{a.home[0] + r * std::cos(t), a.home[1] + r * std::sin(t), a.home[2]};
+                const auto z = ground(p[0], p[1], p[2]);
+                if (!z) continue;
+                p[2] = *z;
+                if (open_at(p[0], p[1], p[2], 0.35f) && path_clear(a.home, p, 0.3f) && free_at(p)) a.position = p, placed = true;
+            }
+    }
+    a.goal = a.position;
     a.path.clear();
     a.path_next = 0;
     a.velocity = {};
@@ -1101,8 +1165,24 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
         nearest[a.squad] = std::min(nearest[a.squad], std::hypot(a.home[0] - player[0], a.home[1] - player[1], a.home[2] - player[2]));
         if (a.active && !far(a.position)) members_far[a.squad] = 0;
     }
+    // Room to spawn (3.112, 推定): squads of several groups share one staging spot (Outpost
+    // (88.9, -60.1): five groups); a squad waits while its spawn nodes already have
+    // spawn_crowd active agents within 4 m, and spawns once they have walked off (in waves).
+    auto crowded = [&](size_t s) {
+        size_t n = 0;
+        for (const auto& a : agents_) {
+            if (!a.active || a.squad == s) continue;
+            for (const auto& p : g_.squads[s].positions)
+                if (std::hypot(a.position[0] - p.position[0], a.position[1] - p.position[1]) < 4 && std::fabs(a.position[2] - p.position[2]) < 2) {
+                    ++n;
+                    break;
+                }
+        }
+        return n >= params_.spawn_crowd;
+    };
     for (size_t s = 0; s < g_.squads.size(); ++s) {
         if (!squad_spawned_[s] && nearest[s] < params_.spawn_range) {
+            if (std::ranges::none_of(agents_, [&](const AiAgent& a) { return a.squad == s && !a.dropship; }) || crowded(s)) continue;
             squad_spawned_[s] = 1;
             for (auto& a : agents_)
                 if (a.squad == s && !a.dropship) spawn(a), ++path_stats_.spawned;

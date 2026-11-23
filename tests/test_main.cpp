@@ -541,7 +541,9 @@ int main() {
             for (int i = 0; i < 10; ++i) sp.step(0.1f, {1000, 0, 0});
             CHECK(!sp.agents()[0].active && sp.path_stats().despawned == 2);
             sp.step(0.1f, {5, 60, 0});
-            CHECK(sp.agents()[0].active && sp.agents()[0].position == sp.agents()[0].home);
+            // Near its node (the two members share one; the simulation keeps them 0.9 m apart).
+            const auto& back = sp.agents()[0];
+            CHECK(back.active && std::hypot(back.position[0] - back.home[0], back.position[1] - back.home[1]) < 1.0f);
         }
         // A dropship squad (3.111): the members ride in the bay while the ship arrives, then leave
         // one by one off its rear onto the floor below and patrol.

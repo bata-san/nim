@@ -124,19 +124,21 @@ struct AiParams {  // every value here is an estimate (推定)
     // and down the ramp, jumping off it backwards and up and falling to the floor below. The bay
     // floor and the ramp are the ship model's own (80ACA5E7: upward faces of bone 2 at z 2.0 for
     // x -4..0, |y| < 2; the inner rear panel, bone 3, folds down about its foot at x -5.41, z 2.39
-    // into a ramp whose top face lies at z 2.65 out to x -7.8; the outer door, bone 10, swings up
-    // over it, 1.2 m above the ramp at x -6.4). Where on the ramp they jump is an estimate.
+    // into a ramp: its inner face, x -5.35 upright (`nimcli mesh-slice 80ACA5E7 -6,-5,-1.5,1.5 3`),
+    // becomes the top at z 2.45, out to x -7.8). The walk rises from the floor to the ramp between
+    // x -4.6 and -5.4, runs to near its end and steps off (3.112). Where it steps off is an estimate.
     float dropship_bay_height = 2.0f;    // m: the bay floor above the ship's origin
-    float dropship_lip_height = 2.65f;   // m: the ramp's top face, where the jump starts
-    float dropship_jump_x = -6.6f;       // m (ship space): the point on the ramp it jumps from
+    float dropship_lip_height = 2.45f;   // m: the ramp's top face, where the jump starts
+    float dropship_jump_x = -7.6f;       // m (ship space): the point near the ramp's end it steps off
     float dropship_bay_walk = 2.0f;      // m/s to the rear edge
     float dropship_jump_back = 1.8f;     // m/s backwards off the edge
-    float dropship_jump_up = 1.5f;       // m/s up off the edge
+    float dropship_jump_up = 0.5f;       // m/s up off the edge (a step off, clearing the ramp's end)
     // Spawning by distance (3.111): a squad appears at its spawn points when the player comes
     // within spawn_range of them, and is removed when the player and all its members are farther
     // than despawn_range (dropship squads: once their ship has left; the ship comes again).
     float spawn_range = 100.0f;          // m
     float despawn_range = 150.0f;        // m
+    size_t spawn_crowd = 4;              // active agents near its spawn nodes that make a squad wait (3.112)
 };
 struct AiEstimate {
     std::string name;
@@ -246,6 +248,7 @@ public:
                                                                size_t max_nodes = 3000) const;
     struct PathStats { size_t straight = 0, partial = 0, found = 0, failed = 0, deferred = 0, spawned = 0, despawned = 0; };
     const PathStats& path_stats() const { return path_stats_; }
+    size_t alternatives_dropped() const { return alternatives_dropped_; }  // squads not spawned: another of their group's alternatives was
 
 private:
     struct Area { std::vector<std::array<std::array<float, 3>, 3>> triangles; std::vector<float> cumulative; };
@@ -283,6 +286,7 @@ private:
     void step_spawns(const std::array<float, 3>& player);
     void spawn(AiAgent& a);
     std::vector<uint8_t> squad_spawned_;          // per squad without a dropship
+    size_t alternatives_dropped_ = 0;              // squads left out as another's alternative (3.112)
     mutable std::vector<float> unload_cache_;     // per dropship: unload_seconds, < 0 = not yet
     // A member's drop from the bay (ship space): x, z and its velocity at `t` s after it starts
     // walking out, and whether it is still leaving (false once it has walked off).
