@@ -787,7 +787,7 @@ private:
     struct FroxelHistoryView {
         M4 projection;
         V3 eye, forward;
-        float near_plane, time, time_of_day, day_night_state;
+        float near_plane, time, time_of_day, day_night_state, fog_density_scale;
         bool noise, shadowed, interior, authored_interior_fog, environment;
     } froxel_history_view_{};
     // Engine values unknown (estimates): one cascade of 64 slices, 8x8 pixels per froxel, slice

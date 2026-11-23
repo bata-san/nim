@@ -2718,7 +2718,8 @@ public:
         light.time = material_time;
         light.delta_time = material_dt;
         light.entity_preview = entity_preview_active && !map_scene;
-        light.dof_focus = cam.distance;  // the orbit target is in focus
+        light.dof_edges_only = map_scene;  // flying retains an orbit radius unrelated to surface depth
+        light.dof_focus = cam.distance;
         try {
             const bool game_view = game_ready && light.mode == ViewMode::Lit;
             if (game_ready) {
@@ -3602,6 +3603,7 @@ public:
             ImGui::Checkbox(ui::tr(ui::S::FroxelFog), &light.froxel_fog);
             ImGui::SetItemTooltip(ui::tr(ui::S::FroxelFogTip));
             ImGui::Checkbox(ui::tr(ui::S::InteriorFog), &light.authored_interior_fog);
+            ImGui::SliderFloat(ui::tr(ui::S::FogDensityScale), &light.fog_density_scale, 0.0f, 1.0f, "%.2f");
             ImGui::Checkbox(ui::trf(ui::S::MapEnvironment, game_lighting.environment_channels()).c_str(), &light.environment);
             ImGui::SetItemTooltip(ui::tr(ui::S::MapEnvironmentTip));
             ImGui::Checkbox(ui::tr(ui::S::SkyAmbient), &light.sky_ambient);

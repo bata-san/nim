@@ -71,7 +71,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
         column[1] -= vm.proj.c[2][1] * column[3];
     }
     const FroxelHistoryView current{volume_projection, vm.eye, vm.fwd, vm.proj.c[3][2],
-                                    p.time, p.time_of_day, p.day_night_state,
+                                    p.time, p.time_of_day, p.day_night_state, p.fog_density_scale,
                                     p.froxel_noise, shadowed, covered, p.authored_interior_fog, p.environment};
     const auto& previous = froxel_history_view_;
     const V3 motion = current.eye - previous.eye;
@@ -80,7 +80,7 @@ void GameLighting::render_froxels(Gpu& gpu, ID3D12GraphicsCommandList* cl, const
         dot(motion, motion) < 32.0f * 32.0f && dot(current.forward, previous.forward) > 0.5f &&
         std::abs(current.time - previous.time) <= 0.25f &&
         current.near_plane == previous.near_plane && current.time_of_day == previous.time_of_day &&
-        current.day_night_state == previous.day_night_state && current.noise == previous.noise &&
+        current.day_night_state == previous.day_night_state && current.fog_density_scale == previous.fog_density_scale && current.noise == previous.noise &&
         current.shadowed == previous.shadowed && current.interior == previous.interior &&
         current.authored_interior_fog == previous.authored_interior_fog && current.environment == previous.environment;
     const uint32_t write_index = froxel_density_index_ ^ 1;

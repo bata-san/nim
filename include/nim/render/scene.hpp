@@ -667,6 +667,7 @@ struct LightingParams {
     // With the atmosphere: the engine's froxel volume (cascade_raymarch_atmosphere_volume and
     // its _inscatter pass) for the height fog's density, sun shadowing and in-scatter.
     bool froxel_fog = true;
+    float fog_density_scale = 0.25f;  // viewer visibility adjustment, 1 = map density
     bool froxel_temporal = true;  // original density reprojection; history weight and reset policy are estimates
     // Full-map viewing keeps every authored probe active at its own spatial bounds. The
     // optional camera-distance fade is an unverified interpretation of +0x3C/+0x40.
@@ -697,6 +698,7 @@ struct LightingParams {
     // Vignette (with post only): the engine's draw_vignette; its strength and radii are estimates.
     bool vignette = false;
     bool depth_of_field = false;
+    bool dof_edges_only = false;
     float dof_focus = 0;
 };
 

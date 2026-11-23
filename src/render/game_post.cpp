@@ -508,7 +508,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
     if (bloom) {
         // Up the pyramid: blur the smallest level, then at each finer level weighted_add the
         // blurred coarser result to it and blur again (gaussian_10 with the engine's cb11 kernel).
-        constexpr float strength = 0.08f;
+        constexpr float strength = 0.10f;
         auto filter = [&](GamePipeline& pipeline, ID3D12Resource* src, ID3D12Resource* dst, uint32_t slot,
                           const std::array<float4, 12>& cb) {
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
@@ -596,7 +596,7 @@ void GameLighting::render_post(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer&
             ext_.note_estimate("lens glare: coarsest blurred bloom level, quarter-resolution upsample, Frame +0x24 = 1",
                                "map-authored optics techniques and texture; original broad filter and brightness are unknown");
         }
-        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, strength 0.08",
+        ext_.note_estimate("bloom: 4 levels (1/3..1/24), gaussian sigma 2 texels, strength 0.10",
                            "third-resolution chain follows a same-engine reference; Marathon weights and strength are unknown");
     }
 
@@ -805,13 +805,18 @@ ID3D12Resource* GameLighting::render_dof(Gpu& gpu, ID3D12GraphicsCommandList* cl
     e.set(kDof, 0x38, 2.0f * f);
     e.set(kDof, 0x3C, 8.0f * f);
     constexpr float max_coc = 0.15f;  // estimated preview cap: about two full-resolution pixels
-    e.set(kDof, 0x40, max_coc);
-    e.set(kDof, 0x44, max_coc);
+    // Close orbit/fly targets stay sharp at the centre. The original prepare pass
+    // applies a signed radial CoC independently of the depth-based CoC.
+    const float depth_weight = p.dof_edges_only ? 0.0f : std::clamp((f - 4.0f) / 4.0f, 0.0f, 1.0f);
+    const float depth_coc = max_coc * depth_weight;
+    const float edge_coc = max_coc * (1.0f - depth_weight);
+    e.set(kDof, 0x40, depth_coc);
+    e.set(kDof, 0x44, depth_coc);
     e.set(kDof, 0x60, float4{0.5f, 0.5f, 1, 1});
-    e.set(kDof, 0x70, float4{0, 0, 0, 1});  // no radial blur
+    e.set(kDof, 0x70, float4{0, edge_coc, 0.42f, 0.53f});
     e.set(kDof, 0x80, float4{1, 1, 0, 0});
     e.note_estimate(std::format("depth of field: focus {:.1f} m; near full blur 0.25x / sharp 0.6x, far sharp 2x / full blur 8x "
-                                "the focus, max |coc| {:.2f} (about 2 px), no radial blur, 12-texel tiles", f, max_coc),
+                                "the focus, depth |coc| {:.3f}, edge |coc| {:.3f}, radial ramp 0.42..0.53 UV, 12-texel tiles", f, depth_coc, edge_coc),
                     "engine depth of field settings (extern 0x37) are code; the cinematic passes are the game's");
     // No screen distortion offsets: the image is already distorted.
     e.set_texture(kBloomDistortion, 0x00, black_.Get());

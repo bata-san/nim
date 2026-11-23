@@ -1949,6 +1949,16 @@ const std::vector<float4>& GameLighting::update_global_channels(const LightingPa
         ext_.note_estimate(std::format("world channel day_night_state = {:g}", night),
                            p.day_night_state >= 0 ? "set by the viewer" : "no script state supplies it; 1 while the map's sun is below the horizon");
     }
+    if (atm_.valid && p.atmosphere && p.fog_density_scale != 1) {
+        // The analytic shading and the froxel passes both use these density channels.
+        for (const size_t slot : {0x0F, 0x18}) {
+            if (slot >= ext_.channels.size()) continue;
+            ext_.channels[slot][0] *= p.fog_density_scale;
+            ext_.channels[slot][1] *= p.fog_density_scale;
+        }
+        ext_.note_estimate(std::format("map fog density multiplier = {:g}", p.fog_density_scale),
+                           "viewer visibility setting for base and layered atmosphere");
+    }
     return ext_.channels;
 }
 
