@@ -2139,6 +2139,19 @@ GUI: 「時刻」スライダー + 大気トグル。nimshade: `--time T`, `--no
 - カリング: 64 件以上を含む静的グループは連続 32 件の外接球を事前計算し、外側のまとまりを除いてから個別判定。Outpost 全域、800×450、40 フレームの比較で可視 28,543 静的配置・349 エンティティ配置が一致。カリングの累計は影 39 → 30 ms、G-buffer 16 → 14 ms。平均フレーム記録 CPU 11.12 → 10.89 ms、GPU 7.82 → 8.08 ms。シーン全体の短縮は今回の計測では確認できなかった。
 - Windows Release ビルド、CTest 2/2、GPU のヘッドレス比較を実施。GUI での音と動きの確認は未実施。
 
+### 3.121 盾・ゴースト材質の条件行修正、敵 AI・壁衝突・Compiler AI、環境音とケープ (2026-11-24)
+
+- **材質条件行 `80808682` の 8 バイト構造修正**: 動的モデル部品 `+0x408 Vec<80808682>` の各要素は 4 バイトではなく **8 バイト** (`{u16 count, u16 first}` の必要条件 + `{u16, u16}` のワイルドカードマスク) で、`count == 0` が既定行、`count == 1` は `part_tags[first]` の直接参照、`count >= 2` のみ `+0x3F8` の `u16` 配列を引く仕様だった。4 バイト刻みで読んでいたため全行が 2 倍ずれて交互に偽の `ANY` 行が混入し、盾持ち普通 (`assault_elite`)・盾持ち指揮官 (`assault_boss`) がウォーデン色へ、ゴーストウォーデン (`ghost_miniboss`) が一般兵色へ誤選択されていた。修正後は `80B80191` (`assault` base/elite/miniboss/boss) と `80A4A8A4` / `80A4A8A6` (`ghost` elite/miniboss 本体・外套) の全スロットが各等級の本来の技法を選ぶ。
+- **敵 AI・壁衝突・Compiler AI**:
+  - 移動ステップの壁判定を `0.01 m` からキャラ半径 (`radius(a)`) へ引き上げ、壁・コンテナに当たった際の接線スライド (`±45°/±75°`) とスタック復帰 (0.8 秒停止で経路再探索) を追加。
+  - `AiSimulation::line_of_sight` で `WalkGrid` の高さ障害物を判定し、壁越しの視認を防止。警戒 (`Suspicious`) 時は最終視認位置へ移動して索敵、戦闘 (`Alerted`) 時は分隊内で 18 m 以内へ警戒共有し、兵種別の交戦距離 (sniper 22 m / assault・grenadier 12 m / ghost・shotgun 6 m) で A* 経路追従と左右ストレイフを行う (推定)。
+  - **Compiler (`80A97147`)**: 固有の浮遊クリップ (`80A97160` / `80A9715A` / `80A97149`) を locomotion に登録し、低温アーカイブの部屋内 (`home` 周囲 5〜13 m) の浮遊巡回と、警戒・戦闘時の軌道移動・チャージ/サージ周期 (`compiler_charge`) を実装。`AiActors::update` から `7C7E0071` (`charge_progress`)・`764F77BA`・`AFBDF744`・`C6BC8C0E`・`6057A3B9` をリアルタイム駆動する。
+- **低温アーカイブの環境音・デカール・ケープ**:
+  - 環境音に短時間 RMS (-24 dBFS) / ピーク (-12 dBFS) の音量リミッター (`measure_pcm_level` / `limit_ambient_gain`) と Wwise バンクの再生規則を適用。
+  - 敵のアーマーデカール (`flags & 8`, PS `80A4ACE1`) を `pipeline_cache_` キーで分離し深度バイアスを適用。
+  - Compiler のケープ (`80A9707E`, PS `80A96FC2`) の微細法線スケールを抑えて滑らかな質感へ調整 (推定)。
+- **検証**: Windows Release ビルド (`build/Release/`、DLSS/Streamline SDK 込み)、`nim_tests`、`nim_render_tests`、Outpost 確認描画 (`nimshade`) を実施。
+
 ## 4. 既知の未解決・注意
 - 通常のビルド先は `build/`。シェーダー調査には `tools/re/dump.sh` と `tools/re/decomp.py` を使用する。過去の個別解析スクリプトと検証出力はプロジェクト外へ整理した。`tools/re/` の旧スクリプトは Git 履歴からも参照できる。
 - 全域の軽量化検証 (Codex): 低温アーカイブ全域 (249,991静的配置、全ライト7369、全原プローブ499) の同一条件で

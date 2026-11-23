@@ -34,6 +34,16 @@ static int g_failures = 0;
     } while (0)
 
 int main() {
+    // A brief loud ambient mechanical burst must be reduced, even in a long quiet bed.
+    {
+        PcmAudio pcm{100, 2, std::vector<int16_t>(200)};
+        for (size_t frame = 20; frame < 30; ++frame) pcm.samples[frame * 2 + 1] = -32768;
+        const PcmLevel level = measure_pcm_level(pcm);
+        CHECK(level.peak == 1.0f && level.short_rms == 1.0f);
+        CHECK(std::abs(limit_ambient_gain(0.75f, level) - 0.0631f) < 1e-5f);
+        CHECK(limit_ambient_gain(0.01f, level) == 0.01f);
+        CHECK(limit_ambient_gain(0.5f, {}) == 0.5f);
+    }
     // TagHash seen in w64_sr_globals_0120: 0x80A51CAA -> pkg 0x128, entry 0x1CAA
     TagHash h(0x80A51CAA);
     CHECK(h.is_pkg_ref());
@@ -816,6 +826,78 @@ int main() {
         elite_assault.state = {{helmet_state, 0x7CB23A4E}};
         CHECK(part_group_visible(broken, elite_assault));
         CHECK(!part_group_visible(intact, elite_assault));
+    }
+
+    // DynamicModelMaterials::technique with 8-byte 80808682 condition rows (count=0 default,
+    // count=1 direct part_tags index, count>=2 multi-key).
+    {
+        constexpr uint32_t kType = 0xB10F785D, kUnit = 0x26170C92;
+        constexpr uint32_t kCore = 0xE1C5A72C, kMiniboss = 0x9A3D2CCB, kBoss = 0x5CFE4C22, kElite = 0x574459CE, kBase = 0x4CF9B596;
+        constexpr uint32_t kAssault = 0x5DC4DC56;
+        DynamicModelMaterials m;
+        m.part_tags = {
+            {{kType, kCore}},      // 0
+            {{kType, kMiniboss}},  // 1
+            {{kType, kBoss}},      // 2
+            {{kType, kElite}},     // 3
+            {{kUnit, kAssault}},   // 4
+        };
+        m.technique_map = {{6, 0, 0}};
+        m.techniques = {TagHash(0x80A4BABD), TagHash(0x80A4BAC6), TagHash(0x80A4BACF),
+                        TagHash(0x80A4BAD8), TagHash(0x80A4BAE1), TagHash(0x80A4BAEA)};
+        m.technique_conditions = {
+            {0, 4},  // core & assault
+            {1, 4},  // miniboss & assault
+            {2, 4},  // boss & assault
+            {3, 4},  // elite & assault
+            {1},     // miniboss only (count=1 direct)
+            {},      // default (count=0)
+        };
+        const std::pair<uint32_t, uint32_t> t_miniboss[] = {{kType, kMiniboss}, {kUnit, kAssault}};
+        const std::pair<uint32_t, uint32_t> t_boss[] = {{kType, kBoss}, {kUnit, kAssault}};
+        const std::pair<uint32_t, uint32_t> t_elite[] = {{kType, kElite}, {kUnit, kAssault}};
+        const std::pair<uint32_t, uint32_t> t_base[] = {{kType, kBase}, {kUnit, kAssault}};
+        CHECK(m.technique(0, 0, t_miniboss).value == 0x80A4BAC6);
+        CHECK(m.technique(0, 0, t_boss).value == 0x80A4BACF);
+        CHECK(m.technique(0, 0, t_elite).value == 0x80A4BAD8);
+        CHECK(m.technique(0, 0, t_base).value == 0x80A4BAEA);
+    }
+
+    // AI wall-occluded line of sight and Compiler chamber patrol / alert charge.
+    {
+        MapGameplay gp;
+        auto& ch = gp.characters.emplace_back();
+        ch.entity = TagHash(0x80A97147);
+        ch.name_estimate = "pfhor_compiler___";
+        auto& sq = gp.squads.emplace_back();
+        sq.members = {0};
+        sq.positions.push_back({{0, 0, 0}, {0, 0, 0, 1}});
+
+        AiParams p;
+        p.player_invisible = false;
+        AiSimulation sim(gp, p, 42);
+        WalkGrid g;
+        g.x0 = -10; g.y0 = -10; g.cell = 0.5f; g.w = 40; g.h = 40;
+        std::vector<uint8_t> free(size_t(g.w) * g.h, 1);
+        g.height.assign(size_t(g.w) * g.h, 0.0f);
+        // Place a 3 m tall wall/container at x in [3, 4], y in [-3, 3].
+        for (uint32_t y = 14; y <= 26; ++y)
+            for (uint32_t x = 26; x <= 28; ++x) {
+                free[size_t(y) * g.w + x] = 0;
+                g.height[size_t(y) * g.w + x] = 3.0f;
+            }
+        g.set_free(free);
+        sim.add_ground_patch(std::move(g));
+
+        CHECK(!sim.line_of_sight({0, 0, 1.6f}, {6, 0, 1.6f}));  // blocked by 3 m wall
+        CHECK(sim.line_of_sight({0, 0, 1.6f}, {0, 6, 1.6f}));   // open floor
+
+        // Compiler sees visible player on open side, becomes alerted, and charges up.
+        for (int k = 0; k < 40; ++k) sim.step(0.1f, {0, 6, 0});
+        CHECK(sim.agents().size() == 1);
+        CHECK(sim.agents()[0].is_compiler);
+        CHECK(sim.agents()[0].alert == AiAlert::Alerted);
+        CHECK(sim.agents()[0].compiler_charge > 0.3f);
     }
 
     if (g_failures) return 1;

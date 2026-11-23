@@ -173,6 +173,7 @@ struct PreparedMesh {
         std::vector<float4> cb0;
         std::map<uint32_t, std::shared_ptr<const Texture>> textures;
         uint8_t stage = 0;  // render stage: 0 = G-buffer, 4 = shadow, 8 = transparents
+        bool armour_marking = false;
         uint8_t lod_mask = 1;  // static mesh LOD levels this part belongs to (bit n = LOD n)
         int blend = -1;     // engine blend state index (transparents)
         std::vector<float4> vs_cb0;                // the VS stage's own cb0
@@ -636,7 +637,7 @@ private:
     std::unordered_map<uint32_t, GpuBuffer> geometry_cache_;
     std::map<uint64_t, ComPtr<ID3D12RootSignature>> root_cache_;
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
-    std::map<std::tuple<uint64_t, uint8_t, uint8_t, uint8_t, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
+    std::map<std::tuple<uint64_t, uint8_t, uint8_t, uint8_t, bool, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;          // models in a single entity preview
     bool assembled_ = false;

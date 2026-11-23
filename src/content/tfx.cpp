@@ -584,23 +584,35 @@ std::unordered_map<uint32_t, DynamicModelMaterials> index_dynamic_model_material
                         m.part_tags.clear();
                     }
                     try {
-                        // Each technique has a slice of u16 indices into the component's tag sets.
+                        // Each 80808682 condition row is 8 bytes: {u16 count, u16 first} for the
+                        // required tag-set groups, followed by {u16, u16} for the matching-key
+                        // wildcard (871AC0EA) mask. count == 0 (first == 0xFFFF) is the default
+                        // row; count == 1 names part_tags[first] directly; count >= 2 slices the
+                        // u16 index table at +0x3F8.
                         const auto indices = r.vec_at(base + 0x3F8);
                         const auto conditions = r.vec_at(base + 0x408);
                         if (conditions.count <= techs.count && conditions.element_class == 0x80808682 &&
                             indices.element_class == 0x80800006 &&
-                            conditions.data <= bytes.size() && conditions.count <= (bytes.size() - conditions.data) / 4 &&
+                            conditions.data <= bytes.size() && conditions.count <= (bytes.size() - conditions.data) / 8 &&
                             indices.data <= bytes.size() && indices.count <= (bytes.size() - indices.data) / 2) {
-                            for (size_t i = 0; i < conditions.count; ++i) {
-                                const size_t offset = conditions.data + i * 4;
+                            for (size_t ci = 0; ci < conditions.count; ++ci) {
+                                const size_t offset = conditions.data + ci * 8;
                                 const auto count = r.u16_at(offset), first = r.u16_at(offset + 2);
-                                if (count && uint64_t(first) + count > indices.count) {
-                                    m.technique_conditions.clear();
-                                    break;
-                                }
                                 auto& groups = m.technique_conditions.emplace_back();
-                                for (uint32_t j = 0; j < count; ++j)
-                                    groups.push_back(r.u16_at(indices.data + size_t(first + j) * 2));
+                                if (count == 1) {
+                                    if (first >= m.part_tags.size()) {
+                                        m.technique_conditions.clear();
+                                        break;
+                                    }
+                                    groups.push_back(first);
+                                } else if (count > 1) {
+                                    if (uint64_t(first) + count > indices.count) {
+                                        m.technique_conditions.clear();
+                                        break;
+                                    }
+                                    for (uint32_t j = 0; j < count; ++j)
+                                        groups.push_back(r.u16_at(indices.data + size_t(first + j) * 2));
+                                }
                             }
                         }
                     } catch (const std::exception&) {

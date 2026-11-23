@@ -12,6 +12,36 @@
 #include <unordered_map>
 
 namespace nim {
+
+PcmLevel measure_pcm_level(const PcmAudio& pcm) {
+    PcmLevel level;
+    if (!pcm.sample_rate || !pcm.frames()) return level;
+    const size_t window = std::max<size_t>(pcm.sample_rate / 10, 1);
+    float largest_square_mean = 0;
+    for (size_t channel = 0; channel < pcm.channels; ++channel) {
+        for (size_t first = 0; first < pcm.frames(); first += window) {
+            const size_t last = std::min(first + window, pcm.frames());
+            double sum = 0;
+            for (size_t f = first; f < last; ++f) {
+                const float sample = std::abs(float(pcm.samples[f * pcm.channels + channel])) / 32768.0f;
+                level.peak = std::max(level.peak, sample);
+                sum += sample * sample;
+            }
+            largest_square_mean = std::max(largest_square_mean, float(sum / double(last - first)));
+        }
+    }
+    level.short_rms = std::sqrt(largest_square_mean);
+    return level;
+}
+
+float limit_ambient_gain(float gain, PcmLevel level) {
+    constexpr float rms_limit = 0.0631f;  // -24 dBFS
+    constexpr float peak_limit = 0.2512f; // -12 dBFS
+    if (level.short_rms > 0) gain = std::min(gain, rms_limit / level.short_rms);
+    if (level.peak > 0) gain = std::min(gain, peak_limit / level.peak);
+    return gain;
+}
+
 namespace {
 
 #include "wwise_codebooks.inc"

@@ -511,278 +511,76 @@ void MoviePlayer::run() {
 }
 
 // ---- Spatialized map ambient audio ----------------------------------------------------------------
-AmbientAudioPlayer::AmbientAudioPlayer(AudioEngine& engine) : engine_(engine) {
-    worker_ = std::thread([this] { decode_loop(); });
-}
-
-AmbientAudioPlayer::~AmbientAudioPlayer() {
-    clear();
-    {
-        std::lock_guard lk(mutex_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    if (worker_.joinable()) worker_.join();
-}
-
 void AmbientAudioPlayer::set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio) {
-    voices_.clear();
-    active_voices_ = 0;
+    clear();
+    player_.set_package(pm);
     audio_ = std::move(audio);
-    {
-        std::lock_guard lk(mutex_);
-        pm_ = pm.fork();
-        decode_queue_.clear();
-        decode_pending_.clear();
-        decoded_.clear();
-        failed_.clear();
-    }
 }
 
 void AmbientAudioPlayer::clear() {
-    voices_.clear();
-    active_voices_ = 0;
+    player_.clear();
+    selected_.clear();
     audio_.reset();
-    {
-        std::lock_guard lk(mutex_);
-        decode_queue_.clear();
-        decode_pending_.clear();
-        decoded_.clear();
-        failed_.clear();
-    }
-}
-
-size_t AmbientAudioPlayer::decoded_count() const {
-    std::lock_guard lk(mutex_);
-    return decoded_.size();
-}
-
-float AmbientAudioPlayer::next_random_unit() {
-    rng_state_ ^= rng_state_ << 13;
-    rng_state_ ^= rng_state_ >> 17;
-    rng_state_ ^= rng_state_ << 5;
-    return float(rng_state_ & 0x00FFFFFFu) / float(0x01000000u);
-}
-
-void AmbientAudioPlayer::request_decode(TagHash wem) {
-    if (wem.is_none()) return;
-    std::lock_guard lk(mutex_);
-    if (!pm_) return;
-    for (const auto& [k, _] : decoded_) if (k == wem.value) return;
-    for (uint32_t f : failed_) if (f == wem.value) return;
-    for (uint32_t p : decode_pending_) if (p == wem.value) return;
-    decode_pending_.push_back(wem.value);
-    decode_queue_.push_back(wem);
-    cv_.notify_one();
-}
-
-void AmbientAudioPlayer::decode_loop() {
-    for (;;) {
-        TagHash wem;
-        PackageManager* pm = nullptr;
-        {
-            std::unique_lock lk(mutex_);
-            cv_.wait(lk, [&] { return stop_ || !decode_queue_.empty(); });
-            if (stop_) return;
-            wem = decode_queue_.front();
-            decode_queue_.pop_front();
-            pm = pm_.get();
-        }
-        std::shared_ptr<const PcmAudio> pcm;
-        if (pm) {
-            try {
-                auto raw = pm->read(wem);
-                auto dec = decode_wem(raw);
-                if (!dec.samples.empty() && dec.sample_rate > 0 && dec.channels > 0)
-                    pcm = std::make_shared<const PcmAudio>(std::move(dec));
-            } catch (...) {
-            }
-        }
-        std::lock_guard lk(mutex_);
-        std::erase(decode_pending_, wem.value);
-        if (pcm) {
-            // Bound decoded cache to ~48 entries (~40-60 MB) so memory stays lean on huge maps.
-            if (decoded_.size() >= 48) decoded_.erase(decoded_.begin());
-            decoded_.emplace_back(wem.value, std::move(pcm));
-        } else {
-            failed_.push_back(wem.value);
-        }
-    }
 }
 
 void AmbientAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> right, float dt,
                                 float master_volume, bool enabled) {
-    if (!engine_.ok() || !audio_ || !enabled || master_volume <= 1e-4f) {
-        for (auto& v : voices_)
-            if (v.voice) v.voice->set_volume(0.0f);
-        active_voices_ = 0;
+    if (!audio_ || !enabled || master_volume <= 1e-4f) {
+        if (!selected_.empty()) player_.clear(), selected_.clear();
         return;
     }
-    constexpr size_t kMaxVoices = 8;
-    constexpr double kLoopThresholdSec = 10.0;  // >= 10s: continuous ambient bed; < 10s: periodic one-shot
+
     struct Candidate {
-        uint32_t event_tag = 0;
-        const MapAudioEmitter* emitter = nullptr;
-        float weight = 0.0f;
-        float pan = 0.0f;
+        const MapAudioEmitter* emitter;
+        std::array<float, 3> point;
+        float weight;
     };
-    // Deduplicate by event tag: keep the loudest/closest emitter for each distinct AudioEvent.
-    std::vector<Candidate> best;
-    best.reserve(64);
-    for (const auto& em : audio_->emitters) {
-        if (em.wems.empty()) continue;
-        const auto pt = em.closest_point(eye);
-        const float dx = pt[0] - eye[0], dy = pt[1] - eye[1], dz = pt[2] - eye[2];
-        const float d2 = dx * dx + dy * dy + dz * dz;
-        const float max_dist = em.max_distance > 0.0f ? em.max_distance : std::max(52.0f, em.radius + 40.0f);
-        if (!em.global && d2 > max_dist * max_dist) continue;
-        const float d = std::sqrt(d2);
-        const float ref_dist = std::min(std::max(7.0f, em.radius + 5.0f), max_dist * 0.45f);
-        const float edge_fade = em.global ? 1.0f : std::clamp(1.0f - (d / max_dist) * (d / max_dist), 0.0f, 1.0f);
-        const float att = em.global ? 0.55f : (edge_fade / (1.0f + (d / ref_dist) * (d / ref_dist)));
-        const float w = std::clamp(em.gain, 0.1f, 3.0f) * att;
-        if (w < 0.015f) continue;
-        float pan = 0.0f;
-        if (!em.global && d > 0.25f) {
-            pan = std::clamp((dx * right[0] + dy * right[1] + dz * right[2]) / d, -1.0f, 1.0f);
-        }
-        bool merged = false;
-        for (auto& c : best) {
-            if (c.event_tag == em.event.value) {
-                if (w > c.weight) {
-                    c.weight = w;
-                    c.pan = pan;
-                    c.emitter = &em;
-                }
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            best.push_back({em.event.value, &em, w, pan});
-        }
+    std::vector<Candidate> nearby;
+    nearby.reserve(32);
+    for (const auto& emitter : audio_->emitters) {
+        const auto point = emitter.global ? eye : emitter.closest_point(eye);
+        const float distance = std::hypot(point[0] - eye[0], point[1] - eye[1], point[2] - eye[2]);
+        const float range = emitter.max_distance > 0 ? emitter.max_distance : std::max(52.0f, emitter.radius + 40.0f);
+        if (distance >= range) continue;
+        const float weight = emitter.gain * (1.0f - distance / range);
+        const auto same = std::ranges::find_if(nearby, [&](const Candidate& c) { return c.emitter->event == emitter.event; });
+        if (same == nearby.end()) nearby.push_back({&emitter, point, weight});
+        else if (weight > same->weight) *same = {&emitter, point, weight};
     }
-    if (best.size() > kMaxVoices) {
-        std::partial_sort(best.begin(), best.begin() + kMaxVoices, best.end(),
+    constexpr size_t kMaxEvents = 8;
+    if (nearby.size() > kMaxEvents) {
+        std::partial_sort(nearby.begin(), nearby.begin() + kMaxEvents, nearby.end(),
                           [](const Candidate& a, const Candidate& b) { return a.weight > b.weight; });
-        best.resize(kMaxVoices);
+        nearby.resize(kMaxEvents);
     }
 
-    // Lookup decoded PCMs under lock.
-    auto find_pcm = [&](TagHash wem) -> std::shared_ptr<const PcmAudio> {
-        std::lock_guard lk(mutex_);
-        for (const auto& [k, p] : decoded_)
-            if (k == wem.value) return p;
-        return nullptr;
-    };
-
-    const float clamped_dt = std::clamp(dt, 0.001f, 0.1f);
-    const float smooth = 1.0f - std::exp(-clamped_dt * 5.0f);
-    // Fade out voices no longer in `best`.
-    for (auto& v : voices_) {
-        const auto it = std::find_if(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
-        if (it == best.end()) {
-            v.volume += (0.0f - v.volume) * smooth;
-            if (v.voice) v.voice->set_volume(v.volume);
-        }
-    }
-    std::erase_if(voices_, [&](const ActiveVoice& v) {
-        const bool wanted = std::any_of(best.begin(), best.end(), [&](const Candidate& c) { return c.event_tag == v.event_tag; });
-        return !wanted && (v.volume < 0.004f || (!v.looping && (!v.voice || v.voice->queued() == 0)));
+    std::vector<EntityAudioPlayer::Cue> starts;
+    std::vector<uint64_t> stops;
+    std::vector<std::pair<uint64_t, std::array<float, 3>>> positions;
+    std::erase_if(selected_, [&](const Selected& selected) {
+        if (std::ranges::any_of(nearby, [&](const Candidate& c) { return c.emitter->event.value == selected.emitter; })) return false;
+        stops.push_back(selected.emitter);
+        return true;
     });
-
-    // Update or start wanted voices.
-    const float mix_scale = 0.22f * master_volume;
-    size_t playing = 0;
-    for (const auto& c : best) {
-        const auto& wems = c.emitter->wems;
-        const float target_vol = std::min(c.weight * mix_scale, 0.75f * master_volume);
-        auto it = std::find_if(voices_.begin(), voices_.end(), [&](const ActiveVoice& v) { return v.event_tag == c.event_tag; });
-        if (it != voices_.end()) {
-            it->pan += (c.pan - it->pan) * smooth;
-            if (it->looping) {
-                it->volume += (target_vol - it->volume) * smooth;
-                if (it->voice) {
-                    it->voice->set_volume(it->volume);
-                    it->voice->set_pan(it->pan, engine_.master_channels());
-                    if (it->volume > 0.005f) ++playing;
-                }
-            } else {
-                // Periodic one-shot: wait a natural randomized interval between plays and cycle variations.
-                const bool busy = it->voice && it->voice->queued() > 0;
-                if (busy) {
-                    it->volume += (target_vol - it->volume) * smooth;
-                    it->voice->set_volume(it->volume);
-                    it->voice->set_pan(it->pan, engine_.master_channels());
-                    ++playing;
-                } else {
-                    it->voice.reset();
-                    it->cooldown -= clamped_dt;
-                    if (it->cooldown <= 0.0f) {
-                        const TagHash next_wem = wems[it->next_index % wems.size()];
-                        auto pcm = find_pcm(next_wem);
-                        if (!pcm) {
-                            request_decode(next_wem);
-                        } else {
-                            it->wem = next_wem;
-                            it->pcm = std::move(pcm);
-                            it->next_index = (it->next_index + 1u + uint32_t(next_random_unit() * float(wems.size()))) % uint32_t(wems.size());
-                            it->voice = std::make_unique<Voice>(engine_, it->pcm->sample_rate, it->pcm->channels);
-                            if (it->voice->ok()) {
-                                it->volume = target_vol;
-                                it->voice->set_volume(it->volume);
-                                it->voice->set_pan(it->pan, engine_.master_channels());
-                                auto alias = std::shared_ptr<const std::vector<int16_t>>(it->pcm, &it->pcm->samples);
-                                it->voice->submit(alias, true);
-                                it->voice->start();
-                                // Natural pause before next one-shot: 6..18 s (longer when many variations exist).
-                                it->cooldown = 6.0f + next_random_unit() * 12.0f;
-                                ++playing;
-                            }
-                        }
-                    }
-                }
-            }
-            continue;
+    for (const auto& c : nearby) {
+        const uint64_t emitter = c.emitter->event.value;
+        positions.emplace_back(emitter, c.point);
+        auto selected = std::ranges::find(selected_, emitter, &Selected::emitter);
+        if (selected == selected_.end()) {
+            selected_.push_back({emitter, 0.0f});
+            selected = std::prev(selected_.end());
         }
-        const uint32_t start_idx = uint32_t(c.emitter->event_id % wems.size());
-        const TagHash wem = wems[start_idx];
-        auto pcm = find_pcm(wem);
-        if (!pcm) {
-            request_decode(wem);
-            continue;
-        }
-        if (voices_.size() >= kMaxVoices + 4) continue;
-        ActiveVoice av;
-        av.event_tag = c.event_tag;
-        av.wem = wem;
-        av.pcm = std::move(pcm);
-        av.pan = c.pan;
-        av.looping = av.pcm->seconds() >= kLoopThresholdSec;
-        av.next_index = (start_idx + 1u) % uint32_t(wems.size());
-        if (av.looping) {
-            av.voice = std::make_unique<Voice>(engine_, av.pcm->sample_rate, av.pcm->channels);
-            if (av.voice->ok()) {
-                av.volume = target_vol * smooth;
-                av.voice->set_volume(av.volume);
-                av.voice->set_pan(av.pan, engine_.master_channels());
-                auto alias = std::shared_ptr<const std::vector<int16_t>>(av.pcm, &av.pcm->samples);
-                av.voice->submit_looping(alias);
-                av.voice->start();
-                voices_.push_back(std::move(av));
-                ++playing;
-            }
-        } else {
-            // Stagger initial one-shot trigger (1..9 s) so entering an area does not fire every sound at once.
-            av.cooldown = 1.0f + next_random_unit() * 8.0f;
-            voices_.push_back(std::move(av));
-        }
+        if (player_.has_emitter(emitter)) continue;
+        selected->next_play -= std::min(std::max(dt, 0.0f), 0.25f);
+        if (selected->next_play > 0) continue;
+        starts.push_back({c.emitter->event, emitter, std::clamp(c.emitter->gain, 0.0f, 3.0f)});
+        selected->next_play = 6.0f + float(emitter % 13);  // stagger a finished one-shot's next activation
     }
-    active_voices_ = playing;
+    player_.update(starts, stops, positions, eye, right, dt, master_volume * 0.32f, true);
 }
 
 // ---- Entity sounds (3.90) -------------------------------------------------------------------------
-EntityAudioPlayer::EntityAudioPlayer(AudioEngine& engine) : engine_(engine) {
+EntityAudioPlayer::EntityAudioPlayer(AudioEngine& engine, bool ambient) : engine_(engine), ambient_(ambient) {
     worker_ = std::thread([this] { work(); });
 }
 
@@ -822,12 +620,17 @@ size_t EntityAudioPlayer::events_loaded() const {
     return events_.size();
 }
 
+bool EntityAudioPlayer::has_emitter(uint64_t emitter) const {
+    return std::ranges::any_of(pending_, [&](const Pending& p) { return p.cue.emitter == emitter; }) ||
+           std::ranges::any_of(playing_, [&](const Playing& p) { return p.emitter == emitter && !p.stopping; });
+}
+
 void EntityAudioPlayer::work() {
-    PackageManager* indexed = nullptr;
+    uint64_t indexed_generation = uint64_t(-1);
     std::unordered_map<uint32_t, TagHash> streams;  // every Wwise stream, for sources an event does not list
     for (;;) {
         Job job;
-        PackageManager* pm = nullptr;
+        std::shared_ptr<PackageManager> pm;
         uint64_t gen = 0;
         {
             std::unique_lock lk(mutex_);
@@ -835,14 +638,17 @@ void EntityAudioPlayer::work() {
             if (stop_) return;
             job = std::move(jobs_.front());
             jobs_.pop_front();
-            pm = pm_.get();
+            pm = pm_;
             gen = generation_;
         }
         if (!pm) continue;
         if (!job.event.is_none()) {
             std::shared_ptr<const Event> out;
             try {
-                if (indexed != pm) streams = index_wwise_streams(*pm), indexed = pm;
+                if (indexed_generation != gen) {
+                    streams = index_wwise_streams(*pm);
+                    indexed_generation = gen;
+                }
                 auto data = std::make_shared<const WwiseEventData>(load_wwise_event(*pm, job.event, &streams));
                 auto e = std::make_shared<Event>();
                 e->stops = wwise_stop_targets(*data->bank, data->play_id);
@@ -855,12 +661,15 @@ void EntityAudioPlayer::work() {
             if (out) events_[job.event.value] = std::move(out);
             else event_requested_[job.event.value] = true;
         } else {
-            std::shared_ptr<const PcmAudio> out;
+            std::shared_ptr<const DecodedVoice> out;
             try {
                 const auto bytes = wwise_source_bytes(*pm, *job.source_event, job.source);
                 if (!bytes.empty()) {
                     auto pcm = wwise_downmix(decode_wem(bytes));
-                    if (pcm.frames() && pcm.sample_rate) out = std::make_shared<const PcmAudio>(std::move(pcm));
+                    if (pcm.frames() && pcm.sample_rate) {
+                        const PcmLevel level = ambient_ ? measure_pcm_level(pcm) : PcmLevel{};
+                        out = std::make_shared<const DecodedVoice>(DecodedVoice{std::move(pcm), level});
+                    }
                 }
             } catch (...) {
             }
@@ -870,7 +679,7 @@ void EntityAudioPlayer::work() {
                 pcm_requested_[job.source] = true;
                 continue;
             }
-            pcm_bytes_ += out->samples.size() * sizeof(int16_t);
+            pcm_bytes_ += out->audio.samples.size() * sizeof(int16_t);
             pcm_[job.source] = std::move(out);
             pcm_order_.push_back(job.source);
             // Keep the decoded cache under ~192 MB (voices hold what they play).
@@ -878,7 +687,7 @@ void EntityAudioPlayer::work() {
                 const uint32_t old = pcm_order_.front();
                 pcm_order_.pop_front();
                 if (const auto it = pcm_.find(old); it != pcm_.end()) {
-                    pcm_bytes_ -= it->second->samples.size() * sizeof(int16_t);
+                    pcm_bytes_ -= it->second->audio.samples.size() * sizeof(int16_t);
                     pcm_.erase(it);
                 }
                 pcm_requested_.erase(old);
@@ -903,7 +712,8 @@ bool EntityAudioPlayer::event_failed(TagHash t) const {
     return !pm_ || (it != event_requested_.end() && it->second);
 }
 
-std::shared_ptr<const PcmAudio> EntityAudioPlayer::pcm(const std::shared_ptr<const WwiseEventData>& ev, uint32_t source) {
+std::shared_ptr<const EntityAudioPlayer::DecodedVoice> EntityAudioPlayer::pcm(
+    const std::shared_ptr<const WwiseEventData>& ev, uint32_t source) {
     std::lock_guard lk(mutex_);
     if (const auto it = pcm_.find(source); it != pcm_.end()) return it->second;
     if (!pm_ || pcm_requested_.contains(source)) return nullptr;
@@ -920,7 +730,7 @@ bool EntityAudioPlayer::pcm_failed(uint32_t source) const {
 }
 
 float EntityAudioPlayer::gain(const Playing& p) const {
-    float g = std::pow(10.0f, p.v.volume_db / 20.0f) * std::max(p.stop_gain, 0.0f);
+    float g = std::pow(10.0f, p.v.volume_db / 20.0f) * p.placement_gain * std::max(p.stop_gain, 0.0f);
     const auto at = where_.find(p.emitter);
     if (at == where_.end()) return g;
     const auto& w = at->second;
@@ -933,7 +743,7 @@ float EntityAudioPlayer::gain(const Playing& p) const {
 }
 
 void EntityAudioPlayer::add_voices(uint64_t emitter, uint64_t group, const std::shared_ptr<const WwiseEventData>& ev,
-                                   std::vector<WwiseVoice> voices, int after) {
+                                   std::vector<WwiseVoice> voices, float placement_gain, int after) {
     int offset = 0;
     for (const auto& p : playing_)
         if (p.group == group) offset = std::max(offset, p.index + 1);
@@ -944,6 +754,7 @@ void EntityAudioPlayer::add_voices(uint64_t emitter, uint64_t group, const std::
         p.index = offset + int(i);
         p.event = ev;
         p.v = voices[i];
+        p.placement_gain = placement_gain;
         if (p.v.after >= 0) p.v.after += offset;
         else if (after >= 0) p.v.after = after, p.v.overlap = 0;
         p.start_at = p.v.after < 0 ? clock_ + p.v.delay : -1;
@@ -963,8 +774,9 @@ void EntityAudioPlayer::instantiate(const Cue& cue, const Event& ev, float age) 
             if (p.emitter == cue.emitter && wwise_is_under(*p.event->bank, p.v.sound, target)) p.stopping = true;
     auto voices = wwise_play_event(*d->bank, d->play_id, state_);
     // A one-shot that waited too long for its bank is dropped; loops still start.
-    if (age > 0.75f && std::ranges::none_of(voices, [](const WwiseVoice& v) { return v.loops == 0 || v.repeat; })) return;
-    add_voices(cue.emitter, next_group_++, d, std::move(voices), -1);
+    if (!ambient_ && age > 0.75f &&
+        std::ranges::none_of(voices, [](const WwiseVoice& v) { return v.loops == 0 || v.repeat; })) return;
+    add_voices(cue.emitter, next_group_++, d, std::move(voices), cue.placement_gain, -1);
 }
 
 void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64_t> stopped,
@@ -997,6 +809,7 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
         uint64_t emitter, group;
         std::shared_ptr<const WwiseEventData> ev;
         uint32_t node;
+        float placement_gain;
         int after;
     };
     std::vector<Repeat> repeats;
@@ -1023,12 +836,12 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
             if (!p.pcm) p.pcm = pcm(p.event, p.v.source);
             if (!p.pcm) {
                 const bool endless = p.v.loops == 0 || p.v.repeat;
-                if (pcm_failed(p.v.source) || (!endless && clock_ - p.start_at > 0.5)) drop[i] = true;
+                if (pcm_failed(p.v.source) || (!endless && clock_ - p.start_at > (ambient_ ? 5.0 : 0.5))) drop[i] = true;
                 continue;
             }
-            const auto& a = *p.pcm;
+            const auto& a = p.pcm->audio;
             auto voice = std::make_unique<Voice>(engine_, a.sample_rate, a.channels);
-            const auto samples = std::shared_ptr<const std::vector<int16_t>>(p.pcm, &p.pcm->samples);
+            const auto samples = std::shared_ptr<const std::vector<int16_t>>(p.pcm, &a.samples);
             const uint32_t frames = uint32_t(a.frames());
             const uint32_t begin = std::min<uint32_t>(uint32_t(p.v.seek * float(frames)), frames ? frames - 1 : 0);
             const uint32_t repeats_left = p.v.loops == 0 ? ~0u : p.v.loops - 1;
@@ -1048,7 +861,7 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
         } else {
             if (p.v.repeat && !p.repeated && p.end_at >= 0 && clock_ >= p.end_at - 1.0) {
                 p.repeated = true;
-                repeats.push_back({p.emitter, p.group, p.event, p.v.repeat, p.index});
+                repeats.push_back({p.emitter, p.group, p.event, p.v.repeat, p.placement_gain, p.index});
             }
             if (p.end_at >= 0 && clock_ > p.end_at + 0.05 && p.voice->queued() == 0) drop[i] = true;
         }
@@ -1057,11 +870,13 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
         if (drop[i]) playing_.erase(playing_.begin() + ptrdiff_t(i));
     for (auto& r : repeats) {
         if (std::ranges::none_of(playing_, [&](const Playing& q) { return q.group == r.group && !q.stopping; })) continue;
-        add_voices(r.emitter, r.group, r.ev, wwise_play_node(*r.ev->bank, r.node, state_), r.after);
+        add_voices(r.emitter, r.group, r.ev, wwise_play_node(*r.ev->bank, r.node, state_), r.placement_gain, r.after);
     }
     // Levels and pans. Over 32 sounding voices the quietest one-shots are cut.
     const float master = enabled ? std::max(master_volume, 0.0f) : 0.0f;
     std::vector<std::pair<float, size_t>> levels;
+    std::vector<std::pair<Voice*, float>> ambient_levels;
+    float ambient_peak = 0;
     for (size_t i = 0; i < playing_.size(); ++i) {
         auto& p = playing_[i];
         if (!p.started) continue;
@@ -1073,10 +888,20 @@ void EntityAudioPlayer::update(std::span<const Cue> cues, std::span<const uint64
             const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
             if (len > 1e-3f) pan = (dx * right[0] + dy * right[1] + dz * right[2]) / len;
         }
-        p.voice->set_volume(std::min(g, 4.0f));
+        if (ambient_) {
+            g = limit_ambient_gain(g, p.pcm->level);
+            ambient_peak += g * p.pcm->level.peak;
+            ambient_levels.emplace_back(p.voice.get(), g);
+        } else {
+            p.voice->set_volume(std::min(g, 4.0f));
+        }
         p.voice->set_pan(pan, engine_.master_channels());
         levels.push_back({(p.v.loops == 0 || p.v.repeat) ? 1e9f : g, i});
     }
+    // Leave headroom even when the loudest peaks of the ambient voices line up.
+    // The stereo balance matrix can add up to 1.5 times the source amplitude.
+    const float ambient_scale = ambient_peak > 0.4f ? 0.4f / ambient_peak : 1.0f;
+    for (const auto& [voice, gain] : ambient_levels) voice->set_volume(gain * ambient_scale);
     active_ = levels.size();
     if (levels.size() > 32) {
         std::ranges::sort(levels);

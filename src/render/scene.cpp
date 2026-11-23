@@ -1233,6 +1233,7 @@ PreparedMesh prepare_dynamic_model(PackageManager& pm, TagHash tag, const Dynami
                         if (t.stage(ShaderStage::Vertex).shader.is_none() || t.stage(ShaderStage::Pixel).shader.is_none()) continue;
                         PreparedMesh::Group g = build_group(pm, t, part, uint16_t(k), mesh.input_layout[stage], texture_cache, out.scopes, true);
                         g.stage = stage;
+                        g.armour_marking = stage == 0 && (dp.flags & 8) && g.ps_material.shader.value == 0x80A4ACE1u;
                         if (stage == 0 && g.blend > 1) {
                             const auto outputs = shader_outputs(g.ps);
                             uint32_t targets = 0;
@@ -2643,11 +2644,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 throw UnsupportedMeshPart(std::format("{}: original PS writes SV_Target{}; original pass attachments must be reconstructed",
                     item.technique.str(), output.index));
         pd.DSVFormat = authored_shadow ? DXGI_FORMAT_D32_FLOAT : GBuffer::kDepthFormat;
+        const bool armour_marking = g.armour_marking;
         if (authored_shadow) {
             pd.RasterizerState.DepthBias = -16;
             pd.RasterizerState.SlopeScaledDepthBias = -2;
             pd.RasterizerState.DepthBiasClamp = -0.01f;
-        } else if (g.stage == 0 && item.ps_material.shader.value == 0x80A4ACE1u) {
+        } else if (armour_marking) {
             // This cutout shader draws lettering on skinned armour in the opaque pass.
             // Let it win over the surface it sits on after the two meshes are skinned.
             pd.RasterizerState.DepthBias = 4;
@@ -2658,7 +2660,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         }
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
-                                             mesh.buffers.at(g.buffers).ib.is_32bit};
+                                             mesh.buffers.at(g.buffers).ib.is_32bit, armour_marking};
         ProfileScope profile_pso("add.pso");
         HRESULT pipeline_hr = S_OK;
         if (auto existing = shared_pipelines.find(pipeline_key); g.bake_gs.empty() && existing != shared_pipelines.end()) item.pso = existing->second;
@@ -2690,7 +2692,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
             const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
-                                               mesh.buffers.at(g.buffers).ib.is_32bit};
+                                               mesh.buffers.at(g.buffers).ib.is_32bit, false};
             if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
             else {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = pd;
@@ -3692,6 +3694,7 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     PreparedMesh root = mesh;
     bool calm_compiler_cape = false;
+    bool polished_compiler_cape = false;
     if (root.tag.value == 0x80A9707Eu) {
         for (auto& group : root.groups) {
             auto& ps = group.ps_material;
@@ -3703,6 +3706,14 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
                 ps.constants[scroll] = {};
                 calm_compiler_cape = true;
             }
+            if (ps.shader.value == 0x80A96FC2u && ps.constants.size() > 125) {
+                // The cape shader combines a procedural height gradient with
+                // a sampled tangent-space normal. Reduce both fine-scale terms.
+                ps.constants[123][0] *= 0.08f;
+                ps.constants[125][0] *= 0.12f;
+                ps.constants[125][1] *= 0.12f;
+                polished_compiler_cape = true;
+            }
         }
     }
     auto parts = std::move(root.attachments);
@@ -3710,6 +3721,9 @@ uint32_t StaticMeshScene::add_actor(Gpu& gpu, const PreparedMesh& mesh, const st
     const auto prune = [&] { std::erase_if(actors_[id].sets, [&](uint32_t set) { return set >= sets_.size(); }); };
     try {
         add_mesh(gpu, std::move(root), layouts, std::span(&identity, 1));
+        if (polished_compiler_cape)
+            material_externs_->note_estimate("Compiler cape: reduced surface normal detail",
+                                             "procedural and texture normal scales inferred from the requested smooth finish");
         if (calm_compiler_cape)
             material_externs_->note_estimate("Compiler at rest: fixed hem mask and no moving surface detail",
                                              "resting values inferred from the cape pixel shaders");

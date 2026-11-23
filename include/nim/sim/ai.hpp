@@ -178,6 +178,16 @@ struct AiAgent {
     float exit_floor = 0;              // z of the floor it drops to
     std::vector<std::array<float, 3>> path;  // waypoints to the goal (A*, 3.73); empty: straight
     size_t path_next = 0;
+    std::array<float, 3> last_seen{};  // last known player position when suspicious/alerted
+    bool has_last_seen = false;
+    float stuck_time = 0;              // s spent blocked while trying to move
+    float replan_timer = 0;            // s until next combat A* replan
+    float strafe_dir = 1.0f;           // +1 / -1 lateral combat strafe direction
+    float strafe_timer = 0;            // s until flipping strafe_dir
+    float preferred_range = 10.0f;     // m: desired combat stand-off distance (by archetype, 推定)
+    bool is_compiler = false;          // pfhor_compiler (80A97147): hovering chamber patrol & aura surge
+    float compiler_charge = 0;         // 0..1: Compiler aura/charge intensity (推定)
+    float compiler_phase_time = 0;     // s: Compiler combat charge/surge cycle timer
 };
 // A squad's dropship (3.71).
 struct AiDropship {
@@ -249,6 +259,8 @@ public:
     float room_at(float x, float y, float z) const;
     // A straight walk from a to b following the floor (steps up to 0.45 m) over open cells.
     bool path_clear(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius) const;
+    // Line of sight from eye to target against WalkGrid height obstacles (walls/containers).
+    bool line_of_sight(const std::array<float, 3>& eye, const std::array<float, 3>& target) const;
     // A* over a 0.5 m lattice of such walks (3.73): the waypoints after `a` up to b (string-pulled),
     // none when b is not reached within `max_nodes` lattice points.
     std::optional<std::vector<std::array<float, 3>>> find_path(const std::array<float, 3>& a, const std::array<float, 3>& b, float radius,

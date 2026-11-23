@@ -165,57 +165,6 @@ private:
     std::thread thread_;
 };
 
-// Spatialized multi-voice ambient sound player for maps (XAudio2).
-// Selects the loudest distinct AudioEvents around the camera, decodes their .wem streams
-// asynchronously on a worker thread, and loops them with smooth distance attenuation & stereo pan.
-class AmbientAudioPlayer {
-public:
-    explicit AmbientAudioPlayer(AudioEngine& engine);
-    ~AmbientAudioPlayer();
-    AmbientAudioPlayer(const AmbientAudioPlayer&) = delete;
-    AmbientAudioPlayer& operator=(const AmbientAudioPlayer&) = delete;
-
-    void set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio);
-    void clear();
-    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float master_volume, bool enabled);
-
-    size_t emitter_count() const { return audio_ ? audio_->emitters.size() : 0; }
-    size_t active_voices() const { return active_voices_; }
-    size_t decoded_count() const;
-
-private:
-    struct ActiveVoice {
-        uint32_t event_tag = 0;
-        TagHash wem;
-        std::shared_ptr<const PcmAudio> pcm;
-        std::unique_ptr<Voice> voice;
-        float volume = 0.0f;
-        float pan = 0.0f;
-        bool looping = false;
-        float cooldown = 0.0f;  // remaining wait seconds before next one-shot trigger
-        uint32_t next_index = 0;
-    };
-    void decode_loop();
-    void request_decode(TagHash wem);
-    float next_random_unit();
-
-    AudioEngine& engine_;
-    std::shared_ptr<const MapAudio> audio_;
-    std::vector<ActiveVoice> voices_;
-    size_t active_voices_ = 0;
-    uint32_t rng_state_ = 0x12345678u;
-
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::unique_ptr<PackageManager> pm_;
-    std::deque<TagHash> decode_queue_;
-    std::vector<uint32_t> decode_pending_;
-    std::vector<std::pair<uint32_t, std::shared_ptr<const PcmAudio>>> decoded_;
-    std::vector<uint32_t> failed_;
-    bool stop_ = false;
-    std::thread worker_;
-};
-
 // Sounds started at moving emitters (docs/PROGRESS.md 3.90): the audio events AiActors cues
 // (clip events, component loops), played as their Wwise banks lay out (wwise_play_event: delays,
 // containers, loops, seeks, fades, pitch, volume, attenuation curves), panned and attenuated by
@@ -225,8 +174,9 @@ public:
     struct Cue {
         TagHash event;
         uint64_t emitter = 0;
+        float placement_gain = 1;
     };
-    explicit EntityAudioPlayer(AudioEngine& engine);
+    explicit EntityAudioPlayer(AudioEngine& engine, bool ambient = false);
     ~EntityAudioPlayer();
     EntityAudioPlayer(const EntityAudioPlayer&) = delete;
     EntityAudioPlayer& operator=(const EntityAudioPlayer&) = delete;
@@ -239,11 +189,16 @@ public:
                 std::array<float, 3> right, float dt, float master_volume, bool enabled);
     size_t active_voices() const { return active_; }
     size_t events_loaded() const;
+    bool has_emitter(uint64_t emitter) const;
 
 private:
     struct Event {
         std::shared_ptr<const WwiseEventData> data;
         std::vector<uint32_t> stops;  // the nodes its own stop actions name
+    };
+    struct DecodedVoice {
+        PcmAudio audio;
+        PcmLevel level;
     };
     struct Playing {
         uint64_t emitter = 0;
@@ -251,7 +206,8 @@ private:
         int index = 0;       // in its group
         std::shared_ptr<const WwiseEventData> event;
         WwiseVoice v;
-        std::shared_ptr<const PcmAudio> pcm;
+        float placement_gain = 1;
+        std::shared_ptr<const DecodedVoice> pcm;
         std::unique_ptr<Voice> voice;
         double start_at = -1;  // clock time it starts (< 0: waiting on the voice it follows)
         double end_at = -1;    // clock time it ends (< 0: endless or not started)
@@ -262,14 +218,15 @@ private:
     std::shared_ptr<const Event> event(TagHash t);           // nullptr while loading
     bool event_failed(TagHash t) const;
     bool pcm_failed(uint32_t source) const;
-    std::shared_ptr<const PcmAudio> pcm(const std::shared_ptr<const WwiseEventData>& ev, uint32_t source);
+    std::shared_ptr<const DecodedVoice> pcm(const std::shared_ptr<const WwiseEventData>& ev, uint32_t source);
     void instantiate(const Cue& cue, const Event& ev, float age);
     void add_voices(uint64_t emitter, uint64_t group, const std::shared_ptr<const WwiseEventData>& ev,
-                    std::vector<WwiseVoice> voices, int after);
+                    std::vector<WwiseVoice> voices, float placement_gain, int after);
     float gain(const Playing& p) const;  // without the master volume
     std::array<float, 3> eye_{};
 
     AudioEngine& engine_;
+    const bool ambient_;
     std::vector<Playing> playing_;
     struct Pending {
         Cue cue;
@@ -284,7 +241,7 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::unique_ptr<PackageManager> pm_;
+    std::shared_ptr<PackageManager> pm_;
     struct Job {
         TagHash event;
         std::shared_ptr<const WwiseEventData> source_event;
@@ -293,13 +250,35 @@ private:
     std::deque<Job> jobs_;
     std::unordered_map<uint32_t, std::shared_ptr<const Event>> events_;
     std::unordered_map<uint32_t, bool> event_requested_;  // true: failed
-    std::unordered_map<uint32_t, std::shared_ptr<const PcmAudio>> pcm_;
+    std::unordered_map<uint32_t, std::shared_ptr<const DecodedVoice>> pcm_;
     std::unordered_map<uint32_t, bool> pcm_requested_;  // true: failed
     std::deque<uint32_t> pcm_order_;
     size_t pcm_bytes_ = 0;
     bool stop_ = false;
     uint64_t generation_ = 0;
     std::thread worker_;
+};
+
+// Map placements select and position nearby Wwise events. The same player drives
+// their authored loops, sound selection, and attenuation used for entity events.
+class AmbientAudioPlayer {
+public:
+    explicit AmbientAudioPlayer(AudioEngine& engine) : player_(engine, true) {}
+    void set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio);
+    void clear();
+    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float master_volume, bool enabled);
+
+    size_t emitter_count() const { return audio_ ? audio_->emitters.size() : 0; }
+    size_t active_voices() const { return player_.active_voices(); }
+
+private:
+    struct Selected {
+        uint64_t emitter;
+        float next_play;
+    };
+    EntityAudioPlayer player_;
+    std::shared_ptr<const MapAudio> audio_;
+    std::vector<Selected> selected_;
 };
 
 } // namespace nim::media

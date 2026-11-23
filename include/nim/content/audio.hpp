@@ -23,6 +23,13 @@ struct PcmAudio {
     double seconds() const { return sample_rate ? double(frames()) / sample_rate : 0; }
 };
 
+struct PcmLevel {
+    float peak = 0;
+    float short_rms = 0;  // loudest 100 ms window in any channel
+};
+PcmLevel measure_pcm_level(const PcmAudio& pcm);
+float limit_ambient_gain(float gain, PcmLevel level);
+
 struct WemInfo {
     uint16_t codec = 0;  // 0xFFFF Wwise Vorbis, 0x0001/0xFFFE PCM, 0x0002 Wwise IMA ADPCM, 0x3040 Opus
     uint16_t channels = 0;

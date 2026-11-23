@@ -155,6 +155,25 @@ bool AiSimulation::path_clear(const std::array<float, 3>& a, const std::array<fl
     return z && std::abs(*z - b[2]) < 0.8f;
 }
 
+bool AiSimulation::line_of_sight(const std::array<float, 3>& eye, const std::array<float, 3>& target) const {
+    if (std::ranges::none_of(grids_, [](const WalkGrid& g) { return g.w != 0; }) && patches_.empty()) return true;
+    const float dx = target[0] - eye[0], dy = target[1] - eye[1], dz = target[2] - eye[2];
+    const float d = std::hypot(dx, dy);
+    if (d < 1.5f) return true;
+    const float z_hi = std::max(eye[2], target[2]) + 8.0f;
+    for (float s = 0.75f; s < d - 0.75f; s += 0.5f) {
+        const float t = s / d;
+        const float x = eye[0] + dx * t, y = eye[1] + dy * t, rz = eye[2] + dz * t;
+        bool blocked = false;
+        each_grid(x, y, [&](const WalkGrid& g) {
+            if (blocked) return;
+            if (const auto h = g.surface(x, y); h && *h > rz + 0.25f && *h < z_hi) blocked = true;
+        });
+        if (blocked) return false;
+    }
+    return true;
+}
+
 // A* (推定: the engine's navigation is not in game data) over lattice points 0.5 m apart, each
 // edge a floor-following walk; nodes at one lattice point are told apart by height (0.6 m), so
 // floors above one another stay separate. Bounded to an ellipse around a and b.
@@ -508,6 +527,29 @@ MotionSet build_motion_set(PackageManager& pm, TagHash entity, float fps) {
         // The character's own clips first; what it lacks comes from the shared family (推定: the
         // motion graph's choice is not decoded).
         set.locomotion = !own.locomotion.empty() ? own.locomotion : borrowed.locomotion;
+        // The Compiler (80A97147) hovers rather than walking with foot root motion; use its own
+        // authored hover/glide and surge clips so it animates smoothly while moving (推定).
+        if (entity.value == 0x80A97147u && set.locomotion.empty()) {
+            auto add_hover = [&](uint32_t tag_val, float speed, bool cyclic) {
+                try {
+                    const AnimationClip c = load_animation_clip(pm, TagHash(tag_val));
+                    if (c.frame_count > 1) {
+                        MotionClip m;
+                        m.clip = TagHash(tag_val);
+                        m.speed = speed;
+                        m.direction = {1.0f, 0.0f};
+                        m.seconds = float(c.frame_count - 1) / fps;
+                        m.cyclic = cyclic;
+                        m.authored = true;
+                        set.locomotion.push_back(m);
+                    }
+                } catch (...) {
+                }
+            };
+            add_hover(0x80A97160u, 1.0f, true);   // calm hover drift
+            add_hover(0x80A9715Au, 1.8f, true);   // forward hover glide
+            add_hover(0x80A97149u, 3.3f, false);  // forward surge
+        }
         set.turns = !own.turns.empty() ? own.turns : borrowed.turns;
         set.idle = own_idle ? own_idle : borrowed_idle;
         set.borrowed = (own.locomotion.empty() && !borrowed.locomotion.empty() ? 1 : 0) +
@@ -748,6 +790,21 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
                     : (tier != character.tags.end() ? tier->second == boss : name.find("boss") != std::string::npos) ? params_.sight_boss
                     : (tier != character.tags.end() ? tier->second == elite : name.find("elite") != std::string::npos) ? params_.sight_elite
                     : params_.sight_base;
+            a.is_compiler = character.entity.value == 0x80A97147u || name.find("compiler") != std::string::npos;
+            if (a.is_compiler) {
+                a.sight = 45.0f;
+                a.preferred_range = 9.0f;
+            } else if (name.find("sniper") != std::string::npos) {
+                a.preferred_range = 22.0f;
+            } else if (name.find("ghost") != std::string::npos || name.find("shotgun") != std::string::npos) {
+                a.preferred_range = 6.0f;
+            } else if (name.find("assault") != std::string::npos || name.find("grenadier") != std::string::npos) {
+                a.preferred_range = 12.0f;
+            } else {
+                a.preferred_range = 10.0f;
+            }
+            a.strafe_dir = (agents_.size() % 2) ? 1.0f : -1.0f;
+            a.strafe_timer = std::uniform_real_distribution<float>(2.0f, 4.5f)(rng_);
             a.wait = std::uniform_real_distribution<float>(0, params_.wait_max)(rng_);
             if (!ship) ground_squad_members_[s].push_back(agents_.size());
             agents_.push_back(a);
@@ -902,7 +959,7 @@ void AiSimulation::perceive(const std::array<float, 3>& eye, float yaw, float ra
     const bool noticeable = !params_.player_invisible && std::abs(dz) < params_.vertical_limit;
     if (noticeable && d < range) {
         const bool inside = !cone || d < 1e-3f || (dx * std::cos(yaw) + dy * std::sin(yaw)) / d >= cos_half_fov;
-        if (inside) {
+        if (inside && line_of_sight(eye, player)) {
             sees = true;
             rise += params_.sight_rise * (1 - d / range);
         }
@@ -1351,21 +1408,150 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
         }
         perceive({a.position[0], a.position[1], a.position[2] + 1.6f}, a.yaw, a.sight, cos_half, true, player, dt, a.awareness,
                  a.alert, a.sees_player);
+        if (a.sees_player) {
+            a.last_seen = player;
+            a.has_last_seen = true;
+        }
+        // Squad alert sharing (推定): an alerted member who sees the player alerts nearby squadmates.
+        if (!params_.player_invisible && a.alert == AiAlert::Alerted && a.sees_player) {
+            for (auto& mate : agents_) {
+                if (&mate == &a || !mate.active || mate.squad != a.squad || mate.exit >= 0) continue;
+                if (dist2d(mate.position, a.position) < 18.0f && std::abs(mate.position[2] - a.position[2]) < 5.0f) {
+                    mate.awareness = std::max(mate.awareness, params_.suspicious_at + 0.15f);
+                    if (mate.alert == AiAlert::Unaware) mate.alert = AiAlert::Suspicious;
+                    mate.last_seen = player;
+                    mate.has_last_seen = true;
+                }
+            }
+        }
         const bool react = !params_.player_invisible && a.alert != AiAlert::Unaware;
+        a.replan_timer = std::max(0.0f, a.replan_timer - dt);
+        a.strafe_timer -= dt;
+        if (a.strafe_timer <= 0) {
+            a.strafe_dir = -a.strafe_dir;
+            a.strafe_timer = std::uniform_real_distribution<float>(2.5f, 4.5f)(rng_);
+        }
         float speed = 0;
         std::array<float, 3> target = a.goal;
         float face = a.yaw;
-        if (react) {
-            face = std::atan2(player[1] - a.position[1], player[0] - a.position[0]);
-            if (a.alert == AiAlert::Alerted && !squad_areas_[a.squad].empty()) {
-                auto approach = player;
-                const float angle = float((&a - agents_.data()) % 23) * 2.399963f;
-                approach[0] += 4.0f * std::cos(angle);
-                approach[1] += 4.0f * std::sin(angle);
-                approach[2] = a.position[2];
-                target = nearest_objective_point(a.squad, approach);
-                speed = run_speed(a);
+        const float r = radius(a);
+        auto plan_to = [&](const std::array<float, 3>& dest) {
+            a.goal = dest;
+            if (path_clear(a.position, dest, r)) {
+                a.path.clear();
+                a.path_next = 0;
+                return;
             }
+            if (a.replan_timer <= 0 && search_budget_ >= 1.0f) {
+                search_budget_ -= 1.0f;
+                a.replan_timer = 0.6f;
+                if (auto found = find_path(a.position, dest, r, 1200)) {
+                    a.path = std::move(*found);
+                    a.path_next = 0;
+                    ++path_stats_.found;
+                } else {
+                    a.path.clear();
+                    a.path_next = 0;
+                }
+            }
+        };
+        if (a.is_compiler) {
+            // Compiler (80A97147) encounter behavior (推定): hovers around its Cryo chamber
+            // terminals at rest; charges its aura and orbits/surges when alerted.
+            if (react) {
+                const auto& focus = a.sees_player ? player : (a.has_last_seen ? a.last_seen : player);
+                face = std::atan2(focus[1] - a.position[1], focus[0] - a.position[0]);
+                if (a.alert == AiAlert::Alerted) {
+                    a.compiler_phase_time = std::fmod(a.compiler_phase_time + dt, 5.5f);
+                    const bool charging = a.compiler_phase_time < 3.5f;
+                    const float desired_charge = charging ? (0.4f + 0.6f * (a.compiler_phase_time / 3.5f))
+                                                          : (1.0f - 0.65f * ((a.compiler_phase_time - 3.5f) / 2.0f));
+                    a.compiler_charge += (desired_charge - a.compiler_charge) * std::min(1.0f, dt * 3.0f);
+                    const float dp = dist2d(a.position, focus);
+                    const float ang = std::atan2(a.position[1] - focus[1], a.position[0] - focus[0]) + a.strafe_dir * (charging ? 0.35f : 0.75f);
+                    std::array<float, 3> dest{focus[0] + a.preferred_range * std::cos(ang), focus[1] + a.preferred_range * std::sin(ang), a.position[2]};
+                    if (dp < a.preferred_range * 0.65f) {
+                        dest[0] = focus[0] + a.preferred_range * std::cos(ang - a.strafe_dir * 0.25f);
+                        dest[1] = focus[1] + a.preferred_range * std::sin(ang - a.strafe_dir * 0.25f);
+                    }
+                    plan_to(dest);
+                    speed = charging ? 1.8f : 3.2f;
+                } else {
+                    a.compiler_charge += (0.45f - a.compiler_charge) * std::min(1.0f, dt * 2.0f);
+                    if (dist2d(a.position, focus) > 2.5f) {
+                        plan_to(focus);
+                        speed = 1.4f;
+                    }
+                }
+            } else {
+                a.compiler_charge = std::max(0.0f, a.compiler_charge - dt * 0.5f);
+                a.compiler_phase_time = 0;
+                if (a.wait > 0) {
+                    a.wait -= dt;
+                    if (a.wait <= 0) {
+                        // Pick a chamber patrol point 6..14 m around home (matching the aura terminals).
+                        for (int attempt = 0; attempt < 16; ++attempt) {
+                            const float ang = std::uniform_real_distribution<float>(0, 2 * kPi)(rng_);
+                            const float rad = std::uniform_real_distribution<float>(5.0f, 13.0f)(rng_);
+                            std::array<float, 3> p{a.home[0] + rad * std::cos(ang), a.home[1] + rad * std::sin(ang), a.home[2]};
+                            if (const auto s = ground(p[0], p[1], a.home[2])) p[2] = *s;
+                            if (!ground(a.position[0], a.position[1], a.position[2]) || (open_at(p[0], p[1], p[2], r) && path_clear(a.position, p, r))) {
+                                a.goal = p;
+                                a.path.clear();
+                                a.path_next = 0;
+                                break;
+                            }
+                        }
+                    }
+                } else if (dist2d(a.position, a.goal) < 0.6f) {
+                    a.wait = std::uniform_real_distribution<float>(3.0f, 6.0f)(rng_);
+                } else {
+                    speed = 1.5f;
+                }
+            }
+            target = a.goal;
+            while (a.path_next < a.path.size() && a.path_next + 1 < a.path.size() && dist2d(a.position, a.path[a.path_next]) < 0.6f) ++a.path_next;
+            if (a.path_next < a.path.size()) target = a.path[a.path_next];
+        } else if (react) {
+            const auto& focus = a.sees_player ? player : (a.has_last_seen ? a.last_seen : player);
+            face = std::atan2(focus[1] - a.position[1], focus[0] - a.position[0]);
+            if (a.alert == AiAlert::Alerted && !squad_areas_[a.squad].empty()) {
+                std::array<float, 3> dest = focus;
+                const float dp = dist2d(a.position, focus);
+                if (a.sees_player) {
+                    const float from_player = std::atan2(a.position[1] - focus[1], a.position[0] - focus[0]);
+                    if (dp < a.preferred_range * 0.7f) {
+                        // Too close: back off slightly while strafing.
+                        dest = {focus[0] + a.preferred_range * std::cos(from_player + a.strafe_dir * 0.25f),
+                                focus[1] + a.preferred_range * std::sin(from_player + a.strafe_dir * 0.25f), a.position[2]};
+                    } else if (dp <= a.preferred_range * 1.3f) {
+                        // In combat range: strafe laterally around the player.
+                        dest = {focus[0] + dp * std::cos(from_player + a.strafe_dir * 0.35f),
+                                focus[1] + dp * std::sin(from_player + a.strafe_dir * 0.35f), a.position[2]};
+                    } else {
+                        // Advance to preferred range with per-agent angular spread.
+                        const float spread = float((&a - agents_.data()) % 23) * 2.399963f;
+                        dest = {focus[0] + a.preferred_range * 0.85f * std::cos(spread),
+                                focus[1] + a.preferred_range * 0.85f * std::sin(spread), a.position[2]};
+                    }
+                    dest = nearest_objective_point(a.squad, dest);
+                    speed = dp > a.preferred_range * 1.3f ? run_speed(a) : walk_speed(a);
+                } else if (a.has_last_seen && dp > 2.0f) {
+                    dest = nearest_objective_point(a.squad, focus);
+                    speed = run_speed(a);
+                }
+                if (speed > 0) plan_to(dest);
+            } else if (a.alert == AiAlert::Suspicious && a.has_last_seen && !squad_areas_[a.squad].empty()) {
+                // Investigate last known player position instead of freezing in place.
+                const auto dest = nearest_objective_point(a.squad, focus);
+                if (dist2d(a.position, dest) > 2.0f) {
+                    plan_to(dest);
+                    speed = walk_speed(a);
+                }
+            }
+            target = a.goal;
+            while (a.path_next < a.path.size() && a.path_next + 1 < a.path.size() && dist2d(a.position, a.path[a.path_next]) < 0.5f) ++a.path_next;
+            if (a.path_next < a.path.size()) target = a.path[a.path_next];
         } else if (!squad_areas_[a.squad].empty() && (a.character >= motions_.size() || !motions_[a.character].locomotion.empty())) {
             if (a.wait > 0) {
                 a.wait -= dt;
@@ -1431,16 +1617,57 @@ void AiSimulation::step(float dt, const std::array<float, 3>& player) {
             next[0] += dir[0] * step;
             next[1] += dir[1] * step;
             if (ground(a.position[0], a.position[1], a.position[2])) {
-                const auto z = follow(a.position, next, 0.01f, 0, 0.125f, true);
-                if (z) next[2] = *z;
-                else next = a.position;
+                // Enforce body-radius wall/container clearance (clamped when walking out of a tight
+                // spawn so the agent never moves deeper into a wall). Slide tangentially on block.
+                const float here_room = room_at(a.position[0], a.position[1], a.position[2]);
+                const float move_r = here_room > 0 ? std::min(r, std::max(0.18f, here_room - 0.02f)) : 0.18f;
+                auto try_step = [&](std::array<float, 2> d2, float s) -> std::optional<std::array<float, 3>> {
+                    std::array<float, 3> cand{a.position[0] + d2[0] * s, a.position[1] + d2[1] * s, a.position[2]};
+                    if (const auto z = follow(a.position, cand, move_r, 0, 0.125f, true)) {
+                        cand[2] = *z;
+                        return cand;
+                    }
+                    return std::nullopt;
+                };
+                if (auto ok = try_step(dir, step)) {
+                    next = *ok;
+                } else {
+                    bool slid = false;
+                    constexpr float kSlideAngles[] = {0.785f, -0.785f, 1.309f, -1.309f};
+                    for (const float ang : kSlideAngles) {
+                        const float ca = std::cos(ang), sa = std::sin(ang);
+                        if (auto ok = try_step({dir[0] * ca - dir[1] * sa, dir[0] * sa + dir[1] * ca}, step * 0.7f)) {
+                            next = *ok;
+                            slid = true;
+                            break;
+                        }
+                    }
+                    if (!slid) next = a.position;
+                }
             } else {
                 next[2] += (target[2] - a.position[2]) * std::min(1.0f, step / d);
+            }
+            const float moved = dist2d(a.position, next);
+            if (step > 1e-3f && moved < step * 0.15f) {
+                a.stuck_time += dt;
+                if (a.stuck_time > 0.8f) {
+                    a.stuck_time = 0;
+                    a.path.clear();
+                    a.path_next = 0;
+                    a.replan_timer = 0;
+                    if (!react) {
+                        a.goal = a.position;
+                        a.wait = 0.35f;
+                    }
+                }
+            } else {
+                a.stuck_time = std::max(0.0f, a.stuck_time - dt * 2.0f);
             }
             a.velocity = {(next[0] - a.position[0]) / dt, (next[1] - a.position[1]) / dt, 0};
             a.position = next;
         } else {
             a.velocity = {};
+            a.stuck_time = 0;
         }
         // On the floor under it (the surface nearest its height), where a grid or patch has one.
         if (const auto s = ground(a.position[0], a.position[1], a.position[2])) a.position[2] = *s;
