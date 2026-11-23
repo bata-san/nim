@@ -2289,6 +2289,7 @@ public:
     std::vector<int> weather_states;
     bool heat_cascade_enabled = false; // keep the user's selection when changing maps/views
     RainOcclusion rain;
+    float weather_rain = 0;  // the chosen weather's rain_amount (0: none); object rain sounds play above 0
 
     void apply_weather() {
         std::map<uint32_t, float> channels;
@@ -2303,6 +2304,10 @@ public:
                 for (const auto& [slot, v] : weather_values(*on)) channels[slot] = v;
         scene.set_global_channels(channels);
         game_lighting.set_global_channels(channels);
+        weather_rain = 0;
+        if (map_weather)
+            if (const auto s = map_weather->registry.slots.find(0x9C4DE32Eu); s != map_weather->registry.slots.end())  // fnv1("rain_amount")
+                if (const auto v = channels.find(s->second); v != channels.end()) weather_rain = v->second;
     }
     std::string weather_state_label(const WeatherState& st) const {
         std::string s = map_weather->name(st.name);
@@ -2774,7 +2779,7 @@ public:
             }
             if (object_audio)
                 object_audio->update({vm.eye.x, vm.eye.y, vm.eye.z}, {vm.right.x, vm.right.y, vm.right.z},
-                                     light.frame_delta_time, object_audio_volume, object_audio_enabled && map_scene);
+                                     light.frame_delta_time, object_audio_volume, object_audio_enabled && map_scene, weather_rain);
             if (entity_audio) {
                 entity_audio->update(entity_cues, entity_stopped, entity_emitters, {vm.eye.x, vm.eye.y, vm.eye.z},
                                      {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time, entity_audio_volume,

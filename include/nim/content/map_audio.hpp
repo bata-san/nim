@@ -38,6 +38,9 @@ struct MapObjectSound {
     TagHash entity, event;
     std::array<float, 3> position{};
     float max_distance = 0;
+    // The entity's components read the world channel rain_amount: the loop is a rain sound,
+    // played only while the weather sets rain (docs/PROGRESS.md 3.109).
+    bool rain = false;
 };
 
 struct MapAudio {

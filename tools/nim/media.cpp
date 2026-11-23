@@ -1101,12 +1101,13 @@ void MapObjectAudioPlayer::clear() {
 }
 
 void MapObjectAudioPlayer::update(std::array<float, 3> eye, std::array<float, 3> right, float dt,
-                                  float volume, bool enabled) {
+                                  float volume, bool enabled, float rain) {
     if (!audio_ || audio_->objects.empty()) return;
     std::vector<std::pair<float, size_t>> nearby;
     if (enabled && volume > 0) {
         for (size_t i = 0; i < audio_->objects.size(); ++i) {
             const auto& source = audio_->objects[i];
+            if (source.rain && !(rain > 0)) continue;  // rain sounds: only while the weather sets rain
             const float distance = std::hypot(eye[0] - source.position[0], eye[1] - source.position[1],
                                               eye[2] - source.position[2]);
             if (distance < source.max_distance) nearby.emplace_back(distance, i);

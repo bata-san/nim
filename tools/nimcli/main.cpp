@@ -4202,7 +4202,8 @@ int main(int argc, char** argv) {
                          bubble.str(), audio.emitters.size(), audio.point_emitters, audio.polyline_emitters, audio.global_emitters,
                          audio.unique_events, audio.events_with_wems, audio.events_without_wems, audio.unique_wems);
             if (std::ranges::find(args, std::string("--survey")) != args.end()) return cmd_object_audio_survey(pm, audio);
-            std::println("object audio: {} placed looping emitters", audio.objects.size());
+            std::println("object audio: {} placed looping emitters ({} rain sounds, played only while the weather sets rain_amount)", audio.objects.size(),
+                         std::ranges::count_if(audio.objects, [](const MapObjectSound& o) { return o.rain; }));
             std::println("  left out: {} loops an event starts (named only in reaction tables 8080AF57 / 8080AF59); one of a component's alternatives at {} placements", audio.event_loops.size(), audio.alternative_picks);
             {
                 // Per entity and event: placements, the event's reach.

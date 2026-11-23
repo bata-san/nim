@@ -307,7 +307,7 @@ public:
     explicit MapObjectAudioPlayer(AudioEngine& engine) : player_(engine) {}
     void set_map(PackageManager& pm, std::shared_ptr<const MapAudio> audio);
     void clear();
-    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float volume, bool enabled);
+    void update(std::array<float, 3> eye, std::array<float, 3> right, float dt, float volume, bool enabled, float rain = 0);  // rain: the weather's rain_amount
     size_t source_count() const { return audio_ ? audio_->objects.size() : 0; }
 
 private:

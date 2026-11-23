@@ -22,6 +22,7 @@ constexpr uint32_t kClassPolylineAudio = 0x80802A97u;
 constexpr uint32_t kCompPointAudio = 0x80803135u;
 constexpr uint32_t kClassPointAudio = 0x80803137u;
 constexpr uint32_t kClassGlobalAudio = 0x8080B107u;
+constexpr uint32_t kRainAmount = 0x9C4DE32Eu;  // fnv1("rain_amount")
 
 std::array<float, 3> closest_on_segment(std::array<float, 3> p, std::array<float, 3> a, std::array<float, 3> b) {
     const float abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
@@ -40,6 +41,36 @@ struct EntityAudioSources {
     std::set<uint32_t> event_started;
     std::unordered_map<uint32_t, uint32_t> component;
 };
+// Whether one of the entity's components names `channel` (an FNV-1 name its sequences read).
+bool entity_reads_channel(PackageManager& pm, TagHash entity, uint32_t channel) {
+    std::vector<uint8_t> ed;
+    try {
+        ed = pm.read(entity);
+    } catch (...) {
+        return false;
+    }
+    std::set<uint32_t> listed;
+    for (size_t o = 0; o + 4 <= ed.size(); o += 4) {
+        uint32_t c;
+        std::memcpy(&c, ed.data() + o, 4);
+        if (c < 0x80800000u || c == ~0u || !listed.insert(c).second) continue;
+        const Entry* ce = pm.entry(TagHash(c));
+        if (!ce || ce->type != 8 || ce->reference != 0x8080BADBu) continue;
+        std::vector<uint8_t> cd;
+        try {
+            cd = pm.read(TagHash(c));
+        } catch (...) {
+            continue;
+        }
+        for (size_t q = 0; q + 4 <= cd.size(); q += 4) {
+            uint32_t v;
+            std::memcpy(&v, cd.data() + q, 4);
+            if (v == channel) return true;
+        }
+    }
+    return false;
+}
+
 EntityAudioSources entity_audio_sources(PackageManager& pm, TagHash entity) {
     constexpr uint32_t kComponent = 0x8080BADBu, kAudioEvent = 0x8080B128u;
     constexpr uint32_t kReactions = 0x8080AF57u, kReactionSet = 0x8080AF59u;
@@ -162,6 +193,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
 
     std::set<uint32_t> polyline_tags, point_tags, global_tags;
     std::unordered_map<uint32_t, std::vector<std::vector<TagHash>>> object_events;  // entity -> loop groups
+    std::set<uint32_t> rain_entities;  // entities whose components read rain_amount
     std::unordered_map<uint32_t, float> object_distances;
     std::set<std::tuple<uint32_t, std::array<float, 3>>> object_instances;
     for (TagHash table : layout.node_tables) {
@@ -197,6 +229,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
                             by_component[c == sources.component.end() ? 0u : c->second].push_back(ev);
                         }
                         for (auto& [c, list] : by_component) events->second.push_back(std::move(list));
+                        if (!events->second.empty() && entity_reads_channel(pm, *entity, kRainAmount)) rain_entities.insert(entity->value);
                     }
                     const std::array pos{r.f32_at(e + 0x10), r.f32_at(e + 0x14), r.f32_at(e + 0x18)};
                     if (std::ranges::all_of(pos, [](float v) { return std::isfinite(v); })) {
@@ -218,7 +251,7 @@ MapAudio load_map_audio(PackageManager& pm, const MapLayout& layout) {
                                 catch (...) { continue; }
                             }
                             if (std::isfinite(distance->second) && distance->second > 1)
-                                out.objects.push_back({*entity, event, pos, distance->second});
+                                out.objects.push_back({*entity, event, pos, distance->second, rain_entities.contains(entity->value)});
                         }
                     }
                 }
