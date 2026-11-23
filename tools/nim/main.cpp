@@ -5407,7 +5407,7 @@ int run(const std::wstring& cmdline) {
 
     auto app = std::make_unique<App>();
     try {
-        g_frame_generation.init();
+        // Streamline is optional. Initialize it only when the user requests frame generation.
         app->gpu.init(false, [](ID3D12Device* device) { return g_frame_generation.attach(device); });
         init_swapchain(app->gpu);
         app->lighting.init(app->gpu);
@@ -5429,6 +5429,7 @@ int run(const std::wstring& cmdline) {
             else if (a.size() == 8 && a.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos)
                 tag_arg = TagHash(uint32_t(std::stoul(a, nullptr, 16)));
         }
+        if (g_frame_generation_requested) g_frame_generation.init();
         LocalFree(argv);
     }
 
