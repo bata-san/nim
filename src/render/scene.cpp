@@ -826,6 +826,7 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     g.part = part;
     g.input_layout = input_layout;
     g.blend = tech.blend_state();
+    g.raster = (tech.states & 0x800000) ? int((tech.states >> 16) & 0x7F) : -1;
     const auto& vs_stage = tech.stage(ShaderStage::Vertex);
     const auto& ps_stage = tech.stage(ShaderStage::Pixel);
     g.vs_material = vs_stage;
@@ -2226,6 +2227,34 @@ std::shared_ptr<const StaticMeshScene::ShaderReflection> StaticMeshScene::reflec
     return slot;
 }
 
+// The vertex ranges the prepared parts of one buffer set index (dynamic models keep every LOD's
+// vertices in one stream, but only the chosen parts are drawn, so only those need posing).
+static std::vector<std::pair<uint32_t, uint32_t>> used_vertex_ranges(const PreparedMesh& mesh, size_t buffer, size_t vertices) {
+    std::vector<uint8_t> used(vertices, 0);
+    const auto& ib = mesh.buffers[buffer].ib;
+    const size_t width = ib.is_32bit ? 4 : 2, count = ib.data.size() / width;
+    for (const auto& g : mesh.groups) {
+        if (g.buffers != buffer) continue;
+        const size_t end = std::min<size_t>(size_t(g.part.index_start) + g.part.index_count, count);
+        for (size_t i = g.part.index_start; i < end; ++i) {
+            uint32_t v = 0;
+            std::memcpy(&v, ib.data.data() + i * width, width);
+            if (v < vertices) used[v] = 1;
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    for (size_t v = 0; v < vertices;) {
+        if (!used[v]) { ++v; continue; }
+        size_t e = v;
+        while (e < vertices && used[e]) ++e;
+        // Bridge short gaps: fewer, longer ranges skin faster than skipping a few vertices.
+        if (!ranges.empty() && v - ranges.back().second <= 64) ranges.back().second = uint32_t(e);
+        else ranges.push_back({uint32_t(v), uint32_t(e)});
+        v = e;
+    }
+    return ranges;
+}
+
 void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                                      std::span<const std::array<float, 12>> placements, std::span<const float> sky_order) {
     ProfileScope profile_total("add.mesh_parts.total");
@@ -2405,6 +2434,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 set.skin_offset = {mesh.model_cb[5][0], mesh.model_cb[5][1], mesh.model_cb[5][2]};
                 set.skin_pack_offset = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
                 set.skin_range = mesh.model_cb[13][3];
+                set.skin_ranges = used_vertex_ranges(mesh, size_t(&b - mesh.buffers.data()), b.skin.bones.size());
                 skinned_ = skin_dirty_ = true;
             } else if (cpu_skin && b.float_positions && !b.skin.bones.empty() &&
                        b.skin.bones.size() * 48 <= b.vb0.data.size()) {
@@ -2418,6 +2448,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 set.vb0_cpu = b.vb0.data;
                 set.skin = b.skin;
                 set.float_vertices = true;
+                set.skin_ranges = used_vertex_ranges(mesh, size_t(&b - mesh.buffers.data()), b.skin.bones.size());
                 skinned_ = skin_dirty_ = true;
             } else {
                 set.skin_pos = up(b.skin_pos);
@@ -2780,6 +2811,20 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.SampleMask = UINT_MAX;
         pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        // Techniques without a rasterizer state byte (99.98% of Marathon Deck's static groups) use the
+        // pass default, one-sided. The engine's front faces are counter-clockwise in D3D terms: culling
+        // that side's opposite keeps Outpost's standard view within 2,766 px of two-sided drawing, while
+        // culling the other side removes 850k px. Drawing both sides made the back faces of thin
+        // panels Z-fight with the front. Explicit states (index 1: 22 groups) stay two-sided (推定).
+        if (!authored_shadow && !projected) {
+            if (g.raster < 0) pd.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+            else
+                material_externs_->note_estimate(std::format("rasterizer state {} drawn two-sided", g.raster),
+                                                 "the engine's rasterizer state table is not decoded");
+            if (g.raster < 0)
+                material_externs_->note_estimate("default rasterizer state: one-sided, counter-clockwise front faces",
+                                                 "matched against two-sided drawing on Outpost and an enemy model");
+        }
         pd.RasterizerState.DepthClipEnable = TRUE;
         pd.DepthStencilState.DepthEnable = TRUE;
         pd.DepthStencilState.DepthWriteMask = (decal ? !standalone_decal_ : transparent || distortion || blended)
@@ -3560,6 +3605,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             const auto& set = sets_[it.buffers];
             if (it.dynamic) {
                 if (set.actor >= 0 && !actors_[size_t(set.actor)].rows) continue;
+                if (set.actor >= 0 && size_t(set.actor) < actor_in_view_.size() && actor_in_view_[size_t(set.actor)] != 1) continue;
                 const auto c = set.model_center;
                 auto placement = [&](uint32_t i) {
                     if (!set.sky_order.empty()) {
@@ -3658,6 +3704,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             const uint32_t instances = item_instances(it);
             if (!instances) continue;
             const auto& set = sets_[it.buffers];
+            if (!shadow && set.actor >= 0 && size_t(set.actor) < actor_in_view_.size() && actor_in_view_[size_t(set.actor)] != 1) continue;
             if (set.cull == UINT32_MAX) draw(commands, state, it, instances, 0);
             else if (it.dynamic) {
                 for (const auto i : cull_groups_[set.cull].visible_placements) draw(commands, state, it, 1, i);
@@ -3783,7 +3830,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     for (const auto& pose : skin_poses_) matrices[pose.model] = matrices_of(pose);
     std::vector<PoseMap> actor_matrices(actors_.size());
     for (size_t a = 0; a < actors_.size(); ++a)
-        if (actors_[a].rows)
+        if (actors_[a].rows && (a >= actor_in_view_.size() || actor_in_view_[a]))
             for (const auto& pose : actors_[a].poses)
                 if (!pose.bones.empty()) actor_matrices[a][pose.model] = matrices_of(pose);
     std::vector<std::vector<Mat>> curtain_matrices(curtains_.size());
@@ -3797,6 +3844,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         const PoseMap* source = &matrices;
         if (set.actor >= 0) {
             if (!actors_[size_t(set.actor)].rows) continue;  // hidden: not drawn
+            if (size_t(set.actor) < actor_in_view_.size() && !actor_in_view_[size_t(set.actor)]) continue;  // far off-screen
             source = &actor_matrices[size_t(set.actor)];
         }
         const auto pose = source->find(set.model);
@@ -3810,7 +3858,31 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         check_hr(set.skin_upload[slot]->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
         jobs.push_back({&set, mats, dst});
     }
-    WorkerPool::instance().parallel_for(jobs.size(), [&](size_t j) {
+    if (Profile::instance().enabled()) {
+        size_t verts = 0, actor_jobs = 0;
+        for (const auto& j : jobs) verts += j.set->skin.bones.size(), actor_jobs += j.set->actor >= 0;
+        Profile::instance().count("skin.jobs", jobs.size());
+        Profile::instance().count("skin.actor_jobs", actor_jobs);
+        Profile::instance().count("skin.vertices", verts);
+        for (const auto v : actor_in_view_) Profile::instance().count(v == 1 ? "skin.actor_in_view" : v == 2 ? "skin.actor_near" : "skin.actor_far");
+    }
+    // A few actor models hold most of the vertices: split every set into fixed chunks so all
+    // workers share the frame's skinning instead of waiting on the largest set.
+    constexpr size_t kSkinChunk = 4096;
+    struct Chunk { uint32_t job; uint32_t first, end; };
+    std::vector<Chunk> chunks;
+    for (uint32_t j = 0; j < jobs.size(); ++j) {
+        const auto& set = *jobs[j].set;
+        const size_t n = set.skin.bones.size();
+        // The first upload writes every vertex; later frames only the ones the drawn parts use.
+        const bool all = set.skin_ranges.empty() || !set.skin_readable;
+        const std::pair<uint32_t, uint32_t> whole{0, uint32_t(n)};
+        for (const auto& [lo, hi] : all ? std::span(&whole, 1) : std::span(set.skin_ranges))
+            for (size_t first = lo; first < hi; first += kSkinChunk)
+                chunks.push_back({j, uint32_t(first), uint32_t(std::min<size_t>(hi, first + kSkinChunk))});
+    }
+    WorkerPool::instance().parallel_for(chunks.size(), [&](size_t c) {
+        const auto [j, first, end] = chunks[c];
         const BufferSet& set = *jobs[j].set;
         const std::vector<Mat>* mats = jobs[j].mats;
         uint32_t* dst = jobs[j].dst;
@@ -3818,7 +3890,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         const float inv_range = 1.0f / set.skin_range;
         if (set.float_vertices) {  // 48-byte float vertices, rewritten whole (position, normal, tangent)
             float* out = reinterpret_cast<float*>(dst);
-            for (size_t i = 0; i < n; ++i) {
+            for (size_t i = first; i < end; ++i) {
                 float f[12];
                 std::memcpy(f, set.vb0_cpu.data() + i * 48, sizeof(f));
                 if (mats) {
@@ -3848,7 +3920,7 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
             }
             return;
         }
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = first; i < end; ++i) {
             const uint8_t* v = set.vb0_cpu.data() + i * 24;
             V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
                  s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
@@ -3985,7 +4057,12 @@ std::vector<V3> StaticMeshScene::actor_points(uint32_t actor, const std::vector<
                 {bone.translation[0], bone.translation[1], bone.translation[2]},
                 bone.scale});
         }
-        for (size_t i = 0; i < set.skin.bones.size(); i += std::max<size_t>(stride, 1)) {
+        // Only the vertices of the drawn parts: the other LODs' vertices share the stream.
+        const std::pair<uint32_t, uint32_t> whole{0, uint32_t(set.skin.bones.size())};
+        const auto ranges = set.skin_ranges.empty() ? std::span(&whole, 1) : std::span(set.skin_ranges);
+        const size_t step = std::max<size_t>(stride, 1);
+        for (const auto& [lo, hi] : ranges)
+        for (size_t i = lo + (step - lo % step) % step; i < hi; i += step) {
             const uint8_t* v = set.vb0_cpu.data() + i * 24;
             const V3 p{s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
                        s16(v + 4) * set.skin_scale.z + set.skin_offset.z};
@@ -4206,6 +4283,27 @@ bool StaticMeshScene::has_visible_light_grid() const {
     });
 }
 
+// Actors are moved every frame and are not in the cull groups. Their bounds are the placement
+// origin with the model's skinning pack range (the half extent of its posed vertices) doubled.
+void StaticMeshScene::cull_actors(const ViewMatrices& vm) {
+    actor_in_view_.assign(actors_.size(), 1);
+    if (vm.ortho > 0) return;
+    const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
+    constexpr float kShadowRange = 40;  // off-screen actors closer than this keep posing for the sun shadow
+    for (size_t a = 0; a < actors_.size(); ++a) {
+        const auto& actor = actors_[a];
+        if (!actor.rows || actor.sets.empty()) continue;
+        float r = 2;
+        for (const auto index : actor.sets) r = std::max(r, sets_[index].skin_range * 2 + 0.5f);
+        const auto& m = *actor.rows;
+        const V3 d{m[3] - vm.eye.x, m[7] - vm.eye.y, m[11] - vm.eye.z};
+        const float z = dot(d, vm.fwd);
+        const float x = std::abs(dot(d, vm.right)), y = std::abs(dot(d, vm.up));
+        const bool outside = z < -r || x * vm.fx > std::max(0.0f, z) * 1.05f + r * kx || y * vm.fy > std::max(0.0f, z) * 1.05f + r * ky;
+        if (outside) actor_in_view_[a] = dot(d, d) < (kShadowRange + r) * (kShadowRange + r) ? 2 : 0;
+    }
+}
+
 void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow) {
     // Test the bounds against the projection. Leave room for subpixel camera jitter.
     const float kx = std::sqrt(vm.fx * vm.fx + 1), ky = std::sqrt(vm.fy * vm.fy + 1);
@@ -4266,11 +4364,18 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
                 return;
             }
             const float px = projected * (vm.ortho > 0 ? half_h : 540.0f);
-            constexpr std::array<float, 7> detail_radii{144, 60, 24, 12, 7, 3, 1};
-            int level = 0;
-            while (!near_camera && level < int(detail_radii.size()) && px < detail_radii[size_t(level)]) ++level;
-            while (level > 0 && !((group.levels >> level) & 1)) --level;
-            while (level < 7 && !((group.levels >> level) & 1)) ++level;
+            // Each coarser authored LOD takes over below the next projected radius (1080p px). Most
+            // meshes author two (categories 1 and 2), so the second one only replaces the first once
+            // the object is a few dozen pixels tall (推定; the engine's switch distances are unknown).
+            constexpr std::array<float, 7> detail_radii{16, 6, 3, 1.5f, 1, 0.5f, 0.25f};
+            int step = 0;
+            while (!near_camera && step < int(detail_radii.size()) && px < detail_radii[size_t(step)]) ++step;
+            uint32_t levels = group.levels ? group.levels : 1u;
+            int level = std::countr_zero(levels);
+            for (; step > 0 && (levels & (levels - 1)); --step) {
+                levels &= levels - 1;
+                level = std::countr_zero(levels);
+            }
             cull_scratch[size_t(level)].push_back(index);
         };
         if (group.chunk_bounds.empty()) {
@@ -4364,12 +4469,15 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     ProfileScope ps_cull("frame.gbuffer.cull");
     if (!actors_.empty()) bind_actor_constants(gpu);
     cull(gpu, vm, gb.height());
+    cull_actors(vm);
     ps_cull.stop();
     ProfileScope ps_mat("frame.gbuffer.materials");
     update_materials(gpu, gb.width(), gb.height(), vm);
     ps_mat.stop();
-    ProfileScope ps_draw("frame.gbuffer.draw");
+    ProfileScope ps_skin("frame.gbuffer.skin");
     if (skin_dirty_) update_skin(cl);
+    ps_skin.stop();
+    ProfileScope ps_draw("frame.gbuffer.draw");
     const float clear[4] = {0, 0, 0, 0};
     for (int i = 0; i < 4; ++i) cl->ClearRenderTargetView(gb.rtv[i], clear, 0, nullptr);
     cl->ClearDepthStencilView(gb.dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);

@@ -192,6 +192,7 @@ struct PreparedMesh {
         bool armour_marking = false;
         uint8_t lod_mask = 1;  // static mesh LOD levels this part belongs to (bit n = LOD n)
         int blend = -1;     // engine blend state index (transparents)
+        int raster = -1;    // engine rasterizer state index (-1 = the pass default)
         std::vector<float4> vs_cb0;                // the VS stage's own cb0
         std::map<uint32_t, std::shared_ptr<const Texture>> vs_textures;
         TechniqueStage vs_material, ps_material;  // original TFX, retained for frame updates
@@ -547,6 +548,7 @@ private:
         TagHash model;
         V3 skin_scale, skin_offset, skin_pack_offset;
         float skin_range = 1;
+        std::vector<std::pair<uint32_t, uint32_t>> skin_ranges;  // [first, end) vertices the drawn parts use
         std::array<float, 12> actor_previous_rows{};
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
@@ -579,6 +581,10 @@ private:
         std::vector<ModelSkinPose> poses;
     };
     std::vector<Actor> actors_;
+    // Per actor, this frame's main view: 1 = inside the frustum, 2 = outside but near enough to cast
+    // a visible shadow (still skinned), 0 = neither (not skinned, not drawn in the G-buffer).
+    std::vector<uint8_t> actor_in_view_;
+    void cull_actors(const ViewMatrices& vm);
     struct Curtain {
         std::shared_ptr<const Skeleton> skeleton;
         std::array<float, 12> rows;

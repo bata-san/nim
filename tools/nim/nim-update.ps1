@@ -79,7 +79,11 @@ try {
     }
     if ($release.tag_name -notmatch '^v(\d+\.\d+\.\d+)$') { throw "Invalid release tag: $($release.tag_name)" }
     $next = [version]$Matches[1]
-    if ($next -le $Version) { Set-Status 'current'; Write-Log "current: latest=$next"; exit 0 }
+    # Releases up to v0.3.15 shipped without the NVIDIA runtime DLLs; fetch the current package once
+    # more when they are missing so DLSS can load.
+    $repair = $next -eq $Version -and ![IO.File]::Exists((Join-Path $dir 'nvngx_dlss.dll'))
+    if ($next -lt $Version -or ($next -eq $Version -and !$repair)) { Set-Status 'current'; Write-Log "current: latest=$next"; exit 0 }
+    if ($repair) { Write-Log "repair: $next is current but nvngx_dlss.dll is missing" }
     $asset = @($release.assets | Where-Object { $_.name -ceq "nim-v$next-win64.zip" -and $_.state -eq 'uploaded' })
     if ($asset.Count -ne 1 -or $asset[0].digest -notmatch '^sha256:([0-9a-fA-F]{64})$') { throw 'Invalid release asset.' }
     $digest = $Matches[1]
@@ -123,13 +127,14 @@ try {
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $required = @('nim-update.ps1', 'nim.exe')
-    $files = @('README.md', 'LICENSE-imgui.txt') + $required
+    $files = @('README.md', 'LICENSE-imgui.txt', 'nvngx_dlss.dll', 'nvngx_dlssg.dll', 'sl.interposer.dll', 'sl.common.dll',
+               'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll') + $required
     $archive = [IO.Compression.ZipFile]::OpenRead($zip)
     try {
         foreach ($name in $files) {
             $entry = $archive.GetEntry($name)
             if (!$entry -and $name -notin $required) { continue }
-            if (!$entry -or $entry.Length -le 0 -or $entry.Length -gt 64MB) { throw "Invalid package entry: $name" }
+            if (!$entry -or $entry.Length -le 0 -or $entry.Length -gt 128MB) { throw "Invalid package entry: $name" }
             [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $stage $name))
         }
     } finally { $archive.Dispose() }

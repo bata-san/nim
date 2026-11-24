@@ -605,6 +605,44 @@ int run(int argc, char** argv) {
             for (auto& t : threads) t.join();
             prep_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
         }
+        if (std::getenv("NIM_LOD_AUDIT")) {  // diagnostics: the LOD mask patterns of the static meshes' opaque groups
+            std::map<std::string, std::pair<size_t, std::string>> patterns;
+            for (size_t j = terrain.size(); j < terrain.size() + static_count && j < jobs; ++j) {
+                if (!prepared[j]) continue;
+                std::map<uint8_t, size_t> masks;
+                for (const auto& g : prepared[j]->groups)
+                    if (g.stage == 0) ++masks[g.lod_mask];
+                std::string key;
+                for (const auto& [m, n] : masks) key += std::format("{:02X}x{} ", m, n);
+                auto& e = patterns[key];
+                if (!e.first++) e.second = region[j - terrain.size()].mesh.str();
+            }
+            for (const auto& [k, v] : patterns) std::println("lod pattern {:>4} e.g. {}: {}", v.first, v.second, k);
+            size_t mirrored = 0, placements = 0;
+            for (const auto& reg : region)
+                for (const auto& m : reg.rows) {
+                    ++placements;
+                    const float det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) + m[2] * (m[4] * m[9] - m[5] * m[8]);
+                    mirrored += det < 0;
+                }
+            std::println("mirrored placements: {} of {}", mirrored, placements);
+            std::map<uint32_t, std::pair<size_t, std::string>> rs;
+            std::set<uint32_t> seen_mesh;
+            for (size_t r = 0; r < static_count; ++r) {
+                if (!seen_mesh.insert(region[r].mesh.value).second) continue;
+                try {
+                    const auto m = load_static_mesh(pm, region[r].mesh);
+                    for (size_t g = 0; g < m.groups.size() && g < m.techniques.size(); ++g) {
+                        if (m.techniques[g].is_none()) continue;
+                        const auto t = load_technique(pm, m.techniques[g]);
+                        auto& e = rs[(uint32_t(m.groups[g].render_stage) << 24) | (t.states >> 8)];
+                        if (!e.first++) e.second = std::format("{} {}", region[r].mesh.str(), t.tag.str());
+                    }
+                } catch (...) {}
+            }
+            for (const auto& [k, v] : rs)
+                std::println("states stage {:>2} ds {:02X} rs {:02X} bias {:02X}: {:>5} e.g. {}", k >> 24, k & 0xFF, (k >> 8) & 0xFF, (k >> 16) & 0xFF, v.first, v.second);
+        }
         size_t terrain_ok = 0, entity_models_loaded = 0;
         const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         auto tb = std::chrono::steady_clock::now();
