@@ -560,6 +560,7 @@ private:
     void render_sky_lookups(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ScopeBufferFn& scopes);
     ComPtr<ID3D12Resource> unshadowed_;  // 1x1 white: "no shadow" while no shadow pass exists
     ComPtr<ID3D12Resource> hdr_;
+    ComPtr<ID3D12Resource> backdrop_;  // transparent +0x60: the lit image before transparents (refraction source)
 
 public:
     ID3D12Resource* hdr_target() const { return hdr_.Get(); }  // diagnostics (PIXEL_SHADER_RESOURCE after render)

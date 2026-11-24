@@ -71,6 +71,24 @@ struct SunShadow {
     M4 cached_sun_view;
     uint64_t cached_sun_generation = 0;
     float cached_sun_time = 0;
+    // Map sun shadow: the static casters live in their own depth layer, redrawn only when the
+    // snapped view or the scene changes, a fraction of the items per frame into `pending` (then
+    // swapped). Each frame copies the static layer into `depth` and adds the moving casters.
+    struct Layer {
+        ComPtr<ID3D12Resource> depth;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        ViewMatrices vm;
+        float half = 1, range = 1;
+        uint64_t generation = 0;
+    };
+    Layer static_layer, pending;
+    bool static_ok = false;
+    uint32_t pending_step = 0;     // next part of the pending redraw (0 = none in progress)
+    float static_time = 0;
+    uint64_t published = 0;        // static redraws copied into `depth` (skip the copy when unchanged)
+    uint64_t static_serial = 0;
+    void make_layer(Gpu& gpu, Layer& layer) const;
     void resize(Gpu& gpu, uint32_t size);
     // Covers the sphere (center, radius) seen from the sun (sun_dir points toward the sun),
     // snapped to whole texels so the map does not shimmer as the camera moves.
@@ -419,7 +437,7 @@ public:
     void set_exposure(float scale) { material_exposure_ = scale; }
     void set_render_inputs(const ExternStore& inputs);
     size_t item_count() const { return items_.size(); }
-    void set_channels(const ChannelValues& values) { channel_overrides_ = values; ++shadow_generation_; }
+    void set_channels(const ChannelValues& values) { channel_overrides_ = values; ++shadow_generation_; ++static_shadow_generation_; }
 
     TagHash tag() const { return tag_; }
     V3 center() const { return center_; }
@@ -513,6 +531,17 @@ private:
     std::unordered_map<uint64_t, size_t> transparent_probe_cache_;
     uint64_t transparent_probe_gen_ = UINT64_MAX;
     uint64_t shadow_generation_ = 0;
+    uint64_t static_shadow_generation_ = 0;  // changes to what the static casters look like
+    // Shadow drawing subset: 0 = every caster, 1 = static casters (items index % parts == part),
+    // 2 = moving casters (actors, posed or carried models, curtains).
+    uint8_t shadow_filter_ = 0;
+    uint32_t shadow_part_ = 0, shadow_parts_ = 1;
+    size_t moving_casters_items_ = SIZE_MAX;
+    bool has_moving_casters_ = false;
+    bool moving_caster(const Item& it) const;
+    bool shadow_selected(size_t index) const;
+    void draw_shadow_layer(Gpu& gpu, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size,
+                           const ViewMatrices& vm, bool clear);
     struct VisibilityKey {
         std::array<float, 16> view;
         uint64_t generation;

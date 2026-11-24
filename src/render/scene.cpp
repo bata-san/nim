@@ -103,6 +103,10 @@ ViewMatrices make_view(const View& v) {
 void SunShadow::resize(Gpu& gpu, uint32_t n) {
     if (n == size && depth) return;
     valid = false;
+    static_ok = false;
+    pending_step = 0;
+    static_layer.depth.Reset();
+    pending.depth.Reset();
     size = n;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
@@ -127,6 +131,32 @@ void SunShadow::resize(Gpu& gpu, uint32_t n) {
     dd.Format = DXGI_FORMAT_D32_FLOAT;
     dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     gpu.device()->CreateDepthStencilView(depth.Get(), &dd, dsv);
+}
+
+void SunShadow::make_layer(Gpu& gpu, Layer& layer) const {
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = rd.Height = size;
+    rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R32_TYPELESS;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    D3D12_CLEAR_VALUE cv{DXGI_FORMAT_D32_FLOAT};
+    cv.DepthStencil.Depth = 0;
+    layer.depth.Reset();
+    check_hr(gpu.device()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                                   IID_PPV_ARGS(&layer.depth)),
+             "sun shadow layer");
+    if (!layer.heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+        check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&layer.heap)), "sun shadow layer DSV heap");
+    }
+    layer.dsv = layer.heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd{};
+    dd.Format = DXGI_FORMAT_D32_FLOAT;
+    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    gpu.device()->CreateDepthStencilView(layer.depth.Get(), &dd, layer.dsv);
 }
 
 void SunShadow::fit(V3 sun_dir, V3 center, float radius) {
@@ -607,6 +637,7 @@ void StaticMeshScene::set_material_frame(float seconds, float delta_seconds) {
 
 void StaticMeshScene::release(Gpu& gpu) {
     ++shadow_generation_;
+    ++static_shadow_generation_;
     // A failed upload leaves texture copies recorded on the immediate list; run them while their
     // resources are still alive, or the next flush page-faults the GPU (device removed).
     if (!gpu.removed() && (!items_.empty() || !sets_.empty())) {
@@ -2130,7 +2161,8 @@ void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
 void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                                std::span<const std::array<float, 12>> placements, std::span<const float> sky_order) {
     // These authored models are hidden in the map by user request, including activity placements.
-    if (!dynamic_ && (mesh.tag.value == 0x80B07D64u || mesh.tag.value == 0x80B08CCCu)) return;
+    // 80B06EA9 is the red striped 75 m field volume placed by entity 80B0C913 on Dire Marsh.
+    if (!dynamic_ && (mesh.tag.value == 0x80B07D64u || mesh.tag.value == 0x80B08CCCu || mesh.tag.value == 0x80B06EA9u)) return;
     if (!sky_order.empty() && (!mesh.dynamic || sky_order.size() != placements.size()))
         throw std::invalid_argument("Sky order requires one key per dynamic placement");
     scopes_resolved_ = false;
@@ -2156,6 +2188,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         }
         retire_prepared(std::move(mesh));
         ++shadow_generation_;
+        ++static_shadow_generation_;
     } catch (...) {
         try { gpu.flush(); } catch (...) {}
         for (size_t k = items; k < items_.size(); ++k) {
@@ -2606,6 +2639,12 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             std::ranges::any_of(*item.scopes, [&](const Scope& scope) {
                 return scope.tag == advanced_scope->second && scope.name == "transparent_advanced";
             });
+        // Diagnostics: NIM_TECH_EXTERNS=TAG prints the extern texture sources of that technique.
+        if (const char* e = std::getenv("NIM_TECH_EXTERNS"); e && std::strstr(e, g.info.technique.str().c_str()))
+            for (const auto* src : {&item.ps_sources.extern_textures, &item.vs_sources.extern_textures})
+                for (const auto& [slot, t] : *src)
+                    std::fprintf(stderr, "%s %s t%u = extern %u +0x%X\n", g.info.technique.str().c_str(),
+                                 src == &item.ps_sources.extern_textures ? "PS" : "VS", slot, unsigned(t.extern_id), unsigned(t.offset * 8));
         profile_setup.stop();
         ProfileScope profile_root("add.root_signature");
         const uint64_t root_key = g.info.technique.value | (uint64_t(mesh.dynamic) << 32) | (uint64_t(item.object_reflection) << 33);
@@ -3360,6 +3399,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         auto& it = items_[index];
         if (it.light_grid) it.light_grid_ready = frame_inputs && frame_inputs->texture(ext::Transparent, 0x28).resource;
         if (!item_instances(it)) return;  // culled this frame: not drawn, nothing to evaluate
+        if (shadow && !shadow_selected(index)) return;  // another layer of the sun shadow
       try {
         const auto& set = sets_[it.buffers];
         if (it.decal_volume)
@@ -3724,6 +3764,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         for (const auto index : items) {
             const auto& it = items_[index];
             if (it.blended != blended || (shadow && !it.shadow_pso)) continue;
+            if (shadow && !shadow_selected(index)) continue;
             const uint32_t instances = item_instances(it);
             if (!instances) continue;
             const auto& set = sets_[it.buffers];
@@ -4322,6 +4363,7 @@ void StaticMeshScene::set_patrol_drones_active(bool active) {
     if (patrol_drones_active_ == active) return;
     patrol_drones_active_ = active;
     ++shadow_generation_;
+    ++static_shadow_generation_;
 }
 
 size_t StaticMeshScene::update_curtains(V3 eye, float dt) {
@@ -4720,7 +4762,107 @@ void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, Sun
     shadow.valid = true;
 }
 
+bool StaticMeshScene::moving_caster(const Item& it) const {
+    const auto& set = sets_[it.buffers];
+    return set.actor >= 0 || set.equipment || set.curtain >= 0 || set.skin_src || set.skin_upload[0];
+}
+
+bool StaticMeshScene::shadow_selected(size_t index) const {
+    if (!shadow_filter_) return true;
+    const bool moving = moving_caster(items_[index]);
+    if (shadow_filter_ == 2) return moving;
+    return !moving && index % shadow_parts_ == shadow_part_;
+}
+
+void StaticMeshScene::draw_shadow_layer(Gpu& gpu, ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t size,
+                                        const ViewMatrices& vm, bool clear) {
+    ProfileScope ps_cull("frame.shadow.cull");
+    cull(gpu, vm, size, true);
+    ps_cull.stop();
+    ProfileScope ps_mat("frame.shadow.materials");
+    update_materials(gpu, size, size, vm, 0, nullptr, true);
+    ps_mat.stop();
+    ProfileScope ps_draw("frame.shadow.draw");
+    if (clear) cl->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+    cl->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    draw_items(gpu, cl, 0, size, size, vm, true);
+}
+
 void StaticMeshScene::render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map) {
+    if (map && shadow.depth && items_.size() != transparent_count() && !std::getenv("NIM_SHADOW_SINGLE")) {
+        // Static casters: redrawn only when the snapped view or the scene changes (and every 2 s
+        // for animated vertex shaders), 1/4 of the items per frame into the pending layer.
+        if (material_externs_)
+            material_externs_->note_estimate("sun shadow: map origin snapped to 4 m; static casters redrawn over 4 frames on change "
+                                             "and every 2 s, moving casters every frame",
+                                             "single viewer shadow map; engine cascade update schedule unknown");
+        constexpr uint32_t kParts = 4;
+        if (!shadow.static_layer.depth) shadow.make_layer(gpu, shadow.static_layer);
+        if (!shadow.pending.depth) shadow.make_layer(gpu, shadow.pending);
+        if (skin_dirty_) update_skin(gpu, cl);
+        if (!actors_.empty()) bind_actor_constants(gpu);
+        const auto same = [](const ViewMatrices& a, const ViewMatrices& b) {
+            return std::equal(std::begin(a.vp_abs.c), std::end(a.vp_abs.c), std::begin(b.vp_abs.c));
+        };
+        const ViewMatrices target = shadow.vm;
+        const float target_half = shadow.half, target_range = shadow.range;
+        auto& st = shadow.static_layer;
+        auto& pd = shadow.pending;
+        const auto draw_static = [&](SunShadow::Layer& layer, uint32_t part, uint32_t parts) {
+            shadow_filter_ = 1, shadow_part_ = part, shadow_parts_ = parts;
+            draw_shadow_layer(gpu, cl, layer.dsv, shadow.size, layer.vm, part == 0);
+            shadow_filter_ = 0, shadow_part_ = 0, shadow_parts_ = 1;
+        };
+        if (!shadow.static_ok) {  // nothing to show yet: draw it all now
+            st.vm = target, st.half = target_half, st.range = target_range, st.generation = static_shadow_generation_;
+            draw_static(st, 0, 1);
+            shadow.static_ok = true;
+            shadow.static_time = material_time_;
+            ++shadow.static_serial;
+            shadow.pending_step = 0;
+        } else {
+            const bool stale = !same(st.vm, target) || st.generation != static_shadow_generation_ ||
+                               material_time_ < shadow.static_time || material_time_ - shadow.static_time >= 2.0f;
+            // A view that keeps moving (sun motion) still finishes each redraw; a scene change restarts it.
+            if (shadow.pending_step && pd.generation != static_shadow_generation_) shadow.pending_step = 0;
+            if (stale || shadow.pending_step) {
+                if (shadow.pending_step == 0)
+                    pd.vm = target, pd.half = target_half, pd.range = target_range, pd.generation = static_shadow_generation_;
+                draw_static(pd, shadow.pending_step, kParts);
+                if (++shadow.pending_step == kParts) {
+                    std::swap(st, pd);
+                    shadow.pending_step = 0;
+                    shadow.static_time = material_time_;
+                    ++shadow.static_serial;
+                }
+            }
+        }
+        // Publish: the static layer's view, its depth, then the moving casters on top.
+        shadow.vm = st.vm, shadow.half = st.half, shadow.range = st.range;
+        if (moving_casters_items_ != items_.size()) {
+            moving_casters_items_ = items_.size();
+            has_moving_casters_ = std::ranges::any_of(items_, [&](const Item& it) { return it.shadow_pso && moving_caster(it); });
+        }
+        const bool moving = has_moving_casters_;
+        if (shadow.published != shadow.static_serial || moving) {
+            D3D12_RESOURCE_BARRIER b[2]{};
+            for (auto& x : b) x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[0].Transition = {st.depth.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+            b[1].Transition = {shadow.depth.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST};
+            cl->ResourceBarrier(2, b);
+            cl->CopyResource(shadow.depth.Get(), st.depth.Get());
+            for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+            cl->ResourceBarrier(2, b);
+            shadow.published = shadow.static_serial;
+            if (moving) {
+                shadow_filter_ = 2;
+                draw_shadow_layer(gpu, cl, shadow.dsv, shadow.size, shadow.vm, false);
+                shadow_filter_ = 0;
+            }
+        }
+        shadow.valid = true;
+        return;
+    }
     if (map && material_externs_)
         material_externs_->note_estimate("sun shadow: map origin snapped to 4 m, depth refreshed at 4 Hz in a stable view",
                                         "single viewer shadow map; engine cascade update schedule unknown");

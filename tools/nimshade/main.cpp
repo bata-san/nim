@@ -1291,7 +1291,8 @@ int run(int argc, char** argv) {
                 inputs.get_v(ext::Deferred, 0x00) != float4{0, 1, 0, 0})
                 throw std::runtime_error("Transparent pass requires current linear depth with a matching decode");
         }
-        if (scene.has_transparent()) scene.render_transparent(gpu, c, gb, hdr, vm, gl);
+        // Diagnostics: NIM_NO_TRANSPARENT=1 leaves the mesh transparents out.
+        if (scene.has_transparent() && !std::getenv("NIM_NO_TRANSPARENT")) scene.render_transparent(gpu, c, gb, hdr, vm, gl);
         if (particles.loaded()) particles.render(gpu, c, gb, hdr, vm, inputs, fx_delta);
     };
     auto distortions = [&](ID3D12GraphicsCommandList* c, uint32_t w, uint32_t h) {

@@ -1560,6 +1560,8 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint
     hdr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     gpu.device()->CreateRenderTargetView(hdr_.Get(), nullptr, rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+    clear_owned(ext::Transparent, 0x60, backdrop_.Get());
+    backdrop_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
     // Also a UAV: ssr_apply_reflection blends the reflections into it.
     env_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -2277,6 +2279,25 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             ext_.estimate_texture(ext::Transparent, 0x68, ssr_history_.Get(),
                                   "transparent +0x68 (screen image behind refractive particles) = the previous frame's lit image");
         else ext_.set_texture(ext::Transparent, 0x68, nullptr);
+        // Transparent +0x60: refractive surfaces (the Dire Marsh anomaly 80ACD7F3, glass) sample it at
+        // the pixel plus a distortion offset and tint it. Without it they drew black. Its engine
+        // producer is not identified; the lit image just before the transparent pass is the
+        // backdrop those shaders refract.
+        if (backdrop_) {
+            ProfileScope ps_("frame.light.backdrop");
+            Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Gpu::barrier(cl, backdrop_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(backdrop_.Get(), hdr_.Get());
+            Gpu::barrier(cl, backdrop_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            ext_.estimate_texture(ext::Transparent, 0x60, backdrop_.Get(),
+                                  "transparent +0x60 (refraction backdrop) = the lit image just before transparents");
+            // The mesh particles' +0x68 screen image: the same backdrop when no earlier frame exists
+            // (first frame, headless renders).
+            if (!ssr_history_valid_)
+                ext_.estimate_texture(ext::Transparent, 0x68, backdrop_.Get(),
+                                      "transparent +0x68 (screen image behind refractive particles) = this frame's backdrop (no earlier frame)");
+        }
         { ProfileScope ps_("frame.light.transparents"); transparents(cl, hdr); }
         ext_.set(ext::Deferred, 0x00, depth_decode);
         ext_.set_texture(ext::Deferred, 0x98, gb.depth.Get(), GBuffer::kDepthSrvFormat);
