@@ -72,7 +72,7 @@ public:
     Gpu& operator=(const Gpu&) = delete;
     ~Gpu();
     using QueueDeviceHook = ComPtr<ID3D12Device>(*)(ID3D12Device*);
-    void init(bool warp = false, QueueDeviceHook queue_hook = nullptr);
+    void init(bool warp = false, QueueDeviceHook queue_hook = nullptr, bool log_device_removal = false);
     // Independent command queue and descriptors on the viewport's device.
     void init_preview(ID3D12Device* device);
     ID3D12Device* device() const { return device_.Get(); }

@@ -1,4 +1,5 @@
 #pragma once
+#include "nim/content/map.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/tfx.hpp"
 #include "nim/content/tfx_vm.hpp"
@@ -152,6 +153,7 @@ struct ChannelUse {
 };
 
 struct PreparedMesh {
+    bool projected_decals = false;
     struct Buffers {
         IndexBuffer ib;
         VertexBuffer vb0, vb1;
@@ -190,6 +192,7 @@ struct PreparedMesh {
         // Texture-space bakes (export tools): a DXIL geometry shader placed between the original VS and
         // PS that moves each triangle into an atlas (its own PSO, never shared).
         std::vector<uint8_t> bake_gs;
+        std::optional<MapDecalVolumeSet> decal_volume;
     };
     TagHash tag;
     TagHash assembly_root;
@@ -280,6 +283,8 @@ struct MapDecal;
 // `layouts` picks the game input layout matching its vertex streams. Throws on failure.
 PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const std::vector<std::vector<InputElement>>& layouts,
                              PrepareCache* cache = nullptr);
+PreparedMesh prepare_map_decal_volumes(PackageManager& pm, const MapDecalVolumes& volumes,
+                                      PrepareCache* cache = nullptr);
 PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
                                const std::vector<std::vector<InputElement>>& layouts, PrepareCache* cache = nullptr);
 // Dynamic model (class 8080881C), GenerateGbuffer parts at the highest LOD, without the entity's
@@ -444,6 +449,8 @@ private:
         TagHash technique;
         bool vs_live = false, ps_live = false;
         std::array<uint8_t, 2> preview_sky_weights{};
+        std::optional<MapDecalVolumeSet> decal_volume;
+        bool decal_visible = true;
         bool blended = false;  // G-buffer decal: blends into some targets, drawn after the opaque items
         bool failed = false;  // its inputs could not be evaluated: not drawn (reported in notes)
         bool light_grid = false;
@@ -502,7 +509,7 @@ private:
     std::vector<Item> items_;
     std::vector<size_t> transparent_items_, distortion_items_;
     uint32_t distortion_draws_ = 0;
-    std::vector<size_t> decal_items_;
+    std::vector<size_t> decal_items_, projected_decal_items_;
     bool standalone_decal_ = false;
     std::vector<SceneGroupInfo> info_;
     struct PlacementConstants { std::array<float4, 32> values; };

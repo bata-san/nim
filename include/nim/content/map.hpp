@@ -83,6 +83,18 @@ struct MapDecal {
     std::array<float, 4> scale{}, offset{}, uv{};
 };
 
+struct MapDecalVolumeSet {
+    TagHash technique;
+    uint16_t first = 0, count = 0;
+    std::array<float, 4> sphere{};
+    float half_thickness = 0;
+};
+
+struct MapDecalVolumes {
+    TagHash tag, instances, vertices;
+    std::vector<MapDecalVolumeSet> sets;
+};
+
 struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
@@ -90,7 +102,7 @@ struct MapLayout {
     std::vector<MapStatic> statics;      // one per distinct mesh
     std::vector<Terrain> terrains;       // terrain patches
     std::vector<TagHash> decorator_groups; // placement streams referenced by the map nodes
-    std::vector<TagHash> decal_collections;
+    std::vector<TagHash> decal_collections, decal_volumes;
     size_t instances = 0;
     std::array<float, 3> lo{}, hi{};     // bounds of the instance origins
     // Nodes (id at node +0x70) nim leaves out by user decision (3.111), filled by hide_scripted_nodes:
@@ -101,6 +113,8 @@ struct MapLayout {
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
 std::vector<MapDecal> load_map_decals(PackageManager& pm, const MapLayout& map);
+std::vector<MapDecalVolumes> load_map_decal_volumes(PackageManager& pm, const MapLayout& map,
+                                                  std::array<float, 3> center, float radius);
 
 // Where the geometry is: the per-axis median of the instance origins (bounds are stretched by
 // far-off outliers such as skyboxes).

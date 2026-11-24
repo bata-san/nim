@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <limits>
+#include <share.h>
 #include <stdexcept>
 
 namespace nim {
@@ -56,41 +58,46 @@ void DescriptorAllocator::free(uint32_t first, uint32_t n) {
 
 namespace {
 FILE* g_debug_log = nullptr;
+bool g_debug_names = false;
 void CALLBACK on_d3d_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
     if (!g_debug_log || sev > D3D12_MESSAGE_SEVERITY_WARNING) return;
     std::fprintf(g_debug_log, "[%d] #%d %s\n", int(sev), int(id), text);
     std::fflush(g_debug_log);
 }
 void debug_name(ID3D12Resource* r, const char* kind, uint64_t a, uint64_t b) {
-    if (!g_debug_log || !r) return;
+    if (!g_debug_names || !r) return;
     static std::atomic<uint64_t> n{0};
     r->SetName(std::format(L"{} #{} {}x{}", std::wstring(kind, kind + std::strlen(kind)), ++n, a, b).c_str());
 }
 }  // namespace
 
-void Gpu::init(bool warp, QueueDeviceHook queue_hook) {
-    // NIM_D3D_DEBUG=1: D3D12 debug layer + DRED, messages to nim_d3d.log in the current directory.
+void Gpu::init(bool warp, QueueDeviceHook queue_hook, bool log_device_removal) {
+    // The viewer records DRED without turning on the more expensive D3D12 validation layer.
     char flag[8] = {};
     const bool debug = GetEnvironmentVariableA("NIM_D3D_DEBUG", flag, sizeof(flag)) > 0 && flag[0] == '1';
     if (debug) {
+        g_debug_names = true;
         ComPtr<ID3D12Debug> dbg;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+    }
+    if (debug || log_device_removal) {
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
             dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         }
-        wchar_t exe[MAX_PATH]{};
-        if (const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH); n > 0 && n < MAX_PATH) {
-            std::wstring path(exe, n);
-            if (const size_t sep = path.find_last_of(L"\\/"); sep != std::wstring::npos) path.resize(sep + 1);
-            path += L"nim_d3d.log";
-            _wfopen_s(&g_debug_log, path.c_str(), L"w");
-        } else {
-            fopen_s(&g_debug_log, "nim_d3d.log", "w");
+        if (!g_debug_log) {
+            wchar_t exe[MAX_PATH]{};
+            if (const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH); n > 0 && n < MAX_PATH) {
+                std::wstring path(exe, n);
+                if (const size_t sep = path.find_last_of(L"\\/"); sep != std::wstring::npos) path.resize(sep + 1);
+                path += L"nim_d3d.log";
+                g_debug_log = _wfsopen(path.c_str(), L"a", _SH_DENYNO);
+            }
+            if (!g_debug_log) g_debug_log = _fsopen("nim_d3d.log", "a", _SH_DENYNO);
         }
         if (g_debug_log) {
-            std::fprintf(g_debug_log, "nim D3D12 debug + DRED active\n");
+            std::fprintf(g_debug_log, "nim DRED active; validation %s\n", debug ? "on" : "off");
             std::fflush(g_debug_log);
         }
     }
@@ -136,9 +143,11 @@ void Gpu::init_queue(uint32_t descriptors, ID3D12Device* queue_device) {
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check_hr((queue_device ? queue_device : device_.Get())->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
+    queue_->SetName(L"nim GPU work queue");
     check_hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc_)), "CreateCommandAllocator");
     check_hr(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc_.Get(), nullptr, IID_PPV_ARGS(&list_)),
              "CreateCommandList");
+    list_->SetName(L"nim upload and auxiliary render");
     check_hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event_) check_hr(HRESULT_FROM_WIN32(GetLastError()), "CreateEventW");
@@ -158,11 +167,15 @@ uint64_t Gpu::signal() {
 }
 
 void Gpu::wait(uint64_t v) {
-    if (fence_->GetCompletedValue() >= v) return;
+    const auto complete = fence_->GetCompletedValue();
+    if (complete == std::numeric_limits<uint64_t>::max()) check_device();
+    if (complete >= v) return;
     const HRESULT hr = fence_->SetEventOnCompletion(v, event_);
     if (FAILED(hr)) check_device();
     check_hr(hr, "SetEventOnCompletion");
-    WaitForSingleObject(event_, INFINITE);
+    if (WaitForSingleObject(event_, INFINITE) != WAIT_OBJECT_0)
+        check_hr(HRESULT_FROM_WIN32(GetLastError()), "GPU fence wait");
+    if (fence_->GetCompletedValue() == std::numeric_limits<uint64_t>::max()) check_device();
 }
 
 void Gpu::flush() {
@@ -187,7 +200,13 @@ void Gpu::check_device() {
     if (SUCCEEDED(hr)) return;
     std::string dred_summary;
     if (g_debug_log) {
-        std::fprintf(g_debug_log, "Device removed reason: 0x%08X\n", unsigned(hr));
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        std::fprintf(g_debug_log, "%04u-%02u-%02u %02u:%02u:%02u pid %lu: Device removed reason: 0x%08X\n",
+                     unsigned(time.wYear), unsigned(time.wMonth), unsigned(time.wDay), unsigned(time.wHour),
+                     unsigned(time.wMinute), unsigned(time.wSecond), GetCurrentProcessId(), unsigned(hr));
+        std::fprintf(g_debug_log, "Local video memory: %llu MiB used / %llu MiB budget\n",
+                     static_cast<unsigned long long>(vram_usage() >> 20), static_cast<unsigned long long>(vram_budget() >> 20));
         ComPtr<ID3D12DeviceRemovedExtendedData> dred;
         D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
         if (SUCCEEDED(device_.As(&dred)) && SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
@@ -196,10 +215,10 @@ void Gpu::check_device() {
                 const char* lname = n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?";
                 std::fprintf(g_debug_log, "DRED list %s: %u of %u ops done\n", lname, done, n->BreadcrumbCount);
                 if (done < n->BreadcrumbCount) {
-                    if (dred_summary.empty())
+                    if (dred_summary.empty() && n->pCommandHistory)
                         dred_summary = std::format("\nDRED: list {} op {}/{} (op={})", lname, done, n->BreadcrumbCount,
                                                    int(n->pCommandHistory[done]));
-                    for (UINT i = done > 4 ? done - 4 : 0; i < std::min(n->BreadcrumbCount, done + 4); ++i)
+                    for (UINT i = done > 4 ? done - 4 : 0; n->pCommandHistory && i < std::min(n->BreadcrumbCount, done + 4); ++i)
                         std::fprintf(g_debug_log, "   %s op %u = %d\n", i == done ? ">>" : "  ", i, int(n->pCommandHistory[i]));
                 }
             }

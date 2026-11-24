@@ -27,6 +27,8 @@ constexpr uint8_t kStageShadow = 4;
 constexpr uint8_t kStageTransparent = 8;
 constexpr uint8_t kStageDistortion = 9;
 constexpr uint8_t kStageDecal = 2;
+constexpr uint8_t kStageProjectedDecal = 0xFE;  // viewer pass for authored instanced decals
+constexpr uint32_t kDecalBoxVertices = 36;
 
 // The sky layer's VS returns a zero clip position when cb0[1].x is zero.
 // Recognize its authored visibility expression without changing unrelated global channels.
@@ -607,7 +609,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     ++shadow_generation_;
     // A failed upload leaves texture copies recorded on the immediate list; run them while their
     // resources are still alive, or the next flush page-faults the GPU (device removed).
-    if (!items_.empty() || !sets_.empty()) {
+    if (!gpu.removed() && (!items_.empty() || !sets_.empty())) {
         try {
             gpu.flush();
         } catch (...) {
@@ -620,6 +622,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     distortion_items_.clear();
     distortion_draws_ = 0;
     decal_items_.clear();
+    projected_decal_items_.clear();
     standalone_decal_ = false;
     table_cache_.clear();
     scopes_resolved_ = false;
@@ -1932,6 +1935,47 @@ PreparedMesh prepare_terrain(PackageManager& pm, const Terrain& terrain, const s
     return out;
 }
 
+PreparedMesh prepare_map_decal_volumes(PackageManager& pm, const MapDecalVolumes& volumes,
+                                      PrepareCache* cache) {
+    PreparedMesh out;
+    out.tag = volumes.tag;
+    out.projected_decals = true;
+    if (cache) {
+        std::lock_guard lock(*cache->mutex);
+        if (!cache->ready) {
+            prepare_material_inputs(pm, out, nullptr);
+            cache->global_channels = out.global_channels;
+            cache->scopes = out.scopes;
+            cache->ready = true;
+        }
+        out.global_channels = cache->global_channels;
+        out.scopes = cache->scopes;
+    } else {
+        prepare_material_inputs(pm, out, nullptr);
+    }
+    auto& streams = out.buffers.emplace_back();
+    streams.vb0 = load_vertex_buffer(pm, volumes.vertices);
+    streams.vb1 = load_vertex_buffer(pm, volumes.instances);
+    if (!streams.vb0.stride || streams.vb0.data.size() / streams.vb0.stride < kDecalBoxVertices || !streams.vb1.stride)
+        throw std::runtime_error("Invalid projected decal streams: " + volumes.tag.str());
+    TextureCache textures;
+    textures.shared = cache;
+    for (const auto& set : volumes.sets) {
+        if (size_t(set.first) + set.count > streams.vb1.data.size() / streams.vb1.stride)
+            throw std::runtime_error("Projected decal set exceeds the instance stream: " + volumes.tag.str());
+        try {
+            const auto technique = load_technique(pm, set.technique);
+            auto group = build_group(pm, technique, {0, kDecalBoxVertices, 0, 1, 3}, set.first, 17, textures, out.scopes);
+            group.stage = kStageProjectedDecal;
+            group.decal_volume = set;
+            out.groups.push_back(std::move(group));
+        } catch (const std::exception& ex) {
+            out.notes.push_back(std::format("{} projected decal {}: {}", volumes.tag.str(), set.technique.str(), ex.what()));
+        }
+    }
+    return out;
+}
+
 PreparedMesh prepare_map_decal(PackageManager& pm, const MapDecal& decal,
                                const std::vector<std::vector<InputElement>>& layouts, PrepareCache* cache) {
     PreparedMesh out;
@@ -2040,6 +2084,8 @@ void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
 
 void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                                std::span<const std::array<float, 12>> placements, std::span<const float> sky_order) {
+    // These authored models are hidden in the map by user request, including activity placements.
+    if (!dynamic_ && (mesh.tag.value == 0x80B07D64u || mesh.tag.value == 0x80B08CCCu)) return;
     if (!sky_order.empty() && (!mesh.dynamic || sky_order.size() != placements.size()))
         throw std::invalid_argument("Sky order requires one key per dynamic placement");
     scopes_resolved_ = false;
@@ -2047,7 +2093,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
     const size_t items = items_.size(), sets = sets_.size(), infos = info_.size(), transparent = transparent_count(), distortion = distortion_items_.size();
     const size_t instances = instance_total_, culls = cull_groups_.size(), curtains = curtains_.size();
     const size_t uncullable = uncullable_opaque_.size();
-    const size_t decals = decal_items_.size();
+    const size_t decals = decal_items_.size(), projected_decals = projected_decal_items_.size();
     try {
         if (mesh.curtain_skeleton && !dynamic_ && adding_actor_ < 0 && sky_order.empty()) {
             for (const auto& rows : placements) {
@@ -2076,6 +2122,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         transparent_items_.resize(transparent);
         distortion_items_.resize(distortion);
         decal_items_.resize(decals);
+        projected_decal_items_.resize(projected_decals);
         sets_.resize(sets);
         info_.resize(infos);
         instance_total_ = instances;
@@ -2137,7 +2184,6 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     if (mesh.inferred_transparent_stage)
         material_externs_->note_estimate("HDR colour and motion material drawn in the transparent pass",
                                          "the shader writes colour at target 0 and motion at target 4");
-
     // Instance index stream (0..n-1) and t2: n 80-byte records (3x4 rows, translation in w;
     // +60 = byte offset of the mesh block), then the mesh block from the prepared single record.
     const uint32_t n = uint32_t(placements.size());
@@ -2146,7 +2192,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     ProfileScope profile_geometry("add.geometry_upload");
     const GpuBuffer inst = arena_.upload(gpu, iota.data(), iota.size() * 4);
     GpuBuffer t2;
-    if (!mesh.dynamic) {
+    if (!mesh.dynamic && !mesh.projected_decals) {
         if (mesh.instance.size() < 112) throw std::runtime_error("Missing original mesh instance data");
         std::vector<uint8_t> data(size_t(n) * 80 + 48, 0);
         const uint32_t block = n * 80;
@@ -2158,7 +2204,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         t2 = arena_.upload(gpu, data.data(), data.size());
     }
     uint32_t cull = UINT32_MAX;
-    if (!mesh.dynamic || (!dynamic_ && sky_order.empty() && adding_actor_ < 0)) {
+    if (!mesh.projected_decals && (!mesh.dynamic || (!dynamic_ && sky_order.empty() && adding_actor_ < 0))) {
         CullGroup group;
         group.dynamic = mesh.dynamic;
         group.patrol_start = mesh.patrol_start;
@@ -2224,7 +2270,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     };
     for (const auto& b : mesh.buffers) {
         BufferSet set;
-        set.ib = upload_geometry(b.ib);
+        if (!mesh.projected_decals) set.ib = upload_geometry(b.ib);
         set.vb0 = upload_geometry(b.vb0);
         if (!b.vb1.data.empty()) set.vb1 = upload_geometry(b.vb1);
         set.ibv = {set.ib.gpu, UINT(b.ib.data.size()), b.ib.is_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
@@ -2314,6 +2360,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
     const size_t first_item = items_.size();
     std::string first_unsupported_part;
     for (auto& g : mesh.groups) {
+        // The Compiler aura terminal contains the aura as translucent mesh parts.
+        // It has no active encounter in the map viewer; retain its body and indicators.
+        if (!dynamic_ && adding_actor_ < 0 && mesh.tag.value == 0x80B0EE09u &&
+            g.ps_material.shader.value == 0x80B0ED91u) continue;
       try {
         Item item;
         // Finish recorded copies before a failed strict validation destroys this item's assets.
@@ -2585,7 +2635,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 material_externs_->note_estimate("standalone sky layer: visibility weights set to 1",
                                                  "the original vertex shader suppresses the layer until map channels activate it");
         }
-        const bool decal = g.stage == kStageDecal;
+        item.decal_volume = g.decal_volume;
+        const bool projected = g.stage == kStageProjectedDecal;
+        const bool decal = g.stage == kStageDecal || projected;
         const bool authored_shadow = g.stage == kStageShadow;
         const auto outputs = g.ps.empty() ? std::vector<ShaderInput>{} : shader_outputs(g.ps);
         const bool motion = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -2629,6 +2681,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.DepthStencilState.DepthWriteMask = (decal ? !standalone_decal_ : transparent || distortion || blended)
             ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
         pd.DepthStencilState.DepthFunc = transparent || distortion || blended || decal ? D3D12_COMPARISON_FUNC_GREATER_EQUAL : D3D12_COMPARISON_FUNC_GREATER;
+        if (projected) {
+            pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        }
         pd.InputLayout = {ied.data(), UINT(ied.size())};
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         // Strips restart at the all-ones index.
@@ -2713,6 +2769,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         upload_guard.committed = true;
         if (transparent) transparent_items_.push_back(items_.size() - 1);
         else if (distortion) distortion_items_.push_back(items_.size() - 1);
+        else if (projected) projected_decal_items_.push_back(items_.size() - 1);
         else if (decal) decal_items_.push_back(items_.size() - 1);
         else if (cull == UINT32_MAX && !authored_shadow) uncullable_opaque_.push_back(items_.size() - 1);
         if (!authored_shadow) info_.push_back(std::move(g.info));
@@ -2978,7 +3035,9 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         return scope_frame_[slot] = upload.gpu;
     };
     const bool transparent = render_stage == kStageTransparent;
-    const auto& candidates = transparent ? transparent_items_ : render_stage == kStageDistortion ? distortion_items_ : render_stage == kStageDecal ? decal_items_ : visible_opaque_;
+    const bool projected = render_stage == kStageProjectedDecal;
+    const auto& candidates = projected ? projected_decal_items_ : transparent ? transparent_items_ :
+        render_stage == kStageDistortion ? distortion_items_ : render_stage == kStageDecal ? decal_items_ : visible_opaque_;
     if (!material_scratch_) material_scratch_ = std::make_unique<MaterialScratch>();
     // Material constants are evaluated after the walk, on the worker pool when the scene is a map
     // (no per-item extern writes): each live (object, technique, stage) once, into its first
@@ -2993,7 +3052,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
     // A single entity preview writes per-model externs and replaces the evaluated address per
     // placement: evaluated in place, in order, on this thread. A map's items are walked on the
     // worker pool in fixed chunks whose results are merged in item order.
-    const bool deferred_evaluation = !assembled_ && !dynamic_;
+    const bool deferred_evaluation = !assembled_ && !dynamic_ && !projected;
     using Chunk = MaterialScratch::Chunk;  // requests: (item, vs, key, origin)
     auto& chunks = material_scratch_->chunks;
     // Shared tables are claimed by the first item that reaches them in this call.
@@ -3090,6 +3149,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         if (!item_instances(it)) return;  // culled this frame: not drawn, nothing to evaluate
       try {
         const auto& set = sets_[it.buffers];
+        if (it.decal_volume)
+            ext.set(0x2D, 0x20, float4{it.decal_volume->half_thickness, 0, 0, 0});
         if (assembled_) {
             for (uint32_t row = 0; row < set.model_parameters.size(); ++row)
                 ext.set(ext::RigidModel, row * 16, set.model_parameters[row]);
@@ -3101,7 +3162,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             if (!(vs ? it.vs_live : it.ps_live)) return fixed.gpu;
             const bool model_inputs = assembled_ || (set.model_channels && !set.model_channels->empty());
             // An actor with its own object state evaluates apart from the other copies of its model.
-            const uint64_t object = set.actor_channels ? (uint64_t(1) << 30) | it.buffers
+            const uint64_t object = projected ? (uint64_t(1) << 29) | index
+                                    : set.actor_channels ? (uint64_t(1) << 30) | it.buffers
                                     : model_inputs ? uint64_t(set.model.value - TagHash::kBase) + 1 : 0;
             const uint64_t key = (object << 33) | (uint64_t(it.technique.value) << 1) | uint64_t(vs);
             if (deferred_evaluation) {
@@ -3295,10 +3357,10 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         const auto& set = sets_[it.buffers];
         if (it.buffers != state.buffers) {
             state.buffers = it.buffers;
-            commands->IASetIndexBuffer(&set.ibv);
+            commands->IASetIndexBuffer(it.decal_volume ? nullptr : &set.ibv);
             commands->IASetVertexBuffers(0, 4, set.vbv);
         }
-        if (!it.dynamic && (root_changed || state.cbv[2] != set.t2.gpu)) {
+        if (!it.dynamic && !it.decal_volume && (root_changed || state.cbv[2] != set.t2.gpu)) {
             commands->SetGraphicsRootShaderResourceView(2, set.t2.gpu);
             state.cbv[2] = set.t2.gpu;
         }
@@ -3327,7 +3389,9 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         }
         const auto topology = it.part.primitive_type == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         if (state.topology != topology) commands->IASetPrimitiveTopology(state.topology = topology);
-        if (it.dynamic) {
+        if (it.decal_volume) {
+            commands->DrawInstanced(kDecalBoxVertices, it.decal_volume->count, 0, it.decal_volume->first);
+        } else if (it.dynamic) {
             for (size_t p = first_instance; p < size_t(first_instance) + instances; ++p) {
                 const auto object = set.equipment ? set.equipment->gpu : set.object_cb.gpu + p * sizeof(PlacementConstants);
                 for (uint32_t param : it.object_params) set_cbv(param, object);
@@ -3460,6 +3524,15 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     };
     if (stage == kStageDistortion) {
         record(cl, distortion_items_, false);
+        return;
+    }
+    if (stage == kStageProjectedDecal) {
+        DrawState state;
+        for (const size_t index : projected_decal_items_) {
+            const auto& item = items_[index];
+            if (const auto instances = item_instances(item); instances)
+                draw(cl, state, item, instances, item.decal_volume->first);
+        }
         return;
     }
     const std::span<const size_t> opaque(stage == kStageDecal ? decal_items_ : visible_opaque_);
@@ -3946,6 +4019,7 @@ void StaticMeshScene::bind_actor_constants(Gpu& gpu) {
 
 uint32_t StaticMeshScene::item_instances(const Item& it) const {
     if (it.failed) return 0;
+    if (it.decal_volume) return it.decal_visible ? it.decal_volume->count : 0;
     if (it.light_grid && !it.light_grid_ready) return 0;
     const auto& set = sets_[it.buffers];
     if (set.equipment && !set.equipment->current) return 0;
@@ -4000,6 +4074,12 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
         return x * vm.fx > std::max(0.0f, z) * (1 + margin_x) + r * kx ||
                y * vm.fy > std::max(0.0f, z) * (1 + margin_y) + r * ky;
     };
+    if (!shadow)
+        for (const size_t index : projected_decal_items_) {
+            auto& item = items_[index];
+            float z = 0;
+            item.decal_visible = !outside(item.decal_volume->sphere, z);
+        }
     visible_opaque_.clear();
     visible_blended_.clear();
     visible_static_indices_.clear();
@@ -4147,7 +4227,10 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     if (items_.size() == transparent_count()) return;
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
     draw_items(gpu, cl, 0, gb.width(), gb.height(), vm);
-    if (!std::ranges::any_of(decal_items_, [&](size_t i) { return item_instances(items_[i]) != 0; })) return;
+    const auto visible = [&](size_t i) { return item_instances(items_[i]) != 0; };
+    const bool mesh_decals = std::ranges::any_of(decal_items_, visible);
+    const bool projected_decals = std::ranges::any_of(projected_decal_items_, visible);
+    if (!mesh_decals && !projected_decals) return;
 
     // The game's decals sample the underlying packed normals while updating the same G-buffer.
     if (!gb.decal_normals)
@@ -4165,8 +4248,32 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     ext.note_estimate("decal: normal-buffer pixel scale and offset (1, 1, 0, 0)", "preview uses the full-resolution G-buffer without a subrect");
     if (standalone_decal_) ext.note_estimate("standalone decal: depth from the authored decal triangles", "preview has no receiving surface");
     cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
-    update_materials(gpu, gb.width(), gb.height(), vm, kStageDecal);
-    draw_items(gpu, cl, kStageDecal, gb.width(), gb.height(), vm);
+    if (mesh_decals) {
+        update_materials(gpu, gb.width(), gb.height(), vm, kStageDecal);
+        draw_items(gpu, cl, kStageDecal, gb.width(), gb.height(), vm);
+    }
+    if (projected_decals) {
+        constexpr auto depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        Gpu::barrier(cl, gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, depth_read);
+        cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv_ro);
+        ext.set_texture(0x2D, 0x00, gb.depth.Get(), GBuffer::kDepthSrvFormat);
+        const float depth_scale = vm.proj.c[3][2];
+        ext.set(0x2D, 0x10, float4{-vm.proj.c[2][2] / depth_scale, 1.0f / depth_scale, 0, 0});
+        const float w = float(gb.width()), h = float(gb.height());
+        ext.set(0x2D, 0x30, float4{w, h, 1 / w, 1 / h});
+        ext.set(0x2E, 0x00, float4{0, 0, 0, 1});
+        ext.set(0x2E, 0x10, float4{0, 0, 0, 1});
+        ext.note_estimate("projected decal set transform: native world-space geometry defaults",
+                          "per-set runtime transform fields are unresolved");
+        ext.note_estimate("projected decal depth thickness: half the minimum extent of the first authored box",
+                          "the original per-set TFX value is supplied by the runtime");
+        update_materials(gpu, gb.width(), gb.height(), vm, kStageProjectedDecal);
+        draw_items(gpu, cl, kStageProjectedDecal, gb.width(), gb.height(), vm);
+        ext.set_texture(0x2D, 0x00, nullptr);
+        Gpu::barrier(cl, gb.depth.Get(), depth_read, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        cl->OMSetRenderTargets(4, gb.rtv, FALSE, &gb.dsv);
+    }
 }
 
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {

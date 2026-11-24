@@ -40,7 +40,8 @@ bool structural(uint32_t cls) {
 std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std::vector<TagHash>* terrains = nullptr,
                                         std::vector<TagHash>* node_tables = nullptr,
                                         std::vector<TagHash>* decorator_groups = nullptr,
-                                        std::vector<TagHash>* decal_collections = nullptr) {
+                                        std::vector<TagHash>* decal_collections = nullptr,
+                                        std::vector<TagHash>* decal_volumes = nullptr) {
     pm.build_hash64_index();
     std::vector<TagHash> queue{bubble}, found;
     std::set<uint32_t> seen{bubble.value};
@@ -76,6 +77,11 @@ std::vector<TagHash> find_instance_tags(PackageManager& pm, TagHash bubble, std:
             if (ce->reference == kClassMapDecals) {
                 seen.insert(c.value);
                 if (decal_collections) decal_collections->push_back(c);
+                return;
+            }
+            if (ce->reference == 0x80808224) {
+                seen.insert(c.value);
+                if (decal_volumes) decal_volumes->push_back(c);
                 return;
             }
             if (!structural(ce->reference)) return;
@@ -755,10 +761,10 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     out.bubble = bubble;
     std::vector<TagHash> terrain_tags;
     out.instance_tags = find_instance_tags(pm, bubble, &terrain_tags, &out.node_tables, &out.decorator_groups,
-                                           &out.decal_collections);
+                                           &out.decal_collections, &out.decal_volumes);
     for (const auto table : additional_tables) {
         const auto tags = find_instance_tags(pm, table, &terrain_tags, &out.node_tables, &out.decorator_groups,
-                                             &out.decal_collections);
+                                             &out.decal_collections, &out.decal_volumes);
         out.instance_tags.insert(out.instance_tags.end(), tags.begin(), tags.end());
     }
     auto unique = [](auto& tags) { std::sort(tags.begin(), tags.end()); tags.erase(std::unique(tags.begin(), tags.end()), tags.end()); };
@@ -768,6 +774,7 @@ MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const Ta
     deduplicate(out.node_tables);
     deduplicate(out.decorator_groups);
     deduplicate(out.decal_collections);
+    deduplicate(out.decal_volumes);
     unique(terrain_tags);
     for (TagHash t : terrain_tags) {
         try {
@@ -1013,6 +1020,59 @@ std::vector<MapDecal> load_map_decals(PackageManager& pm, const MapLayout& map) 
             decal.uv = {uv[0], uv[2], uv[1], uv[3]};
             result.push_back(decal);
         }
+    }
+    return result;
+}
+
+// The projected decals are authored as box instances. The node table references the
+// collection, and the separate occlusion bounds give one world-space AABB per box.
+std::vector<MapDecalVolumes> load_map_decal_volumes(PackageManager& pm, const MapLayout& map,
+                                                  std::array<float, 3> center, float radius) {
+    std::vector<MapDecalVolumes> result;
+    for (const auto tag : map.decal_volumes) {
+        const auto collection = pm.read(tag);
+        const TagReader r(collection);
+        const auto sets = r.vec_at(0x08);
+        const auto bound_data = pm.read(r.tag_at(0x38));
+        const TagReader br(bound_data);
+        const auto boxes = br.vec_at(0x08);
+        if (sets.element_class != 0x8080822C || sets.data > collection.size() ||
+            sets.count > (collection.size() - sets.data) / 0x0C ||
+            boxes.element_class != 0x8080A7F7 || boxes.data > bound_data.size() ||
+            boxes.count > (bound_data.size() - boxes.data) / 0x30)
+            throw std::runtime_error("Invalid projected decal collection: " + tag.str());
+        if (r.u8_at(0x36) != 0 && r.u8_at(0x36) != 2) continue;
+        MapDecalVolumes volumes{tag, r.tag_at(0x28), r.tag_at(0x2C), {}};
+        for (size_t i = 0; i < sets.count; ++i) {
+            const size_t at = sets.data + i * 0x0C;
+            MapDecalVolumeSet set{r.tag_at(at), r.u16_at(at + 4), r.u16_at(at + 6)};
+            if (!set.count || set.technique.is_none()) continue;
+            if (size_t(set.first) + set.count > boxes.count)
+                throw std::runtime_error("Projected decal set exceeds its bounds table: " + tag.str());
+            std::array<float, 3> lo{INFINITY, INFINITY, INFINITY}, hi{-INFINITY, -INFINITY, -INFINITY};
+            set.half_thickness = INFINITY;
+            for (size_t j = 0; j < set.count; ++j) {
+                const size_t box = boxes.data + (size_t(set.first) + j) * 0x30;
+                for (size_t k = 0; k < 3; ++k) {
+                    const float a = br.f32_at(box + k * 4), b = br.f32_at(box + 0x10 + k * 4);
+                    lo[k] = std::min(lo[k], a);
+                    hi[k] = std::max(hi[k], b);
+                    if (j == 0) set.half_thickness = std::min(set.half_thickness, (b - a) * 0.5f);
+                }
+            }
+            float distance_squared = 0, radius_squared = 0;
+            for (size_t k = 0; k < 3; ++k) {
+                const float distance = std::max({0.0f, lo[k] - center[k], center[k] - hi[k]});
+                distance_squared += distance * distance;
+                set.sphere[k] = (lo[k] + hi[k]) * 0.5f;
+                const float extent = (hi[k] - lo[k]) * 0.5f;
+                radius_squared += extent * extent;
+            }
+            if (distance_squared > radius * radius) continue;
+            set.sphere[3] = std::sqrt(radius_squared);
+            volumes.sets.push_back(set);
+        }
+        if (!volumes.sets.empty()) result.push_back(std::move(volumes));
     }
     return result;
 }

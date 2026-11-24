@@ -648,6 +648,21 @@ int run(int argc, char** argv) {
                 }
             }
             std::println("map decals: {} of {} prepared", ready, decals.size());
+            const auto volumes = load_map_decal_volumes(pm, map, focus, map_radius);
+            constexpr std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+            size_t volume_sets = 0;
+            for (const auto& volume : volumes) {
+                try {
+                    auto prepared = prepare_map_decal_volumes(pm, volume, &cache);
+                    const auto count = prepared.groups.size();
+                    scene.add_mesh(gpu, std::move(prepared), layouts, std::span(&identity, 1));
+                    volume_sets += count;
+                } catch (const std::exception& ex) {
+                    std::println("  projected decals {}: {}", volume.tag.str(), ex.what());
+                    ++failures[ex.what()];
+                }
+            }
+            std::println("projected decals: {} set(s) prepared across {} collection(s)", volume_sets, volumes.size());
         }
         add_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
         if (load_sampler) load_sampler->stop_and_print();

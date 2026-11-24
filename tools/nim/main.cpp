@@ -1217,15 +1217,16 @@ private:
                 const size_t first_sky = region.size();
                 for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
                 const auto decals = load_map_decals(*pm, *layout);
+                const auto decal_volumes = load_map_decal_volumes(*pm, *layout, center, req.radius);
                 const size_t decal_start = terrain.size() + region.size();
                 std::sort(world_jobs.begin(), world_jobs.end());
                 std::vector<size_t> jobs;
-                jobs.reserve(decal_start + decals.size());
+                jobs.reserve(decal_start + decals.size() + decal_volumes.size());
                 // The skyline must be visible while the thousands of world meshes are loading.
                 for (size_t i = first_sky; i < region.size(); ++i) jobs.push_back(terrain.size() + i);
                 for (size_t i = 0; i < terrain.size(); ++i) jobs.push_back(i);
                 for (const auto& [distance, index] : world_jobs) jobs.push_back(index);
-                for (size_t i = 0; i < decals.size(); ++i) jobs.push_back(decal_start + i);
+                for (size_t i = 0; i < decals.size() + decal_volumes.size(); ++i) jobs.push_back(decal_start + i);
                 auto lights = std::make_shared<std::vector<MapLight>>();
                 try {
                     auto all = load_map_lights(*pm, *layout);
@@ -1299,7 +1300,10 @@ private:
                         Piece piece{req.generation};
                         std::string failure;
                         try {
-                            if (j >= decal_start) {
+                            if (j >= decal_start + decals.size()) {
+                                piece.mesh = prepare_map_decal_volumes(wpm, decal_volumes[j - decal_start - decals.size()], &*cache);
+                                piece.rows = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}};
+                            } else if (j >= decal_start) {
                                 const auto& decal = decals[j - decal_start];
                                 piece.mesh = prepare_map_decal(wpm, decal, layouts, &*cache);
                                 piece.rows = {decal.rows};
@@ -1504,16 +1508,25 @@ void init_swapchain(Gpu& gpu) {
     check_hr(gpu.device()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_win.alloc[0].Get(), nullptr,
                                              IID_PPV_ARGS(&g_win.list)),
              "command list");
+    g_win.list->SetName(L"nim viewport and window present");
     g_win.list->Close();
 }
 
 void release_swapchain(Gpu& gpu) {
     g_frame_generation.set_active(false);
-    gpu.wait_idle();
+    if (!gpu.removed()) gpu.wait_idle();
     for (auto& b : g_win.back) b.Reset();
     if (g_win.waitable) CloseHandle(g_win.waitable);
     g_win.waitable = nullptr;
     g_win.swapchain.Reset();
+}
+
+void release_window_gpu(Gpu& gpu) {
+    release_swapchain(gpu);
+    g_win.list.Reset();
+    g_win.rtv_heap.Reset();
+    for (auto& alloc : g_win.alloc) alloc.Reset();
+    std::fill(std::begin(g_win.fence), std::end(g_win.fence), 0);
 }
 
 void resize_swapchain(Gpu& gpu, UINT w, UINT h) {
@@ -1600,6 +1613,8 @@ public:
     MapView map;
     bool map_scene = false;  // the live scene is a map region
     std::optional<TagHash> pending_map;  // from the command line, loaded once the maps are listed
+    std::optional<std::pair<TagHash, uint32_t>> pending_activity;
+    std::optional<Camera> pending_camera;
     static constexpr uint32_t kMapTextureCaps[] = {256, 512, 1024, 0};
 
     // live view
@@ -2038,7 +2053,7 @@ public:
         anim.reset();
         channel_overrides.clear();
         const bool same = map_scene && map.bubble == m.bubble;
-        map.framed = same && center.has_value();  // reloading around the camera keeps the view
+        map.framed = center.has_value();  // reloading around the camera keeps the view
         map.bubble = m.bubble;
         map.activity = m.activity;
         map.activity_map = m.activity_map;
@@ -2431,15 +2446,27 @@ public:
         if (pending_map) {
             // The map as its first game mode uses it (the list's kind follows), else the map alone.
             int pick = -1;
+            if (pending_activity)
+                for (size_t i = 0; i < maps.size() && pick < 0; ++i)
+                    if (maps[i].bubble == *pending_map &&
+                        maps[i].activity == pending_activity->first && maps[i].activity_map == pending_activity->second)
+                        pick = int(i);
             for (size_t i = 0; i < maps.size() && pick < 0; ++i)
                 if (maps[i].bubble == *pending_map && !maps[i].activity.is_none()) pick = int(i);
             for (size_t i = 0; i < maps.size() && pick < 0; ++i)
                 if (maps[i].bubble == *pending_map) pick = int(i);
             if (pick >= 0) {
                 map.selection_mode = maps[size_t(pick)].activity.is_none() ? 0 : 1;
-                load_map(pick, std::nullopt);
+                std::optional<std::array<float, 3>> center;
+                if (pending_camera) {
+                    cam = *pending_camera;
+                    center = std::array{cam.target.x, cam.target.y, cam.target.z};
+                }
+                load_map(pick, center);
             }
             pending_map.reset();
+            pending_activity.reset();
+            pending_camera.reset();
         }
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         const float left_w = 300 * sc, pad = 10 * sc;
@@ -5486,7 +5513,7 @@ public:
         }
         worker.stop();
         map_worker.stop();
-        gpu.wait_idle();
+        if (!gpu.removed()) gpu.wait_idle();
         for (auto& [k, t] : thumbs)
             if (t.srv != UINT32_MAX) gpu.srv().free(t.srv, 1);
         thumbs.clear();
@@ -5592,27 +5619,25 @@ struct BenchDriver {
     }
 };
 
-int run(const std::wstring& cmdline) {
-    ImGui_ImplWin32_EnableDpiAwareness();
-    const float scale = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
-    WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, wnd_proc, 0, 0, GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr, L"nim", nullptr};
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassExW(&wc);
-    g_win.hwnd = CreateWindowW(wc.lpszClassName, L"nim — Marathon asset viewer", WS_OVERLAPPEDWINDOW, 80, 60,
-                               int(1680 * scale), int(1000 * scale), nullptr, nullptr, wc.hInstance, nullptr);
-    {  // dark frame, the shadow and rounded corners kept while the UI draws the title bar
-        BOOL dark = TRUE;
-        DwmSetWindowAttribute(g_win.hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
-        const MARGINS m{0, 0, 0, 1};
-        DwmExtendFrameIntoClientArea(g_win.hwnd, &m);
-        SetWindowPos(g_win.hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
-    }
+struct RecoveryView {
+    bool retry = false;
+    fs::path install;
+    TagHash bubble, activity, model;
+    uint32_t activity_map = 0;
+    std::optional<Camera> camera;
+    float map_radius = 120.0f;
+    int texture_cap = 1;
+    ViewMode mode = ViewMode::Lit;
+    bool ai = false;
+    bool fx = true;
+};
 
+int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recovery) {
+    const bool recovering = recovery.retry;
     auto app = std::make_unique<App>();
     try {
         // Streamline is optional. Initialize it only when the user requests frame generation.
-        app->gpu.init(false, [](ID3D12Device* device) { return g_frame_generation.attach(device); });
+        app->gpu.init(false, [](ID3D12Device* device) { return g_frame_generation.attach(device); }, true);
         init_swapchain(app->gpu);
         app->lighting.init(app->gpu);
     } catch (const std::exception& ex) {
@@ -5628,13 +5653,28 @@ int run(const std::wstring& cmdline) {
         LPWSTR* argv = CommandLineToArgvW(cmdline.c_str(), &argc);
         for (int i = 1; argv && i < argc; ++i) {
             std::wstring a = argv[i];
-            if (a == L"--frame-generation") g_frame_generation_requested = g_frame_generation.supported();
+            if (a == L"--frame-generation") g_frame_generation_requested = !recovering && g_frame_generation.supported();
             else if (fs::is_directory(a)) install_arg = fs::path(a);
             else if (a.size() == 8 && a.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos)
                 tag_arg = TagHash(uint32_t(std::stoul(a, nullptr, 16)));
         }
         if (g_frame_generation_requested) g_frame_generation.init();
         LocalFree(argv);
+    }
+
+    if (recovering) {
+        if (!recovery.install.empty()) install_arg = recovery.install;
+        if (!recovery.bubble.is_none()) tag_arg = recovery.bubble;
+        else if (!recovery.model.is_none()) tag_arg = recovery.model;
+        g_frame_generation_requested = false;
+        // Leave headroom while rebuilding after a hang, especially with window capture active.
+        app->map.radius = std::min(recovery.map_radius, 120.0f);
+        app->map.texture_cap = std::min(recovery.texture_cap, 1);
+        app->light.ssr = false;
+        app->light.volumetrics = false;
+        app->light.mode = recovery.mode;
+        app->fx_enabled = recovery.fx;
+        app->ai.enabled = recovery.ai;
     }
 
     // The interface language is read before anything that shows text (fonts, the first messages).
@@ -5650,15 +5690,18 @@ int run(const std::wstring& cmdline) {
     apply_style(scale);
 
     // Open the install before building fonts: the UI is set in the game's own fonts.
-    ShowWindow(g_win.hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(g_win.hwnd);
+    if (!recovering) {
+        ShowWindow(g_win.hwnd, SW_SHOWDEFAULT);
+        UpdateWindow(g_win.hwnd);
+    }
     if (install_arg) app->open_install(*install_arg);
     else if (auto found = PackageManager::find_install()) app->open_install(*found);
     else app->error(ui::tr(ui::S::ErrNoSteamInstall));
     load_fonts(app->pm.get());
 
     ImGui_ImplWin32_Init(g_win.hwnd);
-    static Gpu* s_gpu = &app->gpu;
+    static Gpu* s_gpu = nullptr;
+    s_gpu = &app->gpu;
     ImGui_ImplDX12_InitInfo ii;
     ii.Device = app->gpu.device();
     ii.CommandQueue = app->gpu.queue();
@@ -5683,6 +5726,10 @@ int run(const std::wstring& cmdline) {
         const Entry* e = app->pm->entry(*tag_arg);
         if (e && e->reference == kClassBubbleParent) {
             app->pending_map = *tag_arg;
+            if (recovering && recovery.camera) {
+                app->pending_activity = std::pair{recovery.activity, recovery.activity_map};
+                app->pending_camera = recovery.camera;
+            }
             app->tab = TabMaps;
         } else {
             app->request_load(*tag_arg);
@@ -5703,10 +5750,13 @@ int run(const std::wstring& cmdline) {
         uint64_t frequency = 1;
         app->gpu.queue()->GetTimestampFrequency(&frequency);
         g_prof.set_frequency(frequency);
-    } else if (g_prefs.auto_update && !start_update(true)) app->error(ui::tr(ui::S::UpdateUnavailable));
+    } else if (!recovering && g_prefs.auto_update && !start_update(true)) app->error(ui::tr(ui::S::UpdateUnavailable));
 
     uint64_t frame = 0;
     bool done = false;
+    std::string gpu_failure;
+    if (recovering) app->info("GPU を再初期化しました。負荷を下げて描画を再開します。");
+    try {
     while (!done) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -5735,7 +5785,7 @@ int run(const std::wstring& cmdline) {
         g_prof.begin_frame();
         {
             const auto ps = g_prof.scope(Prof::Wait);
-            WaitForSingleObjectEx(g_win.waitable, 1000, TRUE);
+            if (g_win.waitable) WaitForSingleObjectEx(g_win.waitable, 1000, FALSE);
             app->gpu.wait(g_win.fence[fi]);
         }
         g_prof.read_slot(fi);
@@ -5772,6 +5822,7 @@ int run(const std::wstring& cmdline) {
             app->record_uploads(cl, fi);
             if (app->viewport_visible) app->record(cl);
         } catch (const std::exception& ex) {
+            app->gpu.check_device();
             app->error(ui::trf(ui::S::ErrRender, ex.what()));
         }
         std::optional<Prof::Scope> submit_scope(std::in_place, g_prof, Prof::Submit);
@@ -5796,22 +5847,12 @@ int run(const std::wstring& cmdline) {
         const bool uncapped = bench.active() && !bench.vsync;
         const HRESULT present = g_win.swapchain->Present(uncapped ? 0 : 1, uncapped && g_win.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
         present_scope.reset();
+        if (FAILED(present)) {
+            app->gpu.check_device();
+            check_hr(present, "Present");
+        }
         g_frame_generation.mark(FrameGeneration::Marker::present_end);
         g_frame_generation.after_present();
-        if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) {
-            // The GPU faulted: every later frame would only wait out timeouts, so say so and quit.
-            std::string why = "GPU error";
-            try {
-                app->gpu.check_device();
-            } catch (const std::exception& ex) {
-                why = ex.what();
-            }
-            MessageBoxW(g_win.hwnd,
-                        to_wide(ui::trf(ui::S::ErrDeviceRemoved, why))
-                            .c_str(),
-                        L"nim", MB_ICONERROR);
-            break;
-        }
         g_win.fence[fi] = app->gpu.signal();
         ++frame;
         app->after_frame();
@@ -5819,16 +5860,72 @@ int run(const std::wstring& cmdline) {
     }
 
     app->gpu.wait_idle();
+    } catch (const std::exception& ex) {
+        gpu_failure = ex.what();
+        if (!app->gpu.removed()) {
+            try {
+                app->gpu.check_device();
+            } catch (const std::exception& removed) {
+                gpu_failure = removed.what();
+            }
+        }
+    }
+
+    const bool retry = !recovering && !bench.active() && app->gpu.removed();
+    if (retry) {
+        recovery.retry = true;
+        recovery.install = app->install;
+        recovery.fx = app->fx_enabled;
+        recovery.ai = app->ai.enabled;
+        recovery.mode = app->light.mode;
+        if (app->map_scene) {
+            recovery.bubble = app->map.bubble;
+            recovery.activity = app->map.activity;
+            recovery.activity_map = app->map.activity_map;
+            recovery.camera = app->cam;
+            recovery.map_radius = app->map.radius;
+            recovery.texture_cap = app->map.texture_cap;
+        } else if (app->scene.loaded()) {
+            recovery.model = app->scene.tag();
+        }
+    } else if (!gpu_failure.empty()) {
+        const auto error = app->gpu.removed() ? ui::trf(ui::S::ErrDeviceRemoved, gpu_failure) : gpu_failure;
+        MessageBoxW(g_win.hwnd, to_wide(error).c_str(), L"nim", MB_ICONERROR);
+    }
     if (app->loader.joinable()) app->loader.join();
     app->shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    release_swapchain(app->gpu);
+    release_window_gpu(app->gpu);
     g_frame_generation.shutdown();
+    g_frame_generation_requested = g_frame_generation_proxy = false;
+    return retry ? 2 : (gpu_failure.empty() ? 0 : 1);
+}
+
+int run(const std::wstring& cmdline) {
+    ImGui_ImplWin32_EnableDpiAwareness();
+    const float scale = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, wnd_proc, 0, 0, GetModuleHandleW(nullptr), nullptr, nullptr, nullptr, nullptr, L"nim", nullptr};
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&wc);
+    g_win.hwnd = CreateWindowW(wc.lpszClassName, L"nim — Marathon asset viewer", WS_OVERLAPPEDWINDOW, 80, 60,
+                               int(1680 * scale), int(1000 * scale), nullptr, nullptr, wc.hInstance, nullptr);
+    {  // dark frame, the shadow and rounded corners kept while the UI draws the title bar
+        BOOL dark = TRUE;
+        DwmSetWindowAttribute(g_win.hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+        const MARGINS m{0, 0, 0, 1};
+        DwmExtendFrameIntoClientArea(g_win.hwnd, &m);
+        SetWindowPos(g_win.hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+    }
+
+    RecoveryView recovery;
+    int result = run_renderer(cmdline, scale, recovery);
+    if (result == 2) result = run_renderer(cmdline, scale, recovery);
     DestroyWindow(g_win.hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    return 0;
+    return result;
 }
 
 } // namespace
