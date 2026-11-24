@@ -2425,13 +2425,36 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             if (cpu_skin && !b.skin.bones.empty() && b.skin_pos.size() == b.skin.bones.size() * 2 && b.vb0.stride == 24) {
                 // Posed on the CPU (update_skin); the first render uploads the bind pose.
                 const size_t bytes = b.skin_pos.size() * 4;
-                set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-                set.skin_normal = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-                for (auto& u : set.skin_upload) u = gpu.buffer(bytes * 2, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                const bool gpu_skin = ensure_skin_pipeline(gpu);
+                const auto uav = gpu_skin ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+                set.skin_pos = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, uav);
+                set.skin_normal = gpu.buffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, uav);
                 set.vb0_cpu = b.vb0.data;
                 set.skin = b.skin;
                 set.skin_scale = {mesh.model_cb[4][0], mesh.model_cb[4][1], mesh.model_cb[4][2]};
                 set.skin_offset = {mesh.model_cb[5][0], mesh.model_cb[5][1], mesh.model_cb[5][2]};
+                if (gpu_skin) {
+                    // Bind pose decoded as update_skin's CPU path reads it: position, normal,
+                    // tangent, 4 bones (u16 pairs), 4 weights.
+                    const size_t n = b.skin.bones.size();
+                    std::vector<uint32_t> src(n * 15);
+                    for (size_t i = 0; i < n; ++i) {
+                        const uint8_t* v = b.vb0.data.data() + i * 24;
+                        const float f[9] = {s16(v) * set.skin_scale.x + set.skin_offset.x, s16(v + 2) * set.skin_scale.y + set.skin_offset.y,
+                                            s16(v + 4) * set.skin_scale.z + set.skin_offset.z, s16(v + 8), s16(v + 10), s16(v + 12),
+                                            s16(v + 16), s16(v + 18), s16(v + 20)};
+                        uint32_t* d = src.data() + i * 15;
+                        std::memcpy(d, f, sizeof(f));
+                        const auto& bk = b.skin.bones[i];
+                        d[9] = bk[0] | (uint32_t(bk[1]) << 16);
+                        d[10] = bk[2] | (uint32_t(bk[3]) << 16);
+                        std::memcpy(d + 11, b.skin.weights[i].data(), 16);
+                    }
+                    set.skin_src = gpu.buffer(src.size() * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+                    gpu.stage_copy(set.skin_src.Get(), 0, src.data(), src.size() * 4);
+                } else {
+                    for (auto& u : set.skin_upload) u = gpu.buffer(bytes * 2, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                }
                 set.skin_pack_offset = {mesh.model_cb[13][0], mesh.model_cb[13][1], mesh.model_cb[13][2]};
                 set.skin_range = mesh.model_cb[13][3];
                 set.skin_ranges = used_vertex_ranges(mesh, size_t(&b - mesh.buffers.data()), b.skin.bones.size());
@@ -3810,7 +3833,100 @@ void StaticMeshScene::set_skin_poses(std::vector<ModelSkinPose> poses) {
 // copied into the streams the vertex shaders read. Runs at most once per frame (from
 // render_gbuffer), so alternating between the kFramesInFlight upload buffers is safe. Sets are
 // skinned in parallel (many actors in a map); the copies are recorded afterwards in order.
-void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
+// The game poses skinned vertices in a compute pass; this one writes the same packed streams
+// (21/21/22-bit snorm position, octahedral normal and tangent) that pack_skin_vertex does on the CPU.
+static constexpr const char* kSkinHlsl = R"(
+struct Vertex { float3 p; float3 n; float3 t; uint2 bones; float4 weights; };
+StructuredBuffer<Vertex> src : register(t0);
+StructuredBuffer<float4> mats : register(t1);
+RWByteAddressBuffer pos_out : register(u0);
+RWByteAddressBuffer nrm_out : register(u1);
+cbuffer C : register(b0) { uint count; uint bone_count; float inv_range; uint posed; float3 pack_offset; uint pad; };
+int quant(float v, int bits) {
+    const int d = 1 << (bits - 1);
+    const float s = clamp(v, -1.0, 0.999999) * float(d);
+    return clamp(int(sign(s) * floor(abs(s) + 0.5)), -d, d - 1);
+}
+float2 oct(float3 v) {
+    const float sum = abs(v.x) + abs(v.y) + abs(v.z);
+    if (sum <= 1e-12) return float2(0, 0);
+    float x = v.x / sum, y = v.y / sum;
+    if (v.z / sum < 0) {
+        const float ox = x;
+        x = (1 - abs(y)) * (x >= 0 ? 1.0 : -1.0);
+        y = (1 - abs(ox)) * (y >= 0 ? 1.0 : -1.0);
+    }
+    return float2(x, y);
+}
+[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) {
+    if (i >= count) return;
+    const Vertex v = src[i];
+    float3 p = v.p, n = v.n, t = v.t;
+    if (posed) {
+        float4 r0 = 0, r1 = 0, r2 = 0;
+        float total = 0;
+        [unroll] for (uint k = 0; k < 4; ++k) {
+            const float w = v.weights[k];
+            const uint b = ((k < 2 ? v.bones.x : v.bones.y) >> ((k & 1) * 16)) & 0xFFFF;
+            if (w <= 0 || b >= bone_count) continue;
+            r0 += mats[b * 3] * w;
+            r1 += mats[b * 3 + 1] * w;
+            r2 += mats[b * 3 + 2] * w;
+            total += w;
+        }
+        if (total > 0) {
+            p = float3(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
+            n = float3(dot(r0.xyz, n), dot(r1.xyz, n), dot(r2.xyz, n));
+            t = float3(dot(r0.xyz, t), dot(r1.xyz, t), dot(r2.xyz, t));
+        }
+    }
+    p = (p - pack_offset) * inv_range;
+    const uint x = asuint(quant(p.x, 21)), y = asuint(quant(p.y, 21)), z = asuint(quant(p.z, 22));
+    pos_out.Store2(i * 8, uint2((x & 0x1FFFFF) | ((y & 0x7FF) << 21), ((y >> 11) & 0x3FF) | ((z & 0x3FFFFF) << 10)));
+    const float2 on = oct(n), ot = oct(t);
+    nrm_out.Store2(i * 8, uint2((asuint(quant(on.y, 16)) << 16) | (asuint(quant(on.x, 16)) & 0xFFFF),
+                                (asuint(quant(ot.y, 16)) << 16) | (asuint(quant(ot.x, 16)) & 0xFFFF)));
+}
+)";
+
+bool StaticMeshScene::ensure_skin_pipeline(Gpu& gpu) {
+    if (skin_pso_) return true;
+    if (skin_pipeline_failed_ || std::getenv("NIM_CPU_SKIN")) return false;
+    try {
+        ComPtr<ID3DBlob> code, err;
+        if (FAILED(D3DCompile(kSkinHlsl, std::strlen(kSkinHlsl), "nim_skin.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err)))
+            throw std::runtime_error(std::format("skinning shader: {}", err ? static_cast<const char*>(err->GetBufferPointer()) : "compile failed"));
+        D3D12_ROOT_PARAMETER params[5]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants = {0, 0, 8};
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[1].Descriptor = {0, 0};
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        params[2].Descriptor = {1, 0};
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[3].Descriptor = {0, 0};
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[4].Descriptor = {1, 0};
+        for (auto& p : params) p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rs{5, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ComPtr<ID3DBlob> blob;
+        check_hr(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err), "skinning root signature");
+        check_hr(gpu.device()->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&skin_root_)),
+                 "skinning root signature");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = skin_root_.Get();
+        pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+        check_hr(gpu.device()->CreateComputePipelineState(&pd, IID_PPV_ARGS(&skin_pso_)), "skinning pipeline");
+        return true;
+    } catch (const std::exception& ex) {
+        skin_pipeline_failed_ = true;
+        notes_.push_back(std::format("GPU skinning unavailable, posing on the CPU: {}", ex.what()));
+        return false;
+    }
+}
+
+void StaticMeshScene::update_skin(Gpu& gpu, ID3D12GraphicsCommandList* cl) {
     skin_dirty_ = false;
     const uint32_t slot = skin_frame_++ % Gpu::kFramesInFlight;
     struct Mat { float m[12]; };  // rows: rotation * scale | translation
@@ -3837,10 +3953,10 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
     for (size_t i = 0; i < curtains_.size(); ++i)
         if (!curtains_[i].pose.bones.empty()) curtain_matrices[i] = matrices_of(curtains_[i].pose);
     struct Job { BufferSet* set; const std::vector<Mat>* mats; uint32_t* dst; };
-    std::vector<Job> jobs;
+    std::vector<Job> jobs, gpu_jobs;
     const D3D12_RANGE none{0, 0};
     for (auto& set : sets_) {
-        if (!set.skin_upload[0]) continue;
+        if (!set.skin_upload[0] && !set.skin_src) continue;
         const PoseMap* source = &matrices;
         if (set.actor >= 0) {
             if (!actors_[size_t(set.actor)].rows) continue;  // hidden: not drawn
@@ -3854,9 +3970,62 @@ void StaticMeshScene::update_skin(ID3D12GraphicsCommandList* cl) {
         const bool posed = mats != nullptr;
         if (!posed && !set.skin_posed && set.skin_readable) continue;
         set.skin_posed = posed;
+        if (set.skin_src) {
+            gpu_jobs.push_back({&set, mats, nullptr});
+            continue;
+        }
         uint32_t* dst = nullptr;
         check_hr(set.skin_upload[slot]->Map(0, &none, reinterpret_cast<void**>(&dst)), "map skin upload");
         jobs.push_back({&set, mats, dst});
+    }
+    if (!gpu_jobs.empty()) {
+        // One batch of transitions in, the dispatches, one batch out.
+        constexpr auto kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        std::vector<D3D12_RESOURCE_BARRIER> in, out;
+        auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+            return b;
+        };
+        for (const auto& job : gpu_jobs) {
+            BufferSet& set = *job.set;
+            if (!set.skin_src_ready) in.push_back(transition(set.skin_src.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kRead));
+            set.skin_src_ready = true;
+            const auto from = set.skin_readable ? kRead : D3D12_RESOURCE_STATE_COPY_DEST;
+            in.push_back(transition(set.skin_pos.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            in.push_back(transition(set.skin_normal.Get(), from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            out.push_back(transition(set.skin_pos.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead));
+            out.push_back(transition(set.skin_normal.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead));
+            set.skin_readable = true;
+        }
+        cl->ResourceBarrier(UINT(in.size()), in.data());
+        cl->SetComputeRootSignature(skin_root_.Get());
+        cl->SetPipelineState(skin_pso_.Get());
+        for (const auto& job : gpu_jobs) {
+            const BufferSet& set = *job.set;
+            const uint32_t n = uint32_t(set.skin.bones.size());
+            D3D12_GPU_VIRTUAL_ADDRESS mats = set.skin_src->GetGPUVirtualAddress();
+            uint32_t bones = 0;
+            if (job.mats && !job.mats->empty()) {
+                const size_t bytes = job.mats->size() * sizeof(Mat);
+                const auto upload = gpu.dynamic(bytes);
+                std::memcpy(upload.cpu, job.mats->data(), bytes);
+                mats = upload.gpu;
+                bones = uint32_t(job.mats->size());
+            }
+            const float inv_range = 1.0f / set.skin_range;
+            uint32_t constants[8] = {n, bones, std::bit_cast<uint32_t>(inv_range), job.mats ? 1u : 0u,
+                                     std::bit_cast<uint32_t>(set.skin_pack_offset.x), std::bit_cast<uint32_t>(set.skin_pack_offset.y),
+                                     std::bit_cast<uint32_t>(set.skin_pack_offset.z), 0};
+            cl->SetComputeRoot32BitConstants(0, 8, constants, 0);
+            cl->SetComputeRootShaderResourceView(1, set.skin_src->GetGPUVirtualAddress());
+            cl->SetComputeRootShaderResourceView(2, mats);
+            cl->SetComputeRootUnorderedAccessView(3, set.skin_pos->GetGPUVirtualAddress());
+            cl->SetComputeRootUnorderedAccessView(4, set.skin_normal->GetGPUVirtualAddress());
+            cl->Dispatch((n + 63) / 64, 1, 1);
+        }
+        cl->ResourceBarrier(UINT(out.size()), out.data());
     }
     if (Profile::instance().enabled()) {
         size_t verts = 0, actor_jobs = 0;
@@ -4475,7 +4644,7 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
     update_materials(gpu, gb.width(), gb.height(), vm);
     ps_mat.stop();
     ProfileScope ps_skin("frame.gbuffer.skin");
-    if (skin_dirty_) update_skin(cl);
+    if (skin_dirty_) update_skin(gpu, cl);
     ps_skin.stop();
     ProfileScope ps_draw("frame.gbuffer.draw");
     const float clear[4] = {0, 0, 0, 0};
@@ -4536,7 +4705,7 @@ void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GB
 void StaticMeshScene::render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow) {
     shadow.valid = false;
     if (!shadow.depth || items_.size() == transparent_count()) return;
-    if (skin_dirty_) update_skin(cl);
+    if (skin_dirty_) update_skin(gpu, cl);
     if (!actors_.empty()) bind_actor_constants(gpu);
     ProfileScope ps_cull("frame.shadow.cull");
     cull(gpu, shadow.vm, shadow.size, true);

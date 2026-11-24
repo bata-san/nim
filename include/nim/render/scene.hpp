@@ -553,6 +553,10 @@ private:
         std::array<ComPtr<ID3D12Resource>, Gpu::kFramesInFlight> skin_upload;
         bool skin_readable = false;  // skin_pos / skin_normal in NON_PIXEL_SHADER_RESOURCE
         bool skin_posed = false;
+        // GPU skinning (packed 24-byte vertices): the bind pose decoded once into skin_src (60-byte
+        // records), posed by a compute pass straight into skin_pos / skin_normal.
+        ComPtr<ID3D12Resource> skin_src;
+        bool skin_src_ready = false;  // skin_src left COPY_DEST for NON_PIXEL_SHADER_RESOURCE
         bool float_vertices = false;  // PreparedMesh::Buffers::float_positions: posed into vb0 itself
         // Dynamic models: the object constants (rigid_model / skinning scope, local_to_world in
         // rows 0-3) and the placements; this frame's constants per placement.
@@ -595,7 +599,11 @@ private:
     std::optional<V3> curtain_eye_;
     int32_t adding_actor_ = -1;
     void bind_actor_constants(Gpu& gpu);
-    void update_skin(ID3D12GraphicsCommandList* cl);
+    void update_skin(Gpu& gpu, ID3D12GraphicsCommandList* cl);
+    bool ensure_skin_pipeline(Gpu& gpu);
+    ComPtr<ID3D12RootSignature> skin_root_;
+    ComPtr<ID3D12PipelineState> skin_pso_;
+    bool skin_pipeline_failed_ = false;
     void rebuild_visibility(const ViewMatrices& vm, uint32_t height, bool shadow);
     void add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
                         std::span<const std::array<float, 12>> placements, std::span<const float> sky_order);

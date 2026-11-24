@@ -61,13 +61,14 @@ try {
             if ($ghToken) { $token = $ghToken.Trim() }
         }
     }
-    if (!$token) { Set-Status 'auth'; Write-Log 'auth: no token'; exit 2 }
+    # The repository is public: a token only raises the API rate limit.
+    if (!$token) { Write-Log 'no token: anonymous request' }
     $headers = @{
-        Authorization = "Bearer $token"
         'User-Agent' = 'nim-updater'
         Accept = 'application/vnd.github+json'
         'X-GitHub-Api-Version' = '2022-11-28'
     }
+    if ($token) { $headers.Authorization = "Bearer $token" }
     try { $release = Invoke-RestMethod "$api/releases/latest" -Headers $headers -TimeoutSec 25 }
     catch {
         if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -in 401,403,404) {
@@ -104,7 +105,7 @@ try {
     $client.MaxResponseContentBufferSize = $asset.size
     try {
         $request = [Net.Http.HttpRequestMessage]::new('GET', "$api/releases/assets/$([long]$asset.id)")
-        $request.Headers.Add('Authorization', "Bearer $token")
+        if ($token) { $request.Headers.Add('Authorization', "Bearer $token") }
         $request.Headers.Add('User-Agent', 'nim-updater')
         $request.Headers.Add('Accept', 'application/octet-stream')
         try { $response = $client.SendAsync($request).GetAwaiter().GetResult() } finally { $request.Dispose() }
