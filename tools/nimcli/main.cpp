@@ -3382,8 +3382,8 @@ int cmd_parts(PackageManager& pm, TagHash tag, bool raw) {
                     hi[a] = std::max(hi[a], p);
                 }
             }
-            std::println(" mesh {} part {:3} stage {:2} tech {} var {:5} lod {:02X} role {} flags {:X} idx {}+{}  ({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})", i, pi,
-                         stage, part.technique.str(), part.variant_shader_index, part.lod_category, part.lod_role, part.flags, part.index_start, part.index_count,
+            std::println(" mesh {} part {:3} stage {:2} tech {} var {:5} lod {:02X} role {} flags {:X} ext {} idx {}+{}  ({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})", i, pi,
+                         stage, part.technique.str(), part.variant_shader_index, part.lod_category, part.lod_role, part.flags, part.external_identifier, part.index_start, part.index_count,
                          lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
             if (raw) {  // -v: the part's 0x28-byte record
                 const size_t q = reader.vec_at(reader.vec_at(0x10).data + i * 0x88 + 0x20).data + pi * 0x28;

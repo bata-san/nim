@@ -67,12 +67,16 @@ std::vector<MapEntry> list_activity_maps(PackageManager& pm);
 // DEIMOS ActivityTab: selected SActivity.unk50 row plus matching ambient activity row.
 std::vector<TagHash> load_activity_node_tables(PackageManager& pm, TagHash activity, uint32_t bubble_name, uint32_t map_index);
 
+struct RegionPermutations;
 struct MapStatic {
     TagHash mesh;
     // Per instance: the 3x4 object-to-world rows (rotation * scale, translation in .w).
     std::vector<std::array<float, 12>> rows;
     std::vector<float> sky_order;  // one authored sort key per row for sky collections
     bool patrol_start = false;  // static drone placement replaced while the patrol simulation is shown
+    // Placed entities: the part-group permutations the entity's region selector picks with no
+    // spawn tags (3.125); null = no selector, every part group drawn.
+    std::shared_ptr<const RegionPermutations> regions;
 };
 inline constexpr uint32_t kBubbleOutpost = 0x80AF9550;  // exp_outpost
 inline constexpr uint32_t kClassMapDecals = 0x808081B2;

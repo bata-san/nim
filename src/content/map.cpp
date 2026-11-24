@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nim {
 namespace {
@@ -961,7 +962,7 @@ std::vector<MapStatic> map_region(const std::vector<MapStatic>& placed, std::arr
     std::vector<std::pair<float, MapStatic>> found;
     const float r2 = radius * radius;
     for (const auto& st : placed) {
-        MapStatic m{st.mesh, {}, {}, st.patrol_start};
+        MapStatic m{st.mesh, {}, {}, st.patrol_start, st.regions};
         float nearest = 1e30f;
         for (size_t i = 0; i < st.rows.size(); ++i) {
             const auto& r = st.rows[i];
@@ -1083,7 +1084,14 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
     std::unordered_multimap<uint32_t, uint32_t> by_component;  // SDynamicModelComponent tag -> model
     for (const auto& [model, m] : materials) by_component.emplace(m.component.value, model);
     std::unordered_map<uint32_t, std::vector<uint32_t>> entity_models;
-    std::unordered_map<uint64_t, size_t> slot;  // model and patrol-start flag -> out.models index
+    // An entity's region selector with no spawn tags (its unconditional entry): which of a
+    // model's alternate part groups the placement shows (a terminal's narrow or wide screen).
+    // Per (entity, the node's tag pairs): a selector's rows are conditioned on tags the placing
+    // node carries (the EXFIL terminal: 8F45EF1B = 4C11F193 wide / 63977E0B narrow screen).
+    std::map<std::pair<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>, std::shared_ptr<const RegionPermutations>> entity_regions;
+    std::unordered_set<uint32_t> has_selector;
+    // model, patrol-start flag, selector and chosen entry -> out.models index
+    std::map<std::tuple<uint32_t, bool, uint32_t, uint32_t>, size_t> slot;
     for (const auto table : map.node_tables) {
             std::vector<uint8_t> data;
             try {
@@ -1122,15 +1130,52 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
                         } catch (...) {
                         }
                     }
+                    if (!models.empty()) {
+                        try {
+                            // A selector exists when some tag set picks a row; rows without
+                            // conditions are picked with none.
+                            if (entity_has_region_selector(pm, *ent)) has_selector.insert(ent->value);
+                        } catch (const std::exception&) {
+                        }
+                    }
                     it = entity_models.emplace(ent->value, std::move(models)).first;
                     ++out.entities;
                 }
                 if (it->second.empty()) continue;
                 const auto rows = quat_rows(r, e);
                 const bool patrol_start = map.patrol_drone_nodes.contains(node);
+                std::shared_ptr<const RegionPermutations> regions;
+                if (has_selector.contains(ent->value)) {
+                    // Every (u32, u32) pair in the node's component records: the selector matches
+                    // only its own condition pairs among them.
+                    std::vector<std::pair<uint32_t, uint32_t>> tags;
+                    for (size_t p = e + 0x78 + size_t(r.u64_at(e + 0x78)), guard = 0;
+                         p != e + 0x78 && p >= 4 && p + 0x10 <= data.size() && guard < 64; ++guard) {
+                        const uint64_t next = r.u64_at(p);
+                        const size_t end = std::min(data.size(), next ? p + size_t(next) : p + 0x100);
+                        for (size_t q = p + 8; q + 8 <= end; q += 4) tags.push_back({r.u32_at(q), r.u32_at(q + 4)});
+                        if (!next) break;
+                        p += size_t(next);
+                    }
+                    std::ranges::sort(tags);
+                    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+                    auto key = std::pair{ent->value, std::move(tags)};
+                    auto er = entity_regions.find(key);
+                    if (er == entity_regions.end()) {
+                        std::shared_ptr<const RegionPermutations> found;
+                        try {
+                            if (auto rp = entity_region_permutations(pm, *ent, key.second); rp && !rp->region_permutation.empty())
+                                found = std::make_shared<const RegionPermutations>(std::move(*rp));
+                        } catch (const std::exception&) {
+                        }
+                        er = entity_regions.emplace(std::move(key), std::move(found)).first;
+                    }
+                    regions = er->second;
+                }
                 for (uint32_t m : it->second) {
-                    auto [s, fresh] = slot.try_emplace((uint64_t(m) << 1) | uint64_t(patrol_start), out.models.size());
-                    if (fresh) out.models.push_back({TagHash(m), {}, {}, patrol_start});
+                    const auto key = std::tuple{m, patrol_start, regions ? regions->selector.value : 0u, regions ? regions->entry : 0u};
+                    auto [s, fresh] = slot.try_emplace(key, out.models.size());
+                    if (fresh) out.models.push_back({TagHash(m), {}, {}, patrol_start, regions});
                     out.models[s->second].rows.push_back(rows);
                 }
                 ++out.placements;

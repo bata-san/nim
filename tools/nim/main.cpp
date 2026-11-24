@@ -1337,7 +1337,7 @@ private:
                                 const auto mat = entity_materials->find(model.mesh.value);
                                 piece.mesh = prepare_dynamic_model(wpm, model.mesh,
                                     mat == entity_materials->end() ? nullptr : &mat->second, -1, nullptr,
-                                    &*cache);
+                                    &*cache, model.regions.get());
                                 if (piece.mesh.no_drawable) throw std::runtime_error("entity model with no drawable parts");
                                 piece.mesh.patrol_start = model.patrol_start;
                                 piece.rows = std::move(model.rows);

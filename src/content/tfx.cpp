@@ -459,6 +459,18 @@ MaterialDefaults entity_material_defaults(PackageManager& pm, TagHash entity) {
     return defaults;
 }
 
+bool entity_has_region_selector(PackageManager& pm, TagHash entity) {
+    bool found = false;
+    for_each_component_resource(pm, entity, [&](TagHash, const TagReader& r, size_t base, uint32_t cls) {
+        if (cls != 0x80804034) return false;
+        const auto regions = r.vec_at(base + 0xE8);
+        const auto entries = r.vec_at(base + 0xF8);
+        found = regions.element_class == 0x80800070 && entries.element_class == 0x80804033 && entries.count > 0;
+        return found;
+    });
+    return found;
+}
+
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions) {
     constexpr uint32_t kRegion = kRegionKey;
     constexpr uint32_t kPermutation = kPermutationKey;

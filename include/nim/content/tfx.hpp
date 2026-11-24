@@ -172,6 +172,8 @@ struct RegionPermutations {
 };
 std::optional<RegionPermutations> entity_region_permutations(PackageManager& pm, TagHash entity,
                                                              std::span<const std::pair<uint32_t, uint32_t>> tags);
+// Whether the entity has a region selector component (80804034) with at least one row.
+bool entity_has_region_selector(PackageManager& pm, TagHash entity);
 bool part_group_visible(std::span<const std::pair<uint32_t, uint32_t>> group_tags, const RegionPermutations& regions);
 std::map<uint32_t, std::array<float, 4>> entity_material_defaults(PackageManager& pm, TagHash entity);
 

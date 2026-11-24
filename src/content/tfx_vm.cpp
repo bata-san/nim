@@ -269,6 +269,12 @@ std::vector<AtlasOperands> tfx_animated_atlas_operands(std::span<const uint8_t> 
     if (steps == std::vector<uint8_t>{0, 7} && counts == std::vector<uint8_t>{4, 8} &&
         scales == std::vector<uint8_t>{5, 6})
         return {{5, 0, 4, 2}, {6, 7, 8, 3}};
+    // Marathon Deck's glowing wall panels (technique 80B27E37, PS 80B27E33): two 64-frame
+    // atlases t1 / t2 (identical 8x8 metadata). Outputs 0x0D = (scale 6, step out 0x0B from
+    // 0x68 00 BB, frames from 0x69 05) and 0x10 = (scale 7, step 0x68 01 BB, frames 0x69 04).
+    if (steps == std::vector<uint8_t>{0, 1} && counts == std::vector<uint8_t>{4, 5} &&
+        scales == std::vector<uint8_t>{6, 7})
+        return {{6, 0, 5, 1}, {7, 1, 4, 2}};
     // The three-layer material samples t0/t1/t2 in these operand groups (PS 80B088FF).
     if (steps == std::vector<uint8_t>{0, 1, 2} && counts == std::vector<uint8_t>{5, 6, 7} &&
         scales == std::vector<uint8_t>{8, 9, 10})

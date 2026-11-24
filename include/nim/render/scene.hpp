@@ -665,7 +665,7 @@ private:
     std::vector<ScopeDef> scope_defs_;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> scope_frame_;
     bool scopes_resolved_ = false;
-    GpuBuffer white_color_;
+    GpuBuffer white_color_, zero_color_;
     BufferArena arena_;  // geometry and fixed constants of this scene  // 1 x RGBA8 white: VS colour stream of meshes without one
     std::map<uint32_t, ComPtr<ID3D12Resource>> texture_cache_;
     std::unordered_map<uint32_t, GpuBuffer> geometry_cache_;

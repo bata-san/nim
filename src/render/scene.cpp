@@ -661,6 +661,7 @@ void StaticMeshScene::release(Gpu& gpu) {
     material_time_ = material_delta_ = 0;
     material_time_of_day_ = 0.5f;
     white_color_ = {};
+    zero_color_ = {};
     arena_.reset();
     material_externs_.reset();
     sets_.clear();
@@ -2651,15 +2652,18 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 } else if ((s == 0 || s == 1) && k == BindingKind::TypedBuffer && bs.color) {
                     create_buffer_srv(dev, bs.color, DXGI_FORMAT_R8G8B8A8_UNORM, h);
                 } else if (vs_kinds.contains(s) && !item.vs_sources.extern_textures.contains(s) && neutral_vertex_color(s, k)) {
-                    if (!white_color_) {
-                        const uint32_t white = 0xFFFFFFFFu;
-                        white_color_ = arena_.upload(gpu, &white, 4);
+                    // Dynamic models: white (same-engine neutral). Map statics: zero, which the
+                    // panel materials read as "not masked" (Marathon Deck's glowing walls, 3.125).
+                    auto& neutral = mesh.dynamic ? white_color_ : zero_color_;
+                    if (!neutral) {
+                        const uint32_t value = mesh.dynamic ? 0xFFFFFFFFu : 0u;
+                        neutral = arena_.upload(gpu, &value, 4);
                     }
-                    create_buffer_srv(dev, white_color_.resource.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1, h, white_color_.offset / 4);
+                    create_buffer_srv(dev, neutral.resource.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1, h, neutral.offset / 4);
                     if (material_externs_)
-                        material_externs_->note_estimate(std::format("{} VS t{} vertex colour = white", item.technique.str(), s),
+                        material_externs_->note_estimate(std::format("{} VS t{} vertex colour = {}", item.technique.str(), s, mesh.dynamic ? "white" : "0"),
                             mesh.dynamic ? "no authored vertex-colour stream; shader indexes element 0; same-engine neutral colour"
-                                         : "mesh has no colour stream (map-baked per-instance colour not decoded)");
+                                         : "static mesh has no colour stream; engine default buffer not decoded; 0 matches the game's lit panel walls");
                 } else if (mesh.dynamic && s >= 2 && s <= 4 && bs.skin_pos) {
                     ID3D12Resource* r = s == 3 ? bs.skin_normal.Get() : bs.skin_pos.Get();
                     create_buffer_srv(dev, r, DXGI_FORMAT_R32_UINT, UINT(r->GetDesc().Width / 4), h);

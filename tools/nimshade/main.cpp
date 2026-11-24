@@ -506,6 +506,10 @@ int run(int argc, char** argv) {
             for (size_t i = 0; i < er.size(); ++i) {
                 if (entity_range && (i < entity_range->first || i >= entity_range->second)) continue;
                 if (entity_range) std::println("entity model [{}]: {} ({} placements)", i, er[i].mesh.str(), er[i].rows.size());
+                if (const char* near_env = std::getenv("NIM_ENTITY_NEAR"))  // diagnostics: placements within N m of the focus
+                    for (const auto& r : er[i].rows)
+                        if (std::hypot(r[3] - focus[0], r[7] - focus[1], r[11] - focus[2]) < std::stof(near_env))
+                            std::println("near: [{}] {} at ({:.2f}, {:.2f}, {:.2f}) x ({:.2f}, {:.2f}, {:.2f})", i, er[i].mesh.str(), r[3], r[7], r[11], r[0], r[4], r[8]);
                 region.push_back(std::move(er[i]));
             }
         }
@@ -582,7 +586,7 @@ int run(int argc, char** argv) {
                         else {
                             const auto mat = entity_materials.find(region[r].mesh.value);
                             prepared[j] = prepare_dynamic_model(wpm, region[r].mesh, mat == entity_materials.end() ? nullptr : &mat->second, -1,
-                                                                nullptr, &cache);
+                                                                nullptr, &cache, region[r].regions.get());
                             prepared[j]->patrol_start = region[r].patrol_start;
                             if (prepared[j]->no_drawable) prepared[j].reset(), errors[j] = "entity model with no drawable parts";
                         }
