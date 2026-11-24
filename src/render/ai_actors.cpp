@@ -1026,9 +1026,10 @@ std::vector<float> top_down_heights(Gpu& gpu, StaticMeshScene& scene, SunShadow&
     const uint32_t mark = gpu.transient_mark();
     const size_t upload_mark = gpu.dynamic_mark();
     gb.resize(gpu, size, size);
+    const bool bundles = scene.bundles_allowed();
     scene.allow_bundles(false);
     scene.render_gbuffer(gpu, gpu.immediate(), gb, vm);
-    scene.allow_bundles(true);
+    scene.allow_bundles(bundles);
     const auto bytes = gpu.read_texture(gb.depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, 4);  // plane 0: R32 depth
     gb.release(gpu);
     gpu.transient_rewind(mark);

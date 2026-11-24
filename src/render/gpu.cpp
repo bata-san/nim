@@ -250,6 +250,10 @@ uint64_t Gpu::vram_budget() const {
 }
 
 void Gpu::begin_frame(uint32_t frame_index) {
+    // The epoch that ends here was submitted and covered by the last signal (the viewer signals
+    // after submitting its frame list; headless work flushes the immediate list).
+    epoch_end_fences_[epoch_ % epoch_end_fences_.size()] = fence_value_;
+    ++epoch_;
     table_frame_ = frame_index % kFramesInFlight;
     table_cache_[table_frame_].clear();
     table_hits_ = 0;

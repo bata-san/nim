@@ -93,6 +93,15 @@ public:
     // the list holding it was submitted. completed() is the value the GPU has reached.
     uint64_t pending_fence() const { return fence_value_ + 1; }
     uint64_t completed() const { return fence_->GetCompletedValue(); }
+    // begin_frame() counts epochs. Work recorded in an earlier epoch is done once epoch_done()
+    // (pending_fence() is not enough for a list still open: a mid-frame flush() signals past it
+    // before that list is submitted).
+    uint64_t epoch() const { return epoch_; }
+    bool epoch_done(uint64_t e) const {
+        if (e >= epoch_) return false;
+        if (epoch_ - e > epoch_end_fences_.size()) return true;  // the viewer waits two frames back
+        return completed() >= epoch_end_fences_[e % epoch_end_fences_.size()];
+    }
     // Throws when the device was removed (a GPU fault); with NIM_D3D_DEBUG=1 logs DRED first.
     void check_device();
     bool removed() const { return removed_; }
@@ -144,6 +153,8 @@ private:
     ComPtr<ID3D12GraphicsCommandList> list_;
     ComPtr<ID3D12Fence> fence_;
     uint64_t fence_value_ = 0;
+    uint64_t epoch_ = 0;
+    std::array<uint64_t, 8> epoch_end_fences_{};
     bool removed_ = false;
     HANDLE event_ = nullptr;
     std::vector<ComPtr<ID3D12Resource>> keep_;  // staging kept alive until the next flush

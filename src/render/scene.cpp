@@ -3539,9 +3539,11 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     std::array<DrawBundle*, kDrawBundles> bundles{};
     size_t available = 0;
     if (opaque.size() >= 1800 && bundles_allowed_) {
-        const auto completed = gpu.completed();
+        // Not by pending_fence(): a flush() of the immediate list during this frame signals past
+        // it while the frame list holding the bundle is still open (DEVICE_HUNG, page fault in
+        // ExecuteBundle). A bundle is reset only once the frame that executed it completed.
         for (auto& bundle : draw_bundles_) {
-            if (bundle.fence > completed) continue;
+            if (bundle.epoch != UINT64_MAX && !gpu.epoch_done(bundle.epoch)) continue;
             bundles[available++] = &bundle;
             if (available == bundles.size()) break;
         }
@@ -3570,7 +3572,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             if (error) throw std::runtime_error(error);
         for (auto* bundle : bundles) {
             cl->ExecuteBundle(bundle->list.Get());
-            bundle->fence = gpu.pending_fence();
+            bundle->epoch = gpu.epoch();
         }
     } else {
         record(cl, opaque, false);

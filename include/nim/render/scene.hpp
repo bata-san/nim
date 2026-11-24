@@ -340,6 +340,7 @@ public:
     // Draw bundles for large opaque lists (frame command lists only: off for one-off views
     // recorded on the immediate list, such as the AI floor probes).
     void allow_bundles(bool allow) { bundles_allowed_ = allow; }
+    bool bundles_allowed() const { return bundles_allowed_; }
     void render_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow);
     void render_sun_shadow(Gpu& gpu, ID3D12GraphicsCommandList* cl, SunShadow& shadow, bool map);
     // Draws the overhead visibility map over the scene (radius around `center`) and hands it to
@@ -626,7 +627,7 @@ private:
     struct DrawBundle {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
-        uint64_t fence = 0;
+        uint64_t epoch = UINT64_MAX;  // Gpu::epoch() of its last ExecuteBundle; MAX = never used
     };
     // Opaque draws are recorded into kDrawBundles bundles in parallel (a few draw calls per frame).
     static constexpr size_t kDrawBundles = 8;

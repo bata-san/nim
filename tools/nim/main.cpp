@@ -1071,17 +1071,16 @@ public:
         while (!pieces_.empty() && pieces_.front().generation != generation) pieces_.pop_front();
         if (pieces_.empty()) return std::nullopt;
         Piece p = std::move(pieces_.front());
+        const bool was_full = pieces_.size() == kMaxQueuedPieces;
         pieces_.pop_front();
-        cv_.notify_all();
+        if (was_full) cv_.notify_all();
         return p;
     }
     Progress progress() {
         std::lock_guard lk(m_);
-        return progress_;
-    }
-    bool drained(uint64_t generation) {
-        std::lock_guard lk(m_);
-        return progress_.generation == generation && progress_.done && pieces_.empty();
+        Progress result = progress_;
+        result.done = result.done && pieces_.empty();
+        return result;
     }
     ~MapWorker() { stop(); }
 
@@ -1227,66 +1226,17 @@ private:
                 for (size_t i = 0; i < terrain.size(); ++i) jobs.push_back(i);
                 for (const auto& [distance, index] : world_jobs) jobs.push_back(index);
                 for (size_t i = 0; i < decals.size() + decal_volumes.size(); ++i) jobs.push_back(decal_start + i);
-                auto lights = std::make_shared<std::vector<MapLight>>();
-                try {
-                    auto all = load_map_lights(*pm, *layout);
-                    try {  // the lights the map's FX carry (3.111), shown with the FX
-                        pm->build_hash64_index();
-                        for (auto& l : load_map_fx_lights(*pm, *layout)) all.push_back(std::move(l));
-                    } catch (const std::exception&) {
-                    }
-                    for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
-                } catch (const std::exception&) {
-                    // a map whose node tables cannot be read is drawn without local lights
-                }
-                auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
-                // Surface probe failures through the worker's existing error path; silently
-                // continuing with zero probes makes a data failure look like missing lighting.
-                *cubemaps = load_map_cubemaps(*pm, *layout);
-                auto particles = std::make_shared<std::vector<MapParticle>>();
-                try {
-                    pm->build_hash64_index();
-                    for (auto& p : load_map_particles(*pm, *layout))
-                        if (std::hypot(p.rows[3] - center[0], p.rows[7] - center[1], p.rows[11] - center[2]) <= req.radius)
-                            particles->push_back(p);
-                } catch (const std::exception&) {
-                    // drawn without FX
-                }
-                if (selection_changed || !weather || weather_bubble_ != req.bubble) {
-                    try {
-                        weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
-                    } catch (const std::exception&) {
-                        weather = std::make_shared<const MapWeather>();  // no weather controls
-                    }
-                    try {
-                        atmosphere = std::make_shared<const MapAtmosphere>(load_map_atmosphere(*pm, *layout));
-                    } catch (const std::exception&) {
-                        atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
-                    }
-                    try {
-                        audio = std::make_shared<const MapAudio>(load_map_audio(*pm, *layout));
-                    } catch (const std::exception&) {
-                        audio = std::make_shared<const MapAudio>();
-                    }
-                    weather_bubble_ = req.bubble;
-                }
                 {
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
-                    progress_.weather = weather;
-                    progress_.atmosphere = atmosphere;
-                    progress_.audio = audio;
                     progress_.total = jobs.size();
                     progress_.center = center;
                     progress_.extent = extent;
                     progress_.typical = typical;
-                    progress_.start = starts.empty() || req.center ? std::nullopt : std::optional<MapStart>(starts.front());
-                    progress_.lights = std::move(lights);
-                    progress_.cubemaps = std::move(cubemaps);
-                    progress_.particles = std::move(particles);
+                    if (!starts.empty() && !req.center) progress_.start = starts.front();
                 }
                 // Prepare sky, terrain and then nearby world assets in parallel.
-                // Every core but the UI thread's.
+                // Keep one logical CPU available for the UI and upload thread.
                 if (helpers.empty()) {
                     const unsigned n = std::max(std::thread::hardware_concurrency(), 2u) - 2;
                     for (unsigned i = 0; i < n; ++i) helpers.push_back(pm->fork());
@@ -1332,7 +1282,7 @@ private:
                         }
                         std::unique_lock lk(m_);
                         // Back-pressure: the UI adds a few meshes per frame.
-                        cv_.wait(lk, [&] { return quit_ || generation_ != req.generation || pieces_.size() < 64; });
+                        cv_.wait(lk, [&] { return quit_ || generation_ != req.generation || pieces_.size() < kMaxQueuedPieces; });
                         if (quit_ || generation_ != req.generation) return;
                         ++progress_.prepared;
                         if (!failure.empty()) {
@@ -1343,6 +1293,61 @@ private:
                 };
                 std::vector<std::jthread> threads;
                 for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
+                // The helpers can fill the upload queue while this thread reads the environment.
+                auto lights = std::make_shared<std::vector<MapLight>>();
+                try {
+                    auto all = load_map_lights(*pm, *layout);
+                    try {  // the lights the map's FX carry (3.111), shown with the FX
+                        pm->build_hash64_index();
+                        for (auto& l : load_map_fx_lights(*pm, *layout)) all.push_back(std::move(l));
+                    } catch (const std::exception&) {
+                    }
+                    for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
+                } catch (const std::exception&) {
+                    // a map whose node tables cannot be read is drawn without local lights
+                }
+                auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
+                // Surface probe failures through the worker's existing error path; silently
+                // continuing with zero probes makes a data failure look like missing lighting.
+                *cubemaps = load_map_cubemaps(*pm, *layout);
+                auto particles = std::make_shared<std::vector<MapParticle>>();
+                try {
+                    pm->build_hash64_index();
+                    for (auto& p : load_map_particles(*pm, *layout))
+                        if (std::hypot(p.rows[3] - center[0], p.rows[7] - center[1], p.rows[11] - center[2]) <= req.radius)
+                            particles->push_back(p);
+                } catch (const std::exception&) {
+                    // drawn without FX
+                }
+                if (selection_changed || !weather || weather_bubble_ != req.bubble) {
+                    try {
+                        weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
+                    } catch (const std::exception&) {
+                        weather = std::make_shared<const MapWeather>();  // no weather controls
+                    }
+                    try {
+                        atmosphere = std::make_shared<const MapAtmosphere>(load_map_atmosphere(*pm, *layout));
+                    } catch (const std::exception&) {
+                        atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
+                    }
+                    try {
+                        audio = std::make_shared<const MapAudio>(load_map_audio(*pm, *layout));
+                    } catch (const std::exception&) {
+                        audio = std::make_shared<const MapAudio>();
+                    }
+                    weather_bubble_ = req.bubble;
+                }
+                {
+                    std::lock_guard lk(m_);
+                    if (generation_ == req.generation) {
+                        progress_.weather = weather;
+                        progress_.atmosphere = atmosphere;
+                        progress_.audio = audio;
+                        progress_.lights = std::move(lights);
+                        progress_.cubemaps = std::move(cubemaps);
+                        progress_.particles = std::move(particles);
+                    }
+                }
                 work(*pm);
                 for (auto& t : threads) t.join();
                 // All prepares have finished. Queued pieces keep their own shared references;
@@ -1372,6 +1377,7 @@ private:
     std::string list_error_;
     uint64_t generation_ = 0;
     std::optional<Request> request_;
+    static constexpr size_t kMaxQueuedPieces = 64;
     std::deque<Piece> pieces_;
     TagHash weather_bubble_;
     Progress progress_;
@@ -1602,6 +1608,9 @@ public:
         int texture_cap = 3;   // kMapTextureCaps index (full resolution)
         uint64_t generation = 0;
         bool streaming = false, framed = false;
+        size_t processed = 0;
+        std::chrono::steady_clock::time_point load_started;
+        double load_seconds = 0;
         TagHash bubble;
         std::string name;
         TagHash activity;
@@ -2045,6 +2054,11 @@ public:
         const auto& maps = map_worker.maps();
         if (index < 0 || index >= int(maps.size())) return;
         const auto& m = maps[size_t(index)];
+        map.load_started = std::chrono::steady_clock::now();
+        map.processed = 0;
+        map.load_seconds = 0;
+        const bool whole = map.radius >= MapView::kUnlimited;
+        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
         loading.reset();  // a live mesh still being prepared is discarded when it arrives
         map_add_failures.clear();
         gpu.wait_idle();
@@ -2073,8 +2087,6 @@ public:
         map.audio_set = false;
         if (ambient_audio) ambient_audio->clear();
         particles.release(gpu);
-        const bool whole = map.radius >= MapView::kUnlimited;
-        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
         info(whole ? ui::trf(ui::S::LogMapLoadAll, m.package, m.bubble.str())
                    : ui::trf(ui::S::LogMapLoadRadius, m.package, m.bubble.str(), map.radius));
     }
@@ -2082,12 +2094,14 @@ public:
         if (!map.streaming) return;
         const auto t0 = std::chrono::steady_clock::now();
         bool added = false;
-        const auto upload_budget = std::chrono::milliseconds(map.framed ? 6 : 12);
-        // Only new GPU objects are created (nothing the frame in flight uses), so no GPU wait.
+        constexpr auto upload_budget = std::chrono::milliseconds(32);
+        // Batch more uploads while the viewport is black. Bound each batch so the loading UI
+        // can still respond and recorded copies can release their staging memory regularly.
         while (std::chrono::steady_clock::now() - t0 < upload_budget) {
             auto piece = map_worker.take(map.generation);
             if (!piece) break;
             added = true;
+            ++map.processed;
             try {
                 scene.add_mesh(g, std::move(piece->mesh), layouts, piece->rows, piece->sky_order);
             } catch (const std::exception& ex) {
@@ -2142,20 +2156,24 @@ public:
                 ambient_audio->set_map(*pm, pr.audio);
             }
         }
-        if (added) {
-            scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]}, std::min(map.radius, pr.extent) * 0.6f);
-            if (!map.framed && scene.loaded()) {
-                frame_scene();
-                if (map.start)
-                    info(ui::trf(ui::S::LogCameraStart, map.start->position[0],
+        if (pr.done) {
+            if (map.processed) {
+                scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]},
+                             std::min(map.radius, pr.extent) * 0.6f);
+                if (!map.framed && scene.loaded()) {
+                    frame_scene();
+                    if (map.start)
+                        info(ui::trf(ui::S::LogCameraStart, map.start->position[0],
                                      map.start->position[1], map.start->position[2], kStartEyeHeight));
-                map.framed = true;
+                    map.framed = true;
+                }
             }
-        }
-        if (map_worker.drained(map.generation)) {
             map.streaming = false;
+            map.load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - map.load_started).count();
             info(ui::trf(ui::S::LogMapDone, map.name, scene.mesh_count(), scene.instance_count(),
                              pr.failed ? ui::trf(ui::S::LogSkipped, pr.failed) : ""));
+        } else if (added) {
+            g.flush();  // submit this batch and release its staging memory
         }
     }
     // ---- AI (docs/PROGRESS.md 3.69 / 3.70) ----
@@ -2537,7 +2555,7 @@ public:
         if (map_scene) {
             const auto pr = map_worker.progress();
             if (map.streaming && pr.generation == map.generation)
-                ImGui::TextDisabled(ui::tr(ui::S::MapLoading), pr.prepared, pr.total);
+                ImGui::TextDisabled(ui::tr(ui::S::MapLoading), std::min(pr.total, map.processed + pr.failed), pr.total);
             else
                 ImGui::TextDisabled(ui::tr(ui::S::MapCounts), scene.mesh_count(), scene.instance_count());
             ImGui::TextDisabled(ui::tr(ui::S::MapCenter), map.center[0], map.center[1], map.center[2]);
@@ -2551,17 +2569,7 @@ public:
         ImGui::BeginChild("mapscene", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         if (details_h <= 0) details_h = 310 * sc;
         const float view_h_px = std::max(120 * sc, ImGui::GetContentRegionAvail().y - details_h - 6 * sc);
-        const ImVec2 view_origin = ImGui::GetCursorScreenPos();
-        const float view_w_px = ImGui::GetContentRegionAvail().x;
-        viewport_ui({view_w_px, view_h_px});
-        if (map.streaming) {
-            const auto pr = map_worker.progress();
-            const float t = pr.total ? float(pr.prepared) / float(pr.total) : 0.0f;
-            const float y = view_origin.y + view_h_px - 2 * sc;
-            auto* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled({view_origin.x, y}, {view_origin.x + view_w_px, y + 2 * sc}, IM_COL32(255, 255, 255, 30));
-            dl->AddRectFilled({view_origin.x, y}, {view_origin.x + view_w_px * t, y + 2 * sc}, kGreen);
-        }
+        viewport_ui({ImGui::GetContentRegionAvail().x, view_h_px});
         ImGui::InvisibleButton("##mhsplit", {ImGui::GetContentRegionAvail().x, 6 * sc});
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         if (ImGui::IsItemActive()) details_h = std::max(40 * sc, details_h - ImGui::GetIO().MouseDelta.y);
@@ -3026,7 +3034,7 @@ public:
         if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && (ImGui::IsKeyPressed(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_L)))
             focus_prompt = true;
         if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_B) && !ImGui::GetIO().WantTextInput) toggle_sidebar();
-        if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S) && gb.lit && scene.loaded())
+        if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_S) && gb.lit && scene.loaded() && !map.streaming)
             capture_requested = true;
     }
 
@@ -3710,11 +3718,23 @@ public:
     // The live 3D view with goriath's overlay toolbar and FPS counter.
     void viewport_ui(ImVec2 size) {
         const float sc = ImGui::GetStyle().FontScaleDpi;
-        viewport_visible = true;
         view_w = uint32_t(std::max(16.0f, size.x));
         view_h = uint32_t(std::max(16.0f, size.y));
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         auto* dl = ImGui::GetWindowDrawList();
+        if (map_scene && map.streaming) {
+            ImGui::Dummy(size);
+            dl->AddRectFilled(origin, {origin.x + size.x, origin.y + size.y}, IM_COL32_BLACK);
+            const ImVec2 center{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f};
+            spinner(dl, {center.x, center.y - 14 * sc}, 14 * sc, kGreen);
+            const auto progress = map_worker.progress();
+            const size_t done = std::min(progress.total, map.processed + progress.failed);
+            const std::string label = progress.total ? std::format("{}/{}", done, progress.total) : map.name;
+            const auto width = ImGui::CalcTextSize(label.c_str()).x;
+            hud_text(dl, {center.x - width * 0.5f, center.y + 13 * sc}, IM_COL32_WHITE, label.c_str());
+            return;
+        }
+        viewport_visible = true;
         if (gb.lit) {
             ImGui::Image(ImTextureID(gpu.srv().gpu(gb.srv_first + 5).ptr), size);
             const auto display = ImGui::GetIO().DisplaySize;
@@ -5607,6 +5627,7 @@ struct BenchDriver {
                          app.map.bubble.str(), app.map.name, app.map.radius >= App::MapView::kUnlimited ? 0.0f : app.map.radius,
                          app.gb.width(), app.gb.height(), ai ? "on" : "off", app.ai.sim ? app.ai.sim->agents().size() : 0,
                          vsync ? "vsync" : "uncapped", settle);
+        r += std::format("map load: {:.3f}s from selection to ready\n", app.map.load_seconds);
         if (eye && look)
             r += std::format("camera eye {:.1f},{:.1f},{:.1f} look {:.1f},{:.1f},{:.1f}\n", eye->x, eye->y, eye->z, look->x, look->y,
                              look->z);
@@ -5844,7 +5865,7 @@ int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recover
         g_frame_generation.mark(FrameGeneration::Marker::render_end);
         g_frame_generation.mark(FrameGeneration::Marker::present_start);
         std::optional<Prof::Scope> present_scope(std::in_place, g_prof, Prof::Present);
-        const bool uncapped = bench.active() && !bench.vsync;
+        const bool uncapped = app->map.streaming || (bench.active() && !bench.vsync);
         const HRESULT present = g_win.swapchain->Present(uncapped ? 0 : 1, uncapped && g_win.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
         present_scope.reset();
         if (FAILED(present)) {
