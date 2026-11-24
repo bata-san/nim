@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <array>
+#include <deque>
 #include <map>
 #include <optional>
 #include <string>
@@ -86,6 +87,9 @@ public:
     // Command list for uploads and headless work; flush() submits it and waits for the GPU.
     ID3D12GraphicsCommandList* immediate() { return list_.Get(); }
     void flush();
+    // Submits the immediate list without waiting (uploads that later work on the same queue
+    // reads) and opens a fresh one; staging is recycled when the GPU is done with it.
+    void submit();
     uint64_t signal();               // signals the queue fence, returns the value
     void wait(uint64_t fence_value); // blocks until the fence reaches it
     void wait_idle() { wait(signal()); }
@@ -161,6 +165,20 @@ private:
     ComPtr<ID3D12Resource> staging_;
     uint8_t* staging_cpu_ = nullptr;
     size_t staging_used_ = 0;
+    // submit(): immediate lists on the GPU without a wait; their allocators, staging chunks and
+    // kept resources are recycled once their fence completes.
+    struct StagingChunk { ComPtr<ID3D12Resource> resource; uint8_t* cpu = nullptr; };
+    struct InFlight {
+        uint64_t fence = 0;
+        ComPtr<ID3D12CommandAllocator> alloc;
+        std::vector<ComPtr<ID3D12Resource>> keep;
+        std::vector<StagingChunk> staging;
+    };
+    std::vector<StagingChunk> staging_full_;  // chunks this open list's copies read
+    std::vector<StagingChunk> staging_free_;
+    std::vector<ComPtr<ID3D12CommandAllocator>> alloc_free_;
+    std::deque<InFlight> in_flight_;
+    void reclaim();
     static constexpr size_t kStagingChunk = 32 << 20;
     DescriptorAllocator srv_;
     ComPtr<ID3D12Resource> dynamic_;

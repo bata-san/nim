@@ -701,8 +701,31 @@ void GamePipeline::load(PackageManager& pm, Gpu& gpu, TagHash technique, std::sp
     }
     pd.SampleDesc.Count = 1;
     check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline)");
-
+    volume_desc_.reset();
+    if (opt.volume && instance_layout.empty()) {
+        auto vd = std::make_shared<VolumeDesc>();
+        vd->pd = pd;
+        vd->vs = std::move(vs_code);
+        vd->ps = std::move(ps_code);
+        volume_desc_ = std::move(vd);
     }
+    }
+}
+
+void GamePipeline::load_cull_twin(Gpu& gpu, const GamePipeline& src, bool cull_front) {
+    if (!src.volume_desc_ || !src.pso_) throw std::runtime_error("load_cull_twin: source is not a loaded volume pipeline");
+    release(gpu);
+    *this = src;
+    pso_.Reset();
+    static const D3D12_INPUT_ELEMENT_DESC position{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    auto pd = volume_desc_->pd;
+    pd.pRootSignature = root_sig_.Get();
+    pd.VS = {volume_desc_->vs.data(), volume_desc_->vs.size()};
+    pd.PS = pd.PS.pShaderBytecode ? D3D12_SHADER_BYTECODE{volume_desc_->ps.data(), volume_desc_->ps.size()} : D3D12_SHADER_BYTECODE{};
+    pd.InputLayout = {&position, 1};
+    if (pd.RasterizerState.CullMode != D3D12_CULL_MODE_NONE)
+        pd.RasterizerState.CullMode = cull_front ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
+    check_hr(gpu.device()->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso_)), "CreateGraphicsPipelineState (game pipeline twin)");
 }
 
 void GamePipeline::draw(Gpu& gpu, ID3D12GraphicsCommandList* cl, const ExternStore& ext, const ScopeBufferFn& scopes,
@@ -2797,15 +2820,18 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
             auto it = keys.find(key);
             if (it == keys.end()) {
                 const uint32_t index = uint32_t(light_pipelines_.size());
-                for (bool front : {true, false}) {
+                {  // front then back culling: one load, the twin only its own PSO
                     auto lp = std::make_unique<GamePipeline>();
                     GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                     opt.volume = true;
-                    opt.cull_front = front;
+                    opt.cull_front = true;
                     opt.depth_func = D3D12_COMPARISON_FUNC_LESS_EQUAL;
                     opt.cbuffer_floor = 64;
                     lp->load(pm, gpu, l->technique, scopes, opt);
+                    auto back = std::make_unique<GamePipeline>();
+                    back->load_cull_twin(gpu, *lp, false);
                     light_pipelines_.push_back(std::move(lp));
+                    light_pipelines_.push_back(std::move(back));
                 }
                 it = keys.emplace(key, index).first;
             }
@@ -2845,15 +2871,18 @@ void GameLighting::set_lights(PackageManager& pm, Gpu& gpu, std::span<const MapL
                     auto sit = keys.find(skey);
                     if (sit == keys.end()) {
                         const uint32_t index = uint32_t(light_pipelines_.size());
-                        for (bool front : {true, false}) {
+                        {  // front then back culling: one load, the twin only its own PSO
                             auto lp = std::make_unique<GamePipeline>();
                             GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, true, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                             opt.volume = true;
-                            opt.cull_front = front;
+                            opt.cull_front = true;
                             opt.depth_func = D3D12_COMPARISON_FUNC_LESS_EQUAL;
                             opt.cbuffer_floor = 64;
                             lp->load(pm, gpu, l->shadow_technique, scopes, opt);
+                            auto back = std::make_unique<GamePipeline>();
+                            back->load_cull_twin(gpu, *lp, false);
                             light_pipelines_.push_back(std::move(lp));
+                            light_pipelines_.push_back(std::move(back));
                         }
                         sit = keys.emplace(skey, index).first;
                     }
@@ -3782,16 +3811,19 @@ void GameLighting::set_cubemaps(PackageManager& pm, Gpu& gpu, std::span<const Ma
                 const TagHash technique = globals_.pipeline(name);
                 if (technique.is_none()) throw std::runtime_error("render_globals has no pipeline " + name);
                 const uint32_t index = uint32_t(cubemap_pipelines_.size());
-                for (bool front : {true, false}) {
+                {  // front then back culling: one load, the twin only its own PSO
                     auto gp = std::make_unique<GamePipeline>();
                     GamePipeline::Options opt{DXGI_FORMAT_R16G16B16A16_FLOAT, false, {DXGI_FORMAT_R16G16B16A16_FLOAT}};
                     opt.volume = true;
                     opt.stencil_test = diagnostic_csg;
-                    opt.cull_front = front;
+                    opt.cull_front = true;
                     opt.cbuffer_floor = 64;
                     opt.blend_state = 23;  // goriath CubemapRenderer: src + dst * src.a over both targets
                     gp->load(pm, gpu, technique, scopes, opt);
+                    auto back = std::make_unique<GamePipeline>();
+                    back->load_cull_twin(gpu, *gp, false);
                     cubemap_pipelines_.push_back(std::move(gp));
+                    cubemap_pipelines_.push_back(std::move(back));
                 }
                 it = cubemap_variants_.emplace(variant_key, index).first;
             }

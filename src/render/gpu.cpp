@@ -191,8 +191,54 @@ void Gpu::flush() {
     check_device();
     keep_.clear();
     staging_used_ = 0;
+    for (auto& c : staging_full_) staging_free_.push_back(std::move(c));
+    staging_full_.clear();
+    reclaim();
     check_hr(alloc_->Reset(), "allocator Reset");
     check_hr(list_->Reset(alloc_.Get(), nullptr), "list Reset");
+}
+
+void Gpu::submit() {
+    ProfileScope profile_submit("gpu.submit");
+    check_hr(list_->Close(), "Close");
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    InFlight f;
+    f.fence = signal();
+    f.alloc = std::move(alloc_);
+    f.keep = std::move(keep_);
+    keep_.clear();
+    f.staging = std::move(staging_full_);
+    staging_full_.clear();
+    if (staging_) f.staging.push_back({std::move(staging_), staging_cpu_});
+    staging_ = nullptr;
+    staging_cpu_ = nullptr;
+    staging_used_ = 0;
+    in_flight_.push_back(std::move(f));
+    // Back-pressure: at most a few submissions' staging in flight.
+    if (in_flight_.size() > 4) wait(in_flight_[in_flight_.size() - 5].fence);
+    reclaim();
+    if (!alloc_free_.empty()) {
+        alloc_ = std::move(alloc_free_.back());
+        alloc_free_.pop_back();
+        check_hr(alloc_->Reset(), "allocator Reset");
+    } else {
+        check_hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc_)), "CreateCommandAllocator");
+    }
+    check_hr(list_->Reset(alloc_.Get(), nullptr), "list Reset");
+}
+
+void Gpu::reclaim() {
+    const uint64_t done = fence_->GetCompletedValue();
+    if (done == std::numeric_limits<uint64_t>::max()) check_device();
+    while (!in_flight_.empty() && in_flight_.front().fence <= done) {
+        auto& f = in_flight_.front();
+        alloc_free_.push_back(std::move(f.alloc));
+        for (auto& c : f.staging) staging_free_.push_back(std::move(c));
+        in_flight_.pop_front();
+    }
+    // Bound the idle upload memory (a whole map streams ~1 GB through it).
+    while (staging_free_.size() > 8) staging_free_.pop_back();
 }
 
 void Gpu::check_device() {
@@ -332,9 +378,15 @@ void Gpu::stage_copy(ID3D12Resource* dst, uint64_t dst_offset, const void* data,
     }
     staging_used_ = (staging_used_ + 15) & ~size_t(15);
     if (!staging_ || staging_used_ + size > kStagingChunk) {
-        if (staging_) keep_.push_back(staging_);  // still read by recorded copies
-        staging_ = buffer(kStagingChunk, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        check_hr(staging_->Map(0, nullptr, reinterpret_cast<void**>(&staging_cpu_)), "Map(staging)");
+        if (staging_) staging_full_.push_back({std::move(staging_), staging_cpu_});  // still read by recorded copies
+        if (!staging_free_.empty()) {
+            staging_ = std::move(staging_free_.back().resource);
+            staging_cpu_ = staging_free_.back().cpu;
+            staging_free_.pop_back();
+        } else {
+            staging_ = buffer(kStagingChunk, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check_hr(staging_->Map(0, nullptr, reinterpret_cast<void**>(&staging_cpu_)), "Map(staging)");
+        }
         staging_used_ = 0;
     }
     std::memcpy(staging_cpu_ + staging_used_, data, size);

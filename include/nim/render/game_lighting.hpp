@@ -335,6 +335,18 @@ private:
     std::vector<ID3D12Resource*> view_resources_;
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3D12PipelineState> pso_;
+    // A light / cubemap volume's description, kept so the other cull winding (load_cull_twin)
+    // needs only its own PSO.
+    struct VolumeDesc {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        std::vector<uint8_t> vs, ps;
+    };
+    std::shared_ptr<const VolumeDesc> volume_desc_;
+
+public:
+    // The same technique and options as `src` (a volume pipeline), culling the other winding:
+    // shares its stages, textures and root signature, creating only the pipeline state.
+    void load_cull_twin(Gpu& gpu, const GamePipeline& src, bool cull_front);
 };
 
 // Runs a scope's bytecode for one stage into a cbuffer (cbuffer_init patched by the program).

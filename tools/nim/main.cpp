@@ -7,6 +7,7 @@
 #include "media.hpp"
 #include "frame_generation.hpp"
 #include "frame_profile.hpp"
+#include "nim/core/profile.hpp"
 #include "ui_text.hpp"
 #include "nim/content/animation.hpp"
 #include "nim/content/audio.hpp"
@@ -1160,6 +1161,7 @@ private:
                 return quit_ || generation_ != req.generation;
             };
             try {
+                ProfileScope profile_layout("map.layout");
                 const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map;
                 if (selection_changed) {
                     const auto tables = req.activity.is_none() ? std::vector<TagHash>{} : load_activity_node_tables(*pm, req.activity, req.bubble_name, req.activity_map);
@@ -1174,12 +1176,75 @@ private:
                     entities.reset();
                     starts = find_map_starts(*pm, *layout);
                 }
+                profile_layout.stop();
+                ProfileScope profile_entities("map.entities");
                 if (!cache || cache->max_texture_dim != req.texture_cap) {
                     cache.emplace();
                     cache->max_texture_dim = req.texture_cap;
                     cache->keep_static_lods_for_map = true;
                 }
                 const auto center = req.center ? *req.center : !starts.empty() ? starts.front().position : map_focus(*layout);
+                // Lights, probes, FX, weather, sky and audio need only the layout: read them on a
+                // thread of their own while this one gathers the meshes, so the UI can set the
+                // lighting up before the first mesh arrives.
+                std::shared_ptr<PackageManager> env_pm = pm->fork();
+                auto env_task = std::async(std::launch::async, [&, env_pm, center] {
+                    ProfileScope profile_env("map.environment");
+                    auto lights = std::make_shared<std::vector<MapLight>>();
+                    try {
+                        auto all = load_map_lights(*env_pm, *layout);
+                        try {  // the lights the map's FX carry (3.111), shown with the FX
+                            env_pm->build_hash64_index();
+                            for (auto& l : load_map_fx_lights(*env_pm, *layout)) all.push_back(std::move(l));
+                        } catch (const std::exception&) {
+                        }
+                        for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
+                    } catch (const std::exception&) {
+                        // a map whose node tables cannot be read is drawn without local lights
+                    }
+                    auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
+                    // Surface probe failures through the worker's existing error path; silently
+                    // continuing with zero probes makes a data failure look like missing lighting.
+                    *cubemaps = load_map_cubemaps(*env_pm, *layout);
+                    auto particles = std::make_shared<std::vector<MapParticle>>();
+                    try {
+                        env_pm->build_hash64_index();
+                        for (auto& p : load_map_particles(*env_pm, *layout))
+                            if (std::hypot(p.rows[3] - center[0], p.rows[7] - center[1], p.rows[11] - center[2]) <= req.radius)
+                                particles->push_back(p);
+                    } catch (const std::exception&) {
+                        // drawn without FX
+                    }
+                    if (selection_changed || !weather || weather_bubble_ != req.bubble) {
+                        try {
+                            weather = std::make_shared<const MapWeather>(load_map_weather(*env_pm, req.bubble));
+                        } catch (const std::exception&) {
+                            weather = std::make_shared<const MapWeather>();  // no weather controls
+                        }
+                        try {
+                            atmosphere = std::make_shared<const MapAtmosphere>(load_map_atmosphere(*env_pm, *layout));
+                        } catch (const std::exception&) {
+                            atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
+                        }
+                        try {
+                            audio = std::make_shared<const MapAudio>(load_map_audio(*env_pm, *layout));
+                        } catch (const std::exception&) {
+                            audio = std::make_shared<const MapAudio>();
+                        }
+                        weather_bubble_ = req.bubble;
+                    }
+                    {
+                        std::lock_guard lk(m_);
+                        if (generation_ == req.generation) {
+                            progress_.weather = weather;
+                            progress_.atmosphere = atmosphere;
+                            progress_.audio = audio;
+                            progress_.lights = std::move(lights);
+                            progress_.cubemaps = std::move(cubemaps);
+                            progress_.particles = std::move(particles);
+                        }
+                    }
+                });
                 auto region = map_region(*layout, center, req.radius);
                 const size_t static_count = region.size();
                 const auto terrain = map_terrain_region(*layout, center, req.radius);
@@ -1213,11 +1278,14 @@ private:
                 // Authored sky collections are independent of the world streaming radius.
                 // Append after framing statistics so kilometre-distant scenery cannot move
                 // the user's initial camera.
+                profile_entities.stop();
+                ProfileScope profile_sky("map.sky_decals");
                 const size_t first_sky = region.size();
                 for (auto& model : load_map_sky_objects(*pm, *layout)) region.push_back(std::move(model));
                 const auto decals = load_map_decals(*pm, *layout);
                 const auto decal_volumes = load_map_decal_volumes(*pm, *layout, center, req.radius);
                 const size_t decal_start = terrain.size() + region.size();
+                profile_sky.stop();
                 std::sort(world_jobs.begin(), world_jobs.end());
                 std::vector<size_t> jobs;
                 jobs.reserve(decal_start + decals.size() + decal_volumes.size());
@@ -1293,63 +1361,12 @@ private:
                 };
                 std::vector<std::jthread> threads;
                 for (auto& h : helpers) threads.emplace_back([&, hp = h.get()] { work(*hp); });
-                // The helpers can fill the upload queue while this thread reads the environment.
-                auto lights = std::make_shared<std::vector<MapLight>>();
-                try {
-                    auto all = load_map_lights(*pm, *layout);
-                    try {  // the lights the map's FX carry (3.111), shown with the FX
-                        pm->build_hash64_index();
-                        for (auto& l : load_map_fx_lights(*pm, *layout)) all.push_back(std::move(l));
-                    } catch (const std::exception&) {
-                    }
-                    for (const MapLight* l : map_light_region(all, center, req.radius)) lights->push_back(*l);
-                } catch (const std::exception&) {
-                    // a map whose node tables cannot be read is drawn without local lights
-                }
-                auto cubemaps = std::make_shared<std::vector<MapCubemap>>();
-                // Surface probe failures through the worker's existing error path; silently
-                // continuing with zero probes makes a data failure look like missing lighting.
-                *cubemaps = load_map_cubemaps(*pm, *layout);
-                auto particles = std::make_shared<std::vector<MapParticle>>();
-                try {
-                    pm->build_hash64_index();
-                    for (auto& p : load_map_particles(*pm, *layout))
-                        if (std::hypot(p.rows[3] - center[0], p.rows[7] - center[1], p.rows[11] - center[2]) <= req.radius)
-                            particles->push_back(p);
-                } catch (const std::exception&) {
-                    // drawn without FX
-                }
-                if (selection_changed || !weather || weather_bubble_ != req.bubble) {
-                    try {
-                        weather = std::make_shared<const MapWeather>(load_map_weather(*pm, req.bubble));
-                    } catch (const std::exception&) {
-                        weather = std::make_shared<const MapWeather>();  // no weather controls
-                    }
-                    try {
-                        atmosphere = std::make_shared<const MapAtmosphere>(load_map_atmosphere(*pm, *layout));
-                    } catch (const std::exception&) {
-                        atmosphere = std::make_shared<const MapAtmosphere>();  // drawn without a sky
-                    }
-                    try {
-                        audio = std::make_shared<const MapAudio>(load_map_audio(*pm, *layout));
-                    } catch (const std::exception&) {
-                        audio = std::make_shared<const MapAudio>();
-                    }
-                    weather_bubble_ = req.bubble;
-                }
-                {
-                    std::lock_guard lk(m_);
-                    if (generation_ == req.generation) {
-                        progress_.weather = weather;
-                        progress_.atmosphere = atmosphere;
-                        progress_.audio = audio;
-                        progress_.lights = std::move(lights);
-                        progress_.cubemaps = std::move(cubemaps);
-                        progress_.particles = std::move(particles);
-                    }
-                }
+                // The environment (above) was read alongside; its errors surface here as before.
+                env_task.get();
+                ProfileScope profile_tail("map.prepare_tail");
                 work(*pm);
                 for (auto& t : threads) t.join();
+                profile_tail.stop();
                 // All prepares have finished. Queued pieces keep their own shared references;
                 // uploaded textures live on the GPU. Retaining every CPU mip in this cache
                 // needlessly keeps several GB resident after a whole-map load.
@@ -1610,7 +1627,7 @@ public:
         bool streaming = false, framed = false;
         size_t processed = 0;
         std::chrono::steady_clock::time_point load_started;
-        double load_seconds = 0;
+        double load_seconds = 0, first_piece_seconds = 0, last_piece_seconds = 0;
         TagHash bubble;
         std::string name;
         TagHash activity;
@@ -2094,6 +2111,7 @@ public:
         if (!map.streaming) return;
         const auto t0 = std::chrono::steady_clock::now();
         bool added = false;
+        ProfileScope profile_stream("map.ui_stream");
         constexpr auto upload_budget = std::chrono::milliseconds(32);
         // Batch more uploads while the viewport is black. Bound each batch so the loading UI
         // can still respond and recorded copies can release their staging memory regularly.
@@ -2101,7 +2119,10 @@ public:
             auto piece = map_worker.take(map.generation);
             if (!piece) break;
             added = true;
+            if (!map.processed)
+                map.first_piece_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - map.load_started).count();
             ++map.processed;
+            ProfileScope profile_add("map.ui_add");
             try {
                 scene.add_mesh(g, std::move(piece->mesh), layouts, piece->rows, piece->sky_order);
             } catch (const std::exception& ex) {
@@ -2121,11 +2142,13 @@ public:
         }
         if (pr.atmosphere && map_atmosphere != pr.atmosphere) {
             map_atmosphere = pr.atmosphere;
+            ProfileScope profile_atm("map.ui_atmosphere");
             game_lighting.set_atmosphere(*pm, g, map_atmosphere.get());
             for (const auto& n : game_lighting.atmosphere_notes()) ++map_add_failures[n.substr(0, 120)];
         }
         if (pr.lights && !map.lights_set) {
             map.lights_set = true;
+            ProfileScope profile_lights("map.ui_lights_cubemaps");
             map_lights = pr.lights;  // kept alive while the lighting refers to it
             apply_map_lights(g);
             if (pr.cubemaps) {
@@ -2142,6 +2165,7 @@ public:
         }
         if (pr.particles && !map.particles_set) {
             map.particles_set = true;
+            ProfileScope profile_fx("map.ui_particles");
             try {
                 particles.load(*pm, g, *pr.particles);
             } catch (const std::exception& ex) {
@@ -2157,6 +2181,7 @@ public:
             }
         }
         if (pr.done) {
+            ProfileScope profile_finish("map.ui_finish");
             if (map.processed) {
                 scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]},
                              std::min(map.radius, pr.extent) * 0.6f);
@@ -2173,7 +2198,8 @@ public:
             info(ui::trf(ui::S::LogMapDone, map.name, scene.mesh_count(), scene.instance_count(),
                              pr.failed ? ui::trf(ui::S::LogSkipped, pr.failed) : ""));
         } else if (added) {
-            g.flush();  // submit this batch and release its staging memory
+            map.last_piece_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - map.load_started).count();
+            g.submit();  // queue this batch's uploads without waiting for the GPU
         }
     }
     // ---- AI (docs/PROGRESS.md 3.69 / 3.70) ----
@@ -5627,7 +5653,7 @@ struct BenchDriver {
                          app.map.bubble.str(), app.map.name, app.map.radius >= App::MapView::kUnlimited ? 0.0f : app.map.radius,
                          app.gb.width(), app.gb.height(), ai ? "on" : "off", app.ai.sim ? app.ai.sim->agents().size() : 0,
                          vsync ? "vsync" : "uncapped", settle);
-        r += std::format("map load: {:.3f}s from selection to ready\n", app.map.load_seconds);
+        r += std::format("map load: {:.3f}s from selection to ready (first piece {:.3f}s, last batch {:.3f}s)\n", app.map.load_seconds, app.map.first_piece_seconds, app.map.last_piece_seconds);
         if (eye && look)
             r += std::format("camera eye {:.1f},{:.1f},{:.1f} look {:.1f},{:.1f},{:.1f}\n", eye->x, eye->y, eye->z, look->x, look->y,
                              look->z);

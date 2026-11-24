@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <set>
 #include <shared_mutex>
 #include <memory>
 #include <unordered_map>
@@ -152,6 +153,19 @@ struct ChannelUse {
     bool vs = false, ps = false;
 };
 
+// Immutable shader bytecode shared between copies (a map has ~150k parts over a few thousand shaders).
+struct ShaderCode {
+    std::shared_ptr<const std::vector<uint8_t>> bytes;
+    ShaderCode() = default;
+    ShaderCode(std::vector<uint8_t> v) : bytes(std::make_shared<const std::vector<uint8_t>>(std::move(v))) {}
+    const uint8_t* data() const { return bytes ? bytes->data() : nullptr; }
+    size_t size() const { return bytes ? bytes->size() : 0; }
+    bool empty() const { return size() == 0; }
+    const uint8_t* begin() const { return data(); }
+    const uint8_t* end() const { return data() + size(); }
+    operator std::span<const uint8_t>() const { return {data(), size()}; }
+};
+
 struct PreparedMesh {
     bool projected_decals = false;
     struct Buffers {
@@ -171,7 +185,7 @@ struct PreparedMesh {
         uint8_t input_layout = 0;
         uint32_t buffers = 0;  // index into PreparedMesh::buffers
         SceneGroupInfo info;
-        std::vector<uint8_t> vs, ps;
+        ShaderCode vs, ps;  // the original DXIL, shared by every part using the shader
         std::vector<float4> cb0;
         std::map<uint32_t, std::shared_ptr<const Texture>> textures;
         uint8_t stage = 0;  // render stage: 0 = G-buffer, 4 = shadow, 8 = transparents
@@ -273,6 +287,10 @@ struct PrepareCache {
     // Shared by the threads preparing a map's meshes in parallel (each with its own PackageManager).
     std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
     std::shared_ptr<std::shared_mutex> texture_mutex = std::make_shared<std::shared_mutex>();
+    // A static part's group depends on its technique alone (shaders, TFX, samplers, textures);
+    // each part copies the template and sets its own part fields.
+    std::unordered_map<uint64_t, std::shared_future<std::shared_ptr<const PreparedMesh::Group>>> groups;
+    std::shared_ptr<std::shared_mutex> group_mutex = std::make_shared<std::shared_mutex>();
 };
 // Throws on failure.
 PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash mesh, const ChannelValues* channels = nullptr,
@@ -435,7 +453,7 @@ private:
         std::map<uint32_t, BindingKind> vs_kinds, ps_kinds;
         std::vector<uint32_t> vs_cbvs, ps_cbvs;
         std::vector<std::pair<uint32_t, GpuBuffer>> own_cbvs;  // (root parameter, constants)
-        std::map<std::pair<ShaderStage, uint32_t>, std::vector<float4>> own_regs;
+        std::set<std::pair<ShaderStage, uint32_t>> own_regs;  // registers with own_cbvs
         std::vector<std::pair<uint32_t, uint32_t>> scope_slots;                   // (root parameter, scope_defs_ slot)
         bool object_reflection = false;
         std::vector<std::pair<uint32_t, D3D12_GPU_VIRTUAL_ADDRESS>> scope_addresses;  // this frame's
@@ -624,6 +642,14 @@ private:
     std::vector<size_t> uncullable_opaque_, visible_opaque_, visible_blended_;
     std::vector<uint32_t> visible_static_indices_other_, visible_static_groups_other_;
     std::vector<size_t> visible_opaque_other_, visible_blended_other_;
+    // DXIL reflection of each original shader (by tag and size): parsed once per scene, not per part.
+    struct ShaderReflection {
+        std::vector<ShaderBinding> bindings;
+        std::map<uint32_t, BindingKind> kinds;
+        std::vector<ShaderInput> inputs, outputs;
+    };
+    std::unordered_map<uint64_t, std::shared_ptr<const ShaderReflection>> reflection_cache_;
+    std::shared_ptr<const ShaderReflection> reflect(TagHash tag, std::span<const uint8_t> code);
     struct DrawBundle {
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -643,9 +669,35 @@ private:
     BufferArena arena_;  // geometry and fixed constants of this scene  // 1 x RGBA8 white: VS colour stream of meshes without one
     std::map<uint32_t, ComPtr<ID3D12Resource>> texture_cache_;
     std::unordered_map<uint32_t, GpuBuffer> geometry_cache_;
+    // Read-only material constant buffers (cbuffer_init, 2 KB each) shared by identical content.
+    std::unordered_map<uint64_t, std::vector<std::pair<std::vector<float4>, GpuBuffer>>> constant_cache_;
+    GpuBuffer upload_constants(Gpu& gpu, const std::vector<float4>& values);
     std::map<uint64_t, ComPtr<ID3D12RootSignature>> root_cache_;
     std::map<std::vector<uint64_t>, uint32_t> table_cache_;  // identical static descriptor tables
-    std::map<std::tuple<uint64_t, uint8_t, uint8_t, uint8_t, bool, bool>, ComPtr<ID3D12PipelineState>> pipeline_cache_;
+    // Pipelines compile on pool threads while a map streams in; resolve_pipelines() (before any
+    // draw, and in finish()) hands them to their items. A failed one leaves its item undrawn.
+    struct PipelineResult {
+        ComPtr<ID3D12PipelineState> pso;
+        HRESULT hr = S_OK;
+        std::string error;
+    };
+    using PipelineFuture = std::shared_future<PipelineResult>;
+    struct PipelineJob {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        ComPtr<ID3D12RootSignature> root;
+        std::vector<uint8_t> vs, ps;
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+        std::vector<std::string> names;
+        std::string context;
+    };
+    struct PendingPipeline {
+        size_t item;
+        bool shadow;
+        PipelineFuture future;
+    };
+    std::vector<PendingPipeline> pending_pipelines_;
+    void resolve_pipelines();
+    std::map<std::tuple<uint64_t, uint8_t, uint8_t, uint8_t, bool, bool>, PipelineFuture> pipeline_cache_;
     std::array<float4, 20> model_cb_{};
     bool dynamic_ = false;          // models in a single entity preview
     bool assembled_ = false;

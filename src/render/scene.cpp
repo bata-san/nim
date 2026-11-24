@@ -617,6 +617,8 @@ void StaticMeshScene::release(Gpu& gpu) {
     }
     for (auto& it : items_)
         if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
+    for (auto& p : pending_pipelines_) p.future.wait();  // compiling with this scene's root signatures
+    pending_pipelines_.clear();
     items_.clear();
     transparent_items_.clear();
     distortion_items_.clear();
@@ -642,6 +644,8 @@ void StaticMeshScene::release(Gpu& gpu) {
     instance_total_ = 0;
     texture_cache_.clear();
     geometry_cache_.clear();
+    constant_cache_.clear();
+    reflection_cache_.clear();
     root_cache_.clear();
     pipeline_cache_.clear();
     info_.clear();
@@ -908,6 +912,44 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
     return g;
 }
 
+// build_group through the map's shared cache: the technique's group is built once and each part
+// copies it with its own part fields (the result is the same as build_group's).
+PreparedMesh::Group cached_group(PackageManager& pm, const Technique& tech, const StaticMeshPart& part, uint16_t part_index,
+                                 uint8_t input_layout, TextureCache& texture_cache,
+                                 std::shared_ptr<const std::vector<Scope>> available_scopes, bool validate) {
+    PrepareCache* shared = texture_cache.shared;
+    if (!shared || tech.tag.is_none() || !available_scopes || available_scopes != shared->scopes)
+        return build_group(pm, tech, part, part_index, input_layout, texture_cache, std::move(available_scopes), validate);
+    const uint64_t key = uint64_t(tech.tag.value) | (uint64_t(validate) << 32);
+    std::shared_future<std::shared_ptr<const PreparedMesh::Group>> result;
+    std::promise<std::shared_ptr<const PreparedMesh::Group>> pending;
+    {
+        std::unique_lock lock(*shared->group_mutex);
+        const auto [it, first] = shared->groups.try_emplace(key);
+        if (first) it->second = pending.get_future().share();
+        else result = it->second;
+    }
+    std::shared_ptr<const PreparedMesh::Group> group;
+    if (result.valid()) {
+        group = result.get();  // rethrows the builder's error
+    } else {
+        try {
+            group = std::make_shared<const PreparedMesh::Group>(
+                build_group(pm, tech, part, part_index, input_layout, texture_cache, available_scopes, validate));
+            pending.set_value(group);
+        } catch (...) {
+            pending.set_exception(std::current_exception());
+            throw;
+        }
+    }
+    PreparedMesh::Group g = *group;
+    g.part = part;
+    g.input_layout = input_layout;
+    g.info.part = part_index;
+    g.info.index_count = part.index_count;
+    return g;
+}
+
 // Grows [lo, hi] by the snorm16 positions (x scale + offset) the part's indices reach.
 void grow_bounds(const IndexBuffer& ib, const VertexBuffer& vb0, const StaticMeshPart& part, V3 scale, V3 offset,
                  V3& lo, V3& hi, bool float_positions = false) {
@@ -984,7 +1026,7 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-bool vs_reads_typed_buffers(const std::vector<uint8_t>& vs) {
+bool vs_reads_typed_buffers(std::span<const uint8_t> vs) {
     for (const auto& b : shader_bindings(vs))
         if (b.type == BindingType::Srv && (b.kind == BindingKind::TypedBuffer || b.kind == BindingKind::RawBuffer) &&
             b.lower >= 2 && b.lower <= 4)
@@ -1842,8 +1884,8 @@ PreparedMesh prepare_static_mesh(PackageManager& pm, TagHash tag, const ChannelV
     ProfileScope profile_groups("prepare.static.build_groups");
     for (auto& p : pending) {
         try {
-            out.groups.push_back(build_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes,
-                                             p.group.render_stage == kStageTransparent));
+            out.groups.push_back(cached_group(pm, p.tech, p.part, p.group.part_index, p.group.input_layout, texture_cache, out.scopes,
+                                              p.group.render_stage == kStageTransparent));
             out.groups.back().stage = p.group.render_stage;
             out.groups.back().buffers = buffer_sets.at(p.part.buffer_index);
             out.groups.back().lod_mask = all_lods ? std::max<uint8_t>(1, p.part.lod_category) : 1;
@@ -2076,6 +2118,7 @@ void StaticMeshScene::begin(Gpu& gpu) {
 }
 
 void StaticMeshScene::finish(Gpu& gpu, TagHash tag, V3 center, float radius) {
+    resolve_pipelines();
     gpu.flush();  // texture uploads
     tag_ = tag;
     center_ = center;
@@ -2118,6 +2161,7 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
             gpu.srv().free(items_[k].srv_first, kItemSrvs * items_[k].srv_copies);
             std::erase_if(table_cache_, [&](const auto& e) { return e.second == items_[k].srv_first; });
         }
+        std::erase_if(pending_pipelines_, [&](const PendingPipeline& p) { return p.item >= items; });
         items_.resize(items);
         transparent_items_.resize(transparent);
         distortion_items_.resize(distortion);
@@ -2131,6 +2175,54 @@ void StaticMeshScene::add_mesh(Gpu& gpu, PreparedMesh&& mesh, const std::vector<
         uncullable_opaque_.resize(uncullable);
         throw;
     }
+}
+
+void StaticMeshScene::resolve_pipelines() {
+    if (pending_pipelines_.empty()) return;
+    ProfileScope profile_resolve("add.pso.resolve");
+    for (auto& p : pending_pipelines_) {
+        const PipelineResult& r = p.future.get();
+        auto& it = items_[p.item];
+        if (p.shadow) {
+            it.shadow_pso = r.pso;  // none: the part casts no sun shadow
+        } else {
+            it.pso = r.pso;
+            if (!r.pso) notes_.push_back(std::format("{} part {}: not drawn: {}", it.technique.str(), it.part.index_start, r.error));
+        }
+    }
+    pending_pipelines_.clear();
+}
+
+GpuBuffer StaticMeshScene::upload_constants(Gpu& gpu, const std::vector<float4>& values) {
+    const size_t bytes = values.size() * sizeof(float4);
+    uint64_t h = 1469598103934665603ull ^ bytes;
+    const auto* p = reinterpret_cast<const uint64_t*>(values.data());  // float4: whole 8-byte words
+    for (size_t i = 0; i < bytes / 8; ++i) h = (h ^ p[i]) * 1099511628211ull ^ (h >> 29);
+    auto& bucket = constant_cache_[h];
+    for (const auto& [content, buffer] : bucket)
+        if (content.size() == values.size() && std::memcmp(content.data(), values.data(), bytes) == 0) return buffer;
+    auto buffer = arena_.upload(gpu, values.data(), bytes);
+    bucket.emplace_back(values, buffer);
+    return buffer;
+}
+
+std::shared_ptr<const StaticMeshScene::ShaderReflection> StaticMeshScene::reflect(TagHash tag, std::span<const uint8_t> code) {
+    auto parse = [&] {
+        auto r = std::make_shared<ShaderReflection>();
+        if (code.empty()) return std::shared_ptr<const ShaderReflection>(std::move(r));
+        r->bindings = shader_bindings(code);
+        for (const auto& b : r->bindings)
+            if (b.type == BindingType::Srv && b.space == 0)
+                for (uint32_t reg = b.lower; reg <= b.upper && reg < 32; ++reg) r->kinds[reg] = b.kind;
+        r->inputs = shader_inputs(code);
+        r->outputs = shader_outputs(code);
+        return std::shared_ptr<const ShaderReflection>(std::move(r));
+    };
+    if (tag.is_none()) return parse();
+    const uint64_t key = uint64_t(tag.value) << 32 | uint32_t(code.size());
+    auto& slot = reflection_cache_[key];
+    if (!slot) slot = parse();
+    return slot;
 }
 
 void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::vector<std::vector<InputElement>>& layouts,
@@ -2382,15 +2474,16 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 }
             }
         } upload_guard{gpu, item, table_cache_};
+        ProfileScope profile_setup("add.part_setup");
         item.part = g.part;
         item.dynamic = mesh.dynamic;
         item.buffers = set_base + g.buffers;
         for (const auto& [key, values] : g.own_cbuffers)
             item.own_cbvs.emplace_back(scope_root_parameter(key.first, key.second),
-                                       arena_.upload(gpu, values.data(), values.size() * sizeof(float4)));
-        item.own_regs = g.own_cbuffers;
-        item.cb0 = arena_.upload(gpu, g.cb0.data(), g.cb0.size() * sizeof(float4));
-        item.vs_cb0 = arena_.upload(gpu, g.vs_cb0.data(), g.vs_cb0.size() * sizeof(float4));
+                                       upload_constants(gpu, values));
+        for (const auto& [key, values] : g.own_cbuffers) item.own_regs.insert(key);
+        item.cb0 = upload_constants(gpu, g.cb0);
+        item.vs_cb0 = upload_constants(gpu, g.vs_cb0);
         item.vs_material = std::move(g.vs_material);
         item.ps_material = std::move(g.ps_material);
         std::vector<std::pair<uint32_t, const Texture*>> atlases;
@@ -2420,9 +2513,10 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         item.ps_sources = std::move(g.ps_sources);
         upload_textures(g.textures, item.ps_sources, item.textures);
         upload_textures(g.vs_textures, item.vs_sources, item.vs_textures);
-        for (auto [code, registers] : {std::pair{&g.vs, &item.vs_cbvs}, std::pair{&g.ps, &item.ps_cbvs}}) {
-            if (code->empty()) continue;
-            for (const auto& binding : shader_bindings(*code)) {
+        const auto vs_reflection = reflect(g.info.vs, g.vs);
+        const auto ps_reflection = reflect(g.info.ps, g.ps);
+        for (auto [reflection, registers] : {std::pair{vs_reflection.get(), &item.vs_cbvs}, std::pair{ps_reflection.get(), &item.ps_cbvs}}) {
+            for (const auto& binding : reflection->bindings) {
                 if (binding.space != 0) throw UnsupportedMeshPart("Original material register space is unsupported");
                 if (binding.type == BindingType::Cbv) {
                     if (binding.upper != binding.lower || binding.upper > 13) throw UnsupportedMeshPart("Original material cbuffer range is unsupported");
@@ -2430,8 +2524,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 }
             }
         }
-        const auto ps_kinds = g.ps.empty() ? std::map<uint32_t, BindingKind>{} : srv_kinds(g.ps);
-        const auto vs_kinds = srv_kinds(g.vs);
+        const auto& ps_kinds = ps_reflection->kinds;
+        const auto& vs_kinds = vs_reflection->kinds;
         const auto grid_scope = item.ps_sources.cbuffer_scopes.find(3);
         item.light_grid = g.stage == kStageTransparent && item.scopes &&
             grid_scope != item.ps_sources.cbuffer_scopes.end() &&
@@ -2457,12 +2551,14 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             std::ranges::any_of(*item.scopes, [&](const Scope& scope) {
                 return scope.tag == advanced_scope->second && scope.name == "transparent_advanced";
             });
+        profile_setup.stop();
         ProfileScope profile_root("add.root_signature");
         const uint64_t root_key = g.info.technique.value | (uint64_t(mesh.dynamic) << 32) | (uint64_t(item.object_reflection) << 33);
         auto& root = shared_roots[root_key];
         if (!root) root = make_gbuffer_root_signature(dev, mesh.dynamic, g.vs_samplers, g.ps_samplers, item.object_reflection);
         item.root_sig = root;
         profile_root.stop();
+        ProfileScope profile_validate("add.validate_table");
         item.ps_kinds = ps_kinds;
         item.vs_kinds = vs_kinds;
         auto kind_of = [](const std::map<uint32_t, BindingKind>& m, uint32_t r) {
@@ -2529,6 +2625,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 item.owns_srv = false;
             }
         }
+        profile_validate.stop();
         ProfileScope profile_descriptors("add.descriptors");
         if (item.owns_srv) {
             item.srv_first = gpu.srv().alloc(kItemSrvs * item.srv_copies);
@@ -2578,8 +2675,9 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
 
 
         // Input layout straight from the game's vertex layout table.
+        ProfileScope profile_layout("add.input_layout");
         std::vector<D3D12_INPUT_ELEMENT_DESC> ied;
-        const auto vs_inputs = shader_inputs(g.vs);
+        const auto& vs_inputs = vs_reflection->inputs;
         for (const auto& e : layouts.at(g.input_layout)) {
             D3D12_INPUT_ELEMENT_DESC d{};
             if (e.buffer >= 4 || sets_.at(item.buffers).vbv[e.buffer].BufferLocation == 0) {
@@ -2625,6 +2723,8 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
             throw UnsupportedMeshPart(std::format("{}: original vertex layout {} lacks {}{}", item.technique.str(),
                                                   g.input_layout, input.semantic, input.index));
         }
+        profile_layout.stop();
+        ProfileScope profile_state("add.pipeline_desc");
         item.stage = g.stage;
         item.lod_mask = g.lod_mask;
         const bool transparent = g.stage == kStageTransparent;
@@ -2639,7 +2739,7 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         const bool projected = g.stage == kStageProjectedDecal;
         const bool decal = g.stage == kStageDecal || projected;
         const bool authored_shadow = g.stage == kStageShadow;
-        const auto outputs = g.ps.empty() ? std::vector<ShaderInput>{} : shader_outputs(g.ps);
+        const auto& outputs = ps_reflection->outputs;
         const bool motion = std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
             return _stricmp(output.semantic.c_str(), "SV_Target") == 0 && output.index == 4 && !output.never_written;
         });
@@ -2717,12 +2817,50 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
         pd.SampleDesc.Count = 1;
         const auto pipeline_key = std::tuple{root_key, g.input_layout, g.stage, g.part.primitive_type,
                                              mesh.buffers.at(g.buffers).ib.is_32bit, armour_marking};
+        profile_state.stop();
         ProfileScope profile_pso("add.pso");
         HRESULT pipeline_hr = S_OK;
-        if (auto existing = shared_pipelines.find(pipeline_key); g.bake_gs.empty() && existing != shared_pipelines.end()) item.pso = existing->second;
-        else {
+        PipelineFuture pso_future, shadow_future;
+        // The driver compiles the original DXIL on a pool thread (not the streaming UI thread); draws
+        // wait for it in resolve_pipelines(). The job owns copies of everything the desc points to.
+        auto compile = [&](const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, std::string context) {
+            auto job = std::make_shared<PipelineJob>();
+            job->desc = desc;
+            job->root = item.root_sig;
+            job->vs.assign(g.vs.begin(), g.vs.end());
+            job->ps.assign(g.ps.begin(), g.ps.end());
+            job->elements.assign(ied.begin(), ied.end());
+            for (const auto& e : job->elements) job->names.emplace_back(e.SemanticName);
+            for (size_t i = 0; i < job->elements.size(); ++i) job->elements[i].SemanticName = job->names[i].c_str();
+            job->desc.pRootSignature = job->root.Get();
+            job->desc.VS = {job->vs.data(), job->vs.size()};
+            job->desc.PS = {job->ps.data(), job->ps.size()};
+            job->desc.GS = {};
+            job->desc.InputLayout = {job->elements.data(), UINT(job->elements.size())};
+            job->context = std::move(context);
+            ComPtr<ID3D12Device> device(dev);
+            return std::async(std::launch::async, [device, job]() -> PipelineResult {
+                ProfileScope profile_create("add.pso.create");
+                PipelineResult r;
+                r.hr = device->CreateGraphicsPipelineState(&job->desc, IID_PPV_ARGS(&r.pso));
+                if (FAILED(r.hr)) r.error = std::format("CreateGraphicsPipelineState (game DXIL) failed (hr=0x{:08X}); {}", uint32_t(r.hr), job->context);
+                return r;
+            }).share();
+        };
+        auto layout_context = [&] {
+            std::string vs_in, layout;
+            for (const auto& in : vs_inputs) vs_in += std::format(" {}{}", in.semantic, in.index);
+            for (const auto& d : ied) layout += std::format(" {}{}@{}", d.SemanticName, d.SemanticIndex, d.InputSlot);
+            return std::format("VS in:{}; layout {}:{}", vs_in, g.input_layout, layout);
+        };
+        if (!g.bake_gs.empty()) {
+            ProfileScope profile_create("add.pso.create");
             pipeline_hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&item.pso));
-            if (SUCCEEDED(pipeline_hr) && g.bake_gs.empty()) shared_pipelines.emplace(pipeline_key, item.pso);
+        } else if (auto existing = shared_pipelines.find(pipeline_key); existing != shared_pipelines.end()) {
+            pso_future = existing->second;
+        } else {
+            pso_future = compile(pd, layout_context());
+            shared_pipelines.emplace(pipeline_key, pso_future);
         }
         if (const HRESULT hr = pipeline_hr; FAILED(hr)) {
             std::string vs_in, layout;
@@ -2744,12 +2882,13 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
 
         if (authored_shadow) {
             item.shadow_pso = item.pso;
+            shadow_future = pso_future;
         } else if (!transparent && !distortion && !decal && sky_order.empty()) {
             // Sun shadow: the same VS / PS (alpha-tested parts still clip) with no colour targets,
             // and a slope bias against acne (reversed depth: toward 0).
             const auto shadow_key = std::tuple{root_key, g.input_layout, uint8_t(0xF0), g.part.primitive_type,
                                                mesh.buffers.at(g.buffers).ib.is_32bit, false};
-            if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) item.shadow_pso = existing->second;
+            if (auto existing = shared_pipelines.find(shadow_key); existing != shared_pipelines.end()) shadow_future = existing->second;
             else {
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC sd = pd;
                 sd.GS = {};
@@ -2760,13 +2899,15 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 sd.RasterizerState.DepthBias = -16;
                 sd.RasterizerState.SlopeScaledDepthBias = -2.0f;
                 sd.RasterizerState.DepthBiasClamp = -0.01f;
-                if (SUCCEEDED(dev->CreateGraphicsPipelineState(&sd, IID_PPV_ARGS(&item.shadow_pso))))
-                    shared_pipelines.emplace(shadow_key, item.shadow_pso);
+                shadow_future = compile(sd, "sun shadow variant; " + layout_context());
+                shared_pipelines.emplace(shadow_key, shadow_future);
             }
         }
         if (transparent && cull != UINT32_MAX) cull_groups_[cull].has_transparency = true;
         items_.push_back(std::move(item));
         upload_guard.committed = true;
+        if (pso_future.valid()) pending_pipelines_.push_back({items_.size() - 1, false, pso_future});
+        if (shadow_future.valid()) pending_pipelines_.push_back({items_.size() - 1, true, shadow_future});
         if (transparent) transparent_items_.push_back(items_.size() - 1);
         else if (distortion) distortion_items_.push_back(items_.size() - 1);
         else if (projected) projected_decal_items_.push_back(items_.size() - 1);
@@ -3330,6 +3471,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     const D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+    resolve_pipelines();
     cl->RSSetViewports(1, &vp);
     cl->RSSetScissorRects(1, &sc);
     cl->SetDescriptorHeaps(1, heaps);
@@ -3347,6 +3489,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
     };
     auto draw = [&](ID3D12GraphicsCommandList* commands, DrawState& state, const Item& it, uint32_t instances,
                     uint32_t first_instance, const ReflectionBinding* reflection = nullptr) {
+        if (!(shadow ? it.shadow_pso : it.pso)) return;  // its pipeline failed to compile
         const bool root_changed = state.root != it.root_sig.Get();
         if (root_changed) {
             commands->SetGraphicsRootSignature(state.root = it.root_sig.Get());
