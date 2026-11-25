@@ -1649,6 +1649,97 @@ MapGameplay load_map_gameplay_selection(PackageManager& pm, const MapEntry& sele
     return read_map_gameplay(pm, selection.activity, &selection);
 }
 
+std::vector<MapLootContainer> load_map_loot(PackageManager& pm, const MapEntry& selection) {
+    // Audited opening motions (PROGRESS §3.137); each clip belongs to the placed model.
+    constexpr std::pair<uint32_t, uint32_t> open_clips[] = {
+        {0x80A90349, 0x80A9035A}, {0x80A906E4, 0x80ADF30F}, {0x80ADF2EB, 0x80ADF30F},
+        {0x80ADF303, 0x80ADF40A}, {0x80ADF77C, 0x80ADF78E}, {0x80ADF796, 0x80ADF7A8},
+        {0x80ADF852, 0x80ADF864},
+        {0x80ADF878, 0x80ADF88A}, {0x80ADF892, 0x80ADF8A2}, {0x80AF9749, 0x80AF975A},
+        {0x80AF9763, 0x80AF9773}, {0x80AF977C, 0x80AF9789}, {0x80AF979F, 0x80AF97B3},
+        {0x80AF9A9D, 0x80AF97C7}, {0x80AFB85A, 0x80AF97C7}, {0x80AFB866, 0x80AFB94C},
+        {0x80B38D28, 0x80AF9773}, {0x80B3CF04, 0x80AF975A},
+    };
+    const auto components = selection.activity.is_none() ? std::vector<TagHash>{} :
+        load_activity_node_tables(pm, selection.activity, selection.bubble_name, selection.activity_map);
+    const auto layout = load_map_layout(pm, selection.bubble, components);
+    pm.build_hash64_index();
+    std::unordered_map<uint32_t, std::pair<TagHash, TagHash>> models_by_entity;
+    std::unordered_map<uint32_t, std::pair<TagHash, TagHash>> models_by_component;
+    auto find_model = [&](TagHash entity) -> std::pair<TagHash, TagHash> {
+        const auto [known, fresh] = models_by_entity.try_emplace(entity.value);
+        if (!fresh) return known->second;
+        const auto* entry = pm.entry(entity);
+        if (!entry || entry->reference != 0x8080BAAD) return {};
+        const auto bytes = pm.read(entity);
+        const TagReader reader(bytes);
+        const auto list = reader.vec_at(0x08);
+        for (size_t i = 0; list.data <= bytes.size() && i < std::min<uint64_t>(list.count, (bytes.size() - list.data) / 12); ++i) {
+            const auto component = reader.tag_at(list.data + i * 12);
+            const auto [cached, new_component] = models_by_component.try_emplace(component.value);
+            if (new_component) {
+                const auto* metadata = pm.entry(component);
+                if (metadata && metadata->reference == 0x8080BADB) {
+                    const auto data = pm.read(component);
+                    const TagReader part(data);
+                    if (data.size() >= 0x18) {
+                        const auto p = part.pointer_at(0x10);
+                        // The model reference belongs to the dynamic-model component.
+                        if (p >= 4 && p < data.size() && part.u32_at(p - 4) == 0x80808673)
+                            for (size_t o = 0; o + 4 <= data.size(); o += 4) {
+                                const auto m = part.tag_at(o);
+                                const auto clip = std::ranges::find(open_clips, m.value, &std::pair<uint32_t, uint32_t>::first);
+                                if (clip != std::end(open_clips)) {
+                                    cached->second = {m, TagHash(clip->second)};
+                                    break;
+                                }
+                            }
+                    }
+                }
+            }
+            if (!cached->second.first.is_none()) return known->second = cached->second;
+        }
+        return {};
+    };
+    std::vector<MapLootContainer> out;
+    std::unordered_set<uint64_t> seen;
+    for (const auto table : layout.node_tables) {
+        const auto bytes = pm.read(table);
+        const TagReader reader(bytes);
+        const auto nodes = reader.vec_at(0x08);
+        if (nodes.data > bytes.size()) continue;
+        for (size_t i = 0; i < std::min<uint64_t>(nodes.count, (bytes.size() - nodes.data) / 0x90); ++i) {
+            const size_t p = nodes.data + i * 0x90;
+            const uint64_t id = reader.u64_at(p + 0x70);
+            if (!id || id == ~0ull || seen.contains(id)) continue;
+            const auto entity = pm.resolve64(reader.u64_at(p + 0x30));
+            if (!entity) continue;
+            const auto [model, clip] = find_model(*entity);
+            if (model.is_none()) continue;
+            MapLootContainer container{id, {reader.f32_at(p + 0x10), reader.f32_at(p + 0x14), reader.f32_at(p + 0x18)},
+                                       *entity, model, clip, {}};
+            const size_t link = p + 0x78;
+            size_t component = reader.pointer_at(link);
+            for (unsigned guard = 0; component != link && component >= 4 && component <= bytes.size() &&
+                 bytes.size() - component >= 0x20 && guard < 64; ++guard) {
+                if (reader.u32_at(component - 4) == 0x8080402E) {
+                    const auto tags = reader.vec_at(component + 0x10);
+                    if (tags.element_class == 0x8080402D && tags.data <= bytes.size())
+                        for (size_t j = 0; j < std::min<uint64_t>(tags.count, (bytes.size() - tags.data) / 8); ++j)
+                            container.tags.emplace_back(reader.u32_at(tags.data + j * 8), reader.u32_at(tags.data + j * 8 + 4));
+                }
+                const uint64_t next = reader.u64_at(component);
+                if (!next || next > bytes.size() - component) break;
+                component += size_t(next);
+            }
+            seen.insert(id);
+            out.push_back(std::move(container));
+        }
+    }
+    std::ranges::sort(out, [](const auto& a, const auto& b) { return std::tie(a.model, a.position, a.node) < std::tie(b.model, b.position, b.node); });
+    return out;
+}
+
 size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity, uint64_t preview) {
     map.hidden_nodes.clear();
     map.hidden_fx_nodes.clear();

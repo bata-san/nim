@@ -424,6 +424,15 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity);
 // Audit a single map selection without borrowing placements from other activity modes.
 MapGameplay load_map_gameplay_selection(PackageManager& pm, const MapEntry& selection);
 
+struct MapLootContainer {
+    uint64_t node = 0;
+    std::array<float, 3> position{};
+    TagHash entity, model, open_clip;
+    std::vector<std::pair<uint32_t, uint32_t>> tags;
+};
+// Placed containers with documented opening clips, from this selection's node tables.
+std::vector<MapLootContainer> load_map_loot(PackageManager& pm, const MapEntry& selection);
+
 // Script-placed nodes nim hides by user decision (3.111, 2026-11-23), from the gameplay scripts of
 // `activity` (none: of every activity using map.bubble):
 //  - DCON: every node a script object of a dcon module (pf_dcon.bs, dcon_combiner.bs,

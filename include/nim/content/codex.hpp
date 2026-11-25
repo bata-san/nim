@@ -105,4 +105,13 @@ struct Codex {
 // Builds the codex from the install. `dialogue` is the list from load_all_dialogue.
 Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue);
 
+struct InvestmentItem {
+    uint32_t id = 0;
+    CodexString name, type, description;
+    TagHash icon;
+};
+
+// Display data only. The item table does not specify which containers award an item.
+std::vector<InvestmentItem> load_investment_items(PackageManager& pm);
+
 } // namespace nim

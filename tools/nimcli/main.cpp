@@ -36,6 +36,8 @@
 //   nimcli [--install DIR] event-wav EVENT OUT.wav [S]  render one play of an audio event (no attenuation)
 //   nimcli [--install DIR] entity-fx ENTITY             an entity's components and the particle systems they name
 //   nimcli [--install DIR] map-event-palettes          list event previews for every map and activity selection
+//   nimcli [--install DIR] map-loot TAG [INDEX]          placed containers with audited opening clips
+//   nimcli [--install DIR] items                        investment item IDs, image tags and names
 //   nimcli [--install DIR] map-gameplay TAG [--exact [--map-index N]] [--json OUT]
 //   nimcli [--install DIR] entity-components ENTITY [-v]  an entity's component tags, their classes and referenced tag classes
 //   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
@@ -2677,6 +2679,40 @@ int cmd_map_event_palettes(PackageManager& pm) {
     return 0;
 }
 
+int cmd_items(PackageManager& pm) {
+    const auto items = load_investment_items(pm);
+    StringTable text;
+    text.load_all(pm);
+    for (const auto& item : items) {
+        const auto* name = text.find(item.name.hash, item.name.container);
+        const auto* type = item.type && !item.type.container.is_none() ? text.find(item.type.hash, item.type.container) : nullptr;
+        std::println("{:08X} {} {} | {}", item.id, item.icon.str(), name ? name->text[0] : "", type ? type->text[0] : "");
+    }
+    std::println("{} item definitions", items.size());
+    return 0;
+}
+
+int cmd_map_loot(PackageManager& pm, TagHash tag, uint32_t index) {
+    MapEntry selection;
+    if (const auto* entry = pm.entry(tag); entry && entry->reference == kClassBubbleParent && index == 0) {
+        selection.bubble = tag;
+    } else {
+        const auto maps = list_activity_maps(pm);
+        const auto found = std::ranges::find_if(maps, [&](const auto& m) { return m.activity == tag && m.activity_map == index; });
+        if (found == maps.end()) throw std::runtime_error("unknown map selection");
+        selection = *found;
+    }
+    const auto items = load_map_loot(pm, selection);
+    for (const auto& item : items) {
+        std::print("{:016X} {} {} {} ({:.3f}, {:.3f}, {:.3f})", item.node, item.entity.str(), item.model.str(),
+                   item.open_clip.str(), item.position[0], item.position[1], item.position[2]);
+        for (const auto& [name, value] : item.tags) std::print(" {:08X}={:08X}", name, value);
+        std::println("");
+    }
+    std::println("{} container placements", items.size());
+    return 0;
+}
+
 // Tags that name `tag` by one of its hash64s.
 int cmd_refs64(PackageManager& pm, TagHash tag) {
     std::set<uint64_t> wanted;
@@ -4607,6 +4643,9 @@ int main(int argc, char** argv) {
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
         if (cmd == "map-event-palettes") return cmd_map_event_palettes(pm);
+        if (cmd == "items") return cmd_items(pm);
+        if (cmd == "map-loot" && args.size() >= 2)
+            return cmd_map_loot(pm, TagHash(parse_hex(args[1])), args.size() > 2 ? uint32_t(std::stoul(args[2])) : 0);
         if (cmd == "map-near" && args.size() >= 5)
             return cmd_map_near(pm, TagHash(parse_hex(args[1])), std::stof(args[2]), std::stof(args[3]), std::stof(args[4]));
         if (cmd == "map-sky" && args.size() >= 2) return cmd_map_sky(pm, TagHash(parse_hex(args[1])));

@@ -56,6 +56,38 @@ std::vector<TagHash> find_all(PackageManager& pm, uint32_t cls) {
     return out;
 }
 
+std::vector<TagHash> load_investment_strings(PackageManager& pm) {
+    pm.build_hash64_index();
+    std::vector<TagHash> strings;
+    if (const auto list = find_single(pm, kClassInvestmentStrings)) {
+        const auto b = pm.read(*list);
+        TagReader sr(b);
+        const auto v = sr.vec_at(0x08);
+        for (uint64_t i = 0; i < v.count; ++i) {
+            const size_t e = v.data + size_t(i) * 0x18;
+            if (e + 0x18 > b.size()) break;
+            const auto t = pm.resolve64(sr.u64_at(e + 0x10));
+            strings.push_back(t ? *t : TagHash{});
+        }
+    }
+    return strings;
+}
+
+std::vector<TagHash> load_investment_images(PackageManager& pm) {
+    std::vector<TagHash> images;
+    if (const auto list = find_single(pm, kClassCodexImageList)) {
+        const auto b = pm.read(*list);
+        TagReader lr(b);
+        const auto v = lr.vec_at(0x08);
+        for (uint64_t i = 0; i < v.count; ++i) {
+            const size_t e = v.data + size_t(i) * 0x20;
+            if (e + 0x14 > b.size()) break;
+            images.push_back(lr.tag_at(e + 0x10));
+        }
+    }
+    return images;
+}
+
 // The display component's first u32 indexes the codex image list (class 808071C0): Vec at 0x08
 // of 0x20-byte elements {u32 name hash, ..., 0x10 tag of an 80805335 image entry}. The entry holds
 // its 80805350 image at 0x18, whose nested Vec (0x20 -> Vec -> tags) lists the texture headers,
@@ -116,6 +148,41 @@ CodexString unlock_of(const TagReader& r, const std::vector<TagHash>& strings, c
 
 }  // namespace
 
+std::vector<InvestmentItem> load_investment_items(PackageManager& pm) {
+    constexpr uint32_t kTableClass = 0x80806EF0;
+    constexpr uint32_t kDefinitionClass = 0x80806EF6;
+    std::vector<InvestmentItem> items;
+    const auto table = find_single(pm, kTableClass);
+    if (!table) return items;
+    const auto bytes = pm.read(*table);
+    const TagReader reader(bytes);
+    const auto rows = reader.vec_at(0x08);
+    if (rows.element_class != 0x80806EF4 || rows.data > bytes.size() ||
+        rows.count > (bytes.size() - rows.data) / 0x20)
+        throw std::runtime_error("invalid investment item table");
+    const auto strings = load_investment_strings(pm);
+    const auto images = load_investment_images(pm);
+    std::unordered_map<uint32_t, TagHash> icons;
+    items.reserve(size_t(rows.count));
+    for (size_t i = 0; i < rows.count; ++i) {
+        const size_t offset = rows.data + i * 0x20;
+        const auto definition = reader.tag_at(offset + 0x10);
+        const auto* entry = pm.entry(definition);
+        if (!entry || entry->reference != kDefinitionClass || entry->file_size < 0xE0) continue;
+        const auto data = pm.read(definition);
+        if (data.size() < 0xE0) continue;
+        const TagReader item(data);
+        const auto name = string_at(item, strings, 0xBC);
+        if (!name || name.container.is_none()) continue;
+        const uint32_t image = item.u16_at(0xB8);
+        const auto [icon, fresh] = icons.try_emplace(image);
+        if (fresh) icon->second = illustration_of(pm, images, image).texture;
+        items.push_back({reader.u32_at(offset), name, string_at(item, strings, 0xD0),
+                         string_at(item, strings, 0xD8), icon->second});
+    }
+    return items;
+}
+
 Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) {
     Codex codex;
     const auto defs_tag = find_single(pm, kClassCodexDefinitions);
@@ -125,33 +192,8 @@ Codex load_codex(PackageManager& pm, const std::vector<DialogueLine>& dialogue) 
     const auto defs = parse_codex_definitions(bytes);
     TagReader r(bytes);
 
-    // Investment string list: string list index -> string container.
-    pm.build_hash64_index();
-    std::vector<TagHash> strings;
-    if (const auto list = find_single(pm, kClassInvestmentStrings)) {
-        const auto b = pm.read(*list);
-        TagReader sr(b);
-        const auto v = sr.vec_at(0x08);
-        for (uint64_t i = 0; i < v.count; ++i) {
-            const size_t e = v.data + size_t(i) * 0x18;
-            if (e + 0x18 > b.size()) break;
-            const auto t = pm.resolve64(sr.u64_at(e + 0x10));
-            strings.push_back(t ? *t : TagHash{});
-        }
-    }
-
-    // Codex image list: index -> 80805335 image entry.
-    std::vector<TagHash> images;
-    if (const auto list = find_single(pm, kClassCodexImageList)) {
-        const auto b = pm.read(*list);
-        TagReader lr(b);
-        const auto v = lr.vec_at(0x08);
-        for (uint64_t i = 0; i < v.count; ++i) {
-            const size_t e = v.data + size_t(i) * 0x20;
-            if (e + 0x14 > b.size()) break;
-            images.push_back(lr.tag_at(e + 0x10));
-        }
-    }
+    const auto strings = load_investment_strings(pm);
+    const auto images = load_investment_images(pm);
     auto illustration = [&](const CodexDefinition& d) {
         for (const auto& c : d.components)
             if (c.cls == kClassCodexDisplay && c.offset + 4 <= bytes.size()) return illustration_of(pm, images, r.u32_at(c.offset));

@@ -35,6 +35,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(NavStatics, "背景物", "Scenery", "배경물") \
     X(NavEntities, "モデル", "Models", "모델") \
     X(NavMaps, "マップ", "Maps", "맵") \
+    X(NavLoot, "Loot", "Loot", "Loot") \
     X(NavText, "テキスト", "Text", "텍스트") \
     X(NavDialogue, "台詞", "Dialogue", "대사") \
     X(NavMovies, "ムービー", "Movies", "영상") \
@@ -50,6 +51,25 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(DescStatics, "建物・地形・小物などの背景物を 3D サムネイルで一覧し、ゲームのシェーダで表示", "Buildings, terrain and props, listed as live 3D thumbnails and drawn with the game shaders", "건물·지형·소품을 3D 썸네일로 보고 게임 셰이더로 표시") \
     X(DescEntities, "キャラクター・装備・機械を、材質とアニメーション付きで表示", "Characters, gear and machines with their materials and animations", "캐릭터·장비·기계를 재질과 애니메이션으로 표시") \
     X(DescMaps, "マップを丸ごと読み込んで歩き回る (時刻・天候つき)", "Load a whole map and walk through it, with its time of day and weather", "맵 전체를 불러와 돌아다닙니다 (시간·날씨 포함)") \
+    X(DescLoot, "配置されたロッカーや箱を開ける", "Open lockers and containers placed on the map", "맵에 배치된 보관함과 상자 열기") \
+    X(LootLoading, "コンテナを検索中…", "Finding containers…", "보관함 검색 중…") \
+    X(LootPick, "コンテナを選択してください", "Select a container", "보관함을 선택하세요") \
+    X(LootEmpty, "開閉モーションを確認済みの配置がありません", "No placements have a verified opening animation", "열기 애니메이션이 확인된 배치가 없습니다") \
+    X(LootFilter, "種類・タグ・座標で絞り込む", "Filter by type, tag or coordinates", "종류, 태그 또는 좌표로 필터링") \
+    X(LootContainer, "コンテナ", "Container", "보관함") \
+    X(LootLocker, "ロッカー", "Locker", "락커") \
+    X(LootCrate, "物資箱", "Supply crate", "보급 상자") \
+    X(LootCart, "カート", "Cart", "카트") \
+    X(LootOpen, "開ける", "Open", "열기") \
+    X(LootClose, "閉じる", "Close", "닫기") \
+    X(LootShowMap, "マップで場所を見る", "Show on map", "맵에서 위치 보기") \
+    X(LootClipMissing, "開閉モーションを読み込めませんでした", "Opening animation could not be loaded", "열기 애니메이션을 불러오지 못했습니다") \
+    X(LootDropUnknown, "抽選データは調査中", "Drop table under investigation", "드롭 테이블 조사 중") \
+    X(LootMapPlacements, "マップ上の配置", "Map placements", "맵 배치") \
+    X(LootItems, "アイテム図鑑", "Item catalog", "아이템 도감") \
+    X(LootItemsEmpty, "アイテム定義が見つかりませんでした", "No item definitions found", "아이템 정의를 찾을 수 없습니다") \
+    X(LootItemFilter, "名前・種類・IDで検索", "Search by name, type or ID", "이름, 종류 또는 ID로 검색") \
+    X(LootItemPick, "アイテムを選択してください", "Select an item", "아이템을 선택하세요") \
     X(DescText, "ゲーム内の文字列を 13 言語で検索", "Search the game text in 13 languages", "게임 문자열을 13개 언어로 검색") \
     X(DescDialogue, "台詞を全言語で表示し、音声を再生・話者ごとに書き出す",                                              \
       "Lines in every language, with voice playback and per-speaker WAV export",                                           \

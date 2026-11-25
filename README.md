@@ -50,7 +50,8 @@ focuses the prompt. Pages: **places** (whole maps, with their time of day and we
 (2.3k characters, gear and machines with materials and animation) and **scenery** (57k static meshes)
 with live 3D thumbnails, **voices** (lines in 13 languages with voice playback), **codex** (the
 in-game codex: collections, records in 13 languages and their audio logs), **films** (USM with
-HCA/ADX audio), **text** (every localized string beside a second language), **files** (package
+HCA/ADX audio), **Loot** (preview a placed container’s opening motion and look up installed
+item names and available icons), **text** (every localized string beside a second language), **files** (package
 entries + hex) and **log**.
 
 Everything is drawn with the game's own shaders: the G-buffer pass with each material's DXIL,
@@ -83,6 +84,8 @@ Oodle is loaded from the game's own `bin/x64/oo2core_9_win64.dll`.
 
 ```
 build/Release/nimcli pkgs              # list packages
+build/Release/nimcli map-loot 80AFB43D # verified opening clips and placements for the Outpost expedition
+build/Release/nimcli items             # investment item IDs, localized names and available icon tags
 build/Release/nimcli ls 120            # entries of package 0x120
 build/Release/nimcli types             # entry type/class histogram
 build/Release/nimcli read 80A4001D     # hex preview of a tag
