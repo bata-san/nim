@@ -51,6 +51,7 @@ struct UsmInfo {
     uint32_t video_codec = 0;          // mpeg_codec: 1 = MPEG-1 (Sofdec), 5 = H.264, 9 = VP9
     uint32_t total_frames = 0;
     double frame_rate = 0;
+    uint32_t frame_rate_numerator = 0, frame_rate_denominator = 0;
     struct Audio {
         uint8_t channel = 0;
         uint32_t codec = 0;            // audio_codec: 2 = ADX, 4 = HCA

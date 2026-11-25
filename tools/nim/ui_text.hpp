@@ -463,6 +463,12 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(ErrPlayAudio, "音声を再生できません: {}", "Cannot play audio: {}", "음성을 재생할 수 없습니다: {}")                 \
     X(LogSaved, "保存しました: {}", "Saved: {}", "저장했습니다: {}")                                                    \
     X(ErrSave, "保存に失敗: {}", "Save failed: {}", "저장 실패: {}")                                                    \
+    X(MovieExportMp4, "MP4に書き出す…", "Export MP4…", "MP4로 내보내기…") \
+    X(MovieExportTip, "動画全体と選択中の音声を書き出します。字幕は同名のSRTファイルになります。", "Export the full video with the selected audio track. Subtitles go to a matching SRT file.", "동영상 전체와 선택한 오디오를 내보냅니다. 자막은 같은 이름의 SRT 파일에 저장됩니다.") \
+    X(MovieExportCancelled, "ムービーの書き出しを中止しました", "Movie export cancelled", "동영상 내보내기를 취소했습니다") \
+    X(MovieExportComplete, "MP4を保存しました ({})", "Saved MP4 ({})", "MP4 저장 완료 ({})") \
+    X(MovieExportWithSubtitles, "MP4とSRTを保存しました ({})", "Saved MP4 and SRT ({})", "MP4와 SRT 저장 완료 ({})") \
+    X(MovieExportError, "ムービーの書き出しに失敗しました ({})", "Movie export failed ({})", "동영상 내보내기에 실패했습니다 ({})") \
     X(MovieCount, "%zu 本 (多言語音声 %zu)", "%zu movies (multilingual audio %zu)", "%zu개 (다국어 음성 %zu)")            \
     X(CodexFilterHint, "タイトル・本文で検索", "Search titles and text", "제목·본문 검색") \
     X(CodexAudioOnly, "音声ログのみ", "Audio logs only", "음성 로그만") \

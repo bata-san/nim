@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <numbers>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -194,7 +195,11 @@ UsmInfo parse_usm_info(std::span<const uint8_t> head) {
             info.video_codec = uint32_t(t.integer(0, "mpeg_codec"));
             info.total_frames = uint32_t(t.integer(0, "total_frames"));
             const int64_t n = t.integer(0, "framerate_n"), d = t.integer(0, "framerate_d", 1);
-            info.frame_rate = d ? double(n) / double(d) : 0;
+            if (n > 0 && d > 0 && n <= std::numeric_limits<uint32_t>::max() && d <= std::numeric_limits<uint32_t>::max()) {
+                info.frame_rate_numerator = uint32_t(n);
+                info.frame_rate_denominator = uint32_t(d);
+                info.frame_rate = double(n) / double(d);
+            }
         } else if (t.name == "AUDIO_HDRINFO" && !t.rows.empty()) {
             UsmInfo::Audio a;
             a.channel = c.channel;

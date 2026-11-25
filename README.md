@@ -50,7 +50,7 @@ focuses the prompt. Pages: **places** (whole maps, with their time of day and we
 (2.3k characters, gear and machines with materials and animation) and **scenery** (57k static meshes)
 with live 3D thumbnails, **voices** (lines in 13 languages with voice playback), **codex** (the
 in-game codex: collections, records in 13 languages and their audio logs), **films** (USM with
-HCA/ADX audio), **Loot** (preview a placed container’s opening motion and look up installed
+HCA/ADX audio and MP4 export, with an optional matching SRT), **Loot** (preview a placed container’s opening motion and look up installed
 item names and available icons), **text** (every localized string beside a second language), **files** (package
 entries + hex) and **log**.
 
@@ -107,6 +107,7 @@ build/Release/nimcli wem 80A1B2C3 out/line.wav   # decode a WEM stream or a dial
 build/Release/nimcli wem-audit         # decode every dialogue WEM and report failures
 build/Release/nimcli codex out/codex.md ja  # the in-game codex: collections, records, audio logs (Markdown)
 build/Release/nimcli movies -v         # list movies (USM): size, codecs, audio tracks, subtitles
+build/Release/nimcli movie-export USM out/movie.mp4 2 1  # audio channel 2, Japanese SRT
 build/Release/nimcli movie-audio USM out/m.wav 1   # decode one ADX/HCA track of a movie
 build/Release/nimcli movie-video USM out/m.m1v 8   # dump the MPEG-1 elementary stream (first 8 MB)
 build/Release/nimcli movie-frames USM out/frames 60 30   # decode frames from 60 s as BMP, plus subtitles

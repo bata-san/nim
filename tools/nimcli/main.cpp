@@ -10,6 +10,7 @@
 //   nimcli [--install DIR] dialogue [OUT.csv]         every spoken line: speaker, text (all languages), audio
 //   nimcli [--install DIR] wem-audit [LIMIT]          decode every dialogue stream (NIM_LANGUAGE=6: Japanese)
 //   nimcli [--install DIR] movies [-v]                every USM movie: name, size, video/audio streams
+//   nimcli [--install DIR] movie-export USM OUT.mp4 [CH|-1] [SUB_LANG|-1]
 //   nimcli [--install DIR] movie-audio USM OUT.wav [CH]  decode a movie's audio track (ADX)
 //   nimcli [--install DIR] movie-frames USM OUT_DIR [START_S] [COUNT]  decode frames (BMP) and list subtitles
 //   nimcli [--install DIR] wem TAG|EVENT OUT.wav      decode a Wwise stream (or a dialogue audio event)
@@ -60,6 +61,7 @@
 #include "nim/content/movies.hpp"
 #include "nim/content/hca.hpp"
 #include "media.hpp"
+#include "movie_export.hpp"
 #include "nim/content/audio.hpp"
 #include "nim/content/map_audio.hpp"
 #include "nim/content/fonts.hpp"
@@ -2775,6 +2777,21 @@ bool write_wav(const char* path, const PcmAudio& pcm) {
     return bool(f);
 }
 
+int cmd_movie_export(PackageManager& pm, TagHash tag, const fs::path& out, int channel, int subtitles) {
+    const auto movies = list_movies(pm);
+    const auto found = std::ranges::find(movies, tag, &MovieEntry::usm);
+    if (found == movies.end()) throw std::runtime_error("not a movie");
+    if (channel == -2) channel = found->info.audio.empty() ? -1 : found->info.audio.front().channel;
+    StringTable strings;
+    if (subtitles >= 0) strings.load_all(pm);
+    std::atomic<unsigned> progress{0};
+    const std::atomic<bool> cancel{false};
+    const auto result = media::export_movie(pm, *found, {out, channel, subtitles},
+                                           subtitles >= 0 ? &strings : nullptr, progress, cancel);
+    std::println("Wrote {} frames{}", result.frames, result.subtitles ? " and an SRT subtitle file" : "");
+    return 0;
+}
+
 int cmd_movie_audio(PackageManager& pm, TagHash usm, const char* out, int channel) {
     const Entry* e = pm.entry(usm);
     if (!e) throw std::runtime_error("no such entry");
@@ -4569,6 +4586,9 @@ int main(int argc, char** argv) {
         if (cmd == "movies") return cmd_movies(pm, args.size() >= 2 && args[1] == "-v");
         if (cmd == "movie-video" && args.size() >= 3)
             return cmd_movie_video(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoull(args[3]) << 20 : ~0ull);
+        if (cmd == "movie-export" && args.size() >= 3)
+            return cmd_movie_export(pm, TagHash(parse_hex(args[1])), args[2], args.size() >= 4 ? std::stoi(args[3]) : -2,
+                                    args.size() >= 5 ? std::stoi(args[4]) : -1);
         if (cmd == "movie-audio" && args.size() >= 3)
             return cmd_movie_audio(pm, TagHash(parse_hex(args[1])), args[2].c_str(), args.size() >= 4 ? std::stoi(args[3]) : 0);
         if (cmd == "movie-playcheck" && args.size() >= 2)

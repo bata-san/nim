@@ -5,6 +5,7 @@
 // game's own G-buffer shaders and, by default, shaded by the game's own deferred lighting pass;
 // the UI itself is set in the game's fonts, read from the user's install at startup.
 #include "media.hpp"
+#include "movie_export.hpp"
 #include "frame_generation.hpp"
 #include "frame_profile.hpp"
 #include "nim/core/profile.hpp"
@@ -1835,6 +1836,14 @@ public:
         bool tex_readable = false, has_frame = false, seeking = false;
         float seek_value = 0;
     } movie;
+    struct MovieExportJob {
+        std::atomic<unsigned> progress{0};
+        std::atomic<bool> cancel{false};
+        std::future<media::MovieExportResult> result;
+        fs::path output;
+        std::string message;
+        bool failed = false;
+    } movie_export;
     struct CodexUi {
         char filter[128] = "";
         int lang = -1;  // -1: the second-language setting
@@ -5248,6 +5257,45 @@ public:
         if (paused) movie.player->set_paused(true);
     }
 
+    void start_movie_export(const MovieEntry& entry, int channel, int subtitles) {
+        if (movie_export.result.valid()) return;
+        try {
+            ComPtr<IFileSaveDialog> dialog;
+            check_hr(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)),
+                     "Create movie save dialog");
+            constexpr COMDLG_FILTERSPEC format{L"MP4 (*.mp4)", L"*.mp4"};
+            check_hr(dialog->SetFileTypes(1, &format), "Set movie file type");
+            check_hr(dialog->SetDefaultExtension(L"mp4"), "Set movie extension");
+            check_hr(dialog->SetOptions(FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST | FOS_STRICTFILETYPES),
+                     "Set movie save options");
+            const auto stem = fs::path(to_wide(entry.info.filename)).stem();
+            const auto name = stem.empty() ? to_wide(entry.usm.str()) : stem.wstring();
+            check_hr(dialog->SetFileName(name.c_str()), "Set movie file name");
+            const HRESULT choice = dialog->Show(g_win.hwnd);
+            if (choice == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return;
+            check_hr(choice, "Choose movie file");
+            ComPtr<IShellItem> file;
+            check_hr(dialog->GetResult(&file), "Get movie file");
+            PWSTR raw = nullptr;
+            check_hr(file->GetDisplayName(SIGDN_FILESYSPATH, &raw), "Get movie path");
+            const std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> path(raw, CoTaskMemFree);
+            movie_export.output = path.get();
+            movie_export.cancel = false;
+            movie_export.progress = 0;
+            movie_export.message.clear();
+            movie_export.failed = false;
+            const media::MovieExport settings{movie_export.output, channel, subtitles, fs::exists(movie_export.output)};
+            const StringTable* strings = &catalog->strings;
+            movie_export.result = std::async(std::launch::async, [this, source = pm->fork(), entry, settings, strings] {
+                return media::export_movie(*source, entry, settings, strings, movie_export.progress, movie_export.cancel);
+            });
+        } catch (const std::exception& ex) {
+            movie_export.failed = true;
+            movie_export.message = ui::trf(ui::S::MovieExportError, ex.what());
+            error(movie_export.message);
+        }
+    }
+
     void media_tick() {
         if (audio_request && audio_request->result.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             try {
@@ -5265,6 +5313,19 @@ public:
                 }
             }
             audio_request.reset();
+        }
+        if (movie_export.result.valid() && movie_export.result.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                const auto result = movie_export.result.get();
+                movie_export.message = result.cancelled ? ui::tr(ui::S::MovieExportCancelled) :
+                    ui::trf(result.subtitles ? ui::S::MovieExportWithSubtitles : ui::S::MovieExportComplete,
+                            to_utf8(movie_export.output.wstring()));
+                info(movie_export.message);
+            } catch (const std::exception& ex) {
+                movie_export.failed = true;
+                movie_export.message = ui::trf(ui::S::MovieExportError, ex.what());
+                error(movie_export.message);
+            }
         }
         if (movie.player)
             if (auto f = movie.player->take_due_frame()) movie.pending = std::move(f);
@@ -5807,7 +5868,7 @@ public:
         const size_t sub_lang = movie_sub_lang();
 
         // video area
-        const float list_h = 150 * sc, controls_h = ImGui::GetFrameHeightWithSpacing() * 2 + 8 * sc;
+        const float list_h = 150 * sc, controls_h = ImGui::GetFrameHeightWithSpacing() * 3 + 8 * sc;
         const ImVec2 avail = ImGui::GetContentRegionAvail();
         const float area_h = std::max(80 * sc, avail.y - controls_h - list_h);
         const ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -5864,6 +5925,11 @@ public:
         for (const auto& t : m.info.audio)
             if (t.channel == movie.channel) cur = &t;
         if (begin_combo(ui::tr(ui::S::AudioTrack), cur ? movie_track_label(m, *cur).c_str() : ui::tr(ui::S::None))) {
+            if (ImGui::Selectable(ui::tr(ui::S::None), movie.channel == -1) && movie.channel != -1) {
+                movie.channel = -1;
+                open_movie(movie.selected, pos, p && p->paused());
+                p = movie.player.get();
+            }
             for (const auto& t : m.info.audio)
                 if (ImGui::Selectable(movie_track_label(m, t).c_str(), t.channel == movie.channel)) {
                     movie.channel = t.channel;
@@ -5892,6 +5958,26 @@ public:
                 ImGui::TextDisabled(cur->codec != 2 && cur->codec != 4 ? ui::tr(ui::S::VideoOnlyUnsupported) : ui::tr(ui::S::AudioOutputError),
                                     usm_audio_codec_name(cur->codec));
             }
+        }
+
+        const bool exporting = movie_export.result.valid();
+        ImGui::BeginDisabled(exporting || !m.error.empty() || m.info.video_codec != 1 ||
+                             (movie.sub_lang != kSubtitlesOff && !catalog->strings_ready));
+        if (ImGui::Button(ui::tr(ui::S::MovieExportMp4)))
+            start_movie_export(m, cur ? int(cur->channel) : -1, movie.sub_lang == kSubtitlesOff ? -1 : int(sub_lang));
+        ImGui::SetItemTooltip("%s", ui::tr(ui::S::MovieExportTip));
+        ImGui::EndDisabled();
+        if (exporting) {
+            ImGui::SameLine();
+            ImGui::ProgressBar(float(movie_export.progress.load()) / 100.f, {110 * sc, 0});
+            ImGui::SameLine();
+            ImGui::BeginDisabled(movie_export.cancel);
+            if (ImGui::Button(ui::tr(ui::S::Abort))) movie_export.cancel = true;
+            ImGui::EndDisabled();
+        } else if (!movie_export.message.empty()) {
+            ImGui::SameLine();
+            const ImVec4 color = ImGui::GetStyleColorVec4(movie_export.failed ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+            ImGui::TextColored(color, "%s", movie_export.message.c_str());
         }
 
         // subtitle list (the subtitles are interleaved with the video, so they appear as it plays)
@@ -6049,6 +6135,8 @@ public:
     }
 
     void shutdown() {
+        movie_export.cancel = true;
+        if (movie_export.result.valid()) movie_export.result.wait();
         movie.player.reset();
         clip.reset();
         if (export_thread.joinable()) {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nim LANGUAGES CXX VERSION 0.3.24)
+project(nim LANGUAGES CXX VERSION 0.3.25)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,9 +47,9 @@ target_include_directories(nim_core PUBLIC include)
 target_link_libraries(nim_core PUBLIC bcrypt)
 
 # ---- nimcli: headless inspection / extraction --------------------------------
-add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp tools/nimcli/environment.cpp tools/nim/media.cpp)
+add_executable(nimcli tools/nimcli/main.cpp tools/nimcli/probe_search.cpp tools/nimcli/environment.cpp tools/nim/media.cpp tools/nim/movie_export.cpp)
 target_include_directories(nimcli PRIVATE tools/nim)
-target_link_libraries(nimcli PRIVATE nim_core xaudio2)
+target_link_libraries(nimcli PRIVATE nim_core xaudio2 mfplat mfreadwrite mfuuid ole32)
 
 # ---- nim_render: D3D12 renderer running the game's own shaders --------------
 add_library(nim_render STATIC
@@ -96,14 +96,14 @@ target_link_libraries(nimfbx_extract PRIVATE nim_core)
 
 # ---- nim: GUI viewer (Dear ImGui, docking branch) ---------------------------
 set(IMGUI_DIR third_party/imgui)
-add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/ui_text.cpp tools/nim/frame_generation.cpp
+add_executable(nim WIN32 tools/nim/main.cpp tools/nim/media.cpp tools/nim/movie_export.cpp tools/nim/ui_text.cpp tools/nim/frame_generation.cpp
     ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx12.cpp)
 target_include_directories(nim PRIVATE ${IMGUI_DIR})
 file(GLOB IMGUI_SOURCES ${IMGUI_DIR}/*.cpp ${IMGUI_DIR}/backends/*.cpp)
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
-target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2)
+target_link_libraries(nim PRIVATE nim_render windowscodecs ole32 shell32 dwmapi xaudio2 mfplat mfreadwrite mfuuid)
 target_compile_definitions(nim PRIVATE NIM_VERSION="${PROJECT_VERSION}")
 add_custom_command(TARGET nim POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/tools/nim/nim-update.ps1"
