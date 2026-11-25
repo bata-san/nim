@@ -35,6 +35,8 @@
 //   nimcli [--install DIR] wwise-event EVENT [PLAYS]    an audio event's bank objects and the voices of a few plays
 //   nimcli [--install DIR] event-wav EVENT OUT.wav [S]  render one play of an audio event (no attenuation)
 //   nimcli [--install DIR] entity-fx ENTITY             an entity's components and the particle systems they name
+//   nimcli [--install DIR] map-event-palettes          list event previews for every map and activity selection
+//   nimcli [--install DIR] map-gameplay TAG [--exact [--map-index N]] [--json OUT]
 //   nimcli [--install DIR] entity-components ENTITY [-v]  an entity's component tags, their classes and referenced tag classes
 //   nimcli [--install DIR] skeleton COMPONENT           bones of a skeleton component (80809FB7)
 //   nimcli [--install DIR] skeletons                    skinned models -> their entity's skeleton and rig, clip counts
@@ -1918,9 +1920,25 @@ int cmd_squad_links(PackageManager& pm, TagHash activity) {
     return 0;
 }
 
-int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const char* json) {
+int cmd_map_gameplay(PackageManager& pm, TagHash tag, bool verbose, const char* json,
+                     std::optional<uint32_t> exact_map) {
     pm.build_hash64_index();
-    const MapGameplay g = load_map_gameplay(pm, activity);
+    const auto selection = [&]() -> std::optional<MapEntry> {
+        if (!exact_map) return std::nullopt;
+        if (const auto* entry = pm.entry(tag); entry && entry->reference == kClassBubbleParent) {
+            if (*exact_map != 0) throw std::runtime_error("a standalone map has no activity map index");
+            MapEntry selection;
+            selection.bubble = tag;
+            return selection;
+        }
+        const auto entries = list_activity_maps(pm);
+        const auto selected = std::ranges::find_if(entries, [&](const MapEntry& m) {
+            return m.activity == tag && m.activity_map == *exact_map;
+        });
+        if (selected == entries.end()) throw std::runtime_error("unknown activity map selection");
+        return *selected;
+    }();
+    const MapGameplay g = selection ? load_map_gameplay_selection(pm, *selection) : load_map_gameplay(pm, tag);
     auto labels = [](const MapGameplayPoint& p) {
         std::string l;
         for (const auto h : p.labels) l += std::format("{}{:08X}", l.empty() ? "" : " ", h);
@@ -1944,7 +1962,7 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
             }
         }
     };
-    std::println("{}: {} nodes", activity.str(), g.nodes);
+    std::println("{}: {} nodes", tag.str(), g.nodes);
     group("spawn points (entity has the start component 80802D32)", g.spawns);
     group("loot containers (labelled nodes with a dynamic model)", g.loot);
     auto char_name = [&](size_t c) {
@@ -2064,7 +2082,7 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
     std::println("script components of the package family by module:");
     for (const auto& [m, n] : g.modules) std::println("  {:5} {}", n, m);
     if (json) {
-        std::string j = std::format("{{\"activity\":\"{}\",\"spawns\":[", activity.str());
+        std::string j = std::format("{{\"activity\":\"{}\",\"spawns\":[", tag.str());
         auto point = [&](const MapGameplayPoint& p) {
             std::string l;
             for (const auto h : p.labels) l += std::format("{}\"{:08X}\"", l.empty() ? "" : ",", h);
@@ -2080,7 +2098,8 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
             const auto& o = g.scripts[i];
             std::string module;
             for (const char c : o.module) module += c == '\\' ? std::string("\\\\") : std::string(1, c);
-            j += std::format("{}{{\"component\":\"{}\",\"module\":\"{}\",\"points\":[", i ? "," : "", o.component.str(), module);
+            j += std::format("{}{{\"component\":\"{}\",\"definition\":\"{}\",\"module\":\"{}\",\"points\":[",
+                             i ? "," : "", o.component.str(), o.definition.str(), module);
             for (size_t k = 0; k < o.placements.size(); ++k) j += (k ? "," : "") + point(o.placements[k].second);
             j += std::format("],\"slot\":\"{:016X}\",\"names\":[", o.slot);
             for (size_t k = 0; k < o.names.size(); ++k) j += std::format("{}\"{}\"", k ? "," : "", o.names[k].second);
@@ -2141,15 +2160,19 @@ int cmd_map_gameplay(PackageManager& pm, TagHash activity, bool verbose, const c
         // The map's static placements (positions only): context for overview plots.
         j += "],\"statics\":[";
         bool first = true;
-        for (const auto& m : list_activity_maps(pm)) {
-            if (m.activity != activity) continue;
-            const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+        auto append_statics = [&](const MapEntry& m) {
+            const auto tables = m.activity.is_none() ? std::vector<TagHash>{} :
+                load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+            const auto layout = load_map_layout(pm, m.bubble, tables);
             for (const auto& st : layout.statics)
                 for (const auto& row : st.rows) {
                     j += std::format("{}[{:.1f},{:.1f},{:.1f}]", first ? "" : ",", row[3], row[7], row[11]);
                     first = false;
                 }
-        }
+        };
+        if (selection) append_statics(*selection);
+        else for (const auto& m : list_activity_maps(pm))
+            if (m.activity == tag) append_statics(m);
         j += "]}\n";
         std::ofstream(json, std::ios::binary) << j;
         std::println("wrote {}", json);
@@ -2630,6 +2653,27 @@ int cmd_maps(PackageManager& pm) {
         std::println("{}  {:<32} statics {:>6}  instances {:>7}  bounds ({:.0f} {:.0f} {:.0f})-({:.0f} {:.0f} {:.0f})", m.bubble.str(),
                      m.package, l.statics.size(), l.instances, l.lo[0], l.lo[1], l.lo[2], l.hi[0], l.hi[1], l.hi[2]);
     }
+    return 0;
+}
+
+int cmd_map_event_palettes(PackageManager& pm) {
+    pm.build_hash64_index();
+    auto print_palette = [&](const MapEntry& entry) {
+        std::vector<TagHash> tables;
+        if (!entry.activity.is_none())
+            tables = load_activity_node_tables(pm, entry.activity, entry.bubble_name, entry.activity_map);
+        auto layout = load_map_layout(pm, entry.bubble, tables);
+        hide_scripted_nodes(pm, layout, entry.activity);
+        std::println("map\t{}\t{}\t{}\t{}\t{}\t{}\t{}", entry.bubble.str(),
+                     entry.activity.is_none() ? "-" : entry.activity.str(), entry.activity_map,
+                     entry.activity.is_none() ? entry.package : entry.name,
+                     layout.event_previews.size(), layout.hidden_nodes.size(), layout.hidden_fx_nodes.size());
+        for (const auto& event : layout.event_previews)
+            std::println("event\t{:016X}\t{}\t{}\t{:.3f}\t{:.3f}\t{:.3f}", event.id, event.name,
+                         event.placements, event.position[0], event.position[1], event.position[2]);
+    };
+    for (const auto& entry : list_activity_maps(pm)) print_palette(entry);
+    for (const auto& entry : list_maps(pm)) print_palette(entry);
     return 0;
 }
 
@@ -4562,6 +4606,7 @@ int main(int argc, char** argv) {
         if (cmd == "crawl" && args.size() >= 2)
             return cmd_crawl(pm, TagHash(parse_hex(args[1])), args.size() >= 3 ? std::stoi(args[2]) : 8, args.size() >= 4 ? parse_hex(args[3]) : 0);
         if (cmd == "maps") return cmd_maps(pm);
+        if (cmd == "map-event-palettes") return cmd_map_event_palettes(pm);
         if (cmd == "map-near" && args.size() >= 5)
             return cmd_map_near(pm, TagHash(parse_hex(args[1])), std::stof(args[2]), std::stof(args[3]), std::stof(args[4]));
         if (cmd == "map-sky" && args.size() >= 2) return cmd_map_sky(pm, TagHash(parse_hex(args[1])));
@@ -4659,11 +4704,14 @@ int main(int argc, char** argv) {
         if (cmd == "map-gameplay" && args.size() >= 2) {
             bool verbose = false;
             const char* json = nullptr;
+            std::optional<uint32_t> exact_map;
             for (size_t i = 2; i < args.size(); ++i) {
                 if (args[i] == "-v") verbose = true;
                 else if (args[i] == "--json" && i + 1 < args.size()) json = args[++i].c_str();
+                else if (args[i] == "--exact" && !exact_map) exact_map = 0;
+                else if (args[i] == "--map-index" && i + 1 < args.size()) exact_map = uint32_t(std::stoul(args[++i]));
             }
-            return cmd_map_gameplay(pm, TagHash(parse_hex(args[1])), verbose, json);
+            return cmd_map_gameplay(pm, TagHash(parse_hex(args[1])), verbose, json, exact_map);
         }
         if (cmd == "map-entities" && args.size() >= 2) return cmd_map_entities(pm, TagHash(parse_hex(args[1])));
         if (cmd == "map-components" && args.size() >= 2)

@@ -1191,7 +1191,7 @@ MapEntities load_map_entities(PackageManager& pm, const MapLayout& map,
     return out;
 }
 
-MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
+static MapGameplay read_map_gameplay(PackageManager& pm, TagHash activity, const MapEntry* selection) {
     MapGameplay out;
     struct EntityInfo { bool spawn = false; TagHash model; };
     std::unordered_map<uint32_t, EntityInfo> entities;
@@ -1223,22 +1223,32 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     };
     std::unordered_map<uint64_t, MapGameplayPoint> by_id;
     TagHash bubble;
-    const auto activity_maps = list_activity_maps(pm);
-    for (const auto& m : activity_maps)
-        if (m.activity == activity) bubble = m.bubble;
+    std::vector<MapEntry> activity_maps;
     // The activity's own nodes first; then the other activities on the same bubble, whose nodes
     // only resolve squad locations (3.112: the ambient and TDM activities place none of the squads'
     // location nodes, the expedition activity does; the squads are the bubble family's).
     std::vector<const MapEntry*> order;
-    for (const auto& m : activity_maps)
-        if (m.activity == activity) order.push_back(&m);
-    const size_t own_maps = order.size();
-    for (const auto& m : activity_maps)
-        if (m.bubble == bubble && m.activity != activity) order.push_back(&m);
+    size_t own_maps = 1;
+    if (selection) {
+        bubble = selection->bubble;
+        order.push_back(selection);
+    } else {
+        activity_maps = list_activity_maps(pm);
+        for (const auto& m : activity_maps)
+            if (m.activity == activity) {
+                bubble = m.bubble;
+                order.push_back(&m);
+            }
+        own_maps = order.size();
+        for (const auto& m : activity_maps)
+            if (m.bubble == bubble && m.activity != activity) order.push_back(&m);
+    }
     for (size_t mi = 0; mi < order.size(); ++mi) {
         const auto& m = *order[mi];
         const bool own = mi < own_maps;
-        const auto layout = load_map_layout(pm, m.bubble, load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map));
+        const auto tables = m.activity.is_none() ? std::vector<TagHash>{} :
+            load_activity_node_tables(pm, m.activity, m.bubble_name, m.activity_map);
+        const auto layout = load_map_layout(pm, m.bubble, tables);
         for (const auto table : layout.node_tables) {
             std::vector<uint8_t> data;
             try {
@@ -1478,7 +1488,8 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
     // Keep the components that place, spawn or link something, and the ones linked to.
     std::vector<size_t> index(all.size(), SIZE_MAX), orig;
     for (size_t k = 0; k < all.size(); ++k)
-        if (!all[k].placements.empty() || !all[k].characters.empty() || !all[k].links.empty() || linked[k]) {
+        if (!all[k].placements.empty() || !all[k].characters.empty() || !all[k].links.empty() || linked[k] ||
+            (selection && !all[k].definition.is_none())) {
             index[k] = out.scripts.size();
             orig.push_back(k);
             out.scripts.push_back(std::move(all[k]));
@@ -1626,6 +1637,14 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
             if (v > best) best = v, out.characters[c].name_estimate = n;
     }
     return out;
+}
+
+MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity) {
+    return read_map_gameplay(pm, activity, nullptr);
+}
+
+MapGameplay load_map_gameplay_selection(PackageManager& pm, const MapEntry& selection) {
+    return read_map_gameplay(pm, selection.activity, &selection);
 }
 
 size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity, uint64_t preview) {

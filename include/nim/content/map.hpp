@@ -403,6 +403,8 @@ struct MapGameplay {
 };
 // Needs the hash64 index (PackageManager::build_hash64_index).
 MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity);
+// Audit a single map selection without borrowing placements from other activity modes.
+MapGameplay load_map_gameplay_selection(PackageManager& pm, const MapEntry& selection);
 
 // Script-placed nodes nim hides by user decision (3.111, 2026-11-23), from the gameplay scripts of
 // `activity` (none: of every activity using map.bubble):
