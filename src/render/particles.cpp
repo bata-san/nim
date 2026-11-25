@@ -72,12 +72,12 @@ const std::map<std::string, std::string>& ParticleScene::estimates() const {
 bool ParticleScene::has_emitters_near(V3 eye) const {
     return std::ranges::any_of(emitters_, [&](const auto& e) {
         const V3 d = e.position - eye;
-        return (!e.event || event_playing_) && !systems_[e.system]->failed && dot(d, d) <= radius * radius;
+        return (!e.event || e.event == active_event_) && !systems_[e.system]->failed && dot(d, d) <= radius * radius;
     });
 }
 
 void ParticleScene::release(Gpu&) {
-    event_playing_ = false;
+    active_event_ = 0;
     systems_.clear();
     emitters_.clear();
     for (auto& s : state_) s.Reset();
@@ -268,12 +268,12 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     notes_.push_back(std::format("particles: {} systems, {} emitters, {} particle slots", systems_.size(), emitters_.size(), total_));
 }
 
-size_t ParticleScene::event_count() const {
-    return std::ranges::count(emitters_, true, &Emitter::event);
+size_t ParticleScene::event_count(uint64_t event) const {
+    return event ? std::ranges::count(emitters_, event, &Emitter::event) : 0;
 }
 
-void ParticleScene::set_event_playing(bool playing) {
-    event_playing_ = playing;
+void ParticleScene::set_active_event(uint64_t event) {
+    active_event_ = event;
     for (auto& e : emitters_) {
         if (!e.event) continue;
         e.active = false;
@@ -462,7 +462,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     std::vector<uint32_t> live, warm, visible;
     for (uint32_t i = 0; i < emitters_.size(); ++i) {
         Emitter& e = emitters_[i];
-        if (systems_[e.system]->failed || (e.event && !event_playing_)) continue;
+        if (systems_[e.system]->failed || (e.event && e.event != active_event_)) continue;
         const V3 d{e.position.x - vm.eye.x, e.position.y - vm.eye.y, e.position.z - vm.eye.z};
         const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
         const bool in_range = d2 <= radius * radius;

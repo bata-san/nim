@@ -207,6 +207,11 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(EventReplay, "最初から再生", "Replay", "다시 재생") \
     X(EventStop, "停止", "Stop", "정지") \
     X(EventStaticOnly, "配置のみ表示できます", "Placement preview only", "배치만 미리 볼 수 있습니다") \
+    X(EventAuto, "近づいたら発動", "Start on approach", "접근 시 발동") \
+    X(EventAutoTip, "カメラがイベントの位置に近づくと再生します (降下艇は AI の呼び出し距離 60 m、ほかは 30 m、どちらも推定)。離れると再び発動できます。", "Plays an event when the camera comes near it (dropships at the AI call range of 60 m, others 30 m; both estimates). Leaving re-arms it.", "카메라가 이벤트 위치에 가까워지면 재생합니다 (강하선은 AI 호출 거리 60 m, 나머지는 30 m, 모두 추정). 멀어지면 다시 발동합니다.") \
+    X(EventDropshipHint, "敵 AI の降下艇として呼び出します", "Calls the enemy AI's dropship", "적 AI 강하선으로 호출합니다") \
+    X(LogEventDropship, "イベント: 降下艇 {} を呼び出しました ({:.0f}, {:.0f}, {:.0f})", "event: called dropship {} ({:.0f}, {:.0f}, {:.0f})", "이벤트: 강하선 {} 호출 ({:.0f}, {:.0f}, {:.0f})") \
+    X(LogEventDropshipAlone, "イベント: ({:.0f}, {:.0f}, {:.0f}) の分隊は AI が選ばなかった候補のため、降下艇の到着だけを再生します", "event: the squad at ({:.0f}, {:.0f}, {:.0f}) is an alternative the AI did not pick; playing the ship's arrival alone", "이벤트: ({:.0f}, {:.0f}, {:.0f})의 분대는 AI가 고르지 않은 후보이므로 강하선 도착만 재생합니다") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \

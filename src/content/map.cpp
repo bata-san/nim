@@ -1655,14 +1655,23 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
     map.patrol_drone_nodes.clear();
     map.event_previews.clear();
     map.preview_models.clear();
-    map.event_fx_nodes.clear();
-    map.event_placements.clear();
-    map.event_route.clear();
+    map.event_groups.clear();
+    map.event_fx_owner.clear();
     map.event_actor_models.clear();
+    // Every event is loaded with the map and played on demand (3.133); `preview` only names the
+    // one a caller wants first and changes nothing here.
+    (void)preview;
     std::unordered_map<uint64_t, std::array<float, 3>> map_positions;
     std::unordered_map<uint64_t, MapEventPlacement> available_placements;
-    std::unordered_set<uint64_t> preview_fx, preview_models;
     std::set<uint64_t> event_ids;
+    // The event's models: the placement at `id` with `model` (none: resolved from the entity).
+    auto placement_of = [&](uint64_t id, TagHash model) -> std::optional<MapEventPlacement> {
+        const auto p = available_placements.find(id);
+        if (p == available_placements.end()) return std::nullopt;
+        auto out = p->second;
+        if (!model.is_none()) out.model = model;
+        return out;
+    };
     const auto available = list_activity_maps(pm);
     const bool expedition = std::ranges::any_of(available, [&](const MapEntry& entry) {
         return entry.bubble == map.bubble && (entry.name.starts_with("exp_") || entry.name.starts_with("expeditions_")) &&
@@ -1688,17 +1697,17 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
             if (expedition) map_positions.try_emplace(id, position);
             const auto entity = pm.resolve64(r.u64_at(entry + 0x30));
             if (!entity) continue;
-            if (preview && expedition)
+            if (expedition)
                 available_placements.try_emplace(id, MapEventPlacement{id, *entity, {}, quat_rows(r, entry)});
             const bool lockdown = entity->value == 0x80B08991 || entity->value == 0x80B0D412;
             const bool dropship = entity->value == 0x80ACA699 || entity->value == 0x80ACA69F || entity->value == 0x80ACA6A4;
             if (!lockdown && !(expedition && dropship)) continue;
-            if (expedition && event_ids.insert(id).second)
+            map.hidden_nodes.insert(id);
+            if (expedition && event_ids.insert(id).second) {
                 map.event_previews.push_back({id, lockdown ? "lockdown ship" : "UESC dropship", position, 1});
-            if (!expedition || preview != id) map.hidden_nodes.insert(id);
-            else {
-                preview_fx.insert(id);
-                if (dropship) map.preview_models[id] = TagHash(0x80ACA5E7);
+                MapEventGroup group{id, {id}, {}, {}, dropship};
+                if (auto p = placement_of(id, dropship ? TagHash(0x80ACA5E7) : TagHash())) group.placements.push_back(*p);
+                map.event_groups.push_back(std::move(group));
             }
         }
     }
@@ -1752,6 +1761,7 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
                 name == "pf_dcon.bs" || name.starts_with("pf_dcon_") || name == "dcon_combiner.bs" ||
                 name == "compiler_aura_terminals.es");
             std::set<uint64_t> placements;
+            std::map<uint64_t, TagHash> ship_props;  // the flyover's hidden ships and props
             if (flyover) {
                 // The flyover's directly linked native layouts carry its ship and set dressing.
                 // The two props share model 80B580E0. Keep the gate tied to the original node.
@@ -1760,10 +1770,7 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
                         if (!map_positions.contains(p.id)) continue;
                         if (p.entity.value == 0x80B580F3 || p.entity.value == 0x80B580F9)
                             map.hidden_nodes.insert(p.id);
-                        if (preview == g.scripts[k].component.value && map.hidden_nodes.contains(p.id)) {
-                            preview_models.insert(p.id);
-                            if (!p.model.is_none()) map.preview_models[p.id] = p.model;
-                        }
+                        if (map.hidden_nodes.contains(p.id)) ship_props.try_emplace(p.id, p.model);
                     }
             }
             walk_placements(k, [&](size_t x) {
@@ -1780,8 +1787,8 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
                 });
                 const uint64_t anchor = origin == g.scripts[k].placements.end() ? *placements.begin() : origin->second.id;
                 map.event_previews.push_back({key, name, map_positions.at(anchor), placements.size()});
-                if (preview == key) {
-                    preview_fx.insert(placements.begin(), placements.end());
+                {
+                    MapEventGroup group{key, {placements.begin(), placements.end()}, {}, {}, false};
                     // Convoy route groups in source-to-destination order (see 3.131).
                     const std::array<uint32_t, 5> route_tags =
                         key == 0x80AFB4DE ? std::array{0x80AFCDA8u, 0x80AFCD92u, 0x80AFCD61u, 0x80AFCD3Eu, 0x80AFCD16u} :
@@ -1813,29 +1820,24 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
                             }
                             route.insert(route.end(), points.begin() + std::ptrdiff_t(join), points.end());
                         }
-                        map.event_route = std::move(route);
+                        group.route = std::move(route);
                     }
+                    std::map<uint64_t, TagHash> models = ship_props;
                     walk_placements(k, [&](size_t x) {
                         for (const auto& [off, point] : g.scripts[x].placements)
-                            if (placements.contains(point.id) && !point.model.is_none())
-                                if (auto found = available_placements.find(point.id); found != available_placements.end())
-                                    found->second.model = point.model;
+                            if (placements.contains(point.id) && !point.model.is_none()) models.try_emplace(point.id, point.model);
                     });
+                    for (const auto id : placements) models.try_emplace(id, TagHash());
+                    for (const auto& [id, model] : models)
+                        if (auto p = placement_of(id, model)) group.placements.push_back(*p);
+                    map.event_groups.push_back(std::move(group));
                 }
             }
         }
     }
-    for (const auto id : preview_models) map.hidden_nodes.erase(id);
-    for (const auto id : preview_fx) {
-        map.hidden_fx_nodes.erase(id);
-        if (const auto p = available_placements.find(id); p != available_placements.end()) {
-            auto placement = p->second;
-            if (const auto model = map.preview_models.find(id); model != map.preview_models.end()) placement.model = model->second;
-            map.event_placements.push_back(placement);
-        }
-    }
-    std::ranges::sort(map.event_placements, {}, &MapEventPlacement::node);
-    map.event_fx_nodes = std::move(preview_fx);
+    // The ship nodes' FX are hidden with them; an event runs its FX nodes while it plays.
+    for (const auto& group : map.event_groups)
+        for (const auto id : group.fx_nodes) map.event_fx_owner.try_emplace(id, group.id);
     std::ranges::sort(map.event_previews, {}, [](const MapEventPreview& event) {
         return std::tie(event.name, event.id);
     });
@@ -1899,7 +1901,10 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
             const size_t e = nodes.data + size_t(k) * 0x90;
             if (e + 0x90 > data.size()) break;
             const uint64_t node = r.u64_at(e + 0x70);
-            if (map.hidden(node, true)) continue;  // hide_scripted_nodes (3.111)
+            // hide_scripted_nodes (3.111); an event's FX load too and run while it plays (3.133).
+            const auto owner = map.event_fx_owner.find(node);
+            const uint64_t event = owner == map.event_fx_owner.end() ? 0 : owner->second;
+            if (!event && map.hidden(node, true)) continue;
             const uint64_t h64 = r.u64_at(e + 0x30);
             if (!h64 || h64 == ~0ull) continue;
             const auto ent = pm.resolve64(h64);
@@ -1954,7 +1959,7 @@ std::vector<MapParticle> load_map_particles(PackageManager& pm, const MapLayout&
                 // Hide the Compiler room's dark/haze FX entity (80AA4CE0: 80AA4CA0/80AA4CBF/80AA4CDE).
                 if (map.bubble.value == 0x80B385FAu && ent->value == 0x80AA4CE0u) continue;
                 if (node && node != ~0ull && !emitted.emplace(node, s).second) continue;
-                out.push_back({TagHash(s), rows, gate, map.event_fx_nodes.contains(node)});
+                out.push_back({TagHash(s), rows, gate, event});
             }
         }
     }
@@ -1997,8 +2002,9 @@ std::vector<MapLight> load_map_fx_lights(PackageManager& pm, const MapLayout& ma
             const size_t e = nodes.data + size_t(k) * 0x90;
             if (e + 0x90 > data.size()) break;
             const uint64_t id = r.u64_at(e + 0x70);
-            if (map.hidden(id, true)) continue;  // hide_scripted_nodes (3.111)
-            const bool event = map.event_fx_nodes.contains(id);
+            const auto owner = map.event_fx_owner.find(id);
+            const uint64_t event = owner == map.event_fx_owner.end() ? 0 : owner->second;
+            if (!event && map.hidden(id, true)) continue;  // hide_scripted_nodes (3.111)
             const uint64_t h64 = r.u64_at(e + 0x30);
             if (!h64 || h64 == ~0ull) continue;
             const auto ent = pm.resolve64(h64);

@@ -457,7 +457,7 @@ int run(int argc, char** argv) {
         MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
         pm.build_hash64_index();
         hide_scripted_nodes(pm, map, selected_activity, event_preview);
-        auto event_tracks = event_seconds ?
+        auto event_tracks = event_preview ?
             std::make_shared<const std::vector<PreparedEventTrack>>(prepare_event_tracks(pm, map)) : nullptr;
         for (const auto& event : map.event_previews)
             if (list_events || event.id == event_preview)
@@ -571,7 +571,7 @@ int run(int argc, char** argv) {
                 auto fx_lights = load_map_fx_lights(pm, map, &attached);
                 std::println("fx lights: {} ({} with a named attachment, placed at the node: estimate)", fx_lights.size(), attached);
                 for (auto& l : fx_lights)
-                    if (!l.event || event_seconds) map_lights.push_back(std::move(l));
+                    if (!l.event || (event_seconds && l.event == event_preview)) map_lights.push_back(std::move(l));
             }
             region_lights = map_light_region(map_lights, focus, map_radius);
             std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
@@ -730,9 +730,13 @@ int run(int argc, char** argv) {
         std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
         std::println("placed entity models added: {}", entity_models_loaded);
         if (event_tracks) {
+            gpu.wait_idle();
             event_player.build(gpu, scene, layouts, event_tracks);
-            event_player.play();
-            std::println("event playback: {} tracks at {:.2f}s", event_player.size(), *event_seconds);
+            std::println("event tracks: {} in the map, {} for {:016X}", event_player.size(), event_player.tracks(event_preview), event_preview);
+        }
+        if (event_tracks && event_seconds) {
+            event_player.play(scene, event_preview);
+            std::println("event playback: {} tracks at {:.2f}s", event_player.tracks(event_preview), *event_seconds);
             for (float elapsed = 0; ; ) {
                 const float dt = std::min(1.0f / 30, *event_seconds - elapsed);
                 event_player.step(scene, dt);
@@ -1302,7 +1306,7 @@ int run(int argc, char** argv) {
     if (!particle_placements.empty()) {
         const auto tp = std::chrono::steady_clock::now();
         particles.load(pm, gpu, particle_placements);
-        if (event_seconds) particles.set_event_playing(true);
+        if (event_seconds) particles.set_active_event(event_preview);
         gpu.flush();
         for (const auto& n : particles.notes()) std::println("  {}", n);
         std::println("fx pipelines ready ({:.1f}s)", std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());

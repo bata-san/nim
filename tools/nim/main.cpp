@@ -1169,7 +1169,7 @@ private:
             };
             try {
                 ProfileScope profile_layout("map.layout");
-                const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map || layout_preview != req.preview;
+                const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map;
                 if (selection_changed) {
                     const auto tables = req.activity.is_none() ? std::vector<TagHash>{} : load_activity_node_tables(*pm, req.activity, req.bubble_name, req.activity_map);
                     layout = load_map_layout(*pm, req.bubble, tables);
@@ -1183,9 +1183,10 @@ private:
                     layout_preview = req.preview;
                     events = std::make_shared<const std::vector<MapEventPreview>>(std::move(layout->event_previews));
                     event_tracks.reset();
-                    if (req.preview) {
+                    try {  // every event of the map is ready with it; the palette plays them without reloading (3.133)
                         auto tracks = prepare_event_tracks(*pm, *layout);
                         event_tracks = std::make_shared<const std::vector<PreparedEventTrack>>(std::move(tracks));
+                    } catch (const std::exception&) {
                     }
                     entities.reset();
                     starts = find_map_starts(*pm, *layout);
@@ -1668,8 +1669,7 @@ public:
     GameLighting game_lighting;
     ParticleScene particles;  // the map's FX
     EventPlayback event_player;
-    bool event_playing = false;
-    std::unique_ptr<media::EntityAudioPlayer> event_audio;
+    uint64_t event_active = 0;  // the palette event playing, 0 for none
     std::vector<media::EntityAudioPlayer::Cue> event_cues;
     bool fx_enabled = true;
     bool game_ready = false;
@@ -1769,6 +1769,8 @@ public:
     float ambient_audio_volume = 0.75f;
     // Sounds of the AI actors and dropships (3.90): cues gathered by update_ai, played each frame.
     std::unique_ptr<media::EntityAudioPlayer> entity_audio;
+    // The palette events' sounds; declared after the engine so it is destroyed first (3.133).
+    std::unique_ptr<media::EntityAudioPlayer> event_audio;
     bool entity_audio_enabled = true;
     float entity_audio_volume = 0.75f;
     std::vector<media::EntityAudioPlayer::Cue> entity_cues;
@@ -2076,6 +2078,7 @@ public:
             error(ui::trf(ui::S::ErrMapStopped, ex.what()));
         }
         try {
+            update_event_triggers();
             update_ai(g);
         } catch (const std::exception& ex) {
             ai.failed = true;
@@ -2089,7 +2092,7 @@ public:
         map_worker.cancel();
         map.streaming = false;
     }
-    void load_map(int index, std::optional<std::array<float, 3>> center, uint64_t preview = 0) {
+    void load_map(int index, std::optional<std::array<float, 3>> center) {
         const auto& maps = map_worker.maps();
         if (index < 0 || index >= int(maps.size())) return;
         const auto& m = maps[size_t(index)];
@@ -2101,14 +2104,17 @@ public:
             map.events.reset();
             map.event_filter[0] = 0;
         }
-        map.preview = preview;
-        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap], preview);
+        map.preview = 0;
+        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap], 0);
         loading.reset();  // a live mesh still being prepared is discarded when it arrives
         map_add_failures.clear();
         gpu.wait_idle();
         reset_ai();
         event_player = {};
-        event_playing = false;
+        event_active = 0;
+        event_triggered.clear();
+        particles.set_active_event(0);
+        ai.call_dropships.clear();
         if (event_audio) event_audio->clear();
         scene.begin(gpu);
         anim.reset();
@@ -2214,8 +2220,10 @@ public:
         if (pr.done) {
             ProfileScope profile_finish("map.ui_finish");
             if (map.processed) {
-                if (pr.event_tracks && !pr.event_tracks->empty())
+                if (pr.event_tracks && !pr.event_tracks->empty()) {
+                    g.wait_idle();  // add_actor grows buffers a recorded bundle may still read (3.123 / 3.133)
                     event_player.build(g, scene, layouts, pr.event_tracks);
+                }
                 scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]},
                              std::min(map.radius, pr.extent) * 0.6f);
                 if (!map.framed && scene.loaded()) {
@@ -2258,6 +2266,10 @@ public:
         std::unique_ptr<AiSimulation> sim;
         AiActors actors;
         bool failed = false;
+        // A palette "UESC dropship" event waiting for the simulation (3.133): its spawner node.
+        struct DropshipCall { uint64_t event; std::array<float, 3> at; };
+        std::vector<DropshipCall> call_dropships;
+        size_t dropship_calls = 0, dropship_misses = 0;  // for NIM_BENCH_EVENT
     } ai;
     std::vector<std::future<AiPrepared>> ai_discarded;  // preparations of maps left since
 
@@ -2362,7 +2374,34 @@ public:
                 return;
             }
         }
+        if (ai.failed && !ai.call_dropships.empty()) {  // ErrAi says why; the ship arrives on its own
+            play_event(ai.call_dropships.back().event);
+            ai.call_dropships.clear();
+        }
         if (!ai.sim) return;
+        for (const auto call : std::exchange(ai.call_dropships, {})) {
+            // The palette's dropship event is the AI's own dropship: call the one at that spawner node.
+            const auto at = call.at;
+            const auto& ships = ai.sim->dropships();
+            size_t best = ships.size();
+            float best_d = 5;  // metres: the event node is the spawner node
+            for (size_t i = 0; i < ships.size(); ++i) {
+                const auto& p = ships[i].position;
+                const float d = std::hypot(p[0] - at[0], p[1] - at[1], p[2] - at[2]);
+                if (d < best_d) best_d = d, best = i;
+            }
+            if (best < ships.size()) {
+                ++ai.dropship_calls;
+                ai.sim->call_dropship(best);
+                info(ui::trf(ui::S::LogEventDropship, best, at[0], at[1], at[2]));
+            } else {
+                // The squad at this spawner is an alternative the simulation did not pick (3.117):
+                // the ship's arrival plays without troops.
+                ++ai.dropship_misses;
+                play_event(call.event);
+                info(ui::trf(ui::S::LogEventDropshipAlone, at[0], at[1], at[2]));
+            }
+        }
         const ViewMatrices vm = make_view(current_view());
         const std::array<float, 3> eye{vm.eye.x, vm.eye.y, vm.eye.z};
         if (!ai.enabled) {
@@ -2426,7 +2465,7 @@ public:
         if (!map_lights) return;
         std::vector<const MapLight*> ptrs;
         for (const auto& l : *map_lights)
-            if ((!l.fx || fx_enabled) && (!l.event || event_playing)) ptrs.push_back(&l);
+            if ((!l.fx || fx_enabled) && (!l.event || l.event == event_active)) ptrs.push_back(&l);
         map_lights_fx = fx_enabled;
         try {
             game_lighting.set_lights(*pm, g, ptrs);
@@ -2435,16 +2474,20 @@ public:
         }
     }
 
-    void set_event_playing(bool play) {
-        const bool lights_changed = event_playing != play && map_lights &&
-            std::ranges::any_of(*map_lights, &MapLight::event);
-        event_playing = play;
-        particles.set_event_playing(play);
+    // Plays one palette event in the loaded map (0 stops): its tracks, FX and lights switch on
+    // and every other event idles. No reload (3.133).
+    void play_event(uint64_t id) {
+        const uint64_t before = event_active;
+        event_active = id;
+        const bool lights_changed = map_lights && std::ranges::any_of(*map_lights, [&](const MapLight& l) {
+            return l.event && (l.event == before || l.event == id);
+        });
+        particles.set_active_event(id);
         event_cues.clear();
         if (event_audio) event_audio->clear();
-        if (play) {
-            event_player.play();
-            if (!event_audio && event_player.size())
+        if (id) {
+            event_player.play(scene, id);
+            if (!event_audio && event_player.tracks(id))
                 if (auto* eng = audio_engine()) {
                     event_audio = std::make_unique<media::EntityAudioPlayer>(*eng);
                     event_audio->set_package(*pm);
@@ -2453,6 +2496,49 @@ public:
             event_player.stop(scene);
         }
         if (lights_changed) apply_map_lights(gpu);
+    }
+    bool event_is_dropship(uint64_t id) const {
+        if (!map.events) return false;
+        const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
+        return it != map.events->end() && it->name == "UESC dropship";
+    }
+    // Replays `id`; a dropship event calls the enemy AI's dropship at its spawner (3.133).
+    void start_event(uint64_t id) {
+        if (event_is_dropship(id) && !map.activity.is_none()) {
+            const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
+            ai.enabled = true;
+            ai.call_dropships.push_back({id, it->position});
+            return;
+        }
+        play_event(id);
+    }
+    // 近づいたら発動 (3.133): an event starts when the camera comes within its range and re-arms
+    // once the camera has left 1.5 times that range. Dropship events use the AI's call range
+    // (AiParams::dropship_call_range, an estimate itself); the others 30 m (推定).
+    bool event_auto = true;
+    std::unordered_set<uint64_t> event_triggered;
+    static constexpr float kEventTriggerRange = 30;
+    void update_event_triggers() {
+        if (!event_auto || !map_scene || map.streaming || !scene.loaded() || !map.events) return;
+        const ViewMatrices vm = make_view(current_view());
+        const std::array eye{vm.eye.x, vm.eye.y, vm.eye.z};
+        const float ship_range = AiParams{}.dropship_call_range;
+        const MapEventPreview* nearest = nullptr;
+        float nearest_d = 0;
+        for (const auto& e : *map.events) {
+            const float range = e.name == "UESC dropship" ? ship_range : kEventTriggerRange;
+            const auto& p = e.position;
+            const float d = std::hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
+            if (event_triggered.contains(e.id)) {
+                if (d > range * 1.5f) event_triggered.erase(e.id);
+            } else if (d < range && (!nearest || d < nearest_d)) {
+                nearest = &e, nearest_d = d;
+            }
+        }
+        if (!nearest) return;
+        event_triggered.insert(nearest->id);  // one start per frame; the next ones follow
+        map.preview = nearest->id;
+        start_event(nearest->id);
     }
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
@@ -2627,7 +2713,7 @@ public:
         ImGui::BeginDisabled(map.selected < 0);
         if (dbutton(ui::tr(ui::S::LoadAtCamera), w)) {
             const bool here = map_scene && map.selected >= 0 && maps[size_t(map.selected)].bubble == map.bubble;
-            load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt, map.preview);
+            load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt);
         }
         ImGui::EndDisabled();
         ImGui::SetItemTooltip(ui::tr(ui::S::LoadAtCameraTip));
@@ -2687,33 +2773,44 @@ public:
                 ImGui::SetNextItemWidth(-1);
                 ImGui::InputTextWithHint("##eventfilter", ui::tr(ui::S::EventFilter), map.event_filter, sizeof(map.event_filter));
                 const auto filter = lower_ascii(map.event_filter);
-                if (ImGui::Selectable(ui::tr(ui::S::EventIdle), map.preview == 0) && map.preview)
-                    load_map(map.selected, std::array{cam.target.x, cam.target.y, cam.target.z});
+                if (ImGui::Selectable(ui::tr(ui::S::EventIdle), map.preview == 0) && map.preview) {
+                    map.preview = 0;
+                    play_event(0);
+                }
                 for (const auto& event : *events) {
                     const auto& p = event.position;
                     const auto row = std::format("{}  ({:.0f}, {:.0f}, {:.0f})##{:016X}", event.name, p[0], p[1], p[2], event.id);
                     if (!filter.empty() && !contains_ci(row, filter)) continue;
-                    if (ImGui::Selectable(row.c_str(), map.preview == event.id) && map.preview != event.id) {
+                    if (ImGui::Selectable(row.c_str(), map.preview == event.id)) {
+                        // The map stays loaded: the camera moves and the event plays in place (3.133).
+                        const float view_distance = event.name == "UESC dropship" ? 60.0f : 25.0f;
                         cam.target = {p[0], p[1], p[2]};
-                        cam.distance = 25;
+                        cam.distance = view_distance;
                         cam.pitch = 0.2f;
-                        material_time = 0;
-                        load_map(map.selected, p, event.id);
+                        map.preview = event.id;
+                        start_event(event.id);
                     }
                 }
                 ImGui::EndCombo();
             }
+            ImGui::SameLine();
+            if (ImGui::Checkbox(ui::tr(ui::S::EventAuto), &event_auto)) event_triggered.clear();
+            ImGui::SetItemTooltip("%s", ui::tr(ui::S::EventAutoTip));
             if (selected != events->end()) {
                 ImGui::SameLine();
-                const bool playable = event_player.size() || particles.event_count() ||
-                    (map_lights && std::ranges::any_of(*map_lights, &MapLight::event));
+                const uint64_t id = selected->id;
+                const bool dropship = event_is_dropship(id);
+                const bool playable = dropship ? !map.activity.is_none() :
+                    event_player.tracks(id) || particles.event_count(id) ||
+                    (map_lights && std::ranges::any_of(*map_lights, [&](const MapLight& l) { return l.event == id; }));
+                const bool playing = event_active == id;
                 ImGui::BeginDisabled(!playable);
-                if (ImGui::Button(ui::tr(event_playing ? ui::S::EventReplay : ui::S::EventPlay)))
-                    set_event_playing(true);
+                if (ImGui::Button(ui::tr(playing ? ui::S::EventReplay : ui::S::EventPlay))) start_event(id);
                 ImGui::EndDisabled();
-                if (event_playing) {
+                if (dropship) ImGui::SetItemTooltip("%s", ui::tr(ui::S::EventDropshipHint));
+                if (playing) {
                     ImGui::SameLine();
-                    if (ImGui::Button(ui::tr(ui::S::EventStop))) set_event_playing(false);
+                    if (ImGui::Button(ui::tr(ui::S::EventStop))) play_event(0);
                 } else if (!playable && !map.streaming) {
                     ImGui::TextDisabled("%s", ui::tr(ui::S::EventStaticOnly));
                 }
@@ -2976,9 +3073,9 @@ public:
         light.frame_delta_time = ImGui::GetIO().DeltaTime;
         light.time = material_time;
         light.delta_time = material_dt;
-        if (map_scene && event_playing) event_player.step(scene, light.frame_delta_time);
-        else if (event_playing) {
-            event_playing = false;
+        if (map_scene && event_active) event_player.step(scene, light.frame_delta_time);
+        else if (event_active) {
+            event_active = 0;
             if (event_audio) event_audio->clear();
         }
         light.entity_preview = entity_preview_active && !map_scene;
@@ -3015,7 +3112,7 @@ public:
                                      entity_audio_enabled && map_scene);
                 entity_cues.clear(), entity_stopped.clear();
             }
-            if (event_audio && map_scene && event_playing) {
+            if (event_audio && map_scene && event_active) {
                 event_cues.clear();
                 for (const auto& cue : event_player.sounds()) event_cues.push_back({cue.event, cue.emitter});
                 event_audio->update(event_cues, {}, event_player.emitters(), {vm.eye.x, vm.eye.y, vm.eye.z},
@@ -5696,6 +5793,11 @@ struct BenchDriver {
     std::optional<V3> eye, look;
     float radius = -1;
     bool ai = false, vsync = false, done = false;
+    // NIM_BENCH_EVENT: an event id (hex) to play once the map is ready, or "all" to play every
+    // palette event in turn (NIM_BENCH_EVENT_FRAMES each) in the loaded map (3.133).
+    std::string event;
+    uint32_t event_frames = 20, event_frame = 0;
+    size_t event_next = 0, events_played = 0, event_count = SIZE_MAX;
     fs::path out;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
     std::string waiting_for;
@@ -5716,6 +5818,10 @@ struct BenchDriver {
         if (const char* a = std::getenv("NIM_BENCH_AI")) ai = a[0] == '1';
         if (const char* v = std::getenv("NIM_BENCH_VSYNC")) vsync = v[0] == '1';
         if (const char* st = std::getenv("NIM_BENCH_SETTLE")) settle = uint32_t(std::max(0, std::atoi(st)));
+        if (const char* e = std::getenv("NIM_BENCH_EVENT")) event = e;
+        if (const char* ef = std::getenv("NIM_BENCH_EVENT_FRAMES")) event_frames = uint32_t(std::max(1, std::atoi(ef)));
+        if (const char* f = std::getenv("NIM_BENCH_EVENT_FIRST")) event_next = size_t(std::max(0, std::atoi(f)));
+        if (const char* n = std::getenv("NIM_BENCH_EVENT_COUNT")) event_count = size_t(std::max(0, std::atoi(n)));
         const char* o = std::getenv("NIM_BENCH_OUT");
         out = o && *o ? fs::path(to_wide(o)) : exe_dir() / "nim_bench.txt";
     }
@@ -5750,12 +5856,37 @@ struct BenchDriver {
                 if (waited > 600) return finish(app, "timed out waiting for " + waiting_for);
                 return false;
             }
+            if (!event.empty() && play_events(app)) return false;
             if (settled++ < settle) return false;
             g_prof.collecting = true;
             return false;
         }
         if (g_prof.frames() >= frames) return finish(app, {});
         return false;
+    }
+    // Returns true while events are still being started (the settle frames wait for them).
+    bool play_events(App& app) {
+        if (!app.map.events) return false;
+        const auto& events = *app.map.events;
+        if (event != "all") {
+            if (events_played) return false;
+            const uint64_t id = std::stoull(event, nullptr, 16);
+            app.map.preview = id;
+            app.start_event(id);
+            ++events_played;
+            return false;
+        }
+        if (event_next >= events.size() || events_played >= event_count) return false;
+        if (event_frame++ % event_frames) return true;
+        const auto& e = events[event_next++];
+        {  // flushed before the event starts: names the event if the GPU stops
+            std::ofstream log(fs::path(out.wstring() + L".events"), std::ios::app);
+            log << std::format("{} {:016X} {}\n", event_next - 1, e.id, e.name);
+        }
+        app.map.preview = e.id;
+        app.start_event(e.id);
+        ++events_played;
+        return true;
     }
     bool finish(App& app, const std::string& failure) {
         done = true;
@@ -5773,6 +5904,10 @@ struct BenchDriver {
         const auto [statics, lod0, entities] = app.scene.visibility_counts();
         r += std::format("scene: {} meshes, {} instances; visible {} static ({} LOD0), {} entity\n", app.scene.mesh_count(),
                          app.scene.instance_count(), statics, lod0, entities);
+        r += std::format("events: {} played without reload, {} tracks on {} actors, {} started on approach, dropship calls {} "
+                         "(no AI ship {}), active {:016X}\n",
+                         events_played, app.event_player.size(), app.event_player.actors(), app.event_triggered.size(),
+                         app.ai.dropship_calls, app.ai.dropship_misses, app.event_active);
         r += g_prof.report();
         std::ofstream(out, std::ios::binary) << r;
         return true;

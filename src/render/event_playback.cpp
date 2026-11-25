@@ -7,7 +7,7 @@
 namespace nim {
 
 std::vector<PreparedEventTrack> prepare_event_tracks(PackageManager& pm, MapLayout& map) {
-    if (map.event_placements.empty()) return {};
+    if (map.event_groups.empty()) return {};
     const auto sources = index_actor_sources(pm);
     struct Resource {
         std::shared_ptr<const PreparedMesh> mesh;
@@ -16,80 +16,71 @@ std::vector<PreparedEventTrack> prepare_event_tracks(PackageManager& pm, MapLayo
         std::shared_ptr<const EntitySounds> sounds;
     };
     std::map<std::pair<TagHash, TagHash>, Resource> resources;
-    std::vector<TagHash> ship_entities;
-    for (const auto& p : map.event_placements)
-        if (p.model.value == 0x80ACA5E7) ship_entities.push_back(p.entity);
-    std::ranges::sort(ship_entities);
-    ship_entities.erase(std::unique(ship_entities.begin(), ship_entities.end()), ship_entities.end());
-    const auto ships = ship_entities.empty() ? ActorDropship{} :
-        prepare_actor_dropship(pm, sources, TagHash(0x80ACA5E7), ship_entities);
     std::vector<PreparedEventTrack> tracks;
-    for (auto placement : map.event_placements) {
-        if (placement.model.is_none()) {
-            if (placement.entity.value != 0x80B08991 && placement.entity.value != 0x80B0D412) continue;
-            const auto models = entity_dynamic_models(pm, placement.entity, sources);
-            if (models.size() != 1) continue;
-            placement.model = models.front();
-        }
-        const auto [it, fresh] = resources.try_emplace({placement.entity, placement.model});
-        auto& r = it->second;
-        const bool payload = !map.event_route.empty() &&
-            (placement.entity.value == 0x80AC9EEB || placement.entity.value == 0x80B0F90C);
-        if (fresh) {
-            try {
-                if (payload) {
+    for (const auto& group : map.event_groups) {
+        // A dropship group's track is the ship's arrival alone, for a spawner whose squad the AI
+        // did not pick; the AI's own dropship plays the others (3.133).
+        for (auto placement : group.placements) {
+            const bool hidden = map.hidden_nodes.contains(placement.node);
+            const bool lockdown = placement.entity.value == 0x80B08991 || placement.entity.value == 0x80B0D412;
+            if (placement.model.is_none()) {
+                if (!lockdown) continue;
+                const auto models = entity_dynamic_models(pm, placement.entity, sources);
+                if (models.size() != 1) continue;
+                placement.model = models.front();
+            }
+            const bool payload = !group.route.empty() &&
+                (placement.entity.value == 0x80AC9EEB || placement.entity.value == 0x80B0F90C);
+            const auto [it, fresh] = resources.try_emplace({placement.entity, placement.model});
+            auto& r = it->second;
+            if (fresh) {
+                try {
                     auto mesh = prepare_entity_preview(pm, placement.model, sources.materials, sources.assemblies);
                     if (!mesh.no_drawable) {
+                        decltype(prepare_preview_animation(pm, mesh, sources.rigs, sources.clips, placement.model)) binding;
+                        if (sources.rigs.contains(placement.model.value) && !payload)
+                            binding = prepare_preview_animation(pm, mesh, sources.rigs, sources.clips, placement.model);
+                        if (binding && binding->model == placement.model && binding->clips.size() == 1) {
+                            const auto& info = binding->clips.front();
+                            if (placement.model.value != 0x80B580E0 || info.tag.value == 0x80B580F4) {
+                                auto clip = load_animation_clip(pm, info.tag);
+                                restrict_preview_clip(clip, info);
+                                r.clip = std::make_shared<const AnimationClip>(std::move(clip));
+                                r.binding = std::make_shared<const PreviewAnimation>(std::move(*binding));
+                            }
+                        }
                         r.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
                         r.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&placement.entity, 1)));
                     }
-                } else if (placement.model.value == 0x80ACA5E7) {
-                    const auto spawner = std::ranges::find(ships.spawners, placement.entity, &ActorDropship::Spawner::entity);
-                    if (spawner != ships.spawners.end() && spawner->arrival >= 0) {
-                        r.mesh = ships.mesh;
-                        r.binding = ships.binding;
-                        r.clip = std::make_shared<const AnimationClip>(ships.arrivals[size_t(spawner->arrival)]);
-                        r.sounds = spawner->sounds;
-                    }
-                } else if (sources.rigs.contains(placement.model.value)) {
-                    auto mesh = prepare_entity_preview(pm, placement.model, sources.materials, sources.assemblies);
-                    auto binding = prepare_preview_animation(pm, mesh, sources.rigs, sources.clips, placement.model);
-                    if (!mesh.no_drawable && binding && binding->model == placement.model && binding->clips.size() == 1) {
-                        const auto& info = binding->clips.front();
-                        if (placement.model.value != 0x80B580E0 || info.tag.value == 0x80B580F4) {
-                            auto clip = load_animation_clip(pm, info.tag);
-                            restrict_preview_clip(clip, info);
-                            r.clip = std::make_shared<const AnimationClip>(std::move(clip));
-                            r.binding = std::make_shared<const PreviewAnimation>(std::move(*binding));
-                            r.mesh = std::make_shared<const PreparedMesh>(std::move(mesh));
-                            r.sounds = std::make_shared<const EntitySounds>(load_entity_sounds(pm, std::span(&placement.entity, 1)));
-                        }
-                    }
+                } catch (const std::exception&) {
+                    // A candidate that fails resolution retains its ordinary placement.
+                    r = {};
                 }
-            } catch (const std::exception&) {
-                // A candidate that fails resolution retains its ordinary unanimated placement.
-                r = {};
             }
-        }
-        if (!r.mesh || (!payload && (!r.clip || !r.clip->frame_count))) continue;
-        PreparedEventTrack track{placement, r.mesh, r.binding, r.clip, r.sounds};
-        if (payload) {
-            const auto& rows = placement.rows;
-            const std::array start{rows[3], rows[7], rows[11]};
-            const auto distance = [](const auto& a, const auto& b) {
-                return std::hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
-            };
-            const auto first = std::ranges::min_element(map.event_route, {}, [&](const auto& point) { return distance(point, start); });
-            track.route.push_back({0, start});
-            for (auto point = first; point != map.event_route.end(); ++point) {
-                const auto& last = track.route.back();
-                const float segment = distance(last.position, *point);
-                if (std::isfinite(segment) && segment > 0.01f) track.route.push_back({last.distance + segment, *point});
+            if (!r.mesh) continue;
+            const bool animated = r.clip && r.clip->frame_count;
+            // A visible model with nothing to play stays with the map's ordinary entities.
+            if (!hidden && !animated && !payload) continue;
+            PreparedEventTrack track{group.id, !hidden, placement, r.mesh, animated ? r.binding : nullptr,
+                                     animated ? r.clip : nullptr, r.sounds};
+            if (payload) {
+                const auto& rows = placement.rows;
+                const std::array start{rows[3], rows[7], rows[11]};
+                const auto distance = [](const auto& a, const auto& b) {
+                    return std::hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+                };
+                const auto first = std::ranges::min_element(group.route, {}, [&](const auto& point) { return distance(point, start); });
+                track.route.push_back({0, start});
+                for (auto point = first; point != group.route.end(); ++point) {
+                    const auto& last = track.route.back();
+                    const float segment = distance(last.position, *point);
+                    if (std::isfinite(segment) && segment > 0.01f) track.route.push_back({last.distance + segment, *point});
+                }
+                if (track.route.size() < 2) continue;
             }
-            if (track.route.size() < 2) continue;
+            if (!map.event_actor_models.try_emplace(placement.node, placement.model).second) continue;
+            tracks.push_back(std::move(track));
         }
-        if (!map.event_actor_models.try_emplace(placement.node, placement.model).second) continue;
-        tracks.push_back(std::move(track));
     }
     return tracks;
 }
@@ -98,35 +89,64 @@ void EventPlayback::build(Gpu& gpu, StaticMeshScene& scene, const std::vector<st
                           std::shared_ptr<const std::vector<PreparedEventTrack>> prepared) {
     prepared_ = std::move(prepared);
     slots_.clear();
-    previous_frames_.clear();
+    active_ = 0;
     if (!prepared_) return;
+    // Only one event plays at a time, so the k-th copy of a mesh in every event shares one actor
+    // (83 Outpost dropship events need one ship). Tracks drawn while idle keep their own.
+    std::map<std::pair<const PreparedMesh*, size_t>, uint32_t> shared;
+    std::map<std::pair<uint64_t, const PreparedMesh*>, size_t> copies;
     for (size_t i = 0; i < prepared_->size(); ++i) {
         const auto& track = (*prepared_)[i];
-        slots_.push_back({scene.add_actor(gpu, *track.mesh, layouts), i});
+        const PreparedMesh* mesh = track.mesh.get();
+        if (track.idle_visible) {
+            slots_.push_back({scene.add_actor(gpu, *mesh, layouts), i});
+            continue;
+        }
+        const size_t k = copies[{track.event, mesh}]++;
+        const auto [it, fresh] = shared.try_emplace({mesh, k}, 0u);
+        if (fresh) it->second = scene.add_actor(gpu, *mesh, layouts);
+        slots_.push_back({it->second, i});
     }
-    previous_frames_.resize(slots_.size(), -1);
-    stop(scene);
+    actors_ = shared.size() + size_t(std::ranges::count(*prepared_, true, &PreparedEventTrack::idle_visible));
+    previous_frames_.assign(slots_.size(), -1);
+    idle(scene);
 }
 
-void EventPlayback::play() {
-    seconds_ = 0;
-    std::ranges::fill(previous_frames_, -1);
+size_t EventPlayback::tracks(uint64_t event) const {
+    if (!prepared_ || !event) return 0;
+    return size_t(std::ranges::count(*prepared_, event, &PreparedEventTrack::event));
 }
 
-void EventPlayback::stop(StaticMeshScene& scene) {
+void EventPlayback::idle(StaticMeshScene& scene) {
     sounds_.clear();
     emitters_.clear();
     for (const auto& slot : slots_)
-        scene.set_actor(slot.actor, (*prepared_)[slot.track].placement.rows);
+        if (!(*prepared_)[slot.track].idle_visible) scene.set_actor(slot.actor, std::nullopt);
+    for (const auto& slot : slots_)
+        if (const auto& track = (*prepared_)[slot.track]; track.idle_visible) scene.set_actor(slot.actor, track.placement.rows);
+}
+
+void EventPlayback::play(StaticMeshScene& scene, uint64_t event) {
+    idle(scene);
+    active_ = event;
+    seconds_ = 0;
+    std::ranges::fill(previous_frames_, -1.0f);
+}
+
+void EventPlayback::stop(StaticMeshScene& scene) {
+    active_ = 0;
+    idle(scene);
 }
 
 void EventPlayback::step(StaticMeshScene& scene, float dt) {
-    seconds_ += std::clamp(dt, 0.0f, 0.1f);
     sounds_.clear();
     emitters_.clear();
+    if (!active_) return;
+    seconds_ += std::clamp(dt, 0.0f, 0.1f);
     for (size_t i = 0; i < slots_.size(); ++i) {
         const auto& slot = slots_[i];
         const auto& track = (*prepared_)[slot.track];
+        if (track.event != active_) continue;
         auto rows = track.placement.rows;
         const float frame = track.clip ? std::min(seconds_ * frames_per_second, float(track.clip->frame_count - 1)) : 0;
         float& previous = previous_frames_[i];
@@ -149,8 +169,8 @@ void EventPlayback::step(StaticMeshScene& scene, float dt) {
             }
         }
         std::array<float, 3> position{rows[3], rows[7], rows[11]};
-        if ((track.placement.model.value == 0x80B580E0 || track.placement.model.value == 0x80ACA5E7) &&
-            !poses.empty() && poses.front().bones.size() > 1 && track.binding->skeleton.bind.size() > 1) {
+        if (track.placement.model.value == 0x80B580E0 && !poses.empty() && poses.front().bones.size() > 1 &&
+            track.binding->skeleton.bind.size() > 1) {
             const auto point = (poses.front().bones[1] * track.binding->skeleton.bind[1]).translation;
             for (size_t axis = 0; axis < 3; ++axis)
                 for (size_t k = 0; k < 3; ++k) position[axis] += rows[axis * 4 + k] * point[k];
