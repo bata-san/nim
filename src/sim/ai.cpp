@@ -673,6 +673,8 @@ AiSimulation::AiSimulation(const MapGameplay& g, AiParams params, uint64_t seed,
     }
     squad_areas_.resize(g.squads.size());
     squad_spawned_.assign(g.squads.size(), 0);
+    held_.assign(g.squads.size(), 0);
+    event_squad_.assign(g.squads.size(), 0);
     ground_squad_members_.resize(g.squads.size());
     spawn_retry_at_.assign(g.squads.size(), 0.0f);
     for (size_t s = 0; s < g.squads.size(); ++s)
@@ -1228,7 +1230,8 @@ void AiSimulation::call_all_dropships() {
 void AiSimulation::step_dropships(float dt, const std::array<float, 3>& player) {
     for (size_t i = 0; i < dropships_.size(); ++i) {
         auto& d = dropships_[i];
-        if (d.start < 0 && time_ >= d.ready_at && time_ >= next_dropship_call_ && dist2d(d.position, player) < params_.dropship_call_range) {
+        const bool held = std::ranges::any_of(d.squads, [&](size_t s) { return s < held_.size() && held_[s]; });
+        if (!held && d.start < 0 && time_ >= d.ready_at && time_ >= next_dropship_call_ && dist2d(d.position, player) < params_.dropship_call_range) {
             size_t flying = 0;
             for (size_t j = 0; j < dropships_.size(); ++j) {
                 const auto phase = dropship_state(j).phase;
@@ -1357,7 +1360,7 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
     };
     for (size_t s = 0; s < g_.squads.size(); ++s) {
         const auto& members = ground_squad_members_[s];
-        if (nearest[s] < params_.spawn_range && time_ >= spawn_retry_at_[s] &&
+        if (!held_[s] && nearest[s] < params_.spawn_range && time_ >= spawn_retry_at_[s] &&
             std::ranges::any_of(members, [&](size_t i) { return !agents_[i].active; })) {
             spawn_retry_at_[s] = time_ + 0.25f;
             if (crowded(s)) continue;
@@ -1370,6 +1373,7 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
         } else if (squad_spawned_[s] && nearest[s] > params_.despawn_range && members_far[s]) {
             squad_spawned_[s] = 0;
             spawn_retry_at_[s] = 0.0f;
+            held_[s] = event_squad_[s];  // an event's squad waits for its event again (3.135)
             for (size_t i : members)
                 if (agents_[i].active) agents_[i].active = false, ++path_stats_.despawned;
         }
@@ -1380,6 +1384,7 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
         if (std::ranges::any_of(d.members, [&](size_t m) { return agents_[m].active && !far(agents_[m].position); })) continue;
         d.start = -1;
         d.ready_at = time_ + std::uniform_real_distribution<float>(params_.dropship_return_min, params_.dropship_return_max)(rng_);
+        for (const auto s : d.squads) held_[s] = event_squad_[s];
         for (const auto m : d.members) {
             auto& a = agents_[m];
             path_stats_.despawned += a.active;
@@ -1389,6 +1394,36 @@ void AiSimulation::step_spawns(const std::array<float, 3>& player) {
             a.position = d.position;
         }
     }
+}
+
+// Event squads (3.135): the squads an encounter event spawns wait for it instead of the player's
+// distance; release_squad brings one now (on foot at its spawn points, or by its dropship).
+void AiSimulation::hold_event_squads(const std::vector<size_t>& squads) {
+    for (const auto s : squads)
+        if (s < held_.size()) held_[s] = event_squad_[s] = 1;
+}
+
+size_t AiSimulation::release_squad(size_t s) {
+    if (s >= held_.size()) return 0;
+    held_[s] = 0;
+    size_t brought = 0;
+    for (const size_t i : ground_squad_members_[s])
+        if (agents_[i].active || spawn(agents_[i])) {
+            if (agents_[i].active) ++brought;
+            squad_spawned_[s] = 1;
+        }
+    for (auto& d : dropships_)
+        if (std::ranges::find(d.squads, s) != d.squads.end()) {
+            if (d.start < 0) d.start = time_;
+            brought += d.members.size();
+        }
+    return brought;
+}
+
+bool AiSimulation::squad_present(size_t s) const {
+    return s < ground_squad_members_.size() &&
+           (!ground_squad_members_[s].empty() ||
+            std::ranges::any_of(dropships_, [&](const AiDropship& d) { return std::ranges::find(d.squads, s) != d.squads.end(); }));
 }
 
 void AiSimulation::step(float dt, const std::array<float, 3>& player) {

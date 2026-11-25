@@ -104,6 +104,7 @@ struct MapEventPreview {
     std::string name;
     std::array<float, 3> position{};
     size_t placements = 0;
+    std::vector<uint64_t> nodes;  // its placement nodes: the AI's squads spawning there are the event's (3.135)
 };
 struct MapEventPlacement {
     uint64_t node = 0;

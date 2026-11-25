@@ -78,7 +78,14 @@ void Gpu::init(bool warp, QueueDeviceHook queue_hook, bool log_device_removal) {
     if (debug) {
         g_debug_names = true;
         ComPtr<ID3D12Debug> dbg;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+            dbg->EnableDebugLayer();
+            // NIM_D3D_GBV=1: GPU-based validation (descriptors of freed resources, out-of-range reads).
+            char gbv[4] = {};
+            ComPtr<ID3D12Debug1> dbg1;
+            if (GetEnvironmentVariableA("NIM_D3D_GBV", gbv, sizeof(gbv)) > 0 && gbv[0] == '1' && SUCCEEDED(dbg.As(&dbg1)))
+                dbg1->SetEnableGPUBasedValidation(TRUE);
+        }
     }
     if (debug || log_device_removal) {
         ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
@@ -264,14 +271,15 @@ void Gpu::check_device() {
                     if (dred_summary.empty() && n->pCommandHistory)
                         dred_summary = std::format("\nDRED: list {} op {}/{} (op={})", lname, done, n->BreadcrumbCount,
                                                    int(n->pCommandHistory[done]));
-                    for (UINT i = done > 4 ? done - 4 : 0; n->pCommandHistory && i < std::min(n->BreadcrumbCount, done + 4); ++i)
+                    for (UINT i = done > 40 ? done - 40 : 0; n->pCommandHistory && i < std::min(n->BreadcrumbCount, done + 4); ++i)
                         std::fprintf(g_debug_log, "   %s op %u = %d\n", i == done ? ">>" : "  ", i, int(n->pCommandHistory[i]));
                 }
             }
         }
         D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
         if (dred && SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
-            std::fprintf(g_debug_log, "DRED page fault VA 0x%llx\n", (unsigned long long)pf.PageFaultVA);
+            std::fprintf(g_debug_log, "DRED page fault VA 0x%llx (per-frame upload ring at 0x%llx)\n", (unsigned long long)pf.PageFaultVA,
+                         dynamic_ ? (unsigned long long)dynamic_->GetGPUVirtualAddress() : 0ull);
             dred_summary += std::format("\nPageFault VA=0x{:x}", (unsigned long long)pf.PageFaultVA);
             for (auto* a = pf.pHeadExistingAllocationNode; a; a = a->pNext)
                 std::fprintf(g_debug_log, "  existing: %s type %d\n", a->ObjectNameA ? a->ObjectNameA : "?", int(a->AllocationType));

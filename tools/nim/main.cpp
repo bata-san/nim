@@ -2113,10 +2113,11 @@ public:
         event_player = {};
         event_active = 0;
         event_triggered.clear();
+        squads_triggered.clear();
         event_manual = false;
         ai_auto_enabled = false;
         particles.set_active_event(0);
-        ai.call_dropships.clear();
+        ai.release_events.clear();
         if (event_audio) event_audio->clear();
         scene.begin(gpu);
         anim.reset();
@@ -2269,9 +2270,10 @@ public:
         AiActors actors;
         bool failed = false;
         // A palette "UESC dropship" event waiting for the simulation (3.133): its spawner node.
-        struct DropshipCall { uint64_t event; std::array<float, 3> at; };
-        std::vector<DropshipCall> call_dropships;
-        size_t dropship_calls = 0, dropship_misses = 0;  // for NIM_BENCH_EVENT
+        // Encounter events' squads (3.135): event id -> MapGameplay::squads, and events to bring now.
+        std::unordered_map<uint64_t, std::vector<size_t>> event_squads;
+        std::vector<uint64_t> release_events;
+        size_t squad_releases = 0, squad_misses = 0;  // for NIM_BENCH_EVENT
     } ai;
     std::vector<std::future<AiPrepared>> ai_discarded;  // preparations of maps left since
 
@@ -2346,6 +2348,25 @@ public:
                 AiParams params;
                 params.player_invisible = !ai.visible;
                 ai.sim = std::make_unique<AiSimulation>(*ai.gameplay, params, 1, std::move(p.motions));
+                // Encounter squads (3.135): a squad with a spawn point among an event's placement
+                // nodes is that event's (dropship events: the spawner node itself). It waits for
+                // the event instead of the camera's distance.
+                ai.event_squads.clear();
+                if (map.events) {
+                    std::unordered_map<uint64_t, std::vector<size_t>> by_node;
+                    for (size_t s = 0; s < ai.gameplay->squads.size(); ++s)
+                        for (const auto& pt : ai.gameplay->squads[s].positions) by_node[pt.id].push_back(s);
+                    std::vector<size_t> held;
+                    for (const auto& e : *map.events) {
+                        std::set<size_t> squads;
+                        for (const auto n : e.nodes)
+                            if (const auto it = by_node.find(n); it != by_node.end()) squads.insert(it->second.begin(), it->second.end());
+                        if (squads.empty()) continue;
+                        held.insert(held.end(), squads.begin(), squads.end());
+                        ai.event_squads[e.id].assign(squads.begin(), squads.end());
+                    }
+                    ai.sim->hold_event_squads(held);
+                }
                 // Open floor of every firing area the squads use (drawn top-down, before actors exist).
                 std::set<size_t> areas;
                 for (const auto& sq : ai.gameplay->squads)
@@ -2376,28 +2397,25 @@ public:
                 return;
             }
         }
-        if (ai.failed) ai.call_dropships.clear();  // ErrAi says why
+        if (ai.failed) ai.release_events.clear();  // ErrAi says why
         if (!ai.sim) return;
-        for (const auto call : std::exchange(ai.call_dropships, {})) {
-            // The palette's dropship event is the AI's own dropship: call the one at that spawner node.
-            const auto at = call.at;
-            const auto& ships = ai.sim->dropships();
-            size_t best = ships.size();
-            float best_d = 5;  // metres: the event node is the spawner node
-            for (size_t i = 0; i < ships.size(); ++i) {
-                const auto& p = ships[i].position;
-                const float d = std::hypot(p[0] - at[0], p[1] - at[1], p[2] - at[2]);
-                if (d < best_d) best_d = d, best = i;
-            }
-            if (best < ships.size()) {
-                ++ai.dropship_calls;
-                ai.sim->call_dropship(best);
-                info(ui::trf(ui::S::LogEventDropship, best, at[0], at[1], at[2]));
+        for (const auto id : std::exchange(ai.release_events, {})) {
+            // The event's squads come now: on foot at their spawn points or by their dropship.
+            const auto it = ai.event_squads.find(id);
+            const auto ev = map.events ? std::ranges::find(*map.events, id, &MapEventPreview::id) : decltype(map.events->end()){};
+            const std::string name = map.events && ev != map.events->end() ? ev->name : std::format("{:016X}", id);
+            size_t squads = 0, members = 0;
+            if (it == ai.event_squads.end() && !event_is_dropship(id)) continue;  // FX only
+            if (it != ai.event_squads.end())
+                for (const auto s : it->second)
+                    if (ai.sim->squad_present(s)) ++squads, members += ai.sim->release_squad(s);
+            if (squads) {
+                ++ai.squad_releases;
+                info(ui::trf(ui::S::LogEventSquads, name, squads, members));
             } else {
-                // No squad of this simulation spawns here (an alternative it did not pick, 3.117,
-                // or a spawner no squad uses): no ship comes, as none would bring anyone.
-                ++ai.dropship_misses;
-                info(ui::trf(ui::S::LogEventDropshipNone, at[0], at[1], at[2]));
+                // No squad of this run spawns here: an alternative it left out (3.117) or nodes no squad uses.
+                ++ai.squad_misses;
+                info(ui::trf(ui::S::LogEventNoSquad, name));
             }
         }
         const ViewMatrices vm = make_view(current_view());
@@ -2465,6 +2483,9 @@ public:
         for (const auto& l : *map_lights)
             if ((!l.fx || fx_enabled) && (!l.event || l.event == event_active)) ptrs.push_back(&l);
         map_lights_fx = fx_enabled;
+        // set_lights frees the light pipelines and buffers a frame in flight still reads; events
+        // switch them mid-session (page fault, 3.135).
+        g.wait_idle();
         try {
             game_lighting.set_lights(*pm, g, ptrs);
         } catch (const std::exception& ex) {
@@ -2500,16 +2521,15 @@ public:
         const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
         return it != map.events->end() && it->name == "UESC dropship";
     }
-    // From the palette or its buttons (3.133). A dropship event calls the enemy AI's dropship at
-    // its spawner; the others play here and stay until stopped, whatever the camera does.
+    // From the palette or its buttons (3.133 / 3.135). An event's enemies come through the AI: its
+    // squads (dropship events: the squad at that spawner) are released now. The rest of a
+    // non-dropship event (models, FX, lights, sounds) plays here until stopped, whatever the camera does.
     void start_event(uint64_t id) {
-        if (event_is_dropship(id)) {
-            if (map.activity.is_none()) return;
-            const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
+        if (!map.activity.is_none() && (event_is_dropship(id) || !ai.sim || ai.event_squads.contains(id))) {
             ai.enabled = true;
-            ai.call_dropships.push_back({id, it->position});
-            return;
+            ai.release_events.push_back(id);
         }
+        if (event_is_dropship(id)) return;
         event_manual = true;
         event_triggered.insert(id);
         play_event(id);
@@ -2518,15 +2538,15 @@ public:
         event_manual = false;
         play_event(0);
     }
-    // 近づいたら発動 (3.133). Enemies come by the AI's own spawning, which runs on approach: squads
-    // appear at their spawn points within AiParams::spawn_range and dropship squads are called
-    // within dropship_call_range (both estimates, 3.111), so the mode turns the AI on. The other
-    // events start when the camera comes within 30 m (推定) of them, unless one started from the
-    // palette is playing; one started this way stops once the camera is 1.5 times that far, and
-    // re-arms then.
+    // 近づいたら発動 (3.133 / 3.135), with the AI on. Squads that belong to no event spawn by the
+    // AI's distance rules (3.111). An event's squads wait for the event: it fires when the camera
+    // comes within 60 m of a dropship spawner (AiParams::dropship_call_range) or 30 m of another
+    // event (推定), and again after the camera has been 1.5 times that far. The event's other
+    // content plays the same way, unless one started from the palette is playing; one started by
+    // approach stops when the camera leaves.
     bool event_auto = true;
     bool event_manual = false;
-    std::unordered_set<uint64_t> event_triggered;
+    std::unordered_set<uint64_t> event_triggered, squads_triggered;
     static constexpr float kEventTriggerRange = 30;
     void update_event_triggers() {
         if (!event_auto || !map_scene || map.streaming || !scene.loaded() || !map.events) return;
@@ -2536,18 +2556,29 @@ public:
         }
         const ViewMatrices vm = make_view(current_view());
         const std::array eye{vm.eye.x, vm.eye.y, vm.eye.z};
+        const float ship_range = AiParams{}.dropship_call_range;
         const MapEventPreview* nearest = nullptr;
         float nearest_d = 0;
         for (const auto& e : *map.events) {
-            if (e.name == "UESC dropship") continue;  // the AI's spawning
+            const bool ship = e.name == "UESC dropship";
+            const float range = ship ? ship_range : kEventTriggerRange;
             const auto& p = e.position;
             const float d = std::hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
+            if (ai.sim && ai.event_squads.contains(e.id)) {
+                if (squads_triggered.contains(e.id)) {
+                    if (d > range * 1.5f) squads_triggered.erase(e.id);
+                } else if (d < range) {
+                    squads_triggered.insert(e.id);
+                    ai.release_events.push_back(e.id);
+                }
+            }
+            if (ship) continue;
             if (event_triggered.contains(e.id)) {
-                if (d > kEventTriggerRange * 1.5f) {
+                if (d > range * 1.5f) {
                     event_triggered.erase(e.id);
                     if (event_active == e.id && !event_manual) play_event(0);
                 }
-            } else if (d < kEventTriggerRange && (!nearest || d < nearest_d)) {
+            } else if (d < range && (!nearest || d < nearest_d)) {
                 nearest = &e, nearest_d = d;
             }
         }
@@ -2555,8 +2586,7 @@ public:
         event_triggered.insert(nearest->id);
         map.preview = nearest->id;
         play_event(nearest->id);
-    }
-    bool ai_auto_enabled = false;
+    }    bool ai_auto_enabled = false;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
     bool entity_preview_active = false;
@@ -2796,7 +2826,11 @@ public:
                 }
                 for (const auto& event : *events) {
                     const auto& p = event.position;
-                    const auto row = std::format("{}  ({:.0f}, {:.0f}, {:.0f})##{:016X}", event.name, p[0], p[1], p[2], event.id);
+                    // Once the AI is ready: how many squads the event brings (3.135).
+                    const auto squads = ai.event_squads.find(event.id);
+                    const std::string enemies = !ai.sim ? std::string() : squads == ai.event_squads.end() ? (event_is_dropship(event.id) ? std::string(ui::tr(ui::S::EventNoSquad)) : std::string())
+                        : ui::trf(ui::S::EventSquads, squads->second.size());
+                    const auto row = std::format("{}{}  ({:.0f}, {:.0f}, {:.0f})##{:016X}", event.name, enemies, p[0], p[1], p[2], event.id);
                     if (!filter.empty() && !contains_ci(row, filter)) continue;
                     if (ImGui::Selectable(row.c_str(), map.preview == event.id)) {
                         // The map stays loaded: the camera moves and the event plays in place (3.133).
@@ -5922,10 +5956,10 @@ struct BenchDriver {
         const auto [statics, lod0, entities] = app.scene.visibility_counts();
         r += std::format("scene: {} meshes, {} instances; visible {} static ({} LOD0), {} entity\n", app.scene.mesh_count(),
                          app.scene.instance_count(), statics, lod0, entities);
-        r += std::format("events: {} played without reload, {} tracks on {} actors, {} started on approach, dropship calls {} "
-                         "(no AI ship {}), active {:016X}\n",
+        r += std::format("events: {} played without reload, {} tracks on {} actors, {} started on approach, squad events {} "
+                         "(no squad {}), active {:016X}\n",
                          events_played, app.event_player.size(), app.event_player.actors(), app.event_triggered.size(),
-                         app.ai.dropship_calls, app.ai.dropship_misses, app.event_active);
+                         app.ai.squad_releases, app.ai.squad_misses, app.event_active);
         if (app.ai.sim) {
             size_t active = 0, riding = 0, flying = 0;
             for (const auto& a : app.ai.sim->agents()) active += a.active, riding += a.riding;
@@ -5936,6 +5970,8 @@ struct BenchDriver {
             r += std::format("ai: enabled {}, {} of {} agents active, {} riding, {} of {} dropships flying or landed\n", app.ai.enabled,
                              active, app.ai.sim->agents().size(), riding, flying, app.ai.sim->dropships().size());
         }
+        for (const auto& [name, count] : app.map_add_failures) r += std::format("map failure x{}: {}\n", count, name);
+        for (const auto& line : app.log) r += std::format("log{} {}\n", line.error ? " ERROR" : ":", line.text);
         r += g_prof.report();
         if (const char* shot = std::getenv("NIM_BENCH_SHOT"); shot && *shot) {  // the last frame's lit image
             try {
@@ -5973,7 +6009,8 @@ int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recover
         init_swapchain(app->gpu);
         app->lighting.init(app->gpu);
     } catch (const std::exception& ex) {
-        MessageBoxW(g_win.hwnd, to_wide(ui::trf(ui::S::ErrD3D12, ex.what())).c_str(), L"nim", MB_ICONERROR);
+        if (std::getenv("NIM_HEADLESS")) std::fprintf(stderr, "nim: %s\n", ui::trf(ui::S::ErrD3D12, ex.what()).c_str());
+        else MessageBoxW(g_win.hwnd, to_wide(ui::trf(ui::S::ErrD3D12, ex.what())).c_str(), L"nim", MB_ICONERROR);
         return 1;
     }
 
@@ -6022,7 +6059,8 @@ int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recover
     apply_style(scale);
 
     // Open the install before building fonts: the UI is set in the game's own fonts.
-    if (!recovering) {
+    // NIM_HEADLESS=1: the window is never shown (benches and checks run without a visible GUI).
+    if (!recovering && !std::getenv("NIM_HEADLESS")) {
         ShowWindow(g_win.hwnd, SW_SHOWDEFAULT);
         UpdateWindow(g_win.hwnd);
     }
@@ -6222,7 +6260,8 @@ int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recover
         }
     } else if (!gpu_failure.empty()) {
         const auto error = app->gpu.removed() ? ui::trf(ui::S::ErrDeviceRemoved, gpu_failure) : gpu_failure;
-        MessageBoxW(g_win.hwnd, to_wide(error).c_str(), L"nim", MB_ICONERROR);
+        if (std::getenv("NIM_HEADLESS")) std::fprintf(stderr, "nim: %s\n", error.c_str());
+        else MessageBoxW(g_win.hwnd, to_wide(error).c_str(), L"nim", MB_ICONERROR);
     }
     if (app->loader.joinable()) app->loader.join();
     app->shutdown();

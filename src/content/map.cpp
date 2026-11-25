@@ -1836,8 +1836,11 @@ size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity,
         }
     }
     // The ship nodes' FX are hidden with them; an event runs its FX nodes while it plays.
-    for (const auto& group : map.event_groups)
+    for (const auto& group : map.event_groups) {
         for (const auto id : group.fx_nodes) map.event_fx_owner.try_emplace(id, group.id);
+        if (auto preview = std::ranges::find(map.event_previews, group.id, &MapEventPreview::id); preview != map.event_previews.end())
+            preview->nodes = group.fx_nodes;
+    }
     std::ranges::sort(map.event_previews, {}, [](const MapEventPreview& event) {
         return std::tie(event.name, event.id);
     });

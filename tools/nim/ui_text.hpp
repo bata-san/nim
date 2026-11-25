@@ -208,10 +208,12 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(EventStop, "停止", "Stop", "정지") \
     X(EventStaticOnly, "配置のみ表示できます", "Placement preview only", "배치만 미리 볼 수 있습니다") \
     X(EventAuto, "近づいたら発動", "Start on approach", "접근 시 발동") \
-    X(EventAutoTip, "敵 AI をオンにし、敵は AI の出現処理で現れます (近づくと出現点に出る分隊と降下艇で来る分隊、範囲は推定)。ほかのイベントはカメラが 30 m (推定) まで近づくと再生し、離れると止まります。パレットから再生したイベントは停止するまで続きます。", "Turns the enemy AI on: enemies come by its spawning (squads appearing at their spawn points and squads brought by dropship as you approach; ranges are estimates). Other events play when the camera comes within 30 m (estimate) and stop when it leaves. An event played from the palette runs until stopped.", "적 AI를 켜고, 적은 AI의 출현 처리로 나타납니다 (접근하면 출현 지점에 나타나는 분대와 강하선으로 오는 분대, 범위는 추정). 다른 이벤트는 카메라가 30 m(추정)까지 다가가면 재생되고 멀어지면 멈춥니다. 팔레트에서 재생한 이벤트는 정지할 때까지 계속됩니다.") \
+    X(EventAutoTip, "敵 AI をオンにします。イベントに属する分隊はそのイベントで出現し、近づくと発動します (降下艇は 60 m、ほかは 30 m、どちらも推定)。イベントに属さない分隊は AI の距離で出現します。イベントの FX・モデル・音も近づくと再生し、離れると止まります。パレットから再生したイベントは停止するまで続きます。", "Turns the enemy AI on. An event's squads come with the event, which fires as you approach (dropships 60 m, others 30 m; estimates); other squads spawn by the AI's distance rules. Event FX, models and sounds also play on approach and stop when you leave; one played from the palette runs until stopped.", "적 AI를 켭니다. 이벤트에 속한 분대는 그 이벤트로 출현하며, 접근하면 발동합니다 (강하선 60 m, 그 외 30 m, 모두 추정). 이벤트에 속하지 않은 분대는 AI의 거리 규칙으로 출현합니다. 이벤트의 FX·모델·소리도 접근하면 재생되고 멀어지면 멈춥니다. 팔레트에서 재생한 이벤트는 정지할 때까지 계속됩니다.") \
+    X(EventSquads, "  [敵 {} 分隊]", "  [{} enemy squads]", "  [적 {} 분대]") \
+    X(EventNoSquad, "  [分隊なし]", "  [no squad]", "  [분대 없음]") \
     X(EventDropshipHint, "敵 AI の降下艇として呼び出します", "Calls the enemy AI's dropship", "적 AI 강하선으로 호출합니다") \
-    X(LogEventDropship, "イベント: 降下艇 {} を呼び出しました ({:.0f}, {:.0f}, {:.0f})", "event: called dropship {} ({:.0f}, {:.0f}, {:.0f})", "이벤트: 강하선 {} 호출 ({:.0f}, {:.0f}, {:.0f})") \
-    X(LogEventDropshipNone, "イベント: ({:.0f}, {:.0f}, {:.0f}) から出る分隊は今回の AI にいないため、降下艇は来ません", "event: no squad of this AI run spawns at ({:.0f}, {:.0f}, {:.0f}), so no dropship comes", "이벤트: ({:.0f}, {:.0f}, {:.0f})에서 나오는 분대가 이번 AI에 없어 강하선이 오지 않습니다") \
+    X(LogEventSquads, "イベント {}: 分隊 {} 個 ({} 体) を出現させました", "event {}: brought {} squad(s) ({} members)", "이벤트 {}: 분대 {}개 ({}명)를 출현시켰습니다") \
+    X(LogEventNoSquad, "イベント {}: 今回の AI にこのイベントの分隊がいません (選ばれなかった代替分隊、または分隊のいない地点)", "event {}: no squad of this AI run belongs to it (an alternative left out, or nodes no squad uses)", "이벤트 {}: 이번 AI에 이 이벤트의 분대가 없습니다 (선택되지 않은 대체 분대이거나 분대가 없는 지점)") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \

@@ -3145,6 +3145,7 @@ StaticMeshScene::~StaticMeshScene() = default;
 
 void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage,
                                        const ExternStore* frame_inputs, bool shadow) {
+    srv_frame_ = frame_table_copy(gpu);
     if (!material_externs_) return;
     auto& ext = *material_externs_;
     if (assembled_) for (auto& set : sets_) {
@@ -3452,7 +3453,8 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
                 const auto view = ext.texture(source.extern_id, uint32_t(source.offset) * 8);
                 const uint32_t table_slot = (vs ? kPsSrvs : 0) + slot;
                 if (it.srv_copies == 1) {
-                    const std::pair<const void*, uint32_t> now{view.resource ? static_cast<const void*>(view.resource) : &it, uint32_t(view.format)};
+                    Item::WrittenView now{view.resource, view.resource ? nullptr : static_cast<const void*>(&it), uint32_t(view.format),
+                                          view.stride, view.elements, view.mip, view.first_element};
                     auto& last = it.written[table_slot];
                     if (last == now) continue;  // unchanged since it was written (and reported)
                     last = now;
@@ -3476,13 +3478,16 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             throw;
         }
         if (it.vs_reads_position < 0) it.vs_reads_position = reads_object_position(it.vs_material);
-        if (!shadow && it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
+        if (it.ps_reads_position < 0) it.ps_reads_position = reads_object_position(it.ps_material);
         it.vs_address = evaluate(it.vs_material, it.vs_constants, it.vs_cb0, true);
-        if (!shadow) it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
+        // Shadow pipelines keep the pixel shader (alpha-tested parts clip), so its constants are
+        // this frame's too: the last colour pass's address is in the upload ring's other half,
+        // which the next frame rewrites while this one may still run (page fault, 3.135).
+        it.ps_address = evaluate(it.ps_material, it.ps_constants, it.cb0, false);
         if (deferred_evaluation) {
             it.vs_placement_addresses.clear();
             it.ps_placement_addresses.clear();
-            if (it.vs_reads_position || (!shadow && it.ps_reads_position)) chunk.placements.push_back(index);
+            if (it.vs_reads_position || it.ps_reads_position) chunk.placements.push_back(index);
         } else {
             placement_constants(index, channels_for(set));
         }
@@ -3584,6 +3589,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
 
 void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                                  bool shadow, const GameLighting* lighting) {
+    srv_frame_ = frame_table_copy(gpu);
     const D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     const D3D12_RECT sc{0, 0, LONG(w), LONG(h)};
     ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
@@ -4686,7 +4692,6 @@ void StaticMeshScene::cull(Gpu& gpu, const ViewMatrices& vm, uint32_t height, bo
 
 void StaticMeshScene::render_gbuffer(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm) {
     distortion_draws_ = 0;
-    srv_frame_ = (srv_frame_ + 1) % kSrvCopies;
     ProfileScope ps_cull("frame.gbuffer.cull");
     if (!actors_.empty()) bind_actor_constants(gpu);
     cull(gpu, vm, gb.height());

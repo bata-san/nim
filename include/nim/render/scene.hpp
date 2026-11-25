@@ -503,14 +503,26 @@ private:
         uint32_t srv_first = UINT32_MAX;  // kItemSrvs descriptors: PS t0-t31, then VS t0-t31
         uint32_t srv_copies = 1;          // kSrvCopies when engine textures are rebound per frame
         bool owns_srv = true;             // false: a table shared with an item with the same views
-        // Single-copy tables: the engine views last written (resource, format) per table slot, so
-        // a slot is only rewritten when the view changes.
-        std::map<uint32_t, std::pair<const void*, uint32_t>> written;
+        // Single-copy tables: the engine view last written per table slot, so a slot is only
+        // rewritten when the view changes. The resource is held: a freed texture's address could
+        // come back as a new one's and leave the descriptor on freed memory (page fault, 3.135).
+        struct WrittenView {
+            ComPtr<ID3D12Resource> resource;
+            const void* self = nullptr;  // no resource: the estimated null view
+            uint32_t format = 0, stride = 0, elements = 0, mip = 0;
+            uint64_t first_element = 0;
+            bool operator==(const WrittenView&) const = default;
+        };
+        std::map<uint32_t, WrittenView> written;
         std::map<uint32_t, ComPtr<ID3D12Resource>> textures, vs_textures;
     };
     static constexpr uint32_t kPsSrvs = 32, kVsSrvs = 32, kItemSrvs = kPsSrvs + kVsSrvs;
     static constexpr uint32_t kSrvCopies = Gpu::kFramesInFlight + 1;
+    // The table copy of this frame: every pass of a frame (sun and light shadows first, then the
+    // G-buffer) uses the same one, and the frames still in flight use the other two. Advancing it
+    // in the G-buffer pass let the next frame's shadow passes rewrite a copy in flight (3.135).
     uint32_t srv_frame_ = 0;
+    static uint32_t frame_table_copy(const Gpu& gpu) { return uint32_t(gpu.epoch() % kSrvCopies); }
     void draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_t stage, uint32_t w, uint32_t h, const ViewMatrices& vm,
                     bool shadow = false, const GameLighting* lighting = nullptr);
     void update_materials(Gpu& gpu, uint32_t w, uint32_t h, const ViewMatrices& vm, uint8_t render_stage = 0,

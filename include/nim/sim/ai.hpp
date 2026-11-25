@@ -228,6 +228,11 @@ public:
     // Calls every waiting dropship now (all squads present from the start, as before 3.71).
     void call_all_dropships();
     void call_dropship(size_t dropship);
+    // Encounter squads (3.135): held ones neither spawn by distance nor call their ship; release
+    // brings one now and returns how many members come (0: an alternative this run left out).
+    void hold_event_squads(const std::vector<size_t>& squads);
+    size_t release_squad(size_t squad);
+    bool squad_present(size_t squad) const;  // has members in this run
     const AiParams& params() const { return params_; }
     void set_player_invisible(bool invisible) { params_.player_invisible = invisible; }
     const std::vector<MotionSet>& motions() const { return motions_; }
@@ -307,6 +312,7 @@ private:
     std::vector<std::vector<size_t>> ground_squad_members_;
     std::vector<float> spawn_retry_at_;
     std::vector<uint8_t> squad_spawned_;          // per squad without a dropship
+    std::vector<uint8_t> held_, event_squad_;     // per squad: waiting for its event / belongs to one (3.135)
     float next_dropship_call_ = 0;                 // simulation time the next ship may be called (3.117)
     size_t alternatives_dropped_ = 0;              // squads left out as another's alternative (3.112)
     mutable std::vector<float> unload_cache_;     // per dropship: unload_seconds, < 0 = not yet
