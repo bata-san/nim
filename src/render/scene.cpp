@@ -1,4 +1,5 @@
 #include "nim/render/scene.hpp"
+#include "nim/render/visibility_lod.hpp"
 #include "nim/core/profile.hpp"
 #include "nim/core/parallel.hpp"
 #include "nim/content/map.hpp"
@@ -650,6 +651,7 @@ void StaticMeshScene::release(Gpu& gpu) {
         if (it.owns_srv) gpu.srv().free(it.srv_first, kItemSrvs * it.srv_copies);
     for (auto& p : pending_pipelines_) p.future.wait();  // compiling with this scene's root signatures
     pending_pipelines_.clear();
+    transparent_draw_scratch_.clear();
     items_.clear();
     transparent_items_.clear();
     distortion_items_.clear();
@@ -3667,8 +3669,8 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
         } else commands->DrawIndexedInstanced(it.part.index_count, instances, it.part.index_start, 0, first_instance);
     };
     if (stage == kStageTransparent) {
-        struct Draw { const Item* item; uint32_t instance; float depth; V3 centre; bool sky; };
-        std::vector<Draw> ordered;
+        auto& ordered = transparent_draw_scratch_;
+        ordered.clear();
         auto enqueue = [&](const Item& item, uint32_t instance, float depth, V3 centre, bool sky = false) {
             ordered.push_back({&item, instance, std::isfinite(depth) ? depth : 0, centre, sky});
         };
@@ -3714,7 +3716,7 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             }
         }
         // Preserve the authored part order for equal depths, including parts of one placement.
-        std::stable_sort(ordered.begin(), ordered.end(), [](const Draw& a, const Draw& b) {
+        std::stable_sort(ordered.begin(), ordered.end(), [](const TransparentDraw& a, const TransparentDraw& b) {
             if (a.sky != b.sky) return a.sky;
             // Sky records hold an ascending layer order at +0x64 (stars/dome -110..-90 first,
             // distant planets/clouds/horizon layers in ascending order); world transparents draw
@@ -4580,10 +4582,14 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
             if (group.spheres.size() != 1 && outside(sp, z)) return;
             const float r = sp[3];
             const float projected = vm.ortho > 0 ? r / vm.ortho : r * vm.fy / std::max(z - r, 1e-4f);
-            const auto delta = V3{sp[0], sp[1], sp[2]} - vm.eye;
-            const float d2 = dot(delta, delta);
-            const bool near_camera = vm.ortho == 0 && d2 <= (25 + r) * (25 + r);
-            const float min_px = (vm.ortho == 0 && d2 > (40 + r) * (40 + r)) ? 1.8f : 1.25f;
+            bool near_camera = false;
+            float min_px = 1.25f;
+            if (vm.ortho == 0) {
+                const auto delta = V3{sp[0], sp[1], sp[2]} - vm.eye;
+                const float d2 = dot(delta, delta);
+                near_camera = d2 <= (25 + r) * (25 + r);
+                if (d2 > (40 + r) * (40 + r)) min_px = 1.8f;
+            }
             if (!near_camera && projected * half_h < min_px) return;
             ++group.visible;
             if (group.dynamic) {
@@ -4594,16 +4600,7 @@ void StaticMeshScene::rebuild_visibility(const ViewMatrices& vm, uint32_t height
             // Each coarser authored LOD takes over below the next projected radius (1080p px). Most
             // meshes author two (categories 1 and 2), so the second one only replaces the first once
             // the object is a few dozen pixels tall (推定; the engine's switch distances are unknown).
-            constexpr std::array<float, 7> detail_radii{16, 6, 3, 1.5f, 1, 0.5f, 0.25f};
-            int step = 0;
-            while (!near_camera && step < int(detail_radii.size()) && px < detail_radii[size_t(step)]) ++step;
-            uint32_t levels = group.levels ? group.levels : 1u;
-            int level = std::countr_zero(levels);
-            for (; step > 0 && (levels & (levels - 1)); --step) {
-                levels &= levels - 1;
-                level = std::countr_zero(levels);
-            }
-            cull_scratch[size_t(level)].push_back(index);
+            cull_scratch[visibility_lod(group.levels, px, near_camera)].push_back(index);
         };
         if (group.chunk_bounds.empty()) {
             for (uint32_t index = 0; index < group.spheres.size(); ++index) test_placement(index);
