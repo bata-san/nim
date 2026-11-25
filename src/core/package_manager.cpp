@@ -48,15 +48,16 @@ std::optional<fs::path> PackageManager::find_install() {
     return std::nullopt;
 }
 
-PackageManager::PackageManager(const fs::path& install_dir) : pkg_dir_(install_dir / "packages") {
-    if (!fs::is_directory(pkg_dir_))
+PackageManager::PackageManager(const fs::path& install_dir) : open_(std::make_shared<OpenPackages>()) {
+    const auto package_dir = install_dir / "packages";
+    if (!fs::is_directory(package_dir))
         throw std::runtime_error("no packages directory in " + install_dir.string());
     auto oodle = install_dir / "bin" / "x64" / "oo2core_9_win64.dll";
     if (!Oodle::load(oodle)) throw std::runtime_error("failed to load " + oodle.string());
 
     // Keep only the newest patch of each package.
     std::unordered_map<std::string, std::pair<int, fs::path>> newest;
-    for (const auto& de : fs::directory_iterator(pkg_dir_)) {
+    for (const auto& de : fs::directory_iterator(package_dir)) {
         if (de.path().extension() != ".pkg") continue;
         std::string stem = de.path().stem().string();
         auto pos = stem.rfind('_');
@@ -77,12 +78,12 @@ PackageManager::PackageManager(const fs::path& install_dir) : pkg_dir_(install_d
         info.newest_patch = uint16_t(pp.first);
         std::memcpy(&info.pkg_id, hdr + 0x10, 2);
         std::memcpy(&info.language, hdr + 0x32, 2);
-        infos_.push_back(std::move(info));
+        open_->infos.push_back(std::move(info));
     }
-    std::ranges::sort(infos_, {}, &PackageInfo::pkg_id);
-    open_->slots.reserve(infos_.size());
-    for (size_t i = 0; i < infos_.size(); ++i) {
-        by_id_[infos_[i].pkg_id].push_back(i);
+    std::ranges::sort(open_->infos, {}, &PackageInfo::pkg_id);
+    open_->slots.reserve(open_->infos.size());
+    for (size_t i = 0; i < open_->infos.size(); ++i) {
+        open_->by_id[open_->infos[i].pkg_id].push_back(i);
         open_->slots.push_back(std::make_unique<OpenSlot>());
     }
 }
@@ -90,11 +91,11 @@ PackageManager::PackageManager(const fs::path& install_dir) : pkg_dir_(install_d
 void PackageManager::set_language(uint16_t language) { language_ = language; }
 
 const PackageInfo* PackageManager::info(uint16_t pkg_id) const {
-    auto it = by_id_.find(pkg_id);
-    if (it == by_id_.end()) return nullptr;
-    const PackageInfo* fallback = &infos_[it->second.front()];
+    auto it = open_->by_id.find(pkg_id);
+    if (it == open_->by_id.end()) return nullptr;
+    const PackageInfo* fallback = &open_->infos[it->second.front()];
     for (size_t i : it->second) {
-        const PackageInfo& p = infos_[i];
+        const PackageInfo& p = open_->infos[i];
         if (p.language == 0 || p.language == language_) return &p;
         if (p.language == 1) fallback = &p;  // English when the preferred language is not installed
     }
@@ -102,7 +103,7 @@ const PackageInfo* PackageManager::info(uint16_t pkg_id) const {
 }
 
 Package& PackageManager::open(const PackageInfo& info) {
-    const size_t index = size_t(&info - infos_.data());
+    const size_t index = size_t(&info - open_->infos.data());
     auto& slot = *open_->slots.at(index);
     std::call_once(slot.once, [&] { slot.package = std::make_unique<Package>(info.newest_path); });
     return *slot.package;
@@ -142,7 +143,7 @@ void PackageManager::build_hash64_index() {
     if (h64_) return;
     std::call_once(open_->hash64_once, [this] {
         auto index = std::make_shared<Hash64Index>();
-        for (const auto& i : infos_)
+        for (const auto& i : open_->infos)
             for (const auto& e : open(i).hash64s()) index->emplace(e.hash64, e.hash32);
         open_->hash64 = std::move(index);
     });
@@ -151,9 +152,6 @@ void PackageManager::build_hash64_index() {
 
 std::unique_ptr<PackageManager> PackageManager::fork() const {
     std::unique_ptr<PackageManager> m(new PackageManager());
-    m->pkg_dir_ = pkg_dir_;
-    m->infos_ = infos_;
-    m->by_id_ = by_id_;
     m->language_ = language_;
     m->h64_ = h64_;
     m->open_ = open_;
