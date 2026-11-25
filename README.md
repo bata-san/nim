@@ -50,9 +50,8 @@ focuses the prompt. Pages: **places** (whole maps, with their time of day and we
 (2.3k characters, gear and machines with materials and animation) and **scenery** (57k static meshes)
 with live 3D thumbnails, **voices** (lines in 13 languages with voice playback), **codex** (the
 in-game codex: collections, records in 13 languages and their audio logs), **films** (USM with
-HCA/ADX audio and MP4 export, with an optional matching SRT), **Loot** (preview a placed container’s opening motion and look up installed
-item names and available icons), **text** (every localized string beside a second language), **files** (package
-entries + hex) and **log**.
+HCA/ADX audio and MP4 export, with an optional matching SRT), **text** (every localized string
+beside a second language), **files** (package entries + hex) and **log**.
 
 Everything is drawn with the game's own shaders: the G-buffer pass with each material's DXIL,
 then the game's deferred `global_lighting_and_shading` and its `final_combine` film curve

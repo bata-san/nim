@@ -662,9 +662,6 @@ struct Catalog {
     std::vector<MeshEntry> dynamics;     // dynamic models (entity meshes)
     std::vector<PackageGroup> dyn_packages;
     StringTable strings;
-    std::vector<InvestmentItem> items;
-    std::atomic<bool> items_ready{false};
-    std::string items_error;
     std::vector<DialogueLine> dialogue;
     std::vector<MovieEntry> movies;
     Codex codex;
@@ -715,12 +712,6 @@ void load_catalog(fs::path install, Catalog* cat) {
             cat->status = ui::tr(ui::S::StatusLoadingDialogue);
         }
         cat->strings_ready = true;
-        try {
-            cat->items = load_investment_items(pm);
-        } catch (const std::exception& ex) {
-            cat->items_error = ex.what();
-        }
-        cat->items_ready = true;
         auto dlg = load_all_dialogue(pm);
         {
             std::lock_guard lk(cat->mutex);
@@ -767,7 +758,6 @@ public:
     struct Result {
         TagHash tag;
         uint64_t serial = 0;
-        std::optional<MapLootContainer> loot;
         bool thumbnail = false;
         bool no_drawable = false;
         ComPtr<ID3D12Resource> thumbnail_texture;
@@ -802,10 +792,9 @@ public:
         assemblies_.clear();
         motions_.clear();
     }
-    uint64_t request_live(TagHash t, int permutation = -1, ChannelValues channels = {},
-                          std::optional<MapLootContainer> loot = {}) {
+    uint64_t request_live(TagHash t, int permutation = -1, ChannelValues channels = {}) {
         std::lock_guard lk(m_);
-        live_ = LiveRequest{++serial_, t, permutation, std::move(channels), std::move(loot)};
+        live_ = LiveRequest{++serial_, t, permutation, std::move(channels)};
         cv_.notify_all();
         return serial_;
     }
@@ -919,7 +908,6 @@ private:
             Result r;
             r.tag = tag;
             r.serial = live.serial;
-            r.loot = std::move(live.loot);
             r.thumbnail = thumb;
             const auto& channels = live.channels;
             const bool background = thumb && SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
@@ -930,12 +918,8 @@ private:
                     // The entity components hold the materials; index them once.
                     if (!materials_) materials_ = index_dynamic_model_materials(*pm);
                     if (!rigs_) rigs_ = index_model_skeletons(*pm, *materials_, &assemblies_, &motions_);
-                    const auto tags = r.loot ? std::span<const std::pair<uint32_t, uint32_t>>(r.loot->tags) :
-                                              std::span<const std::pair<uint32_t, uint32_t>>{};
-                    const auto regions = r.loot ? entity_region_permutations(*pm, r.loot->entity, tags) : std::nullopt;
                     r.mesh = prepare_entity_preview(*pm, tag, *materials_, assemblies_, live.permutation,
-                                                    channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr,
-                                                    regions ? &*regions : nullptr, tags);
+                                                    channels.empty() ? nullptr : &channels, thumb ? &thumbnail_cache_ : nullptr);
                     const auto skinned = [](const PreparedMesh& m) {
                         return std::ranges::any_of(m.buffers, [](const auto& b) { return !b.skin.bones.empty(); });
                     };
@@ -943,12 +927,12 @@ private:
                         (rigs_->contains(tag.value) || !r.mesh->attachments.empty() || skinned(*r.mesh))) {
                         try {
                             if (!clips_) clips_ = index_animation_clips(*pm);
-                            r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, r.loot ? tag : TagHash{}, {}, &motions_);
+                            r.animation = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, {}, {}, &motions_);
                             if (r.animation && r.animation->model != tag) {
                                 auto local = prepare_preview_animation(*pm, *r.mesh, *rigs_, *clips_, tag, {}, &motions_);
                                 if (local && !local->clips.empty()) r.part_animation = std::move(local);
                             }
-                            if (r.animation && !r.loot) prepare_preview_equipment(*pm, *r.mesh, *r.animation, *rigs_, *clips_, *materials_);
+                            if (r.animation) prepare_preview_equipment(*pm, *r.mesh, *r.animation, *rigs_, *clips_, *materials_);
                         } catch (const std::exception& ex) {
                             r.mesh->notes.push_back(std::format("animation: {}", ex.what()));
                         }
@@ -995,7 +979,6 @@ private:
         TagHash tag;
         int permutation = -1;
         ChannelValues channels;
-        std::optional<MapLootContainer> loot;
     };
     std::optional<LiveRequest> live_;
     uint64_t serial_ = 0;
@@ -1612,7 +1595,7 @@ struct Camera {
 enum class Engine : int { Game };
 
 // The pages of the navigation rail. Every page is always reachable from the rail.
-enum Tab : int { TabHome, TabFind, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages, TabLog, TabLoot, TabCount };
+enum Tab : int { TabHome, TabFind, TabSettings, TabStatics, TabEntities, TabMaps, TabText, TabDialogue, TabMovies, TabCodex, TabPackages, TabLog, TabCount };
 struct TabInfo { uint32_t icon; ui::S name; ui::S desc; };
 constexpr TabInfo kTabs[TabCount] = {
     {ico::Home, ui::S::NavHome, ui::S::DescHome},
@@ -1627,7 +1610,6 @@ constexpr TabInfo kTabs[TabCount] = {
     {ico::Codex, ui::S::NavCodex, ui::S::DescCodex},
     {ico::Packages, ui::S::NavPackages, ui::S::DescPackages},
     {ico::Log, ui::S::NavLog, ui::S::DescLog},
-    {ico::Packages, ui::S::NavLoot, ui::S::DescLoot},
 };
 
 struct Thumb {
@@ -1677,16 +1659,6 @@ public:
         std::shared_ptr<const std::vector<MapEventPreview>> events;
     };
     MapView map;
-    struct LootView {
-        int selection = -1, pending_map = -1;
-        uint64_t selected_node = 0, displayed_node = 0;
-        char filter[80]{}, item_filter[96]{};
-        size_t item_index = size_t(-1);
-        bool browse_items = false;
-        std::string error;
-        std::map<int, std::vector<MapLootContainer>> containers;
-        std::future<std::vector<MapLootContainer>> pending;
-    } loot;
     bool map_scene = false;  // the live scene is a map region
     std::optional<TagHash> pending_map;  // from the command line, loaded once the maps are listed
     std::optional<std::pair<TagHash, uint32_t>> pending_activity;
@@ -1738,7 +1710,7 @@ public:
         TagHash equipment_model;
         AnimationClip loaded;
         std::string error;
-        bool playing = true, dirty = false, once = false;
+        bool playing = true, dirty = false;
         float frame = 0, speed = 1;
         char filter[96]{};
     };
@@ -2026,15 +1998,15 @@ public:
         if (changed) scene.set_channels(channel_overrides);
     }
 
-    void request_load(TagHash tag, std::optional<MapLootContainer> container = {}) {
-        if (!container && loading && *loading == tag) return;
+    void request_load(TagHash tag) {
+        if (loading && *loading == tag) return;
         stop_map();
         channel_overrides.clear();
         channel_filter[0] = '\0';
         loading = tag;
         no_drawable_tag.reset();
         no_drawable_reason.clear();
-        load_serial = worker.request_live(tag, -1, {}, std::move(container));
+        load_serial = worker.request_live(tag);
     }
 
     // Runs at the top of a frame, before any UI references GPU resources.
@@ -2084,21 +2056,10 @@ public:
                     if (game_ready) set_entity_preview(game_lighting, entity_preview_active);
                     if (!r->animation) {
                         anim.reset();
-                    } else if (r->loot || !anim || anim->once || anim->model != r->tag) {
+                    } else if (!anim || anim->model != r->tag) {
                         anim = Animation{r->tag, std::move(*r->animation), std::move(r->part_animation)};
                     } else {
                         anim->dirty = true;  // same model reloaded (variant / channels): pose it again
-                    }
-                    if (r->loot) {
-                        loot.displayed_node = r->loot->node;
-                        if (anim) {
-                            const auto clip = std::ranges::find(anim->binding.clips, r->loot->open_clip, &ClipInfo::tag);
-                            if (clip != anim->binding.clips.end()) {
-                                select_clip(int(clip - anim->binding.clips.begin()));
-                                anim->once = true;
-                                anim->playing = false;
-                            }
-                        }
                     }
                     keep_camera = prev == scene.tag();
                     if (!keep_camera) {
@@ -2982,190 +2943,6 @@ public:
         return v;
     }
 
-    void loot_items() {
-        static const std::string empty;
-        if (!catalog || !catalog->items_ready) {
-            const auto label = catalog && catalog->done && !catalog->error.empty() ? catalog->error.c_str() : ui::tr(ui::S::Loading);
-            ImGui::TextWrapped("%s", label);
-            return;
-        }
-        if (!catalog->items_error.empty() || catalog->items.empty()) {
-            ImGui::TextWrapped("%s", catalog->items_error.empty() ? ui::tr(ui::S::LootItemsEmpty) : catalog->items_error.c_str());
-            return;
-        }
-        const auto& items = catalog->items;
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float width = std::clamp(ImGui::GetContentRegionAvail().x * 0.38f, 205.f * sc, 390.f * sc);
-        ImGui::BeginChild("loot_item_list", {width, 0}, ImGuiChildFlags_AlwaysUseWindowPadding);
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##loot_item_filter", ui::tr(ui::S::LootItemFilter), loot.item_filter, sizeof(loot.item_filter));
-        const std::string filter = lower_ascii(loot.item_filter);
-        ImGui::BeginChild("loot_items_results");
-        for (size_t i = 0; i < items.size(); ++i) {
-            const auto& item = items[i];
-            const auto& name = text(item.name, language);
-            const auto& type = item.type.container.is_none() ? empty : text(item.type, language);
-            if (name.empty() || (!filter.empty() && !contains_ci(name, filter) && !contains_ci(type, filter) &&
-                                 !contains_ci(std::format("{:08X}", item.id), filter))) continue;
-            ImGui::PushID(int(i));
-            if (ImGui::Selectable(name.c_str(), loot.item_index == i)) loot.item_index = i;
-            ImGui::PopID();
-        }
-        ImGui::EndChild();
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("loot_item_details", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding);
-        if (loot.item_index < items.size()) {
-            const auto& item = items[loot.item_index];
-            ImGui::TextWrapped("%s", text(item.name, language).c_str());
-            const auto& type = item.type.container.is_none() ? empty : text(item.type, language);
-            if (!type.empty()) ImGui::TextDisabled("%s", type.c_str());
-            if (!item.icon.is_none()) {
-                const auto& art = investment_art(item.icon);
-                if (art.tex && art.w && art.h && art.error.empty()) {
-                    const float scale = std::clamp(ImGui::GetContentRegionAvail().x, 1.f, 192.f * sc) / float(std::max(art.w, art.h));
-                    ImGui::Image(ImTextureID(gpu.srv().gpu(art.srv).ptr), {art.w * scale, art.h * scale});
-                }
-            }
-            const auto& description = item.description.container.is_none() ? empty : text(item.description, language);
-            if (!description.empty()) ImGui::TextWrapped("%s", description.c_str());
-            ImGui::TextDisabled("%08X", item.id);
-        } else {
-            ImGui::TextDisabled("%s", ui::tr(ui::S::LootItemPick));
-        }
-        ImGui::EndChild();
-    }
-
-    void loot_tab() {
-        if (ImGui::RadioButton(ui::tr(ui::S::LootMapPlacements), !loot.browse_items)) loot.browse_items = false;
-        ImGui::SameLine();
-        if (ImGui::RadioButton(ui::tr(ui::S::LootItems), loot.browse_items)) loot.browse_items = true;
-        ImGui::Separator();
-        if (loot.browse_items) {
-            loot_items();
-            return;
-        }
-        if (!pm) return;
-        map_worker.request_list();
-        if (!map_worker.listed()) {
-            ImGui::TextDisabled("%s", ui::tr(ui::S::MapsListing));
-            return;
-        }
-        if (const auto err = map_worker.list_error(); !err.empty()) {
-            ImGui::TextWrapped("%s", err.c_str());
-            return;
-        }
-        const auto& maps = map_worker.maps();
-        if (maps.empty()) return;
-        if (loot.selection < 0) {
-            const auto expedition = std::ranges::find_if(maps, [](const MapEntry& m) { return m.name.starts_with("exp_"); });
-            loot.selection = map.selected >= 0 ? map.selected : expedition == maps.end() ? 0 : int(expedition - maps.begin());
-        }
-        if (loot.pending.valid() && loot.pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            try {
-                loot.containers.emplace(loot.pending_map, loot.pending.get());
-            } catch (const std::exception& ex) {
-                if (loot.pending_map == loot.selection) loot.error = ex.what();
-            }
-        }
-        const float sc = ImGui::GetStyle().FontScaleDpi;
-        const float left = std::clamp(ImGui::GetContentRegionAvail().x * 0.36f, 205.f * sc, 350.f * sc);
-        auto map_name = [](const MapEntry& m) -> const std::string& { return m.name.empty() ? m.package : m.name; };
-        ImGui::BeginChild("loot_list", {left, 0}, ImGuiChildFlags_AlwaysUseWindowPadding);
-        ImGui::SetNextItemWidth(-1);
-        if (begin_combo("##loot_map", map_name(maps[size_t(loot.selection)]).c_str())) {
-            for (int i = 0; i < int(maps.size()); ++i) {
-                ImGui::PushID(i);
-                if (ImGui::Selectable(map_name(maps[size_t(i)]).c_str(), loot.selection == i) && loot.selection != i) {
-                    loot.selection = i;
-                    loot.selected_node = loot.displayed_node = 0;
-                    loot.error.clear();
-                    loading.reset();
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndCombo();
-        }
-        const auto list = loot.containers.find(loot.selection);
-        if (list == loot.containers.end() && !loot.pending.valid() && loot.error.empty()) {
-            loot.pending_map = loot.selection;
-            loot.pending = std::async(std::launch::async, [dir = install, selection = maps[size_t(loot.selection)]] {
-                PackageManager packages(dir);
-                return load_map_loot(packages, selection);
-            });
-        }
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##loot_filter", ui::tr(ui::S::LootFilter), loot.filter, sizeof(loot.filter));
-        ImGui::BeginChild("loot_containers", {0, 0}, ImGuiChildFlags_None);
-        const MapLootContainer* selected = nullptr;
-        if (list != loot.containers.end()) {
-            const std::string filter = lower_ascii(loot.filter);
-            if (list->second.empty()) ImGui::TextWrapped("%s", ui::tr(ui::S::LootEmpty));
-            for (const auto& item : list->second) {
-                if (item.node == loot.selected_node) selected = &item;
-                ui::S kind = ui::S::LootContainer;
-                if (item.model.value == 0x80AFB866) kind = ui::S::LootLocker;
-                else if (item.model.value == 0x80ADF796) kind = ui::S::LootCart;
-                else if (item.model.value == 0x80ADF303 || item.model.value == 0x80ADF2EB || item.model.value == 0x80A906E4)
-                    kind = ui::S::LootCrate;
-                const auto label = std::format("{}  {:.1f}, {:.1f}, {:.1f}", ui::tr(kind), item.position[0], item.position[1], item.position[2]);
-                const auto key = std::format("{} {:016X} {} {}", label, item.node, item.model.str(), item.entity.str());
-                if (!filter.empty() && !contains_ci(key, filter)) continue;
-                const auto id = std::format("{}##{:016X}", label, item.node);
-                if (ImGui::Selectable(id.c_str(), item.node == loot.selected_node)) {
-                    selected = &item;
-                    loot.selected_node = item.node;
-                    loot.displayed_node = 0;
-                    request_load(item.model, item);
-                }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s · %016llX", item.model.str().c_str(), static_cast<unsigned long long>(item.node));
-            }
-        } else {
-            ImGui::TextWrapped("%s", loot.error.empty() ? ui::tr(ui::S::LootLoading) : loot.error.c_str());
-        }
-        ImGui::EndChild();
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("loot_preview", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding);
-        if (!selected) {
-            ImGui::TextDisabled("%s", ui::tr(ui::S::LootPick));
-        } else {
-            const bool ready = loot.displayed_node == selected->node && scene.loaded() && scene.tag() == selected->model;
-            const bool has_clip = ready && anim && anim->once && anim->loaded.has_tracks();
-            ImGui::BeginDisabled(!has_clip || (has_clip && anim->frame >= float(anim->loaded.frame_count - 1)));
-            if (ImGui::Button(ui::tr(ui::S::LootOpen))) { anim->speed = 1; anim->playing = true; }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled(!has_clip || (has_clip && anim->frame <= 0));
-            if (ImGui::Button(ui::tr(ui::S::LootClose))) { anim->speed = -1; anim->playing = true; }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button(ui::tr(ui::S::LootShowMap))) {
-                const auto p = selected->position;
-                cam.target = {p[0], p[1], p[2] + 0.6f};
-                cam.distance = 6;
-                cam.pitch = 0.25f;
-                map.selection_mode = maps[size_t(loot.selection)].activity.is_none() ? 0 : 1;
-                open_tab(TabMaps);
-                load_map(loot.selection, p);
-                ImGui::EndChild();
-                return;
-            }
-            if (has_clip && anim->frame >= float(anim->loaded.frame_count - 1)) {
-                ImGui::TextDisabled("%s", ui::tr(ui::S::LootDropUnknown));
-            }
-            if (ready) {
-                if (!has_clip) ImGui::TextDisabled("%s", ui::tr(ui::S::LootClipMissing));
-                viewport_ui(ImGui::GetContentRegionAvail());
-            } else if (loading) {
-                ImGui::TextDisabled("%s", ui::tr(ui::S::LootLoading));
-            } else {
-                ImGui::TextDisabled("%s", ui::tr(ui::S::LootClipMissing));
-            }
-        }
-        ImGui::EndChild();
-    }
-
     void select_clip(int i) {
         if (!anim || i < 0 || i >= int(anim->binding.clips.size())) return;
         anim->clip = i;
@@ -3194,13 +2971,8 @@ public:
         const float frames = float(a.loaded.frame_count);
         if (a.playing && frames > 1 && !a.dirty) {
             a.frame += dt * kClipFps * a.speed;
-            if (a.once) {
-                a.frame = std::clamp(a.frame, 0.0f, frames - 1);
-                if (a.frame == 0 || a.frame == frames - 1) a.playing = false;
-            } else {
-                a.frame = std::fmod(a.frame, frames);
-                if (a.frame < 0) a.frame += frames;
-            }
+            a.frame = std::fmod(a.frame, frames);
+            if (a.frame < 0) a.frame += frames;
             a.dirty = true;
         }
         if (!a.dirty) return;
@@ -3501,10 +3273,6 @@ public:
     void open_tab(int t) {
         if (tab != t && (tab == TabDialogue || tab == TabCodex)) stop_line_audio();
         if (tab != t && (tab == TabStatics || tab == TabEntities)) worker.request_thumbnails({});
-        if (tab == TabLoot && t != TabLoot) {
-            loading.reset();
-            loot.selected_node = loot.displayed_node = 0;
-        }
         tab = Tab(t);
     }
     void set_ui_language(ui::Lang l) {
@@ -3687,7 +3455,7 @@ public:
 
     // The page body. The 3D pages draw edge to edge; the rest sit inside the page margins.
     void content_frame(float sc) {
-        const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps || tab == TabLoot;
+        const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps;
         ImGui::SetCursorPos({0, 0});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{24 * sc, 20 * sc});
         ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoBackground);
@@ -3698,7 +3466,6 @@ public:
         case TabStatics: statics_tab(false); break;
         case TabEntities: statics_tab(true); break;
         case TabMaps: maps_tab(); break;
-        case TabLoot: loot_tab(); break;
         case TabText: strings_tab(); break;
         case TabDialogue: dialogue_tab(); break;
         case TabMovies: movies_tab(); break;
@@ -3730,7 +3497,6 @@ public:
         ImGui::BeginChild("##nav", {w - 1, h - title_h - foot_h}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
         nav_item(TabMaps);
-        nav_item(TabLoot);
         nav_item(TabEntities);
         nav_item(TabStatics);
         nav_gap();
