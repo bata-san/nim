@@ -1,5 +1,6 @@
 #pragma once
 #include "nim/core/crypto.hpp"
+#include "nim/core/block_cache.hpp"
 #include "nim/core/mapped_file.hpp"
 #include "nim/core/tag_hash.hpp"
 
@@ -87,7 +88,7 @@ public:
 
     // Reads one decrypted, decompressed block (bypasses the cache). Thread-safe.
     std::vector<uint8_t> read_block(uint32_t index) const;
-    // Same, through a small LRU of recently decoded blocks. Thread-safe.
+    // Same, through a bounded cache of decoded blocks. Thread-safe.
     std::shared_ptr<const std::vector<uint8_t>> cached_block(uint32_t index) const;
     // Reads one entry's bytes. Thread-safe.
     std::vector<uint8_t> read_entry(uint32_t index) const;
@@ -110,9 +111,7 @@ private:
     std::vector<Hash64Entry> hash64s_;
     std::unique_ptr<PackageCipher> cipher_;
 
-    static constexpr size_t kCacheSlots = 1024;  // decompressed blocks kept per package
-    mutable std::shared_mutex cache_mutex_;
-    mutable std::unordered_map<uint32_t, std::shared_ptr<const std::vector<uint8_t>>> cache_;
+    mutable DecodedBlockCache cache_;
 
     mutable std::mutex files_mutex_;
     mutable std::map<uint16_t, std::unique_ptr<MappedFile>> files_;

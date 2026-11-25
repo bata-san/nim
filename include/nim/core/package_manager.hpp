@@ -45,8 +45,8 @@ public:
     // Builds the global hash64 table by opening every package (header + tables only).
     void build_hash64_index();
 
-    // Another manager over the same install for a worker thread: the package list and hash64
-    // index are copied (no directory scan); open packages and their block caches are shared
+    // Another manager over the same install for a worker thread: the package list is copied
+    // (no directory scan); the immutable hash64 index, open packages and block caches are shared
     // (Package reads are thread-safe), so threads do not decompress the same blocks again.
     std::unique_ptr<PackageManager> fork() const;
 
@@ -55,13 +55,20 @@ private:
     std::filesystem::path pkg_dir_;
     std::vector<PackageInfo> infos_;
     std::unordered_map<uint16_t, std::vector<size_t>> by_id_;
+    using Hash64Index = std::unordered_map<uint64_t, TagHash>;
+    struct OpenSlot {
+        std::once_flag once;
+        std::unique_ptr<Package> package;
+    };
     struct OpenPackages {
-        std::mutex mutex;
-        std::unordered_map<size_t, std::unique_ptr<Package>> by_index;  // index into infos_
+        std::once_flag hash64_once;
+        std::shared_ptr<const Hash64Index> hash64;
+        // Fixed after the install scan; each package can be opened independently.
+        std::vector<std::unique_ptr<OpenSlot>> slots;
     };
     std::shared_ptr<OpenPackages> open_ = std::make_shared<OpenPackages>();
     uint16_t language_ = 1;
-    std::unordered_map<uint64_t, TagHash> h64_;
+    std::shared_ptr<const Hash64Index> h64_;
 };
 
 } // namespace nim

@@ -128,20 +128,15 @@ std::vector<uint8_t> Package::read_block(uint32_t index) const {
 }
 
 std::shared_ptr<const std::vector<uint8_t>> Package::cached_block(uint32_t index) const {
-    {
-        ProfileScope profile("package.block_cache_lookup");
-        std::shared_lock lock(cache_mutex_);
-        if (auto it = cache_.find(index); it != cache_.end()) {
-            Profile::instance().count("package.block_cache_hits");
-            return it->second;
-        }
-    }
-    Profile::instance().count("package.block_cache_misses");
-    auto data = std::make_shared<const std::vector<uint8_t>>(read_block(index));
-    std::unique_lock lock(cache_mutex_);
-    if (cache_.size() >= kCacheSlots) cache_.erase(cache_.begin());  // bounded: an arbitrary block makes room
-    auto [it, inserted] = cache_.emplace(index, data);
-    return inserted ? data : it->second;
+    ProfileScope profile("package.block_cache_lookup");
+    bool hit = false;
+    auto data = cache_.get(index, [this, &profile](uint32_t i) {
+        profile.stop();  // keep decode time separate from cache lookup
+        Profile::instance().count("package.block_cache_misses");
+        return read_block(i);
+    }, &hit);
+    if (hit) Profile::instance().count("package.block_cache_hits");
+    return data;
 }
 
 std::vector<uint8_t> Package::read_entry(uint32_t index) const {
@@ -181,7 +176,6 @@ std::vector<uint8_t> Package::read_entry_range(uint32_t index, uint64_t offset, 
 }
 
 void Package::clear_block_cache() const {
-    std::unique_lock lock(cache_mutex_);
     cache_.clear();
 }
 

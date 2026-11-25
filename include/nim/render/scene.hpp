@@ -573,6 +573,9 @@ private:
     bool visibility_shadow_ = false;
     std::map<uint32_t, ChannelUse> channels_;
     std::vector<Item> items_;
+    struct TransparentDraw { const Item* item; uint32_t instance; float depth; V3 centre; bool sky; };
+    // Retain capacity across frames; the authored stable sorting policy is unchanged.
+    std::vector<TransparentDraw> transparent_draw_scratch_;
     std::vector<size_t> transparent_items_, distortion_items_;
     uint32_t distortion_draws_ = 0;
     std::vector<size_t> decal_items_, projected_decal_items_;
