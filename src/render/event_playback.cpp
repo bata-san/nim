@@ -18,9 +18,14 @@ std::vector<PreparedEventTrack> prepare_event_tracks(PackageManager& pm, MapLayo
     std::map<std::pair<TagHash, TagHash>, Resource> resources;
     std::vector<PreparedEventTrack> tracks;
     for (const auto& group : map.event_groups) {
-        // A dropship group's track is the ship's arrival alone, for a spawner whose squad the AI
-        // did not pick; the AI's own dropship plays the others (3.133).
+        // Dropship spawners belong to the enemy AI's spawning (3.133): its ships bring their
+        // squads; a ship with no squad is never drawn.
+        if (group.dropship) continue;
         for (auto placement : group.placements) {
+            // Dropship spawners in other events (the convoy's five) are the AI's too: drawn as
+            // tracks they stood still with no squad (3.133).
+            const uint32_t e = placement.entity.value;
+            if (e == 0x80ACA699 || e == 0x80ACA69F || e == 0x80ACA6A4) continue;
             const bool hidden = map.hidden_nodes.contains(placement.node);
             const bool lockdown = placement.entity.value == 0x80B08991 || placement.entity.value == 0x80B0D412;
             if (placement.model.is_none()) {

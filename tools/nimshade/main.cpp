@@ -459,10 +459,16 @@ int run(int argc, char** argv) {
         hide_scripted_nodes(pm, map, selected_activity, event_preview);
         auto event_tracks = event_preview ?
             std::make_shared<const std::vector<PreparedEventTrack>>(prepare_event_tracks(pm, map)) : nullptr;
+        std::unordered_map<uint64_t, size_t> event_fx, event_lights;
+        if (list_events) {  // what each event can play (3.133): its FX and FX lights
+            for (const auto& p : load_map_particles(pm, map)) ++event_fx[p.event];
+            for (const auto& l : load_map_fx_lights(pm, map)) ++event_lights[l.event];
+        }
         for (const auto& event : map.event_previews)
             if (list_events || event.id == event_preview)
-                std::println("event {:016X}: {} at ({:.1f}, {:.1f}, {:.1f}), {} placement(s)", event.id, event.name,
-                             event.position[0], event.position[1], event.position[2], event.placements);
+                std::println("event {:016X}: {} at ({:.1f}, {:.1f}, {:.1f}), {} placement(s), {} fx, {} fx lights", event.id, event.name,
+                             event.position[0], event.position[1], event.position[2], event.placements, event_fx[event.id],
+                             event_lights[event.id]);
         if (event_preview && std::ranges::find(map.event_previews, event_preview, &MapEventPreview::id) == map.event_previews.end())
             throw std::runtime_error("event preview ID does not belong to this map selection");
         std::println("hidden by script: {} nodes, FX of {} nodes", map.hidden_nodes.size(), map.hidden_fx_nodes.size());
@@ -732,7 +738,13 @@ int run(int argc, char** argv) {
         if (event_tracks) {
             gpu.wait_idle();
             event_player.build(gpu, scene, layouts, event_tracks);
-            std::println("event tracks: {} in the map, {} for {:016X}", event_player.size(), event_player.tracks(event_preview), event_preview);
+            std::println("event tracks: {} in the map on {} actors, {} for {:016X}", event_player.size(), event_player.actors(),
+                         event_player.tracks(event_preview), event_preview);
+            if (list_events)
+                for (const auto& t : *event_tracks)
+                    std::println("  track {:016X} node {:016X} entity {} model {}{}{}{}", t.event, t.placement.node, t.placement.entity.str(),
+                                 t.placement.model.str(), t.idle_visible ? " idle-visible" : "", t.clip ? " clip" : "",
+                                 t.route.empty() ? "" : " route");
         }
         if (event_tracks && event_seconds) {
             event_player.play(scene, event_preview);

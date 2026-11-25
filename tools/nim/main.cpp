@@ -2113,6 +2113,8 @@ public:
         event_player = {};
         event_active = 0;
         event_triggered.clear();
+        event_manual = false;
+        ai_auto_enabled = false;
         particles.set_active_event(0);
         ai.call_dropships.clear();
         if (event_audio) event_audio->clear();
@@ -2374,10 +2376,7 @@ public:
                 return;
             }
         }
-        if (ai.failed && !ai.call_dropships.empty()) {  // ErrAi says why; the ship arrives on its own
-            play_event(ai.call_dropships.back().event);
-            ai.call_dropships.clear();
-        }
+        if (ai.failed) ai.call_dropships.clear();  // ErrAi says why
         if (!ai.sim) return;
         for (const auto call : std::exchange(ai.call_dropships, {})) {
             // The palette's dropship event is the AI's own dropship: call the one at that spawner node.
@@ -2395,11 +2394,10 @@ public:
                 ai.sim->call_dropship(best);
                 info(ui::trf(ui::S::LogEventDropship, best, at[0], at[1], at[2]));
             } else {
-                // The squad at this spawner is an alternative the simulation did not pick (3.117):
-                // the ship's arrival plays without troops.
+                // No squad of this simulation spawns here (an alternative it did not pick, 3.117,
+                // or a spawner no squad uses): no ship comes, as none would bring anyone.
                 ++ai.dropship_misses;
-                play_event(call.event);
-                info(ui::trf(ui::S::LogEventDropshipAlone, at[0], at[1], at[2]));
+                info(ui::trf(ui::S::LogEventDropshipNone, at[0], at[1], at[2]));
             }
         }
         const ViewMatrices vm = make_view(current_view());
@@ -2502,44 +2500,63 @@ public:
         const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
         return it != map.events->end() && it->name == "UESC dropship";
     }
-    // Replays `id`; a dropship event calls the enemy AI's dropship at its spawner (3.133).
+    // From the palette or its buttons (3.133). A dropship event calls the enemy AI's dropship at
+    // its spawner; the others play here and stay until stopped, whatever the camera does.
     void start_event(uint64_t id) {
-        if (event_is_dropship(id) && !map.activity.is_none()) {
+        if (event_is_dropship(id)) {
+            if (map.activity.is_none()) return;
             const auto it = std::ranges::find(*map.events, id, &MapEventPreview::id);
             ai.enabled = true;
             ai.call_dropships.push_back({id, it->position});
             return;
         }
+        event_manual = true;
+        event_triggered.insert(id);
         play_event(id);
     }
-    // 近づいたら発動 (3.133): an event starts when the camera comes within its range and re-arms
-    // once the camera has left 1.5 times that range. Dropship events use the AI's call range
-    // (AiParams::dropship_call_range, an estimate itself); the others 30 m (推定).
+    void stop_event() {
+        event_manual = false;
+        play_event(0);
+    }
+    // 近づいたら発動 (3.133). Enemies come by the AI's own spawning, which runs on approach: squads
+    // appear at their spawn points within AiParams::spawn_range and dropship squads are called
+    // within dropship_call_range (both estimates, 3.111), so the mode turns the AI on. The other
+    // events start when the camera comes within 30 m (推定) of them, unless one started from the
+    // palette is playing; one started this way stops once the camera is 1.5 times that far, and
+    // re-arms then.
     bool event_auto = true;
+    bool event_manual = false;
     std::unordered_set<uint64_t> event_triggered;
     static constexpr float kEventTriggerRange = 30;
     void update_event_triggers() {
         if (!event_auto || !map_scene || map.streaming || !scene.loaded() || !map.events) return;
+        if (!map.activity.is_none() && !ai.enabled && !ai_auto_enabled) {
+            ai_auto_enabled = true;  // once per map: the user may turn the AI off again
+            ai.enabled = true;
+        }
         const ViewMatrices vm = make_view(current_view());
         const std::array eye{vm.eye.x, vm.eye.y, vm.eye.z};
-        const float ship_range = AiParams{}.dropship_call_range;
         const MapEventPreview* nearest = nullptr;
         float nearest_d = 0;
         for (const auto& e : *map.events) {
-            const float range = e.name == "UESC dropship" ? ship_range : kEventTriggerRange;
+            if (e.name == "UESC dropship") continue;  // the AI's spawning
             const auto& p = e.position;
             const float d = std::hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
             if (event_triggered.contains(e.id)) {
-                if (d > range * 1.5f) event_triggered.erase(e.id);
-            } else if (d < range && (!nearest || d < nearest_d)) {
+                if (d > kEventTriggerRange * 1.5f) {
+                    event_triggered.erase(e.id);
+                    if (event_active == e.id && !event_manual) play_event(0);
+                }
+            } else if (d < kEventTriggerRange && (!nearest || d < nearest_d)) {
                 nearest = &e, nearest_d = d;
             }
         }
-        if (!nearest) return;
-        event_triggered.insert(nearest->id);  // one start per frame; the next ones follow
+        if (!nearest || event_manual || event_active) return;
+        event_triggered.insert(nearest->id);
         map.preview = nearest->id;
-        start_event(nearest->id);
+        play_event(nearest->id);
     }
+    bool ai_auto_enabled = false;
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
     bool entity_preview_active = false;
@@ -2775,7 +2792,7 @@ public:
                 const auto filter = lower_ascii(map.event_filter);
                 if (ImGui::Selectable(ui::tr(ui::S::EventIdle), map.preview == 0) && map.preview) {
                     map.preview = 0;
-                    play_event(0);
+                    stop_event();
                 }
                 for (const auto& event : *events) {
                     const auto& p = event.position;
@@ -2794,7 +2811,7 @@ public:
                 ImGui::EndCombo();
             }
             ImGui::SameLine();
-            if (ImGui::Checkbox(ui::tr(ui::S::EventAuto), &event_auto)) event_triggered.clear();
+            if (ImGui::Checkbox(ui::tr(ui::S::EventAuto), &event_auto)) event_triggered.clear(), ai_auto_enabled = false;
             ImGui::SetItemTooltip("%s", ui::tr(ui::S::EventAutoTip));
             if (selected != events->end()) {
                 ImGui::SameLine();
@@ -2810,7 +2827,7 @@ public:
                 if (dropship) ImGui::SetItemTooltip("%s", ui::tr(ui::S::EventDropshipHint));
                 if (playing) {
                     ImGui::SameLine();
-                    if (ImGui::Button(ui::tr(ui::S::EventStop))) play_event(0);
+                    if (ImGui::Button(ui::tr(ui::S::EventStop))) stop_event();
                 } else if (!playable && !map.streaming) {
                     ImGui::TextDisabled("%s", ui::tr(ui::S::EventStaticOnly));
                 }
@@ -5829,6 +5846,7 @@ struct BenchDriver {
     void configure(App& app) {
         if (radius >= 0) app.map.radius = radius <= 0 ? App::MapView::kUnlimited : radius;
         app.ai.enabled = ai;
+        if (const char* a = std::getenv("NIM_BENCH_EVENT_AUTO")) app.event_auto = a[0] == '1';
     }
     void place_camera(App& app) const {
         if (!eye || !look) return;
@@ -5908,7 +5926,26 @@ struct BenchDriver {
                          "(no AI ship {}), active {:016X}\n",
                          events_played, app.event_player.size(), app.event_player.actors(), app.event_triggered.size(),
                          app.ai.dropship_calls, app.ai.dropship_misses, app.event_active);
+        if (app.ai.sim) {
+            size_t active = 0, riding = 0, flying = 0;
+            for (const auto& a : app.ai.sim->agents()) active += a.active, riding += a.riding;
+            for (size_t i = 0; i < app.ai.sim->dropships().size(); ++i) {
+                const auto phase = app.ai.sim->dropship_state(i).phase;
+                flying += phase != AiDropshipPhase::Waiting && phase != AiDropshipPhase::Gone;
+            }
+            r += std::format("ai: enabled {}, {} of {} agents active, {} riding, {} of {} dropships flying or landed\n", app.ai.enabled,
+                             active, app.ai.sim->agents().size(), riding, flying, app.ai.sim->dropships().size());
+        }
         r += g_prof.report();
+        if (const char* shot = std::getenv("NIM_BENCH_SHOT"); shot && *shot) {  // the last frame's lit image
+            try {
+                app.gpu.wait_idle();
+                const auto px = app.gpu.read_texture(app.gb.lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 4);
+                write_png(fs::path(to_wide(shot)), app.gb.output_width(), app.gb.output_height(), px);
+            } catch (const std::exception& ex) {
+                r += std::format("shot failed: {}\n", ex.what());
+            }
+        }
         std::ofstream(out, std::ios::binary) << r;
         return true;
     }

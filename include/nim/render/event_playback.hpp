@@ -21,8 +21,8 @@ struct PreparedEventTrack {
 };
 
 // Tracks for every event group of `map`. Records their nodes in map.event_actor_models, so
-// load_map_entities leaves those models to the tracks. A dropship event's track is the ship's
-// arrival alone, played when the AI has no dropship at that spawner (3.133).
+// load_map_entities leaves those models to the tracks. Dropship events get none: the enemy AI's
+// spawning plays them with their squads (3.133).
 std::vector<PreparedEventTrack> prepare_event_tracks(PackageManager& pm, MapLayout& map);
 
 class EventPlayback {

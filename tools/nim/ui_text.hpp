@@ -208,10 +208,10 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(EventStop, "停止", "Stop", "정지") \
     X(EventStaticOnly, "配置のみ表示できます", "Placement preview only", "배치만 미리 볼 수 있습니다") \
     X(EventAuto, "近づいたら発動", "Start on approach", "접근 시 발동") \
-    X(EventAutoTip, "カメラがイベントの位置に近づくと再生します (降下艇は AI の呼び出し距離 60 m、ほかは 30 m、どちらも推定)。離れると再び発動できます。", "Plays an event when the camera comes near it (dropships at the AI call range of 60 m, others 30 m; both estimates). Leaving re-arms it.", "카메라가 이벤트 위치에 가까워지면 재생합니다 (강하선은 AI 호출 거리 60 m, 나머지는 30 m, 모두 추정). 멀어지면 다시 발동합니다.") \
+    X(EventAutoTip, "敵 AI をオンにし、敵は AI の出現処理で現れます (近づくと出現点に出る分隊と降下艇で来る分隊、範囲は推定)。ほかのイベントはカメラが 30 m (推定) まで近づくと再生し、離れると止まります。パレットから再生したイベントは停止するまで続きます。", "Turns the enemy AI on: enemies come by its spawning (squads appearing at their spawn points and squads brought by dropship as you approach; ranges are estimates). Other events play when the camera comes within 30 m (estimate) and stop when it leaves. An event played from the palette runs until stopped.", "적 AI를 켜고, 적은 AI의 출현 처리로 나타납니다 (접근하면 출현 지점에 나타나는 분대와 강하선으로 오는 분대, 범위는 추정). 다른 이벤트는 카메라가 30 m(추정)까지 다가가면 재생되고 멀어지면 멈춥니다. 팔레트에서 재생한 이벤트는 정지할 때까지 계속됩니다.") \
     X(EventDropshipHint, "敵 AI の降下艇として呼び出します", "Calls the enemy AI's dropship", "적 AI 강하선으로 호출합니다") \
     X(LogEventDropship, "イベント: 降下艇 {} を呼び出しました ({:.0f}, {:.0f}, {:.0f})", "event: called dropship {} ({:.0f}, {:.0f}, {:.0f})", "이벤트: 강하선 {} 호출 ({:.0f}, {:.0f}, {:.0f})") \
-    X(LogEventDropshipAlone, "イベント: ({:.0f}, {:.0f}, {:.0f}) の分隊は AI が選ばなかった候補のため、降下艇の到着だけを再生します", "event: the squad at ({:.0f}, {:.0f}, {:.0f}) is an alternative the AI did not pick; playing the ship's arrival alone", "이벤트: ({:.0f}, {:.0f}, {:.0f})의 분대는 AI가 고르지 않은 후보이므로 강하선 도착만 재생합니다") \
+    X(LogEventDropshipNone, "イベント: ({:.0f}, {:.0f}, {:.0f}) から出る分隊は今回の AI にいないため、降下艇は来ません", "event: no squad of this AI run spawns at ({:.0f}, {:.0f}, {:.0f}), so no dropship comes", "이벤트: ({:.0f}, {:.0f}, {:.0f})에서 나오는 분대가 이번 AI에 없어 강하선이 오지 않습니다") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \
