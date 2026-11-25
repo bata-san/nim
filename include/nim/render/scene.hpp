@@ -22,6 +22,11 @@ namespace nim {
 
 class ExternStore;
 class GameLighting;
+struct TransparentProbes {
+    size_t primary = 0, secondary = 0;
+    uint8_t weight = 8;
+    auto operator<=>(const TransparentProbes&) const = default;
+};
 
 // ---- small math (column vectors; M4 stores 4 columns) -----------------------------------------
 struct V3 { float x = 0, y = 0, z = 0; };
@@ -528,7 +533,7 @@ private:
     size_t world_transparent_draws_ = 0;
     size_t sky_transparent_draws_ = 0;
     size_t transparent_local_reflections_ = 0, transparent_sky_reflections_ = 0, transparent_local_probes_ = 0;
-    std::unordered_map<uint64_t, size_t> transparent_probe_cache_;
+    std::unordered_map<uint64_t, TransparentProbes> transparent_probe_cache_;
     uint64_t transparent_probe_gen_ = UINT64_MAX;
     uint64_t shadow_generation_ = 0;
     uint64_t static_shadow_generation_ = 0;  // changes to what the static casters look like

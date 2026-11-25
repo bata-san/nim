@@ -26,6 +26,7 @@
 #include "nim/render/scene.hpp"
 #include "nim/render/particles.hpp"
 #include "nim/render/ai_actors.hpp"
+#include "nim/render/event_playback.hpp"
 #include "nim/sim/ai.hpp"
 
 #include "imgui.h"
@@ -1014,6 +1015,7 @@ public:
         std::shared_ptr<const MapAtmosphere> atmosphere;  // the map's sky lookups and sun path
         std::shared_ptr<const MapAudio> audio;  // the map's ambient sound emitters
         std::shared_ptr<const std::vector<MapEventPreview>> events;
+        std::shared_ptr<const std::vector<PreparedEventTrack>> event_tracks;
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -1113,6 +1115,7 @@ private:
         uint32_t layout_activity_map = 0;
         uint64_t layout_preview = 0;
         std::shared_ptr<const std::vector<MapEventPreview>> events;
+        std::shared_ptr<const std::vector<PreparedEventTrack>> event_tracks;
         std::optional<PrepareCache> cache;
         std::vector<std::vector<InputElement>> layouts;
         try {
@@ -1179,6 +1182,11 @@ private:
                     layout_activity_map = req.activity_map;
                     layout_preview = req.preview;
                     events = std::make_shared<const std::vector<MapEventPreview>>(std::move(layout->event_previews));
+                    event_tracks.reset();
+                    if (req.preview) {
+                        auto tracks = prepare_event_tracks(*pm, *layout);
+                        event_tracks = std::make_shared<const std::vector<PreparedEventTrack>>(std::move(tracks));
+                    }
                     entities.reset();
                     starts = find_map_starts(*pm, *layout);
                 }
@@ -1305,6 +1313,7 @@ private:
                     if (generation_ != req.generation) continue;
                     progress_.total = jobs.size();
                     progress_.events = events;
+                    progress_.event_tracks = event_tracks;
                     progress_.center = center;
                     progress_.extent = extent;
                     progress_.typical = typical;
@@ -1658,6 +1667,10 @@ public:
     LightingPass lighting;
     GameLighting game_lighting;
     ParticleScene particles;  // the map's FX
+    EventPlayback event_player;
+    bool event_playing = false;
+    std::unique_ptr<media::EntityAudioPlayer> event_audio;
+    std::vector<media::EntityAudioPlayer::Cue> event_cues;
     bool fx_enabled = true;
     bool game_ready = false;
     Engine engine = Engine::Game;
@@ -2094,6 +2107,9 @@ public:
         map_add_failures.clear();
         gpu.wait_idle();
         reset_ai();
+        event_player = {};
+        event_playing = false;
+        if (event_audio) event_audio->clear();
         scene.begin(gpu);
         anim.reset();
         channel_overrides.clear();
@@ -2198,6 +2214,8 @@ public:
         if (pr.done) {
             ProfileScope profile_finish("map.ui_finish");
             if (map.processed) {
+                if (pr.event_tracks && !pr.event_tracks->empty())
+                    event_player.build(g, scene, layouts, pr.event_tracks);
                 scene.finish(g, map.bubble, V3{pr.center[0], pr.center[1], pr.center[2]},
                              std::min(map.radius, pr.extent) * 0.6f);
                 if (!map.framed && scene.loaded()) {
@@ -2408,13 +2426,33 @@ public:
         if (!map_lights) return;
         std::vector<const MapLight*> ptrs;
         for (const auto& l : *map_lights)
-            if (!l.fx || fx_enabled) ptrs.push_back(&l);
+            if ((!l.fx || fx_enabled) && (!l.event || event_playing)) ptrs.push_back(&l);
         map_lights_fx = fx_enabled;
         try {
             game_lighting.set_lights(*pm, g, ptrs);
         } catch (const std::exception& ex) {
             ++map_add_failures[std::string("local lights: ") + std::string(ex.what()).substr(0, 100)];
         }
+    }
+
+    void set_event_playing(bool play) {
+        const bool lights_changed = event_playing != play && map_lights &&
+            std::ranges::any_of(*map_lights, &MapLight::event);
+        event_playing = play;
+        particles.set_event_playing(play);
+        event_cues.clear();
+        if (event_audio) event_audio->clear();
+        if (play) {
+            event_player.play();
+            if (!event_audio && event_player.size())
+                if (auto* eng = audio_engine()) {
+                    event_audio = std::make_unique<media::EntityAudioPlayer>(*eng);
+                    event_audio->set_package(*pm);
+                }
+        } else {
+            event_player.stop(scene);
+        }
+        if (lights_changed) apply_map_lights(gpu);
     }
     std::shared_ptr<const std::vector<MapCubemap>> map_cubemaps;
     std::shared_ptr<const MapAtmosphere> map_atmosphere;
@@ -2655,7 +2693,7 @@ public:
                     const auto& p = event.position;
                     const auto row = std::format("{}  ({:.0f}, {:.0f}, {:.0f})##{:016X}", event.name, p[0], p[1], p[2], event.id);
                     if (!filter.empty() && !contains_ci(row, filter)) continue;
-                    if (ImGui::Selectable(row.c_str(), map.preview == event.id)) {
+                    if (ImGui::Selectable(row.c_str(), map.preview == event.id) && map.preview != event.id) {
                         cam.target = {p[0], p[1], p[2]};
                         cam.distance = 25;
                         cam.pitch = 0.2f;
@@ -2664,6 +2702,21 @@ public:
                     }
                 }
                 ImGui::EndCombo();
+            }
+            if (selected != events->end()) {
+                ImGui::SameLine();
+                const bool playable = event_player.size() || particles.event_count() ||
+                    (map_lights && std::ranges::any_of(*map_lights, &MapLight::event));
+                ImGui::BeginDisabled(!playable);
+                if (ImGui::Button(ui::tr(event_playing ? ui::S::EventReplay : ui::S::EventPlay)))
+                    set_event_playing(true);
+                ImGui::EndDisabled();
+                if (event_playing) {
+                    ImGui::SameLine();
+                    if (ImGui::Button(ui::tr(ui::S::EventStop))) set_event_playing(false);
+                } else if (!playable && !map.streaming) {
+                    ImGui::TextDisabled("%s", ui::tr(ui::S::EventStaticOnly));
+                }
             }
             ImGui::EndDisabled();
             ImGui::TextDisabled("%s", ui::tr(ui::S::EventPreviewHint));
@@ -2923,6 +2976,11 @@ public:
         light.frame_delta_time = ImGui::GetIO().DeltaTime;
         light.time = material_time;
         light.delta_time = material_dt;
+        if (map_scene && event_playing) event_player.step(scene, light.frame_delta_time);
+        else if (event_playing) {
+            event_playing = false;
+            if (event_audio) event_audio->clear();
+        }
         light.entity_preview = entity_preview_active && !map_scene;
         light.dof_edges_only = map_scene;  // flying retains an orbit radius unrelated to surface depth
         light.dof_focus = cam.distance;
@@ -2956,6 +3014,13 @@ public:
                                      {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time, entity_audio_volume,
                                      entity_audio_enabled && map_scene);
                 entity_cues.clear(), entity_stopped.clear();
+            }
+            if (event_audio && map_scene && event_playing) {
+                event_cues.clear();
+                for (const auto& cue : event_player.sounds()) event_cues.push_back({cue.event, cue.emitter});
+                event_audio->update(event_cues, {}, event_player.emitters(), {vm.eye.x, vm.eye.y, vm.eye.z},
+                                    {vm.right.x, vm.right.y, vm.right.z}, light.frame_delta_time,
+                                    entity_audio_volume, entity_audio_enabled);
             }
             audio_scope.reset();
             SunShadow* shadow = nullptr;
@@ -3869,6 +3934,8 @@ public:
             ImGui::SliderFloat(ui::tr(ui::S::BloomHighlight), &light.bloom_highlight, 0.0f, 6.0f, "%.1f");
             ImGui::SetItemTooltip(ui::tr(ui::S::BloomHighlightTip));
             ImGui::SliderFloat(ui::tr(ui::S::EmissiveGain), &light.emissive_gain, 0.0f, 3.0f, "%.2f");
+            if (map_scene && fx_enabled)
+                ImGui::SliderFloat(ui::tr(ui::S::ParticleStrength), &particles.draw_strength, 0.0f, 1.0f, "%.2f");
             if (g_frame_generation.built()) {
                 if (ImGui::Checkbox("NVIDIA DLSS Frame Generation (2x)", &g_frame_generation_requested) &&
                     g_frame_generation_requested && !g_frame_generation.initialize_device(gpu.device()))

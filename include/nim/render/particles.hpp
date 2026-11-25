@@ -23,6 +23,8 @@ public:
     // left out and listed in notes().
     void load(PackageManager& pm, Gpu& gpu, std::span<const MapParticle> placements);
     void release(Gpu& gpu);  // caller makes sure the GPU is idle
+    void set_event_playing(bool playing);
+    size_t event_count() const;
     bool loaded() const { return !emitters_.empty(); }
     bool has_emitters_near(V3 eye) const;
 
@@ -34,6 +36,7 @@ public:
                 const ExternStore& inputs, float dt);
 
     float radius = 100;  // viewer choice: emitters farther than this are not simulated (60 fps budget, §3.35)
+    float draw_strength = 1;  // multiplier on the original particle draw-fade input
 
     size_t system_count() const { return systems_.size(); }
     size_t emitter_count() const { return emitters_.size(); }
@@ -59,6 +62,7 @@ private:
         uint32_t seed = 0;
         uint32_t warm_steps = 0;
         bool active = false;
+        bool event = false;
     };
     template <class F>
     void guard(System& s, F&& f);
@@ -68,6 +72,7 @@ private:
     std::vector<Emitter> emitters_;
     std::unique_ptr<ExternStore> ext_;
     bool ext_initialized_ = false;
+    bool event_playing_ = false;
     ComPtr<ID3D12Resource> state_[2], history_, instances_, object_constants_;
     uint32_t parity_ = 0;  // state_[parity_] holds the current particles
     uint32_t total_ = 0, state_total_ = 0, instance_total_ = 0;  // slots / pool float4s

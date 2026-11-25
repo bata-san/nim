@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nim LANGUAGES CXX VERSION 0.3.19)
+project(nim LANGUAGES CXX VERSION 0.3.20)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +64,7 @@ add_library(nim_render STATIC
   src/render/particles.cpp
   src/render/game_light_grid.cpp
   src/render/ai_actors.cpp
+  src/render/event_playback.cpp
 )
 target_link_libraries(nim_render PUBLIC nim_core d3d12 dxgi d3dcompiler)
 target_link_libraries(nimcli PRIVATE nim_render)

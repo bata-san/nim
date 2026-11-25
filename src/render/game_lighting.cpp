@@ -1190,6 +1190,21 @@ float2 ps_main(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
+// Transparent +0x68 (3.132): the shield-type shaders multiply it by their tint, the light grid and
+// the exposure, as an albedo. The lit image exposed and clamped to [0, 1] is the estimate.
+constexpr const char* kBackdropLdrHlsl = R"(
+cbuffer P : register(b0) { float exposure; float3 pad; };
+Texture2D<float4> src : register(t0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    float3 c = src.Load(int3(pos.xy, 0)).rgb * exposure;
+    return float4(saturate(c), 1);
+}
+)";
+
 // Convert the current native atmosphere result to the shaft shader's radial density samples.
 // Only the input layout and units are reconstructed here. The game PS integrates the local light.
 constexpr const char* kShaftDensityHlsl = R"(
@@ -1512,6 +1527,10 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.PS = {lps->GetBufferPointer(), lps->GetBufferSize()};
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&linear_depth_pso_)), "linear depth PSO");
+        auto bps = compile_viewer_env("ps_main", "ps_5_0", kBackdropLdrHlsl);
+        pd.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&backdrop_ldr_pso_)), "backdrop exposure PSO");
 
         range.NumDescriptors = 1;
         ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1524,7 +1543,7 @@ void GameLighting::init(PackageManager& pm, Gpu& gpu) {
         pd.RTVFormats[0] = pd.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         check_hr(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&shaft_density_pso_)), "shaft fog density PSO");
     }
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kMaterialAoRtv + 1};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBackdropLdrRtv + 1};
     check_hr(gpu.device()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "game HDR RTV heap");
     load_post(pm, gpu, scopes);
     load_sky_ambient(pm, gpu, scopes);
@@ -1562,6 +1581,11 @@ void GameLighting::resize(Gpu& gpu, uint32_t w, uint32_t h, uint32_t out_w, uint
     gpu.device()->CreateRenderTargetView(hdr_.Get(), nullptr, rtv_heap_->GetCPUDescriptorHandleForHeapStart());
     clear_owned(ext::Transparent, 0x60, backdrop_.Get());
     backdrop_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+    clear_owned(ext::Transparent, 0x68, backdrop_ldr_.Get());
+    backdrop_ldr_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
+    gpu.device()->CreateRenderTargetView(backdrop_ldr_.Get(), nullptr,
+        {rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr +
+         kBackdropLdrRtv * gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)});
     // Also a UAV: ssr_apply_reflection blends the reflections into it.
     env_ = gpu.texture2d(w, h, cv.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
@@ -2275,11 +2299,9 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
         ext_.set_texture(ext::Deferred, 0x98, linear_depth_.Get(), DXGI_FORMAT_R32G32_FLOAT);
         // Transparent +0x68: a screen image the shield's mesh particles blur behind themselves
         // (3x3 taps at the pixel, tinted, scaled by exposure). Its engine producer is not
-        // identified; the previous frame's lit image is the closest nim has.
-        if (ssr_history_valid_)
-            ext_.estimate_texture(ext::Transparent, 0x68, ssr_history_.Get(),
-                                  "transparent +0x68 (screen image behind refractive particles) = the previous frame's lit image");
-        else ext_.set_texture(ext::Transparent, 0x68, nullptr);
+        // identified. The previous frame's lit image already holds the shield, so adding it back
+        // each frame fed back into a white blowout (3.132): use this frame's backdrop below.
+        ext_.set_texture(ext::Transparent, 0x68, nullptr);
         // Transparent +0x60: refractive surfaces (the Dire Marsh anomaly 80ACD7F3, glass) sample it at
         // the pixel plus a distortion offset and tint it. Without it they drew black. Its engine
         // producer is not identified; the lit image just before the transparent pass is the
@@ -2293,11 +2315,33 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
             Gpu::barrier(cl, hdr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             ext_.estimate_texture(ext::Transparent, 0x60, backdrop_.Get(),
                                   "transparent +0x60 (refraction backdrop) = the lit image just before transparents");
-            // The mesh particles' +0x68 screen image: the same backdrop when no earlier frame exists
-            // (first frame, headless renders).
-            if (!ssr_history_valid_)
-                ext_.estimate_texture(ext::Transparent, 0x68, backdrop_.Get(),
-                                      "transparent +0x68 (screen image behind refractive particles) = this frame's backdrop (no earlier frame)");
+            // The shield-type +0x68 screen image: this backdrop exposed and clamped (no self feedback).
+            if (backdrop_ldr_ && backdrop_ldr_pso_) {
+                const UINT inc = gpu.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                const D3D12_CPU_DESCRIPTOR_HANDLE rtv{rtv_heap_->GetCPUDescriptorHandleForHeapStart().ptr + kBackdropLdrRtv * inc};
+                const uint32_t srv = gpu.transient_descriptors(2);
+                for (uint32_t i = 0; i < 2; ++i)
+                    gpu.device()->CreateShaderResourceView(backdrop_.Get(), nullptr, gpu.srv().cpu(srv + i));
+                const float4 k{1, 0, 0, 0};  // the HDR target is already exposed (cb13[1].x)
+                const auto cb = gpu.dynamic(sizeof(k));
+                std::memcpy(cb.cpu, &k, sizeof(k));
+                Gpu::barrier(cl, backdrop_ldr_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                cl->SetGraphicsRootSignature(env_rs_.Get());
+                cl->SetPipelineState(backdrop_ldr_pso_.Get());
+                ID3D12DescriptorHeap* heaps[] = {gpu.srv().heap()};
+                cl->SetDescriptorHeaps(1, heaps);
+                cl->SetGraphicsRootConstantBufferView(0, cb.gpu);
+                cl->SetGraphicsRootDescriptorTable(1, gpu.srv().gpu(srv));
+                cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                cl->DrawInstanced(3, 1, 0, 0);
+                Gpu::barrier(cl, backdrop_ldr_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                cl->OMSetRenderTargets(1, &hdr, FALSE, nullptr);
+                cl->SetGraphicsRootSignature(nullptr);
+                ext_.estimate_texture(ext::Transparent, 0x68, backdrop_ldr_.Get(),
+                                      "transparent +0x68 (screen image the shield-type shaders tint and light) = "
+                                      "the lit (already exposed) image before transparents, clamped to [0, 1]");
+            }
         }
         { ProfileScope ps_("frame.light.transparents"); transparents(cl, hdr); }
         ext_.set(ext::Deferred, 0x00, depth_decode);
@@ -3320,7 +3364,23 @@ std::vector<GameLighting::GridLight> GameLighting::grid_lights(const ViewMatrice
                 g.inner = std::acos(std::clamp(inner, -1.0f, 1.0f));
             }
         }
-        if (g.intensity > 0 && g.end > 0 && (g.colour[0] > 0 || g.colour[1] > 0 || g.colour[2] > 0)) out.push_back(g);
+        const float peak = g.intensity * std::max({g.colour[0], g.colour[1], g.colour[2]});
+        if (!(g.intensity > 0 && g.end > 0 && peak > 0) || !std::isfinite(peak)) continue;
+        // Diagnostics (3.132): NIM_GRID_LIGHT_SKIP=TECH,... leaves lights out, NIM_GRID_LIGHT_DUMP lists them.
+        if (const char* skip = std::getenv("NIM_GRID_LIGHT_SKIP"); skip && std::strstr(skip, ll.technique->tag.str().c_str())) continue;
+        if (std::getenv("NIM_GRID_LIGHT_DUMP"))
+            std::fprintf(stderr, "GRIDLIGHT %s at (%.1f %.1f %.1f) colour (%.3f %.3f %.3f) w %.3f start %.2f end %.2f cone %.2f/%.2f\n",
+                         ll.technique->tag.str().c_str(), g.position[0], g.position[1], g.position[2], g.colour[0], g.colour[1],
+                         g.colour[2], g.intensity, g.start, g.end, g.inner, g.outer);
+        // The point grid lacks the light's shadows, clip planes and cone exponent, so lights of the
+        // neighbouring rooms add up on shield-type surfaces. Bound each light's peak (estimate, 3.132;
+        // NIM_GRID_LIGHT_MAX overrides, 0 = unbounded).
+        static const float kMaxGridLight = [] {
+            const char* e = std::getenv("NIM_GRID_LIGHT_MAX");
+            return e ? float(std::atof(e)) : 1.5f;
+        }();
+        if (kMaxGridLight > 0 && peak > kMaxGridLight) g.intensity *= kMaxGridLight / peak;
+        out.push_back(g);
     }
     return out;
 }

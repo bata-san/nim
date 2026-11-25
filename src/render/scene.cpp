@@ -400,8 +400,8 @@ ComPtr<ID3D12RootSignature> make_gbuffer_root_signature(ID3D12Device* dev, bool 
     bool split_reflection = false) {
     constexpr uint32_t cube_slot = 26;
     D3D12_DESCRIPTOR_RANGE ps_ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, split_reflection ? cube_slot : 32, 0, 0, 0},
-                                         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 31 - cube_slot, cube_slot + 1, 0, cube_slot + 1}};
-    D3D12_DESCRIPTOR_RANGE reflection{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, cube_slot, 0, 0};
+                                         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 30 - cube_slot, cube_slot + 2, 0, cube_slot + 2}};
+    D3D12_DESCRIPTOR_RANGE reflection{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, cube_slot, 0, 0};
     D3D12_DESCRIPTOR_RANGE vs_dynamic{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 32, 0, 0, 0};
     D3D12_DESCRIPTOR_RANGE vs_static[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
                                          {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 29, 3, 0, 3}};
@@ -2631,9 +2631,11 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 item.ps_sources.extern_textures.try_emplace(slot,
                     TfxExternTexture{slot, ext::Transparent, uint8_t((0xE0 + 8 * (slot - 26)) / 8)});
         const auto cube = ps_kinds.find(26);
+        const auto cube2 = ps_kinds.find(27);
         const auto cube_source = item.ps_sources.extern_textures.find(26);
         const auto advanced_scope = item.ps_sources.cbuffer_scopes.find(8);
         item.object_reflection = g.stage == kStageTransparent && cube != ps_kinds.end() && cube->second == BindingKind::TextureCube &&
+            (cube2 == ps_kinds.end() || (cube2->second == BindingKind::TextureCube && !item.textures.contains(27))) &&
             !item.textures.contains(26) && !item.own_regs.contains({ShaderStage::Pixel, 8}) &&
             cube_source != item.ps_sources.extern_textures.end() && cube_source->second.extern_id == ext::Transparent &&
             cube_source->second.offset == 0xE0 / 8 && item.scopes && advanced_scope != item.ps_sources.cbuffer_scopes.end() &&
@@ -3720,45 +3722,51 @@ void StaticMeshScene::draw_items(Gpu& gpu, ID3D12GraphicsCommandList* cl, uint8_
             transparent_probe_cache_.clear();
             transparent_probe_gen_ = lighting->cubemap_generation();
         }
-        std::unordered_map<size_t, ReflectionBinding> reflection_bindings;
+        std::map<TransparentProbes, ReflectionBinding> reflection_bindings;
         DrawState state;
         for (const auto& entry : ordered) {
             const auto& it = *entry.item;
             const ReflectionBinding* binding = nullptr;
             if (it.object_reflection) {
-                size_t probe = 0;
+                TransparentProbes probes;
                 if (!entry.sky) {
                     const auto& set = sets_[it.buffers];
                     if (set.actor >= 0 || set.equipment) {
-                        probe = lighting->transparent_probe_at(entry.centre);
+                        probes = lighting->transparent_probes_at(entry.centre);
                     } else {
                         const uint32_t group = it.dynamic ? it.buffers : set.cull;
                         // Packed visible indices change with culling and LOD. Use the stable placement ID.
                         const uint32_t placement = it.dynamic ? entry.instance : cull_groups_[group].visible_indices[entry.instance];
                         const uint64_t key = (uint64_t(it.dynamic) << 63) | (uint64_t(group) << 32) | placement;
-                        const auto [slot, first] = transparent_probe_cache_.try_emplace(key, 0);
-                        if (first) slot->second = lighting->transparent_probe_at(entry.centre);
-                        probe = slot->second;
+                        const auto [slot, first] = transparent_probe_cache_.try_emplace(key);
+                        if (first) slot->second = lighting->transparent_probes_at(entry.centre);
+                        probes = slot->second;
                     }
                 }
-                const auto [slot, first] = reflection_bindings.try_emplace(probe);
+                const auto [slot, first] = reflection_bindings.try_emplace(probes);
                 if (first) {
-                    const auto reflection = lighting->transparent_reflection(probe);
-                    const uint32_t srv = gpu.transient_descriptors(1);
+                    const auto reflection = lighting->transparent_reflection(probes);
+                    const uint32_t srv = gpu.transient_descriptors(2);
                     create_texture_srv(gpu.device(), reflection.cube, BindingKind::TextureCube, gpu.srv().cpu(srv));
+                    create_texture_srv(gpu.device(), reflection.secondary, BindingKind::TextureCube, gpu.srv().cpu(srv + 1));
                     const auto upload = gpu.dynamic(sizeof(reflection.constants));
                     std::memcpy(upload.cpu, reflection.constants.data(), sizeof(reflection.constants));
                     slot->second = {srv, upload.gpu};
                 }
                 binding = &slot->second;
-                if (probe) ++transparent_local_reflections_;
+                if (probes.primary) ++transparent_local_reflections_;
                 else ++transparent_sky_reflections_;
             }
             draw(cl, state, it, 1, entry.instance, binding);
             if (entry.sky) ++sky_transparent_draws_;
             else ++world_transparent_draws_;
         }
-        transparent_local_probes_ = reflection_bindings.size() - reflection_bindings.contains(0);
+        std::set<size_t> local_probes;
+        for (const auto& [probes, binding] : reflection_bindings) {
+            if (probes.primary) local_probes.insert(probes.primary);
+            if (probes.secondary) local_probes.insert(probes.secondary);
+        }
+        transparent_local_probes_ = local_probes.size();
         return;
     }
     auto record = [&](ID3D12GraphicsCommandList* commands, std::span<const size_t> items, bool blended) {

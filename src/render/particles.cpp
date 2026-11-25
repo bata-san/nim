@@ -72,11 +72,12 @@ const std::map<std::string, std::string>& ParticleScene::estimates() const {
 bool ParticleScene::has_emitters_near(V3 eye) const {
     return std::ranges::any_of(emitters_, [&](const auto& e) {
         const V3 d = e.position - eye;
-        return !systems_[e.system]->failed && dot(d, d) <= radius * radius;
+        return (!e.event || event_playing_) && !systems_[e.system]->failed && dot(d, d) <= radius * radius;
     });
 }
 
 void ParticleScene::release(Gpu&) {
+    event_playing_ = false;
     systems_.clear();
     emitters_.clear();
     for (auto& s : state_) s.Reset();
@@ -106,16 +107,16 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     for (const auto& p : placements) {
         // The exfil device's FX component plays on exfil_activation_progress. With no activation
         // state supplied the device is inactive (as its materials, scene.cpp), so they do not run.
-        if (p.gate == kChannelExfilActivationProgress) {
+        if (!p.event && p.gate == kChannelExfilActivationProgress) {
             ++gated_;
             continue;
         }
         // A turret's FX (its aiming laser and shots) play on its behaviour, not while it idles (3.111).
-        if (p.gate == kChannelTurret) {
+        if (!p.event && p.gate == kChannelTurret) {
             ++turret_;
             continue;
         }
-        if (p.gate == kChannelDevicePosition) {
+        if (!p.event && p.gate == kChannelDevicePosition) {
             ++device_;
             continue;
         }
@@ -210,6 +211,7 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
         if (it->second < 0) continue;
         const System& s = *systems_[size_t(it->second)];
         Emitter e;
+        e.event = p.event;
         e.system = uint32_t(it->second);
         e.rows = p.rows;
         e.position = {p.rows[3], p.rows[7], p.rows[11]};
@@ -264,6 +266,19 @@ void ParticleScene::load(PackageManager& pm, Gpu& gpu, std::span<const MapPartic
     }
     parity_ = 0;
     notes_.push_back(std::format("particles: {} systems, {} emitters, {} particle slots", systems_.size(), emitters_.size(), total_));
+}
+
+size_t ParticleScene::event_count() const {
+    return std::ranges::count(emitters_, true, &Emitter::event);
+}
+
+void ParticleScene::set_event_playing(bool playing) {
+    event_playing_ = playing;
+    for (auto& e : emitters_) {
+        if (!e.event) continue;
+        e.active = false;
+        e.spawned = 0;
+    }
 }
 
 // One simulation step of the emitters in `list` (state_[parity_] -> state_[1 - parity_]): the
@@ -353,8 +368,8 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
             ext.estimate(kGeneric, o, float4{1, 1, 1, 1},
                          "per-instance effect parameters (tint / alpha) the pattern sequencer writes; not decoded: 1");
         ext.set(kParticle, 0x144, 1.0f);
-        ext.note_estimate("particle draw fade = 1, except Perimeter mist 80B0D19F near the camera",
-                          "isolated this emitter as the corridor washout; fade in from 50 to 95 m until its sequencer is decoded");
+        ext.note_estimate("particle draw fade: viewer strength and Perimeter mist 80B0D19F distance fade",
+                          "the sequencer opacity is unavailable; Perimeter mist fades in from 50 to 95 m");
         if (device_)
             ext.note_estimate(std::format("{} particle placements of devices not run: device_position = 0", device_),
                               "their component's sequence reads device_position (e.g. the red laser 80B0DD71 of 80B0DD90); no device state "
@@ -447,7 +462,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     std::vector<uint32_t> live, warm, visible;
     for (uint32_t i = 0; i < emitters_.size(); ++i) {
         Emitter& e = emitters_[i];
-        if (systems_[e.system]->failed) continue;
+        if (systems_[e.system]->failed || (e.event && !event_playing_)) continue;
         const V3 d{e.position.x - vm.eye.x, e.position.y - vm.eye.y, e.position.z - vm.eye.z};
         const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
         const bool in_range = d2 <= radius * radius;
@@ -462,7 +477,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
             e.head = 0;
             e.spawned = 0;
             e.carry = 0;
-            e.warm_steps = kWarmSteps;
+            e.warm_steps = e.event ? 0 : kWarmSteps;
         }
         if (e.warm_steps) warm.push_back(i);
         live.push_back(i);
@@ -517,7 +532,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
     }
     if (dt > 0) step(gpu, cl, live, std::vector<float>(live.size(), dt), scopes, collision_views);
 
-    if (visible.empty()) return;
+    if (visible.empty() || draw_strength <= 0) return;
     // Expand each visible emitter's particles into draw instances.
     ID3D12Resource* cur = state_[parity_].Get();
     Gpu::barrier(cl, cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -569,7 +584,7 @@ void ParticleScene::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb,
             if (t == 0) continue;
             fade = t * t * (3.0f - 2.0f * t);
         }
-        ext.set(kParticle, 0x144, fade);
+        ext.set(kParticle, 0x144, fade * draw_strength);
         object_cb = object_constants_->GetGPUVirtualAddress() + uint64_t(i) * sizeof(ParticleObjectConstants);
         ext.set(kParticle, 0x178, float(e.offset * kHistoryFloat4s));
         ext.set(kParticle, 0x17C, float(e.offset * kHistoryFloat4s));

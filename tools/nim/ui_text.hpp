@@ -202,7 +202,11 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(EventPalette, "イベントパレット", "Event palette", "이벤트 팔레트") \
     X(EventFilter, "イベントを絞り込む", "Filter events", "이벤트 필터") \
     X(EventIdle, "通常状態", "Idle map", "기본 상태") \
-    X(EventPreviewHint, "配置と FX のプレビュー", "Placement and FX preview", "배치 및 효과 미리보기") \
+    X(EventPreviewHint, "選択したイベントを手動で再生します。", "Play the selected event on demand.", "선택한 이벤트를 수동으로 재생합니다.") \
+    X(EventPlay, "再生", "Play", "재생") \
+    X(EventReplay, "最初から再生", "Replay", "다시 재생") \
+    X(EventStop, "停止", "Stop", "정지") \
+    X(EventStaticOnly, "配置のみ表示できます", "Placement preview only", "배치만 미리 볼 수 있습니다") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \
@@ -345,6 +349,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(FogDensityScale, "大気の霧の濃さ", "Atmospheric fog density", "대기 안개 밀도") \
     X(ChromaticAberration, "色収差", "Chromatic aberration", "색수차") \
     X(EmissiveGain, "自己発光の強さ", "Emissive intensity", "자체 발광 강도") \
+    X(ParticleStrength, "パーティクルの表示強度", "Particle strength", "파티클 표시 강도") \
     X(OutputGamma, "出力ガンマ", "Output gamma", "출력 감마") \
     X(OutputSharpen, "シャープネス", "Sharpening", "선명도") \
     X(OutputGrain, "画面ノイズ", "Screen grain", "화면 노이즈") \

@@ -327,14 +327,19 @@ void GameLighting::render_light_grid(Gpu& gpu, ID3D12GraphicsCommandList* cl, co
         if (grid_light_count_ || grid_light_misses_)
             ext_.note_estimate(std::format("transparent local lights: {} lights within 64 m into light_sample_points_instance_grid ({} without readable registers)",
                                            grid_light_count_, grid_light_misses_),
-                               "light PS registers by pattern: falloff = the (-a, b, 0, 0) init, colour = falloff - 1, cone = falloff - 3, weight = the +0x150 product; "
-                               "point / spot from the node +X axis, cone exponent and clip planes dropped, no capsule length, one SH lobe; values taken when the grid is rebuilt");
+                               "estimated point/spot shape; peak per-light RGB contribution is limited to 1.5 before coarse SH accumulation "
+                               "(the grid has no shadows or clip planes; Outpost shield), preserving light hue; opaque lights use their own records unchanged");
     }
     grid_ready_ = true;
 }
 
 size_t GameLighting::transparent_probe_at(V3 position) const {
-    if (transparent_probe_preview_) return 1;
+    return transparent_probes_at(position).primary;
+}
+
+TransparentProbes GameLighting::transparent_probes_at(V3 position) const {
+    if (transparent_probe_preview_) return {1};
+    TransparentProbes probes;
     const float q[3]{position.x, position.y, position.z};
     // Loaded largest first for the opaque pass. The innermost box wins for an object sample.
     for (size_t probe = cubemaps_.size(); probe > 0; --probe) {
@@ -344,43 +349,53 @@ size_t GameLighting::transparent_probe_at(V3 position) const {
         if (q[0] < box.lo[0] || q[0] > box.hi[0] || q[1] < box.lo[1] || q[1] > box.hi[1] ||
             q[2] < box.lo[2] || q[2] > box.hi[2])
             continue;
-        bool inside = true;
-        for (size_t axis = 0; axis < 3 && inside; ++axis) {
+        float edge = 0;
+        for (size_t axis = 0; axis < 3; ++axis) {
             const auto& inv = *cv.world_to_local;
             const float x = inv.c[0][axis] * q[0] + inv.c[1][axis] * q[1] + inv.c[2][axis] * q[2] + inv.c[3][axis];
-            inside = std::abs(x) <= 1;
+            edge = std::max(edge, std::abs(x));
         }
-        if (inside) return probe;
+        if (!(edge <= 1)) continue;
+        if (!probes.primary) {
+            probes.primary = probe;
+            probes.weight = uint8_t(std::lround(std::clamp((1.0f - edge) / 0.2f, 0.0f, 1.0f) * 8));
+            if (probes.weight == 8) break;
+        } else {
+            probes.secondary = probe;
+            break;
+        }
     }
-    return 0;
+    return probes;
 }
 
-GameLighting::TransparentReflection GameLighting::transparent_reflection(size_t probe) const {
+GameLighting::TransparentReflection GameLighting::transparent_reflection(TransparentProbes probes) const {
     TransparentReflection reflection;
     auto& advanced = reflection.constants;
     advanced[6][3] = 1;
-    if (probe > 0 && probe <= cubemaps_.size()) {
+    auto fill = [&](size_t probe, size_t offset, float weight) -> ID3D12Resource* {
+        if (!probe || probe > cubemaps_.size()) return nullptr;
         const auto& cv = cubemaps_[probe - 1];
-        reflection.cube = cv.specular.Get();
-        if (reflection.cube) {
-            advanced[10][3] = cv.volume.unk30;
-            advanced[11][3] = cv.max_mip;
-            advanced[14][3] = 1;
-            advanced[15][3] = cv.squared ? 0.0f : 1.0f;
-            advanced[16] = {1, 1, 1, 0};
+        if (cv.specular) {
+            advanced[offset + 10][3] = cv.volume.unk30;
+            advanced[offset + 11][3] = cv.max_mip;
+            advanced[offset + 14][3] = weight;
+            advanced[offset + 15][3] = cv.squared ? 0.0f : 1.0f;
+            advanced[offset + 16] = {1, 1, 1, 0};
         }
-    }
+        return cv.specular.Get();
+    };
+    reflection.cube = fill(probes.primary, 0, float(probes.weight) / 8);
+    reflection.secondary = fill(probes.secondary, 14, 1.0f);
     return reflection;
 }
 
 void GameLighting::prepare_transparent_reflection(const ViewMatrices& vm, const CubemapVolume* preview) {
     transparent_probe_preview_ = preview != nullptr;
-    const auto reflection = transparent_reflection(transparent_probe_at(vm.eye));
+    const auto reflection = transparent_reflection(transparent_probes_at(vm.eye));
     ext_.set_texture(ext::Transparent, 0xE0, reflection.cube);
-    // The secondary blend block in cb8 is zero in the single-probe preview.
-    ext_.set_texture(ext::Transparent, 0xE8, reflection.cube);
-    ext_.note_estimate("transparent reflection t27: secondary probe inactive",
-                       "the original runtime selection and blending of a second probe are unresolved");
+    ext_.set_texture(ext::Transparent, 0xE8, reflection.secondary);
+    ext_.note_estimate("transparent reflection t26/t27: blend toward the enclosing probe near the inner box edge",
+                       "probe selection and outer 20% fade are viewer estimates; original shader blends the two samples");
     ext_.set_scope_constants(ShaderStage::Pixel, 8, reflection.constants);
     if (preview)
         ext_.note_estimate("transparent reflection: fixed orbit_goliath_013b preview probe", "viewer preview environment");

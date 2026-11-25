@@ -469,12 +469,14 @@ public:
     ID3D12Resource* linear_depth() const { return linear_depth_.Get(); }
     struct TransparentReflection {
         ID3D12Resource* cube = nullptr;
+        ID3D12Resource* secondary = nullptr;
         std::array<float4, 37> constants{};
     };
     // Probe index zero means sky. Other indices belong to the current map or preview.
     size_t transparent_probe_at(V3 position) const;
+    TransparentProbes transparent_probes_at(V3 position) const;
     uint64_t cubemap_generation() const { return cubemap_generation_; }
-    TransparentReflection transparent_reflection(size_t probe) const;
+    TransparentReflection transparent_reflection(TransparentProbes probes) const;
     ID3D12Resource* distortion_view_depth() const { return distortion_view_depth_.Get(); }
     // The exposure scale of the last frame (cb13 [1].x): auto exposure x LightingParams::exposure.
     // Material passes (emissive) read the same value: StaticMeshScene::set_exposure.
@@ -506,8 +508,10 @@ private:
     ExternStore hdao_ext_;
     ExternStore atmo_lut_;  // the atmosphere density pass's inputs
     static constexpr UINT kMaterialAoRtv = 13;
+    static constexpr UINT kBackdropLdrRtv = 14;
     ComPtr<ID3D12Resource> ao_, material_ao_, linear_depth_;
-    ComPtr<ID3D12PipelineState> linear_depth_pso_;
+    ComPtr<ID3D12PipelineState> linear_depth_pso_, backdrop_ldr_pso_;
+    ComPtr<ID3D12Resource> backdrop_ldr_;  // transparent +0x68: the backdrop exposed and clamped (3.132)
     void render_ssao(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm, const ScopeBufferFn& scopes);
     void render_linear_depth(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, const ViewMatrices& vm);
 

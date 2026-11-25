@@ -105,6 +105,11 @@ struct MapEventPreview {
     std::array<float, 3> position{};
     size_t placements = 0;
 };
+struct MapEventPlacement {
+    uint64_t node = 0;
+    TagHash entity, model;
+    std::array<float, 12> rows{};
+};
 struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
@@ -121,6 +126,10 @@ struct MapLayout {
     std::unordered_set<uint64_t> patrol_drone_nodes;
     std::vector<MapEventPreview> event_previews;
     std::unordered_map<uint64_t, TagHash> preview_models;
+    std::unordered_set<uint64_t> event_fx_nodes;
+    std::vector<MapEventPlacement> event_placements;
+    std::vector<std::array<float, 3>> event_route;
+    std::unordered_map<uint64_t, TagHash> event_actor_models;
     bool hidden(uint64_t node, bool fx) const { return hidden_nodes.contains(node) || (fx && hidden_fx_nodes.contains(node)); }
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
@@ -163,6 +172,7 @@ struct MapLight {
     std::array<float, 4> fade_distances{};
     // A light an FX sequence carries (load_map_fx_lights): drawn with the map's FX only.
     bool fx = false;
+    bool event = false;
     // The light's fade (deferred_light +0x160) and its shaft's fade at a camera distance
     // (estimate: saturate((end - d) / (end - start)), linear; 1 where start == end).
     float light_fade(float distance) const { return fade_at(fade_distances[0], fade_distances[1], distance); }
@@ -446,6 +456,7 @@ struct MapParticle {
     // exfil_activation_progress, a device's device_position), or kChannelTurret for a turret's FX,
     // 0 if none: the systems play on that run-time state.
     uint32_t gate = 0;
+    bool event = false;
 };
 inline constexpr uint32_t kChannelExfilActivationProgress = 0x4AE64998;  // fnv1("exfil_activation_progress")
 // An entity whose components name the object channel "turret" (the showcase turrets): its FX are the

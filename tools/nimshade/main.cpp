@@ -27,6 +27,7 @@
 #include "nim/render/scene.hpp"
 #include "nim/render/particles.hpp"
 #include "nim/render/ai_actors.hpp"
+#include "nim/render/event_playback.hpp"
 #include "nim/sim/ai.hpp"
 #include "nim/content/wwise.hpp"
 
@@ -210,6 +211,7 @@ int run(int argc, char** argv) {
     uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
     uint64_t event_preview = 0;
     bool list_events = false;
+    std::optional<float> event_seconds;
     std::string ai_subject_name;  // --ai-subject TEXT: --ai-frame / --ai-strip only consider characters whose name contains it
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
@@ -257,6 +259,7 @@ int run(int argc, char** argv) {
         else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
         else if (args[i] == "--list-events") list_events = true;
         else if (args[i] == "--event-preview" && i + 1 < args.size()) event_preview = std::stoull(args[++i], nullptr, 16);
+        else if (args[i] == "--event-seconds" && i + 1 < args.size()) event_seconds = std::stof(args[++i]);
         else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--ai") ai = true;
@@ -409,6 +412,8 @@ int run(int argc, char** argv) {
     }
     TagHash mesh_tag(uint32_t(std::stoul(pos[0], nullptr, 16)));
     if (!std::isfinite(material_time) || material_time < 0) throw std::runtime_error("--time must be finite and nonnegative");
+    if (event_seconds && (!event_preview || !std::isfinite(*event_seconds) || *event_seconds < 0 || *event_seconds > 120))
+        throw std::runtime_error("--event-seconds requires --event-preview and a time from 0 to 120 seconds");
     if (!std::isfinite(camera_scale) || camera_scale <= 0) throw std::runtime_error("--camera-scale must be finite and positive");
     fs::path out_dir = pos.size() >= 2 ? fs::path(pos[1]) : fs::path("shade_" + mesh_tag.str());
     fs::create_directories(out_dir);
@@ -431,6 +436,7 @@ int run(int argc, char** argv) {
     std::map<uint32_t, float> weather_channels;
     bool is_map = false;
     std::vector<MapParticle> particle_placements;
+    EventPlayback event_player;
     // --ai (3.70): the activity's estimated AI simulation, its agents drawn as actors.
     std::optional<MapGameplay> ai_gameplay;
     std::unique_ptr<AiSimulation> ai_sim;
@@ -451,6 +457,8 @@ int run(int argc, char** argv) {
         MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
         pm.build_hash64_index();
         hide_scripted_nodes(pm, map, selected_activity, event_preview);
+        auto event_tracks = event_seconds ?
+            std::make_shared<const std::vector<PreparedEventTrack>>(prepare_event_tracks(pm, map)) : nullptr;
         for (const auto& event : map.event_previews)
             if (list_events || event.id == event_preview)
                 std::println("event {:016X}: {} at ({:.1f}, {:.1f}, {:.1f}), {} placement(s)", event.id, event.name,
@@ -562,7 +570,8 @@ int run(int argc, char** argv) {
                 size_t attached = 0;
                 auto fx_lights = load_map_fx_lights(pm, map, &attached);
                 std::println("fx lights: {} ({} with a named attachment, placed at the node: estimate)", fx_lights.size(), attached);
-                for (auto& l : fx_lights) map_lights.push_back(std::move(l));
+                for (auto& l : fx_lights)
+                    if (!l.event || event_seconds) map_lights.push_back(std::move(l));
             }
             region_lights = map_light_region(map_lights, focus, map_radius);
             std::println("lights: {} of {} within range", region_lights.size(), map_lights.size());
@@ -720,6 +729,19 @@ int run(int argc, char** argv) {
         if (load_sampler) load_sampler->stop_and_print();
         std::println("terrain: {} of {} patches in range ({} in the map)", terrain_ok, terrain.size(), map.terrains.size());
         std::println("placed entity models added: {}", entity_models_loaded);
+        if (event_tracks) {
+            event_player.build(gpu, scene, layouts, event_tracks);
+            event_player.play();
+            std::println("event playback: {} tracks at {:.2f}s", event_player.size(), *event_seconds);
+            for (float elapsed = 0; ; ) {
+                const float dt = std::min(1.0f / 30, *event_seconds - elapsed);
+                event_player.step(scene, dt);
+                for (const auto& sound : event_player.sounds())
+                    std::println("  event sound {:.3f}s {:016X} {}", elapsed + dt, sound.emitter, sound.event.str());
+                if (dt <= 0 || elapsed + dt >= *event_seconds) break;
+                elapsed += dt;
+            }
+        }
         scene.finish(gpu, mesh_tag, V3{focus[0], focus[1], focus[2]}, std::min(map_radius, geometry_extent) * 0.6f);
         std::println("loaded {} meshes / {} instances in {:.1f}s", scene.mesh_count(), scene.instance_count(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -1280,6 +1302,7 @@ int run(int argc, char** argv) {
     if (!particle_placements.empty()) {
         const auto tp = std::chrono::steady_clock::now();
         particles.load(pm, gpu, particle_placements);
+        if (event_seconds) particles.set_event_playing(true);
         gpu.flush();
         for (const auto& n : particles.notes()) std::println("  {}", n);
         std::println("fx pipelines ready ({:.1f}s)", std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
