@@ -4,6 +4,7 @@
 #include "nim/content/map_audio.hpp"
 #include "nim/content/codex.hpp"
 #include "nim/content/usm.hpp"
+#include "nim/content/movies.hpp"
 #include "nim/content/map.hpp"
 #include "nim/content/tfx_vm.hpp"
 #include "nim/content/tfx.hpp"
@@ -34,6 +35,35 @@ static int g_failures = 0;
     } while (0)
 
 int main() {
+    // Movie audio channels differ from the 13 localized-text slots.
+    {
+        using enum TextLanguage;
+        constexpr std::pair<uint8_t, TextLanguage> dubbed[] = {
+            {1, English}, {2, French}, {3, Italian}, {4, German}, {5, Spanish}, {6, Japanese},
+            {7, Portuguese}, {8, SpanishLatAm}, {10, ChineseSimplified}, {11, Russian}, {12, Polish}, {13, Korean}
+        };
+        MovieEntry movie;
+        movie.info.audio.push_back({0, 2, 44100, 1, 44100});
+        for (const auto& [channel, language] : dubbed)
+            movie.info.audio.push_back({channel, 2, 48000, 6, 480000});
+        for (const auto* filename : {"nux_intro.usm", "zone_select_takeover.usm"}) {
+            movie.info.filename = filename;
+            for (const auto& [channel, language] : dubbed) {
+                CHECK(movie_audio_language(movie, channel) == language);
+                CHECK(default_movie_audio_channel(movie, language) == channel);
+            }
+            CHECK(movie_audio_is_placeholder(movie, movie.info.audio.front()));
+            CHECK(!movie_audio_language(movie, 9));
+            CHECK(default_movie_audio_channel(movie, ChineseTraditional) == 10);
+        }
+        movie.info.audio.erase(movie.info.audio.begin() + 2);  // French missing
+        CHECK(default_movie_audio_channel(movie, French) == 1);
+        movie.info.filename = "unverified.usm";
+        CHECK(!movie_audio_language(movie, 6));
+        CHECK(!movie_audio_is_placeholder(movie, movie.info.audio.front()));
+        CHECK(default_movie_audio_channel(movie, Japanese) == 0);
+    }
+
     // A brief loud ambient mechanical burst must be reduced, even in a long quiet bed.
     {
         PcmAudio pcm{100, 2, std::vector<int16_t>(200)};

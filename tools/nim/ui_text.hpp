@@ -482,11 +482,7 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(CodexNoIllustration, "イラスト: コデックスのデータにテクスチャ参照が見つかっていません (未解明)", "Illustration: the codex data references no texture that nim has found (unresolved)", "일러스트: 코덱스 데이터에서 텍스처 참조를 찾지 못했습니다 (미해명)") \
     X(MovieFilterHint, "  ファイル名で検索", "  Search file name", "  파일 이름 검색")                                 \
     X(AudioTrack, "音声トラック", "Audio track", "음성 트랙")                                                           \
-    X(TrackTip, "言語トラックの割り当てはゲームデータに無いため推定です\n(チャンネル番号 = 文字列の言語スロット + 1。繁体字中国語の ch9 は欠番)", \
-      "The language-track mapping is not in the game data, so it is estimated\n(channel = text language slot + 1; ch9 for Traditional Chinese is unused)", \
-      "언어 트랙 대응은 게임 데이터에 없어 추정입니다\n(채널 = 텍스트 언어 슬롯 + 1. 번체 중국어 ch9은 비어 있음)")         \
-    X(TrackEstimated, "{} (推定)", "{} (estimated)", "{} (추정)")                                                       \
-    X(TrackDefault, "既定", "Default", "기본")                                                                          \
+    X(TrackMandarin, "中国語（普通話）", "Chinese (Mandarin)", "중국어 (표준 중국어)") \
     X(VideoOnlyUnsupported, "この音声 (%s) は未対応のため映像のみ", "This audio (%s) is unsupported, so video only",       \
       "이 음성(%s)은 미지원이라 영상만 재생합니다")                                                                         \
     X(AudioOutputError, "音声出力を開けません", "Cannot open the audio output", "음성 출력을 열 수 없습니다")              \

@@ -7,6 +7,44 @@
 
 namespace nim {
 
+namespace {
+
+bool has_verified_dub_order(const MovieEntry& movie) {
+    return movie.info.filename == "nux_intro.usm" || movie.info.filename == "zone_select_takeover.usm";
+}
+
+} // namespace
+
+std::optional<TextLanguage> movie_audio_language(const MovieEntry& movie, int channel) {
+    using enum TextLanguage;
+    constexpr std::optional<TextLanguage> languages[] = {
+        std::nullopt, English, French, Italian, German, Spanish, Japanese, Portuguese, SpanishLatAm,
+        std::nullopt, ChineseSimplified, Russian, Polish, Korean
+    };
+    if (!has_verified_dub_order(movie) || channel < 0 || size_t(channel) >= std::size(languages)) return std::nullopt;
+    return languages[channel];
+}
+
+bool movie_audio_is_placeholder(const MovieEntry& movie, const UsmInfo::Audio& track) {
+    // These two files have a one-second silent mono stream alongside the full dubbed tracks.
+    return has_verified_dub_order(movie) && track.channel == 0 && track.channels == 1 &&
+           track.sample_rate != 0 && track.total_samples <= 2 * uint64_t(track.sample_rate);
+}
+
+int default_movie_audio_channel(const MovieEntry& movie, TextLanguage language) {
+    if (language == TextLanguage::ChineseTraditional) language = TextLanguage::ChineseSimplified;
+    int first = -1;
+    int english = -1;
+    for (const auto& track : movie.info.audio) {
+        if ((track.codec != 2 && track.codec != 4) || movie_audio_is_placeholder(movie, track)) continue;
+        const auto actual = movie_audio_language(movie, track.channel);
+        if (actual == language) return track.channel;
+        if (actual == TextLanguage::English) english = track.channel;
+        if (first == -1) first = track.channel;
+    }
+    return english >= 0 ? english : first;
+}
+
 std::vector<MovieEntry> list_movies(PackageManager& pm) {
     std::vector<MovieEntry> movies;
     std::unordered_map<uint32_t, size_t> by_usm;

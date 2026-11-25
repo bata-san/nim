@@ -1,7 +1,9 @@
 #pragma once
+#include "nim/content/strings.hpp"
 #include "nim/content/usm.hpp"
 #include "nim/core/package_manager.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,5 +22,11 @@ struct MovieEntry {
 
 // Every USM in the install (all type 27/1 entries that start with "CRID"), with their descriptors.
 std::vector<MovieEntry> list_movies(PackageManager& pm);
+
+// The localized USMs use their own audio channel order, independent of string-table slots.
+std::optional<TextLanguage> movie_audio_language(const MovieEntry& movie, int channel);
+bool movie_audio_is_placeholder(const MovieEntry& movie, const UsmInfo::Audio& track);
+// Prefers the requested language, then English, then the first playable recording. -1 = no audio.
+int default_movie_audio_channel(const MovieEntry& movie, TextLanguage language);
 
 } // namespace nim

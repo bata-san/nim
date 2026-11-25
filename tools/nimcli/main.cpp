@@ -2781,7 +2781,7 @@ int cmd_movie_export(PackageManager& pm, TagHash tag, const fs::path& out, int c
     const auto movies = list_movies(pm);
     const auto found = std::ranges::find(movies, tag, &MovieEntry::usm);
     if (found == movies.end()) throw std::runtime_error("not a movie");
-    if (channel == -2) channel = found->info.audio.empty() ? -1 : found->info.audio.front().channel;
+    if (channel == -2) channel = default_movie_audio_channel(*found, TextLanguage::English);
     StringTable strings;
     if (subtitles >= 0) strings.load_all(pm);
     std::atomic<unsigned> progress{0};

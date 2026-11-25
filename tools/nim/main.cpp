@@ -5211,32 +5211,15 @@ public:
     }
 
     // -- MOVIES --
-    // Localized USM channel numbers follow the text slots with the Japanese and Latin American Spanish channels swapped.
-    static std::optional<TextLanguage> movie_track_language(int channel) {
-        if (channel == 2) return TextLanguage::SpanishLatAm;
-        if (channel == 6) return TextLanguage::Japanese;
-        if (channel < 1 || size_t(channel) > kTextLanguageCount) return std::nullopt;
-        return TextLanguage(channel - 1);
-    }
-
-    int default_movie_channel(const MovieEntry& m) const {
-        if (m.info.audio.empty()) return 0;
-        if (m.info.audio.size() > 1) {
-            for (const auto& a : m.info.audio)
-                if (movie_track_language(a.channel) == TextLanguage(language)) return a.channel;
-            for (const auto& a : m.info.audio)
-                if (movie_track_language(a.channel) == TextLanguage::English) return a.channel;
-        }
-        return m.info.audio.front().channel;
-    }
-
     static std::string movie_track_label(const MovieEntry& m, const UsmInfo::Audio& a) {
         std::string name;
-        const auto locale = movie_track_language(a.channel);
-        if (m.info.audio.size() > 1 && locale)
-            name = ui::trf(ui::S::TrackEstimated, text_language_name(size_t(*locale)));
+        const auto locale = movie_audio_language(m, a.channel);
+        if (locale == TextLanguage::ChineseSimplified)
+            name = ui::tr(ui::S::TrackMandarin);
+        else if (locale)
+            name = text_language_name(size_t(*locale));
         else
-            name = m.info.audio.size() > 1 ? ui::tr(ui::S::Default) : ui::tr(ui::S::Voice);
+            name = ui::tr(ui::S::Voice);
         name += std::format("  ch{} {} {}ch", a.channel, usm_audio_codec_name(a.codec), a.channels);
         if (a.codec != 2 && a.codec != 4) name += std::string(" ") + ui::tr(ui::S::Unsupported);
         return name;
@@ -5249,7 +5232,7 @@ public:
         movie.pending.reset();
         if (movie.selected != index) {
             movie.selected = index;
-            movie.channel = default_movie_channel(m);
+            movie.channel = default_movie_audio_channel(m, TextLanguage(language));
             movie.has_frame = false;
         }
         if (!m.error.empty()) return;
@@ -5930,16 +5913,16 @@ public:
                 open_movie(movie.selected, pos, p && p->paused());
                 p = movie.player.get();
             }
-            for (const auto& t : m.info.audio)
+            for (const auto& t : m.info.audio) {
+                if (movie_audio_is_placeholder(m, t)) continue;
                 if (ImGui::Selectable(movie_track_label(m, t).c_str(), t.channel == movie.channel)) {
                     movie.channel = t.channel;
                     open_movie(movie.selected, pos, p && p->paused());
                     p = movie.player.get();
                 }
+            }
             ImGui::EndCombo();
         }
-        if (m.info.audio.size() > 1)
-            ImGui::SetItemTooltip(ui::tr(ui::S::TrackTip));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(200 * sc);
         if (begin_combo(ui::tr(ui::S::Subtitles), movie.sub_lang == kSubtitlesOff ? ui::tr(ui::S::Off) : text_language_name(sub_lang))) {
