@@ -208,6 +208,8 @@ int run(int argc, char** argv) {
     float ai_time = 20, ai_range = 60, ai_frame_distance = 6, ai_frame_height = 1.7f;
     size_t ai_per_character = 4;
     uint32_t ai_strip = 0;     // --ai-strip N: N frames 0.1 s apart of a walking agent (strip_K.png)
+    uint64_t event_preview = 0;
+    bool list_events = false;
     std::string ai_subject_name;  // --ai-subject TEXT: --ai-frame / --ai-strip only consider characters whose name contains it
     uint32_t ai_ship_strip = 0;  // --ai-dropship-strip N: the nearest dropship called, N frames 0.5 s apart (ship_K.png)
     std::optional<size_t> ai_ship;
@@ -253,6 +255,8 @@ int run(int argc, char** argv) {
             }
         }
         else if (args[i] == "--activity" && i + 1 < args.size()) selected_activity = TagHash(uint32_t(std::stoul(args[++i], nullptr, 16)));
+        else if (args[i] == "--list-events") list_events = true;
+        else if (args[i] == "--event-preview" && i + 1 < args.size()) event_preview = std::stoull(args[++i], nullptr, 16);
         else if (args[i] == "--activity-map" && i + 1 < args.size()) selected_activity_map = uint32_t(std::stoul(args[++i]));
         else if (args[i] == "--no-entities") no_entities = true;
         else if (args[i] == "--ai") ai = true;
@@ -395,7 +399,7 @@ int run(int argc, char** argv) {
         else pos.push_back(args[i]);
     }
     if (pos.empty()) {
-        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-fx-lights] [--bloom-highlight K] [--no-distortion] [--fx-radius M] [--activity ACT] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ship-view EX,EY,EZ,TX,TY,TZ] [--ai-ground-audit] [--ai-sound-log S]");
+        std::println(stderr, "usage: nimshade [--install DIR] TAG [OUT_DIR] [--size WxH] [--warp] [--time-of-day DAYS] [--no-atmosphere] [--no-environment] [--no-sky-ambient] [--no-overhead-occlusion] [--fog-density-scale SCALE] [--near-shaft-strength SCALE] [--interior-fog | --no-interior-fog] [--no-assumed-light-state] [--no-light-shadows] [--no-light-records] [--print-channels] [--no-aa] [--no-taa] [--dlaa] [--emissive-gain N] [--dof] [--dof-focus M] [--vignette] [--output-gamma N] [--sharpen N] [--grain N] [--chromatic-aberration N] [--no-sky-objects] [--verify-frame-inputs] [--time SECONDS] [--channel HASH=VALUE] [--benchmark FRAMES] [--reference] [--camera-scale N] [--no-fx] [--no-fx-lights] [--bloom-highlight K] [--no-distortion] [--fx-radius M] [--activity ACT] [--list-events | --event-preview HEX_ID] [--ai] [--ai-time S] [--ai-range M] [--ai-actors N] [--ai-visible] [--ai-debug] [--ai-frame] [--ai-frame-at DIST,HEIGHT] [--ai-strip N] [--ai-subject NAME] [--ai-dropship-strip N] [--ai-ship-view EX,EY,EZ,TX,TY,TZ] [--ai-ground-audit] [--ai-sound-log S]");
         return 2;
     }
     if (install.empty()) {
@@ -446,7 +450,13 @@ int run(int argc, char** argv) {
         } else std::println("map_view: bubble node tables only");
         MapLayout map = load_map_layout(pm, mesh_tag, activity_tables);
         pm.build_hash64_index();
-        hide_scripted_nodes(pm, map, selected_activity);  // DCON FX and the lockdown ships (3.111)
+        hide_scripted_nodes(pm, map, selected_activity, event_preview);
+        for (const auto& event : map.event_previews)
+            if (list_events || event.id == event_preview)
+                std::println("event {:016X}: {} at ({:.1f}, {:.1f}, {:.1f}), {} placement(s)", event.id, event.name,
+                             event.position[0], event.position[1], event.position[2], event.placements);
+        if (event_preview && std::ranges::find(map.event_previews, event_preview, &MapEventPreview::id) == map.event_previews.end())
+            throw std::runtime_error("event preview ID does not belong to this map selection");
         std::println("hidden by script: {} nodes, FX of {} nodes", map.hidden_nodes.size(), map.hidden_fx_nodes.size());
         is_map = true;
         // Without --eye / --look, the camera stands at the activity's first player start (estimate).

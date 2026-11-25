@@ -99,6 +99,12 @@ struct MapDecalVolumes {
     std::vector<MapDecalVolumeSet> sets;
 };
 
+struct MapEventPreview {
+    uint64_t id = 0;  // authored node ID for a ship, or the script component tag
+    std::string name;
+    std::array<float, 3> position{};
+    size_t placements = 0;
+};
 struct MapLayout {
     TagHash bubble;
     std::vector<TagHash> instance_tags;  // the SStaticMeshInstances found
@@ -113,6 +119,8 @@ struct MapLayout {
     std::unordered_set<uint64_t> hidden_nodes;     // model, FX, lights and ambient emitters are omitted
     std::unordered_set<uint64_t> hidden_fx_nodes;  // their FX (particles and FX lights) not run
     std::unordered_set<uint64_t> patrol_drone_nodes;
+    std::vector<MapEventPreview> event_previews;
+    std::unordered_map<uint64_t, TagHash> preview_models;
     bool hidden(uint64_t node, bool fx) const { return hidden_nodes.contains(node) || (fx && hidden_fx_nodes.contains(node)); }
 };
 MapLayout load_map_layout(PackageManager& pm, TagHash bubble, std::span<const TagHash> additional_tables = {});
@@ -404,8 +412,10 @@ MapGameplay load_map_gameplay(PackageManager& pm, TagHash activity);
 //  - lockdown ships: the nodes lockdown.bs objects place (Dire Marsh: 80B08991 at z = 109), and
 //    those placed by a spawner linking to the parts of a room_lockdown_system.bs (Outpost: 80B0D412
 //    over the room at (87, 144)): not drawn at all (MapLayout::hidden_nodes).
-// Returns the number of nodes hidden. Needs the hash64 index.
-size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity = {});
+// Expedition selections also hide authored ship placements and build an event palette.
+// preview restores the selected models and linked FX for inspection. Returns the number hidden.
+// Needs the hash64 index.
+size_t hide_scripted_nodes(PackageManager& pm, MapLayout& map, TagHash activity = {}, uint64_t preview = 0);
 
 // ---- particle systems (FX) ----------------------------------------------------------------
 // A GPU particle system (808081E8, 64 bytes): +0x00 its definition (808081EF: header floats at

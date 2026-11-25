@@ -1013,6 +1013,7 @@ public:
         std::shared_ptr<const MapWeather> weather;  // the map's world channel controllers
         std::shared_ptr<const MapAtmosphere> atmosphere;  // the map's sky lookups and sun path
         std::shared_ptr<const MapAudio> audio;  // the map's ambient sound emitters
+        std::shared_ptr<const std::vector<MapEventPreview>> events;
         std::map<std::string, size_t> failures;  // reason -> count
     };
 
@@ -1052,9 +1053,9 @@ public:
         return list_error_;
     }
     // center: nullopt = where the map's geometry is (map_focus).
-    uint64_t request(const MapEntry& selection, std::optional<std::array<float, 3>> center, float radius, uint32_t texture_cap) {
+    uint64_t request(const MapEntry& selection, std::optional<std::array<float, 3>> center, float radius, uint32_t texture_cap, uint64_t preview) {
         std::lock_guard lk(m_);
-        request_ = Request{++generation_, selection.bubble, center, radius, texture_cap, selection.activity, selection.bubble_name, selection.activity_map};
+        request_ = Request{++generation_, selection.bubble, center, radius, texture_cap, selection.activity, selection.bubble_name, selection.activity_map, preview};
         pieces_.clear();
         progress_ = Progress{generation_};
         cv_.notify_all();
@@ -1094,6 +1095,7 @@ private:
         uint32_t texture_cap;
         TagHash activity;
         uint32_t bubble_name = 0, activity_map = 0;
+        uint64_t preview = 0;
     };
     void run(fs::path install) {
         std::unique_ptr<PackageManager> pm;
@@ -1109,6 +1111,8 @@ private:
         std::optional<MapLayout> layout;
         TagHash layout_activity;
         uint32_t layout_activity_map = 0;
+        uint64_t layout_preview = 0;
+        std::shared_ptr<const std::vector<MapEventPreview>> events;
         std::optional<PrepareCache> cache;
         std::vector<std::vector<InputElement>> layouts;
         try {
@@ -1162,17 +1166,19 @@ private:
             };
             try {
                 ProfileScope profile_layout("map.layout");
-                const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map;
+                const bool selection_changed = !layout || layout->bubble != req.bubble || layout_activity != req.activity || layout_activity_map != req.activity_map || layout_preview != req.preview;
                 if (selection_changed) {
                     const auto tables = req.activity.is_none() ? std::vector<TagHash>{} : load_activity_node_tables(*pm, req.activity, req.bubble_name, req.activity_map);
                     layout = load_map_layout(*pm, req.bubble, tables);
                     try {  // DCON FX and the lockdown ships, left out by user decision (3.111)
                         pm->build_hash64_index();
-                        hide_scripted_nodes(*pm, *layout, req.activity);
+                        hide_scripted_nodes(*pm, *layout, req.activity, req.preview);
                     } catch (const std::exception&) {
                     }
                     layout_activity = req.activity;
                     layout_activity_map = req.activity_map;
+                    layout_preview = req.preview;
+                    events = std::make_shared<const std::vector<MapEventPreview>>(std::move(layout->event_previews));
                     entities.reset();
                     starts = find_map_starts(*pm, *layout);
                 }
@@ -1298,6 +1304,7 @@ private:
                     std::lock_guard lk(m_);
                     if (generation_ != req.generation) continue;
                     progress_.total = jobs.size();
+                    progress_.events = events;
                     progress_.center = center;
                     progress_.extent = extent;
                     progress_.typical = typical;
@@ -1617,7 +1624,7 @@ public:
         // 0: the map alone, 1: the map as a game mode (activity) uses it. Default 1: the game always
         // plays a map through an activity, whose placements carry most props (terminals, screens).
         int selection_mode = 1;
-        char filter[64] = "";
+        char filter[64] = "", event_filter[64] = "";
         int selected = -1;     // index into map_worker.maps()
         static constexpr float kUnlimited = 5000;
         float radius = kUnlimited;  // default to the user's whole-world workflow
@@ -1635,6 +1642,8 @@ public:
         std::array<float, 3> center{};
         float typical = 0;              // Progress::typical
         std::optional<MapStart> start;  // Progress::start
+        uint64_t preview = 0;
+        std::shared_ptr<const std::vector<MapEventPreview>> events;
     };
     MapView map;
     bool map_scene = false;  // the live scene is a map region
@@ -2067,7 +2076,7 @@ public:
         map_worker.cancel();
         map.streaming = false;
     }
-    void load_map(int index, std::optional<std::array<float, 3>> center) {
+    void load_map(int index, std::optional<std::array<float, 3>> center, uint64_t preview = 0) {
         const auto& maps = map_worker.maps();
         if (index < 0 || index >= int(maps.size())) return;
         const auto& m = maps[size_t(index)];
@@ -2075,7 +2084,12 @@ public:
         map.processed = 0;
         map.load_seconds = 0;
         const bool whole = map.radius >= MapView::kUnlimited;
-        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap]);
+        if (index != map.selected) {
+            map.events.reset();
+            map.event_filter[0] = 0;
+        }
+        map.preview = preview;
+        map.generation = map_worker.request(m, center, whole ? 1e9f : map.radius, kMapTextureCaps[map.texture_cap], preview);
         loading.reset();  // a live mesh still being prepared is discarded when it arrives
         map_add_failures.clear();
         gpu.wait_idle();
@@ -2135,6 +2149,7 @@ public:
         map.center = pr.center;
         map.typical = pr.typical;
         map.start = pr.start;
+        if (pr.events) map.events = pr.events;
         if (pr.weather && map_weather != pr.weather) {
             map_weather = pr.weather;
             weather_states.assign(map_weather->controllers.size(), -1);
@@ -2574,7 +2589,7 @@ public:
         ImGui::BeginDisabled(map.selected < 0);
         if (dbutton(ui::tr(ui::S::LoadAtCamera), w)) {
             const bool here = map_scene && map.selected >= 0 && maps[size_t(map.selected)].bubble == map.bubble;
-            load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt);
+            load_map(map.selected, here ? std::optional(std::array<float, 3>{cam.target.x, cam.target.y, cam.target.z}) : std::nullopt, map.preview);
         }
         ImGui::EndDisabled();
         ImGui::SetItemTooltip(ui::tr(ui::S::LoadAtCameraTip));
@@ -2622,6 +2637,37 @@ public:
         if (ImGui::SmallButton(ui::tr(ui::S::Copy))) ImGui::SetClipboardText(map.bubble.str().c_str());
         if (map.activity.is_none()) ImGui::TextDisabled(ui::tr(ui::S::MapViewLine), map.bubble.str().c_str());
         else ImGui::TextDisabled(ui::tr(ui::S::ActivityViewLine), map.activity.str().c_str(), map.activity_map, map.bubble.str().c_str());
+        if (map.events && !map.events->empty()) {
+            const auto events = map.events;
+            const auto selected = std::ranges::find(*events, map.preview, &MapEventPreview::id);
+            const char* label = selected == events->end() ? ui::tr(ui::S::EventIdle) : selected->name.c_str();
+            ImGui::TextUnformatted(ui::tr(ui::S::EventPalette));
+            ImGui::SameLine();
+            ImGui::BeginDisabled(map.streaming);
+            ImGui::SetNextItemWidth(360 * ImGui::GetStyle().FontScaleDpi);
+            if (ImGui::BeginCombo("##eventpalette", label)) {
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputTextWithHint("##eventfilter", ui::tr(ui::S::EventFilter), map.event_filter, sizeof(map.event_filter));
+                const auto filter = lower_ascii(map.event_filter);
+                if (ImGui::Selectable(ui::tr(ui::S::EventIdle), map.preview == 0) && map.preview)
+                    load_map(map.selected, std::array{cam.target.x, cam.target.y, cam.target.z});
+                for (const auto& event : *events) {
+                    const auto& p = event.position;
+                    const auto row = std::format("{}  ({:.0f}, {:.0f}, {:.0f})##{:016X}", event.name, p[0], p[1], p[2], event.id);
+                    if (!filter.empty() && !contains_ci(row, filter)) continue;
+                    if (ImGui::Selectable(row.c_str(), map.preview == event.id)) {
+                        cam.target = {p[0], p[1], p[2]};
+                        cam.distance = 25;
+                        cam.pitch = 0.2f;
+                        material_time = 0;
+                        load_map(map.selected, p, event.id);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("%s", ui::tr(ui::S::EventPreviewHint));
+        }
         weather_ui();
         ImGui::TextDisabled(ui::tr(ui::S::FlyHint));
         const auto pr = map_worker.progress();
@@ -5867,7 +5913,7 @@ int run_renderer(const std::wstring& cmdline, float scale, RecoveryView& recover
         g_prof.set_list(cl, fi);
         try {
             app->record_uploads(cl, fi);
-            if (app->viewport_visible) app->record(cl);
+            if (app->viewport_visible && !app->map.streaming) app->record(cl);
         } catch (const std::exception& ex) {
             app->gpu.check_device();
             app->error(ui::trf(ui::S::ErrRender, ex.what()));

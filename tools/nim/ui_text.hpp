@@ -199,6 +199,10 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(MapFilterHint, "  マップ / タグ", "  Map / tag", "  맵 / 태그")                                                  \
     X(MapRowStats, "{}   {} メッシュ · {} 配置", "{}   {} meshes · {} placements", "{}   메시 {}개 · 배치 {}개")          \
     X(MapActivityRow, "モード {} / 区画 {} → {}", "mode {} / part {} → {}", "모드 {} / 구역 {} → {}") \
+    X(EventPalette, "イベントパレット", "Event palette", "이벤트 팔레트") \
+    X(EventFilter, "イベントを絞り込む", "Filter events", "이벤트 필터") \
+    X(EventIdle, "通常状態", "Idle map", "기본 상태") \
+    X(EventPreviewHint, "配置と FX のプレビュー", "Placement and FX preview", "배치 및 효과 미리보기") \
     X(MapLoading, "読込中  %zu / %zu", "Loading  %zu / %zu", "불러오는 중  %zu / %zu")                                    \
     X(MapCounts, "%zu メッシュ · %zu 配置", "%zu meshes · %zu placements", "메시 %zu개 · 배치 %zu개")                      \
     X(MapCenter, "中心 (%.0f, %.0f, %.0f)", "Centre (%.0f, %.0f, %.0f)", "중심 (%.0f, %.0f, %.0f)")                      \

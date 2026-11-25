@@ -377,6 +377,10 @@ void GameLighting::prepare_transparent_reflection(const ViewMatrices& vm, const 
     transparent_probe_preview_ = preview != nullptr;
     const auto reflection = transparent_reflection(transparent_probe_at(vm.eye));
     ext_.set_texture(ext::Transparent, 0xE0, reflection.cube);
+    // The secondary blend block in cb8 is zero in the single-probe preview.
+    ext_.set_texture(ext::Transparent, 0xE8, reflection.cube);
+    ext_.note_estimate("transparent reflection t27: secondary probe inactive",
+                       "the original runtime selection and blending of a second probe are unresolved");
     ext_.set_scope_constants(ShaderStage::Pixel, 8, reflection.constants);
     if (preview)
         ext_.note_estimate("transparent reflection: fixed orbit_goliath_013b preview probe", "viewer preview environment");

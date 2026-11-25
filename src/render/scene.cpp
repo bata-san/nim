@@ -894,7 +894,7 @@ PreparedMesh::Group build_group(PackageManager& pm, const Technique& tech, const
             if (b.type != BindingType::Srv) continue;
             for (uint32_t slot = b.lower; slot <= b.upper; ++slot)
                 if (!g.ps_sources.textures.contains(slot) && !g.ps_sources.extern_textures.contains(slot) &&
-                    !(engine_reflection && slot == 26 && b.kind == BindingKind::TextureCube))
+                    !(engine_reflection && (slot == 26 || slot == 27) && b.kind == BindingKind::TextureCube))
                     throw std::runtime_error(std::format("{}: missing original PS t{}", tech.tag.str(), slot));
         }
     }
@@ -2622,12 +2622,14 @@ void StaticMeshScene::add_mesh_parts(Gpu& gpu, PreparedMesh&& mesh, const std::v
                 return scope.tag == grid_scope->second && scope.name == "player_centered_cascaded_grid";
             });
         const auto advanced_cube = [&](uint32_t slot, BindingKind kind) {
-            return item.light_grid && slot == 26 && kind == BindingKind::TextureCube &&
+            return item.light_grid && (slot == 26 || slot == 27) && kind == BindingKind::TextureCube &&
                 std::find(item.ps_cbvs.begin(), item.ps_cbvs.end(), 8u) != item.ps_cbvs.end();
         };
-        if (const auto cube = ps_kinds.find(26); cube != ps_kinds.end() && advanced_cube(26, cube->second) &&
-            !item.textures.contains(26))
-            item.ps_sources.extern_textures.try_emplace(26, TfxExternTexture{26, ext::Transparent, 0xE0 / 8});
+        for (const uint32_t slot : {26u, 27u})
+            if (const auto cube = ps_kinds.find(slot); cube != ps_kinds.end() && advanced_cube(slot, cube->second) &&
+                !item.textures.contains(slot))
+                item.ps_sources.extern_textures.try_emplace(slot,
+                    TfxExternTexture{slot, ext::Transparent, uint8_t((0xE0 + 8 * (slot - 26)) / 8)});
         const auto cube = ps_kinds.find(26);
         const auto cube_source = item.ps_sources.extern_textures.find(26);
         const auto advanced_scope = item.ps_sources.cbuffer_scopes.find(8);

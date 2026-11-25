@@ -2148,6 +2148,7 @@ void GameLighting::render(Gpu& gpu, ID3D12GraphicsCommandList* cl, GBuffer& gb, 
     ext_.set_texture(ext::Transparent, 0x48, nullptr);
     ext_.set_texture(ext::Transparent, 0x50, nullptr);
     ext_.set_texture(ext::Transparent, 0xE0, nullptr);  // engine-bound reflection cube of an isolated preview
+    ext_.set_texture(ext::Transparent, 0xE8, nullptr);
     // The sky ambient writes the specular IBL buffer in place of the viewer environment.
     const bool sky_ambient = own_env && sky_ambient_on(p);
     if (sky_ambient) {
