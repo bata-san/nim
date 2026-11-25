@@ -80,7 +80,11 @@ PackageManager::PackageManager(const fs::path& install_dir) : pkg_dir_(install_d
         infos_.push_back(std::move(info));
     }
     std::ranges::sort(infos_, {}, &PackageInfo::pkg_id);
-    for (size_t i = 0; i < infos_.size(); ++i) by_id_[infos_[i].pkg_id].push_back(i);
+    open_->slots.reserve(infos_.size());
+    for (size_t i = 0; i < infos_.size(); ++i) {
+        by_id_[infos_[i].pkg_id].push_back(i);
+        open_->slots.push_back(std::make_unique<OpenSlot>());
+    }
 }
 
 void PackageManager::set_language(uint16_t language) { language_ = language; }
@@ -99,10 +103,9 @@ const PackageInfo* PackageManager::info(uint16_t pkg_id) const {
 
 Package& PackageManager::open(const PackageInfo& info) {
     const size_t index = size_t(&info - infos_.data());
-    std::lock_guard lk(open_->mutex);
-    auto& slot = open_->by_index[index];
-    if (!slot) slot = std::make_unique<Package>(info.newest_path);
-    return *slot;
+    auto& slot = *open_->slots.at(index);
+    std::call_once(slot.once, [&] { slot.package = std::make_unique<Package>(info.newest_path); });
+    return *slot.package;
 }
 
 Package& PackageManager::open(uint16_t pkg_id) {
@@ -112,25 +115,38 @@ Package& PackageManager::open(uint16_t pkg_id) {
 }
 
 const Entry* PackageManager::entry(TagHash h) {
-    if (!h.is_pkg_ref() || !info(h.pkg_id())) return nullptr;
-    auto& entries = open(h.pkg_id()).entries();
+    if (!h.is_pkg_ref()) return nullptr;
+    const auto* i = info(h.pkg_id());
+    if (!i) return nullptr;
+    auto& entries = open(*i).entries();
     return h.entry_index() < entries.size() ? &entries[h.entry_index()] : nullptr;
 }
 
 std::vector<uint8_t> PackageManager::read(TagHash h) {
-    if (!entry(h)) throw std::runtime_error("unresolvable tag " + h.str());
-    return open(h.pkg_id()).read_entry(h.entry_index());
+    const auto* i = h.is_pkg_ref() ? info(h.pkg_id()) : nullptr;
+    if (!i) throw std::runtime_error("unresolvable tag " + h.str());
+    auto& p = open(*i);
+    if (h.entry_index() >= p.entries().size()) throw std::runtime_error("unresolvable tag " + h.str());
+    return p.read_entry(h.entry_index());
 }
 
 std::vector<uint8_t> PackageManager::read_range(TagHash h, uint64_t offset, size_t size) {
-    if (!entry(h)) throw std::runtime_error("unresolvable tag " + h.str());
-    return open(h.pkg_id()).read_entry_range(h.entry_index(), offset, size);
+    const auto* i = h.is_pkg_ref() ? info(h.pkg_id()) : nullptr;
+    if (!i) throw std::runtime_error("unresolvable tag " + h.str());
+    auto& p = open(*i);
+    if (h.entry_index() >= p.entries().size()) throw std::runtime_error("unresolvable tag " + h.str());
+    return p.read_entry_range(h.entry_index(), offset, size);
 }
 
 void PackageManager::build_hash64_index() {
-    if (!h64_.empty()) return;  // built once (the packages do not change)
-    for (const auto& i : infos_)
-        for (const auto& e : open(i).hash64s()) h64_.emplace(e.hash64, e.hash32);
+    if (h64_) return;
+    std::call_once(open_->hash64_once, [this] {
+        auto index = std::make_shared<Hash64Index>();
+        for (const auto& i : infos_)
+            for (const auto& e : open(i).hash64s()) index->emplace(e.hash64, e.hash32);
+        open_->hash64 = std::move(index);
+    });
+    h64_ = open_->hash64;
 }
 
 std::unique_ptr<PackageManager> PackageManager::fork() const {
@@ -145,8 +161,9 @@ std::unique_ptr<PackageManager> PackageManager::fork() const {
 }
 
 std::optional<TagHash> PackageManager::resolve64(uint64_t hash64) {
-    auto it = h64_.find(hash64);
-    if (it == h64_.end()) return std::nullopt;
+    if (!h64_) return std::nullopt;
+    auto it = h64_->find(hash64);
+    if (it == h64_->end()) return std::nullopt;
     return it->second;
 }
 

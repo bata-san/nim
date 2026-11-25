@@ -61,7 +61,7 @@ private:
 
 class ProfileScope {
 public:
-    explicit ProfileScope(const char* name) : name_(name), active_(Profile::instance().enabled()), start_(Clock::now()) {}
+    explicit ProfileScope(const char* name) : name_(name), active_(Profile::instance().enabled()), start_(active_ ? Clock::now() : Clock::time_point{}) {}
     ~ProfileScope() {
         stop();
     }

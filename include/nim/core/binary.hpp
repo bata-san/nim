@@ -14,7 +14,7 @@ public:
 
     template <typename T>
     T read_at(size_t off) const {
-        if (off + sizeof(T) > data_.size()) throw std::out_of_range("BinaryReader: read past end");
+        if (off > data_.size() || sizeof(T) > data_.size() - off) throw std::out_of_range("BinaryReader: read past end");
         T v;
         std::memcpy(&v, data_.data() + off, sizeof(T));
         return v;
@@ -27,7 +27,7 @@ public:
 
     template <typename Arr>
     void copy_at(size_t off, Arr& out) const {
-        if (off + sizeof(out) > data_.size()) throw std::out_of_range("BinaryReader: copy past end");
+        if (off > data_.size() || sizeof(out) > data_.size() - off) throw std::out_of_range("BinaryReader: copy past end");
         std::memcpy(out.data(), data_.data() + off, sizeof(out));
     }
 

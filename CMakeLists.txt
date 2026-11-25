@@ -148,3 +148,8 @@ add_test(NAME nim_tests COMMAND nim_tests)
 add_executable(nim_render_tests tests/render_inputs.cpp)
 target_link_libraries(nim_render_tests PRIVATE nim_render)
 add_test(NAME nim_render_tests COMMAND nim_render_tests)
+
+# Core scheduling/cache and LOD policy regression tests need neither game data nor D3D12.
+add_executable(nim_core_optimization_tests tests/core_optimizations.cpp)
+target_include_directories(nim_core_optimization_tests PRIVATE include)
+add_test(NAME nim_core_optimization_tests COMMAND nim_core_optimization_tests)
