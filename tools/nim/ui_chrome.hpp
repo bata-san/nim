@@ -127,44 +127,17 @@ inline void text_fit(ImDrawList* dl, ImVec2 pos, ImU32 col, const char* text, fl
 }
 
 
-enum class RailIcon { Map, Models, Scenery, Dialogue, Codex, Movies, Text, Package, Log, Settings, Updates };
+// Keep the viewer's existing Windows Segoe Fluent / MDL2 glyphs. In an installation
+// without the icon font, render labels instead of private-use missing-glyph boxes.
+namespace rail_glyph {
+constexpr ImWchar Maps = 0xE774, Models = 0xE99A, Scenery = 0xE7B8, Dialogue = 0xE8BD,
+                  Codex = 0xE8F1, Movies = 0xE714, Text = 0xE8D2, Packages = 0xE8B7,
+                  Log = 0xE9D9, Settings = 0xE713, Updates = 0xE896;  // Windows Download
+}
 
-inline void rail_icon(ImDrawList* dl, ImVec2 center, float sc, RailIcon kind, ImU32 color) {
-    auto at = [&](float x, float y) { return ImVec2{center.x + x * sc, center.y + y * sc}; };
-    auto line = [&](float x, float y, float xx, float yy) { dl->AddLine(at(x, y), at(xx, yy), color, 1.35f * sc); };
-    auto box = [&](float x, float y, float xx, float yy) { dl->AddRect(at(x, y), at(xx, yy), color, 2 * sc, 1.35f * sc); };
-    switch (kind) {
-    case RailIcon::Map:
-        line(-7, -4, -2, -6); line(-2, -6, 2, -4); line(2, -4, 7, -6); line(7, -6, 7, 5);
-        line(7, 5, 2, 7); line(2, 7, -2, 5); line(-2, 5, -7, 7); line(-7, 7, -7, -4);
-        line(-2, -6, -2, 5); line(2, -4, 2, 7); break;
-    case RailIcon::Models:
-        line(0, -7, 7, -3); line(7, -3, 7, 4); line(7, 4, 0, 8); line(0, 8, -7, 4); line(-7, 4, -7, -3);
-        line(-7, -3, 0, -7); line(-7, -3, 0, 1); line(0, 1, 7, -3); line(0, 1, 0, 8); break;
-    case RailIcon::Scenery:
-        box(-7, -6, 7, 6); line(-6, 4, -2, -1); line(-2, -1, 1, 2); line(1, 2, 4, -2); line(4, -2, 7, 2);
-        dl->AddCircleFilled(at(-3, -3), 1 * sc, color); break;
-    case RailIcon::Dialogue:
-        box(-7, -6, 7, 4); line(-4, 4, -4, 7); line(-4, 7, 0, 4);
-        line(-4, -2, 4, -2); line(-4, 1, 1, 1); break;
-    case RailIcon::Codex:
-        box(-7, -6, 7, 6); line(0, -6, 0, 6); line(-5, -2, -2, -2); line(2, -2, 5, -2); break;
-    case RailIcon::Movies:
-        box(-7, -6, 7, 6); dl->AddTriangleFilled(at(-2, -3), at(-2, 3), at(4, 0), color); break;
-    case RailIcon::Text:
-        line(-6, -5, 6, -5); line(-6, 0, 6, 0); line(-6, 5, 2, 5); break;
-    case RailIcon::Package:
-        box(-7, -6, 7, 6); line(-7, -2, 7, -2); line(-2, 1, 2, 1); break;
-    case RailIcon::Log:
-        box(-7, -6, 7, 6); line(-4, -2, -1, 0); line(-1, 0, -4, 2); line(1, 2, 4, 2); break;
-    case RailIcon::Updates:
-        line(0, -7, 0, 3); line(-4, -1, 0, 3); line(0, 3, 4, -1);
-        line(-7, 2, -7, 7); line(-7, 7, 7, 7); line(7, 7, 7, 2); break;
-    case RailIcon::Settings:
-        line(-7, -5, 7, -5); line(-7, 0, 7, 0); line(-7, 5, 7, 5);
-        dl->AddCircleFilled(at(-2, -5), 2 * sc, color); dl->AddCircleFilled(at(3, 0), 2 * sc, color);
-        dl->AddCircleFilled(at(0, 5), 2 * sc, color); break;
-    }
+inline bool rail_glyph_text(ImWchar codepoint, char (&utf8)[5]) {
+    if (!ImGui::GetFont()->IsGlyphInFont(codepoint)) return false;
+    return ImTextCharToUtf8(utf8, codepoint) > 0;
 }
 
 template <class Open>
@@ -175,19 +148,13 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
     auto* dl = ImGui::GetWindowDrawList();
     dl->AddLine({o.x + w - 1, o.y}, {o.x + w - 1, o.y + h}, theme::kBorder);
     dl->AddLine({o.x, o.y + title_h - 1}, {o.x + w, o.y + title_h - 1}, theme::kBorder);
-    const float mark_x = o.x + (expanded ? 15 * sc : (w - 26 * sc) * 0.5f);
-    const float mark_y = o.y + (title_h - 26 * sc) * 0.5f;
-    dl->AddRectFilled({mark_x, mark_y}, {mark_x + 26 * sc, mark_y + 26 * sc}, theme::kSurfaceHi, 6 * sc);
-    dl->AddRect({mark_x, mark_y}, {mark_x + 26 * sc, mark_y + 26 * sc}, theme::kBorder, 6 * sc);
-    dl->AddQuadFilled({mark_x + 8 * sc, mark_y + 19 * sc}, {mark_x + 12 * sc, mark_y + 7 * sc},
-                     {mark_x + 17 * sc, mark_y + 7 * sc}, {mark_x + 13 * sc, mark_y + 19 * sc}, theme::kText);
-    dl->AddCircleFilled({mark_x + 18 * sc, mark_y + 17 * sc}, 2 * sc, theme::kText);
-    if (expanded) {
-        ImGui::PushFont(bold, 22);
-        dl->AddText({o.x + 51 * sc, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, "nim");
-        ImGui::PopFont();
-    }
-    auto row = [&](ui::S label, RailIcon glyph) {
+    ImGui::PushFont(bold, 22);
+    const char* brand = expanded ? "nim" : "n";
+    const float brand_x = expanded ? 17 * sc : (w - ImGui::CalcTextSize(brand).x) * 0.5f;
+    dl->AddText({o.x + brand_x, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, brand);
+    ImGui::PopFont();
+
+    auto row = [&](ui::S label, ImWchar glyph, const char* compact_label) {
         const float height = 34 * sc, inset = 8 * sc;
         const float width = std::max(1.0f, ImGui::GetWindowWidth() - 2 * inset);
         ImGui::SetCursorPosX(inset);
@@ -201,11 +168,20 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
         if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible)
             d->AddRect(p, q, theme::kRing, 6 * sc, 1 * sc);
         const ImU32 color = selected || hovered ? theme::kText : theme::kMuted;
-        rail_icon(d, {p.x + (expanded ? 18 * sc : width * 0.5f), p.y + height * 0.5f}, sc, glyph, color);
+        char glyph_text[5]{};
+        const bool have_icon = rail_glyph_text(glyph, glyph_text);
+        if (have_icon || !expanded) {
+            const char* text = have_icon ? glyph_text : compact_label;
+            ImGui::PushFont(nullptr, have_icon ? 16 : 11);
+            const auto ts = ImGui::CalcTextSize(text);
+            const float center_x = p.x + (expanded ? 18 * sc : width * 0.5f);
+            d->AddText({center_x - ts.x * 0.5f, p.y + (height - ts.y) * 0.5f}, color, text);
+            ImGui::PopFont();
+        }
         if (expanded) {
             if (selected) ImGui::PushFont(bold, 0);
             const float ty = p.y + (height - ImGui::GetTextLineHeight()) * 0.5f;
-            text_fit(d, {p.x + 35 * sc, ty}, selected || hovered ? theme::kText : theme::kMuted, ui::tr(label), q.x - 7 * sc);
+            text_fit(d, {p.x + (have_icon ? 35 : 11) * sc, ty}, color, ui::tr(label), q.x - 7 * sc);
             if (selected) ImGui::PopFont();
         } else if (hovered) ImGui::SetTooltip("%s", ui::tr(label));
         ImGui::PopID();
@@ -225,14 +201,14 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
                      ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
     section(ui::S::GroupModels3D);
-    row(ui::S::NavMaps, RailIcon::Map); row(ui::S::NavEntities, RailIcon::Models); row(ui::S::NavStatics, RailIcon::Scenery);
+    row(ui::S::NavMaps, rail_glyph::Maps, "MP"); row(ui::S::NavEntities, rail_glyph::Models, "3D"); row(ui::S::NavStatics, rail_glyph::Scenery, "SC");
     ImGui::Dummy({0, 9 * sc});
     section(ui::S::Group2D);
-    row(ui::S::NavDialogue, RailIcon::Dialogue); row(ui::S::NavCodex, RailIcon::Codex);
-    row(ui::S::NavMovies, RailIcon::Movies); row(ui::S::NavText, RailIcon::Text);
+    row(ui::S::NavDialogue, rail_glyph::Dialogue, "VO"); row(ui::S::NavCodex, rail_glyph::Codex, "CX");
+    row(ui::S::NavMovies, rail_glyph::Movies, "MV"); row(ui::S::NavText, rail_glyph::Text, "TX");
     ImGui::Dummy({0, 9 * sc});
     section(ui::S::GroupData);
-    row(ui::S::NavPackages, RailIcon::Package);
+    row(ui::S::NavPackages, rail_glyph::Packages, "PK");
     ImGui::PopStyleVar();
     ImGui::EndChild();
 
@@ -240,8 +216,8 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
     dl->AddLine({o.x + 12 * sc, o.y + foot_top}, {o.x + w - 12 * sc, o.y + foot_top}, theme::kBorder);
     ImGui::SetCursorPos({0, foot_top + 5 * sc});
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
-    row(ui::S::NavLog, RailIcon::Log); row(ui::S::NavSettings, RailIcon::Settings);
-    row(ui::S::SettingsUpdates, RailIcon::Updates);
+    row(ui::S::NavLog, rail_glyph::Log, "LG"); row(ui::S::NavSettings, rail_glyph::Settings, "ST");
+    row(ui::S::SettingsUpdates, rail_glyph::Updates, "UP");
     ImGui::PopStyleVar();
 }
 
