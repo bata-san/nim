@@ -75,7 +75,6 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kVersion = NIM_VERSION;
-constexpr ImU32 kGreen = IM_COL32(201, 254, 0, 255);  // Marathon green
 constexpr uint32_t kThumbSize = 256;
 
 // ---- small utilities ------------------------------------------------------------------------------
@@ -458,7 +457,7 @@ bool dbutton(const char* label, float min_w, bool secondary = false, bool tall =
         fill = held ? IM_COL32(63, 63, 70, 255) : hovered ? IM_COL32(52, 52, 56, 255) : theme::kSurfaceHi;
         text = theme::kText;
     } else {
-        fill = held ? IM_COL32(166, 208, 75, 255) : hovered ? IM_COL32(220, 255, 147, 255) : theme::kAccentHi;
+        fill = held ? theme::kPrimaryPressed : hovered ? theme::kPrimaryHover : theme::kAccentHi;
         text = theme::kPrimaryText;
     }
     if (disabled) {
@@ -1701,7 +1700,7 @@ public:
         char filter[128] = "";
         int lang = -1;  // -1: the second-language setting
         bool audio_only = false;
-        bool crt_tint = true;  // phosphor green CRT filter on codex reader artwork
+        bool crt_tint = false;  // optional CRT tint on the artwork, not the UI
         int collection = -1, entry = -1;
         bool open_reader = false;
         std::vector<std::pair<int, int>> view;  // (collection, record) in grid order
@@ -2554,7 +2553,7 @@ public:
         if (!map_worker.listed()) {
             ImGui::SetCursorPos({20 * sc, 20 * sc});
             spinner(ImGui::GetWindowDrawList(), {ImGui::GetCursorScreenPos().x + 8 * sc, ImGui::GetCursorScreenPos().y + 8 * sc},
-                    7 * sc, kGreen);
+                    7 * sc, theme::kAccentHi);
             ImGui::SetCursorPos({44 * sc, 20 * sc});
             ImGui::TextDisabled(ui::tr(ui::S::MapsListing));
             return;
@@ -2623,7 +2622,7 @@ public:
             if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             auto* dl = ImGui::GetWindowDrawList();
             const float lh = ImGui::GetTextLineHeight();
-            if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, kGreen);
+            if (live) dl->AddRectFilled({pos.x, pos.y + 2 * sc}, {pos.x + 2 * sc, pos.y + lh * 2 + 2 * sc}, theme::kAccentHi);
             const float row_max = pos.x + ImGui::GetContentRegionAvail().x - pad * 0.5f;
             text_fit(dl, {pos.x + pad, pos.y + 2 * sc}, theme::kText, (m.name.empty() ? m.package : m.name).c_str(), row_max);
             text_fit(dl, {pos.x + pad, pos.y + 2 * sc + lh}, grey,
@@ -3331,6 +3330,10 @@ public:
         const bool flush = tab == TabStatics || tab == TabEntities || tab == TabMaps;
         ImGui::SetCursorPos({0, 0});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, flush ? ImVec2{0, 0} : ImVec2{24 * sc, 20 * sc});
+        if (tab == TabSettings && scroll_to_updates) {
+            ImGui::SetNextWindowScroll({-1.0f, 0.0f});
+            scroll_to_updates = false;
+        }
         ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoBackground);
         switch (tab) {
         case TabHome: home_tab(); break;
@@ -3351,8 +3354,15 @@ public:
         ImGui::PopStyleVar();
     }
 
+    bool scroll_to_updates = false;
+
     void sidebar(float title_h, bool expanded) {
         draw_sidebar(title_h, expanded, kTabNames[tab], g_fonts.bold, [this](ui::S target) {
+            if (target == ui::S::SettingsUpdates) {
+                open_tab(TabSettings);
+                scroll_to_updates = true;
+                return;
+            }
             for (int t = 0; t < TabCount; ++t)
                 if (kTabNames[t] == target) { open_tab(Tab(t)); break; }
         });
@@ -3479,7 +3489,7 @@ public:
             any = true;
             ImGui::PushID(int(g.tab));
             ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), "%s", ui::tr(kTabNames[g.tab]));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kAccentHi), "%s", ui::tr(kTabNames[g.tab]));
             ImGui::SameLine();
             ImGui::TextDisabled("%s", ui::trf(ui::S::FindHits, g.count).c_str());
             ImGui::SameLine();
@@ -3569,6 +3579,8 @@ public:
         const float sc = ImGui::GetStyle().FontScaleDpi;
         const float col = std::min(ImGui::GetContentRegionAvail().x, 640 * sc);
         draw_page_heading(ui::tr(ui::S::NavSettings), ui::tr(ui::S::DescSettings), g_fonts.heading);
+        update_card(col);
+        ImGui::Spacing();
         ImGui::PushItemWidth(std::min(330 * sc, col * 0.57f));
         ImGui::SeparatorText(ui::tr(ui::S::SettingsInstall));
         ImGui::TextUnformatted(pm ? to_utf8(install.wstring()).c_str() : ui::tr(ui::S::SettingsNoInstall));
@@ -3598,40 +3610,47 @@ public:
         ImGui::Checkbox(ui::tr(ui::S::SettingsShowFps), &show_fps);
 
         ImGui::SeparatorText(ui::tr(ui::S::SettingsInfo));
-        ImGui::Text("nim %s", kVersion);
-        if (ImGui::Checkbox(ui::tr(ui::S::SettingsAutoUpdate), &g_prefs.auto_update)) {
-            save_prefs();
-            if (g_prefs.auto_update && !start_update(true)) error(ui::tr(ui::S::UpdateUnavailable));
-        }
-        if (ImGui::Button(ui::tr(ui::S::CheckUpdates)) && !start_update(false)) error(ui::tr(ui::S::UpdateUnavailable));
-        static std::string update_state;
-        static std::chrono::steady_clock::time_point next_update_poll;
-        if (const auto now = std::chrono::steady_clock::now(); now >= next_update_poll) {
-            std::ifstream status(exe_dir() / "nim-update-status.txt");
-            update_state.clear();
-            std::getline(status, update_state);
-            next_update_poll = now + std::chrono::milliseconds(500);
-        }
-        if (update_state == "auth") ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateAuth));
-        else if (update_state.starts_with("ready ")) {
-            ImGui::TextWrapped("%s (v%s)", ui::tr(ui::S::UpdateReady), update_state.c_str() + 6);
-            if (ImGui::Button(ui::tr(ui::S::UpdateRestart))) {
-                std::ofstream marker(exe_dir() / ".nim-update-relaunch", std::ios::trunc);
-                marker << "1\n";
-                marker.close();
-                PostQuitMessage(0);
-            }
-        }
-        else if (update_state == "current") ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateCurrent));
-        else if (update_state.starts_with("error ") || update_state == "running")
-            ImGui::TextDisabled("%s (%s)", ui::tr(ui::S::UpdateUnavailable), update_state.c_str());
-        else if (update_state == "checking" || update_state.starts_with("downloading "))
-            ImGui::TextDisabled("%s", ui::tr(ui::S::UpdateChecking));
         ImGui::Text("%s", ui::trf(ui::S::SettingsGpu, gpu.adapter_name()).c_str());
         ImGui::Text("%s", ui::trf(ui::S::SettingsVram, format_bytes(gpu.vram_usage()), format_bytes(gpu.vram_budget())).c_str());
         ImGui::Text("%s", ui::trf(ui::S::SettingsFonts, ui::tr(g_fonts.from_game ? ui::S::FontsGame : ui::S::FontsSystem)).c_str());
         ImGui::Text("%s", ui::trf(ui::S::SettingsThumbs, thumbs.size()).c_str());
         ImGui::PopItemWidth();
+    }
+
+    void update_card(float width) {
+        if (begin_update_card(width, kVersion, g_fonts.heading)) {
+            static std::string state;
+            static std::chrono::steady_clock::time_point next_poll;
+            if (const auto now = std::chrono::steady_clock::now(); now >= next_poll) {
+                std::ifstream status(exe_dir() / "nim-update-status.txt");
+                state.clear();
+                std::getline(status, state);
+                next_poll = now + std::chrono::milliseconds(500);
+            }
+            if (state.starts_with("ready ")) {
+                if (update_primary_button(ui::tr(ui::S::UpdateRestart))) {
+                    std::ofstream marker(exe_dir() / ".nim-update-relaunch", std::ios::trunc);
+                    marker << "1\n";
+                    marker.close();
+                    PostQuitMessage(0);
+                }
+                ImGui::TextWrapped("%s (v%s)", ui::tr(ui::S::UpdateReady), state.c_str() + 6);
+            } else {
+                const bool busy = state == "checking" || state.starts_with("downloading ");
+                if (update_primary_button(ui::tr(ui::S::CheckUpdates)) && !start_update(false))
+                    error(ui::tr(ui::S::UpdateUnavailable));
+                if (busy) ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateChecking));
+                else if (state == "auth") ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateAuth));
+                else if (state == "current") ImGui::TextWrapped("%s", ui::tr(ui::S::UpdateCurrent));
+                else if (state.starts_with("error ") || state == "running")
+                    ImGui::TextWrapped("%s (%s)", ui::tr(ui::S::UpdateUnavailable), state.c_str());
+            }
+            if (ImGui::Checkbox(ui::tr(ui::S::SettingsAutoUpdate), &g_prefs.auto_update)) {
+                save_prefs();
+                if (g_prefs.auto_update && !start_update(true)) error(ui::tr(ui::S::UpdateUnavailable));
+            }
+        }
+        ImGui::EndChild();
     }
 
     // -- STATICS --
@@ -3813,7 +3832,7 @@ public:
         dl->AddText({p.x + 8 * sc, q.y + (footer - ts.y) * 0.5f}, IM_COL32_WHITE, label.c_str());
         const bool selected = (scene.loaded() && scene.tag() == m.tag) || (no_drawable_tag && *no_drawable_tag == m.tag);
         const bool is_loading = loading && *loading == m.tag;
-        if (selected || is_loading) dl->AddRect(p, {q.x, q.y + footer}, kGreen, 0, 0, 2 * sc);
+        if (selected || is_loading) dl->AddRect(p, {q.x, q.y + footer}, theme::kAccentHi, 0, 0, 2 * sc);
         else if (hovered) dl->AddRect(p, {q.x, q.y + footer}, IM_COL32_WHITE, 0, 0, 1.5f * sc);
         if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         ImGui::PopID();
@@ -3831,7 +3850,7 @@ public:
             ImGui::Dummy(size);
             dl->AddRectFilled(origin, {origin.x + size.x, origin.y + size.y}, IM_COL32_BLACK);
             const ImVec2 center{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f};
-            spinner(dl, {center.x, center.y - 14 * sc}, 14 * sc, kGreen);
+            spinner(dl, {center.x, center.y - 14 * sc}, 14 * sc, theme::kAccentHi);
             const auto progress = map_worker.progress();
             const size_t done = std::min(progress.total, map.processed + progress.failed);
             const std::string label = progress.total ? std::format("{}/{}", done, progress.total) : map.name;
@@ -4041,12 +4060,12 @@ public:
         ImGui::SetItemTooltip(ui::tr(ui::S::SavePng));
         ImGui::PopStyleColor(2);
 
-        // FPS / VRAM, top right (goriath: green monospace with a shadow)
+        // FPS / VRAM, top right (monospace with a shadow)
         if (show_fps) {
             std::string fps = std::format("{:.0f} FPS", ImGui::GetIO().Framerate);
             std::string vram = std::format("VRAM {}", format_bytes(gpu.vram_usage()));
             ImVec2 fs1 = ImGui::CalcTextSize(fps.c_str()), fs2 = ImGui::CalcTextSize(vram.c_str());
-            hud_text(dl, {origin.x + size.x - fs1.x - 10 * sc, origin.y + bar_h + 6 * sc}, kGreen, fps.c_str());
+            hud_text(dl, {origin.x + size.x - fs1.x - 10 * sc, origin.y + bar_h + 6 * sc}, theme::kAccentHi, fps.c_str());
             hud_text(dl, {origin.x + size.x - fs2.x - 10 * sc, origin.y + bar_h + 6 * sc + fs1.y}, IM_COL32(200, 200, 200, 255),
                      vram.c_str());
         }
@@ -4077,7 +4096,7 @@ public:
             hud_text(dl, {origin.x + (size.x - ts.x) * 0.5f, origin.y + size.y * 0.5f}, IM_COL32(200, 200, 200, 200), msg);
         }
         if (loading) {
-            spinner(dl, {origin.x + size.x * 0.5f, origin.y + size.y * 0.5f}, 20 * sc, kGreen);
+            spinner(dl, {origin.x + size.x * 0.5f, origin.y + size.y * 0.5f}, 20 * sc, theme::kAccentHi);
             std::string t = ui::trf(ui::S::LoadingItem, loading->str());
             ImVec2 ts = ImGui::CalcTextSize(t.c_str());
             hud_text(dl, {origin.x + (size.x - ts.x) * 0.5f, origin.y + size.y * 0.5f + 32 * sc}, IM_COL32_WHITE, t.c_str());
@@ -4944,14 +4963,13 @@ public:
     // -- CODEX --
     // The in-game codex: collections in game order, each entry's title, unlock hint and body in any
     // of the 13 languages, and its audio log in any installed voice language.
-    // The codex terminal palette (CyberAcme 802.11 NEURO.FILTER intel reader): deep CRT black-green,
-    // phosphor green text, dark emerald ticker bars.
-    static constexpr ImU32 kCxGreen = IM_COL32(34, 214, 88, 255);
-    static constexpr ImU32 kCxBody = IM_COL32(28, 186, 76, 255);
-    static constexpr ImU32 kCxDim = IM_COL32(34, 122, 58, 255);
-    static constexpr ImU32 kCxRule = IM_COL32(22, 68, 36, 255);
-    static constexpr ImU32 kCxPanel = IM_COL32(11, 15, 12, 255);
-    static constexpr ImU32 kCxBarBg = IM_COL32(10, 29, 16, 255);
+    // Preserve the in-universe terminal layout, using the app's neutral chrome.
+    static constexpr ImU32 kCxTitle = theme::kText;
+    static constexpr ImU32 kCxBody = theme::kText;
+    static constexpr ImU32 kCxDim = theme::kMuted;
+    static constexpr ImU32 kCxRule = theme::kBorder;
+    static constexpr ImU32 kCxPanel = theme::kBg;
+    static constexpr ImU32 kCxBarBg = theme::kSurface;
 
     // Investment image textures shared by the codex and the item catalog.
     const CodexUi::Art& investment_art(TagHash tag) {
@@ -5083,18 +5101,18 @@ public:
                                     nullptr, tile - 24 * sc);
                         ImGui::PopFont();
                     }
-                    dl->AddRect(p, q, hov ? kCxGreen : kCxRule, 0, 0, 1 * sc);
+                    dl->AddRect(p, q, hov ? kCxTitle : kCxRule, 0, 0, 1 * sc);
                     if (!e.lines.empty()) {  // audio log badge
                         const std::string g = icon(ico::Volume);
                         const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
                         const ImVec2 b{q.x - gs.x - 14 * sc, p.y + 10 * sc};
                         dl->AddRectFilled({b.x - 6 * sc, b.y - 4 * sc}, {b.x + gs.x + 6 * sc, b.y + gs.y + 2 * sc}, IM_COL32(0, 0, 0, 200), 3 * sc);
-                        dl->AddText(b, kCxGreen, g.c_str());
+                        dl->AddText(b, kCxTitle, g.c_str());
                     }
                     std::string et = text(e.title, lang);
                     if (et.empty()) et = std::format("{:08X}", e.hash);
                     const float ty = q.y + 7 * sc;
-                    text_fit(dl, {p.x, ty}, hov ? kCxGreen : theme::kText, et.c_str(), p.x + tile);
+                    text_fit(dl, {p.x, ty}, hov ? kCxTitle : theme::kText, et.c_str(), p.x + tile);
                     text_fit(dl, {p.x, ty + ImGui::GetTextLineHeight() + 2 * sc}, theme::kMuted, text(c.title, lang).c_str(), p.x + tile);
                     ImGui::PopID();
                 }
@@ -5189,7 +5207,7 @@ public:
             root_dl->PushClipRect(b0, {clip_r, b1.y}, true);
             const float ty = y0 + (bar_h - us.y) * 0.5f;
             for (float x = start_x; x < clip_r; x += step)
-                root_dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {x, ty}, kCxGreen, unit.c_str());
+                root_dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {x, ty}, kCxTitle, unit.c_str());
             root_dl->PopClipRect();
             ImGui::PopFont();
         };
@@ -5206,7 +5224,7 @@ public:
             if (hov) root_dl->AddRectFilled(a, {a.x + bs, a.y + bs}, IM_COL32(26, 74, 40, 200), 2 * sc);
             const std::string g = icon(0xE711);
             const ImVec2 gs = ImGui::CalcTextSize(g.c_str());
-            root_dl->AddText({a.x + (bs - gs.x) * 0.5f, a.y + (bs - gs.y) * 0.5f}, hov ? kCxGreen : kCxDim, g.c_str());
+            root_dl->AddText({a.x + (bs - gs.x) * 0.5f, a.y + (bs - gs.y) * 0.5f}, hov ? kCxTitle : kCxDim, g.c_str());
         }
 
         // Main interior area between the two ticker bars.
@@ -5237,7 +5255,7 @@ public:
             const TagHash art_tag = e.illustration.is_none() ? c.illustration : e.illustration;
             const CodexUi::Art* art = art_tag.is_none() ? nullptr : &investment_art(art_tag);
             const float box_h = box;
-            root_dl->AddRectFilled(p, {p.x + box, p.y + box_h}, IM_COL32(6, 14, 8, 255));
+            root_dl->AddRectFilled(p, {p.x + box, p.y + box_h}, theme::kBg);
             if (art && art->srv != UINT32_MAX) {
                 const float aspect = float(std::max(art->w, 1)) / float(std::max(art->h, 1));
                 float iw = box, ih = box;
@@ -5268,7 +5286,7 @@ public:
             ImGui::PushStyleColor(ImGuiCol_Button, col4(kCxBarBg));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col4(kCxRule));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, col4(kCxRule));
-            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxGreen));
+            ImGui::PushStyleColor(ImGuiCol_Text, col4(kCxTitle));
             if (ImGui::SmallButton(codex.crt_tint ? "[CRT: ON]" : "[CRT: OFF]")) codex.crt_tint = !codex.crt_tint;
             ImGui::PopStyleColor(4);
             ImGui::SameLine(0, 10 * sc);
@@ -5293,7 +5311,7 @@ public:
         auto eq_rule = [&](float w) {
             const size_t n = std::max<size_t>(4, size_t(w / cw));
             const std::string s(n, '=');
-            ImGui::TextColored(col4(kCxGreen), "%s", s.c_str());
+            ImGui::TextColored(col4(kCxTitle), "%s", s.c_str());
         };
 
         // Scrollable body child with thin dark scrollbar on the far right edge.
@@ -5301,9 +5319,9 @@ public:
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 7 * sc);
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 2 * sc);
         ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(0, 0, 0, 0));
-        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, IM_COL32(52, 64, 56, 210));
-        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, IM_COL32(40, 140, 72, 230));
-        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, kCxGreen);
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, theme::kBorder);
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, theme::kRing);
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, kCxTitle);
         ImGui::BeginChild("cxbody", {col_right_w, body_h}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
         auto* bdl = ImGui::GetWindowDrawList();
         const float text_w = std::max(100.0f, ImGui::GetContentRegionAvail().x - 10 * sc);
@@ -5328,7 +5346,7 @@ public:
                 const float bh = ImGui::GetFrameHeight();
                 const float t = clip && clip->id() == id && clip->length() > 0 ? float(clip->position() / clip->length()) : 0.0f;
                 bdl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w, p.y + bh * 0.5f + 1 * sc}, kCxRule);
-                bdl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w * t, p.y + bh * 0.5f + 1 * sc}, kCxGreen);
+                bdl->AddRectFilled({p.x, p.y + bh * 0.5f - 1 * sc}, {p.x + bar_w * t, p.y + bh * 0.5f + 1 * sc}, kCxTitle);
                 ImGui::Dummy({bar_w, bh});
                 ImGui::SameLine();
                 ImGui::AlignTextToFramePadding();
@@ -5340,7 +5358,7 @@ public:
             ImGui::Dummy({0, 4 * sc});
         }
 
-        // Body paragraphs in phosphor green monospace.
+        // Body paragraphs in monospace.
         const std::string& body = text(e.body, lang);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 5 * sc});
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_w);
@@ -5357,7 +5375,7 @@ public:
                 const bool is_rule = line.size() > 8 && line.find_first_not_of("=-_~ ") == std::string::npos;
                 if (is_rule) {
                     line.resize(std::min(line.size(), size_t(text_w / cw)));
-                    ImGui::TextColored(col4(kCxGreen), "%s", line.c_str());
+                    ImGui::TextColored(col4(kCxTitle), "%s", line.c_str());
                 } else if (line.empty()) {
                     ImGui::Dummy({0, line_h * 0.55f});
                 } else {
@@ -5403,7 +5421,7 @@ public:
             ImGui::TextUnformatted(m.info.filename.empty() ? m.usm.str().c_str() : m.info.filename.c_str());
             if (m.info.audio.size() > 1) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kGreen), ui::tr(ui::S::Multilingual));
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::kAccentHi), ui::tr(ui::S::Multilingual));
             }
             ImGui::TextDisabled("%s  %ux%u  %s  %s", m.usm.str().c_str(), m.info.width, m.info.height,
                                 clock_text(m.info.duration()).c_str(), format_bytes(m.size).c_str());

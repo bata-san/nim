@@ -116,6 +116,8 @@ enum class Lang : uint8_t { Ja, En, Ko, Count };
     X(SettingsShowFps, "FPS / VRAM を表示", "Show FPS / VRAM", "FPS / VRAM 표시")                                       \
     X(SettingsSecondLang, "第 2 言語 (ゲームの文字)", "Second language (game text)", "두 번째 언어 (게임 텍스트)")          \
     X(SettingsInfo, "情報", "About", "정보")                                                                            \
+    X(SettingsUpdates, "アプリの更新", "App updates", "앱 업데이트") \
+    X(SettingsVersion, "現在のバージョン: v{}", "Current version: v{}", "현재 버전: v{}") \
     X(SettingsAutoUpdate, "起動時に更新を確認", "Automatically check for updates", "시작 시 업데이트 확인") \
     X(CheckUpdates, "今すぐ更新を確認", "Check for updates now", "지금 업데이트 확인") \
     X(UpdateAuth, "更新に GitHub 認証が必要です。", "GitHub authentication is required for updates.", "업데이트에 GitHub 인증이 필요합니다.") \

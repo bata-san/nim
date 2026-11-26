@@ -9,21 +9,23 @@
 
 namespace nim::chrome {
 
-// Neutral graphite chrome with a restrained Marathon-green accent.
+// shadcn-style neutral surfaces, white primary controls, and red only for errors.
 namespace theme {
-constexpr ImU32 kBg = IM_COL32(13, 16, 18, 255);           // background
-constexpr ImU32 kRail = IM_COL32(19, 23, 25, 255);       // sidebar, title bar and status line
-constexpr ImU32 kSurface = IM_COL32(22, 27, 29, 255);    // cards
-constexpr ImU32 kSurfaceHi = IM_COL32(34, 41, 44, 255);  // secondary controls
-constexpr ImU32 kHover = IM_COL32(31, 38, 40, 255);
-constexpr ImU32 kActive = IM_COL32(39, 49, 34, 255);
-constexpr ImU32 kBorder = IM_COL32(47, 57, 60, 255);
-constexpr ImU32 kRing = IM_COL32(160, 200, 82, 255);
-constexpr ImU32 kText = IM_COL32(238, 243, 244, 255);
-constexpr ImU32 kMuted = IM_COL32(159, 174, 178, 255);
+constexpr ImU32 kBg = IM_COL32(10, 10, 10, 255);           // background
+constexpr ImU32 kRail = IM_COL32(17, 17, 17, 255);       // sidebar, title bar and status line
+constexpr ImU32 kSurface = IM_COL32(22, 22, 22, 255);    // cards
+constexpr ImU32 kSurfaceHi = IM_COL32(38, 38, 38, 255);  // secondary controls
+constexpr ImU32 kHover = IM_COL32(31, 31, 31, 255);
+constexpr ImU32 kActive = IM_COL32(38, 38, 38, 255);
+constexpr ImU32 kBorder = IM_COL32(43, 43, 43, 255);
+constexpr ImU32 kRing = IM_COL32(140, 140, 140, 255);
+constexpr ImU32 kText = IM_COL32(250, 250, 250, 255);
+constexpr ImU32 kMuted = IM_COL32(163, 163, 163, 255);
 constexpr ImU32 kError = IM_COL32(248, 113, 113, 255);
-constexpr ImU32 kAccentHi = IM_COL32(203, 246, 107, 255);
-constexpr ImU32 kPrimaryText = IM_COL32(19, 27, 13, 255);
+constexpr ImU32 kAccentHi = IM_COL32(245, 245, 245, 255);
+constexpr ImU32 kPrimaryText = IM_COL32(23, 23, 23, 255);
+constexpr ImU32 kPrimaryHover = IM_COL32(224, 224, 224, 255);
+constexpr ImU32 kPrimaryPressed = IM_COL32(204, 204, 204, 255);
 } // namespace theme
 
 inline ImVec4 col4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
@@ -63,7 +65,7 @@ inline void apply_style(float scale) {
     c[ImGuiCol_TextDisabled] = col4(theme::kMuted);
     c[ImGuiCol_WindowBg] = col4(theme::kBg);
     c[ImGuiCol_ChildBg] = {0, 0, 0, 0};
-    c[ImGuiCol_PopupBg] = rgb(12, 12, 14, 0.99f);
+    c[ImGuiCol_PopupBg] = rgb(12, 12, 12, 0.99f);
     c[ImGuiCol_Border] = col4(theme::kBorder);
     c[ImGuiCol_BorderShadow] = {0, 0, 0, 0};
     c[ImGuiCol_FrameBg] = col4(theme::kSurface);
@@ -72,17 +74,19 @@ inline void apply_style(float scale) {
     c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = col4(theme::kRail);
     c[ImGuiCol_MenuBarBg] = col4(theme::kRail);
     c[ImGuiCol_Header] = col4(theme::kActive);
-    c[ImGuiCol_HeaderHovered] = rgb(39, 39, 42, 0.6f);
-    c[ImGuiCol_HeaderActive] = rgb(52, 52, 56);
+    c[ImGuiCol_HeaderHovered] = rgb(39, 39, 39, 0.6f);
+    c[ImGuiCol_HeaderActive] = rgb(52, 52, 52);
     c[ImGuiCol_Button] = col4(theme::kSurfaceHi);
-    c[ImGuiCol_ButtonHovered] = rgb(52, 52, 56);
-    c[ImGuiCol_ButtonActive] = rgb(63, 63, 70);
+    c[ImGuiCol_ButtonHovered] = rgb(52, 52, 52);
+    c[ImGuiCol_ButtonActive] = rgb(63, 63, 63);
     c[ImGuiCol_CheckMark] = col4(theme::kAccentHi);
     c[ImGuiCol_CheckboxSelectedBg] = col4(theme::kActive);
-    c[ImGuiCol_SliderGrab] = rgb(212, 212, 216);
+    c[ImGuiCol_InputTextCursor] = col4(theme::kText);
+    c[ImGuiCol_DragDropTarget] = col4(theme::kRing);
+    c[ImGuiCol_SliderGrab] = rgb(212, 212, 212);
     c[ImGuiCol_SliderGrabActive] = col4(theme::kAccentHi);
     c[ImGuiCol_Tab] = {0, 0, 0, 0};
-    c[ImGuiCol_TabHovered] = rgb(39, 39, 42, 0.6f);
+    c[ImGuiCol_TabHovered] = rgb(39, 39, 39, 0.6f);
     c[ImGuiCol_TabSelected] = col4(theme::kActive);
     c[ImGuiCol_TabSelectedOverline] = {0, 0, 0, 0};
     c[ImGuiCol_TabDimmed] = {0, 0, 0, 0};
@@ -95,16 +99,16 @@ inline void apply_style(float scale) {
     c[ImGuiCol_ResizeGrip] = {0, 0, 0, 0};
     c[ImGuiCol_ResizeGripHovered] = c[ImGuiCol_ResizeGripActive] = rgb(250, 250, 250, 0.2f);
     c[ImGuiCol_ScrollbarBg] = {0, 0, 0, 0};
-    c[ImGuiCol_ScrollbarGrab] = rgb(39, 39, 42);
-    c[ImGuiCol_ScrollbarGrabHovered] = rgb(63, 63, 70);
-    c[ImGuiCol_ScrollbarGrabActive] = rgb(82, 82, 91);
-    c[ImGuiCol_TableHeaderBg] = rgb(17, 17, 19);
+    c[ImGuiCol_ScrollbarGrab] = rgb(39, 39, 39);
+    c[ImGuiCol_ScrollbarGrabHovered] = rgb(63, 63, 63);
+    c[ImGuiCol_ScrollbarGrabActive] = rgb(82, 82, 82);
+    c[ImGuiCol_TableHeaderBg] = rgb(17, 17, 17);
     c[ImGuiCol_TableBorderStrong] = col4(theme::kBorder);
-    c[ImGuiCol_TableBorderLight] = rgb(28, 28, 31);
+    c[ImGuiCol_TableBorderLight] = rgb(28, 28, 28);
     c[ImGuiCol_TableRowBgAlt] = {1, 1, 1, 0.02f};
     c[ImGuiCol_TextSelectedBg] = rgb(250, 250, 250, 0.18f);
     c[ImGuiCol_NavCursor] = col4(theme::kRing);
-    c[ImGuiCol_PlotHistogram] = c[ImGuiCol_PlotLines] = rgb(212, 212, 216);
+    c[ImGuiCol_PlotHistogram] = c[ImGuiCol_PlotLines] = rgb(212, 212, 212);
     s.ScaleAllSizes(scale);
     s.FontScaleDpi = scale;
 }
@@ -123,7 +127,7 @@ inline void text_fit(ImDrawList* dl, ImVec2 pos, ImU32 col, const char* text, fl
 }
 
 
-enum class RailIcon { Map, Models, Scenery, Dialogue, Codex, Movies, Text, Package, Log, Settings };
+enum class RailIcon { Map, Models, Scenery, Dialogue, Codex, Movies, Text, Package, Log, Settings, Updates };
 
 inline void rail_icon(ImDrawList* dl, ImVec2 center, float sc, RailIcon kind, ImU32 color) {
     auto at = [&](float x, float y) { return ImVec2{center.x + x * sc, center.y + y * sc}; };
@@ -153,6 +157,9 @@ inline void rail_icon(ImDrawList* dl, ImVec2 center, float sc, RailIcon kind, Im
         box(-7, -6, 7, 6); line(-7, -2, 7, -2); line(-2, 1, 2, 1); break;
     case RailIcon::Log:
         box(-7, -6, 7, 6); line(-4, -2, -1, 0); line(-1, 0, -4, 2); line(1, 2, 4, 2); break;
+    case RailIcon::Updates:
+        line(0, -7, 0, 3); line(-4, -1, 0, 3); line(0, 3, 4, -1);
+        line(-7, 2, -7, 7); line(-7, 7, 7, 7); line(7, 7, 7, 2); break;
     case RailIcon::Settings:
         line(-7, -5, 7, -5); line(-7, 0, 7, 0); line(-7, 5, 7, 5);
         dl->AddCircleFilled(at(-2, -5), 2 * sc, color); dl->AddCircleFilled(at(3, 0), 2 * sc, color);
@@ -170,10 +177,11 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
     dl->AddLine({o.x, o.y + title_h - 1}, {o.x + w, o.y + title_h - 1}, theme::kBorder);
     const float mark_x = o.x + (expanded ? 15 * sc : (w - 26 * sc) * 0.5f);
     const float mark_y = o.y + (title_h - 26 * sc) * 0.5f;
-    dl->AddRectFilled({mark_x, mark_y}, {mark_x + 26 * sc, mark_y + 26 * sc}, theme::kAccentHi, 6 * sc);
+    dl->AddRectFilled({mark_x, mark_y}, {mark_x + 26 * sc, mark_y + 26 * sc}, theme::kSurfaceHi, 6 * sc);
+    dl->AddRect({mark_x, mark_y}, {mark_x + 26 * sc, mark_y + 26 * sc}, theme::kBorder, 6 * sc);
     dl->AddQuadFilled({mark_x + 8 * sc, mark_y + 19 * sc}, {mark_x + 12 * sc, mark_y + 7 * sc},
-                     {mark_x + 17 * sc, mark_y + 7 * sc}, {mark_x + 13 * sc, mark_y + 19 * sc}, theme::kPrimaryText);
-    dl->AddCircleFilled({mark_x + 18 * sc, mark_y + 17 * sc}, 2 * sc, theme::kPrimaryText);
+                     {mark_x + 17 * sc, mark_y + 7 * sc}, {mark_x + 13 * sc, mark_y + 19 * sc}, theme::kText);
+    dl->AddCircleFilled({mark_x + 18 * sc, mark_y + 17 * sc}, 2 * sc, theme::kText);
     if (expanded) {
         ImGui::PushFont(bold, 22);
         dl->AddText({o.x + 51 * sc, o.y + (title_h - ImGui::GetTextLineHeight()) * 0.5f}, theme::kText, "nim");
@@ -192,9 +200,7 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
         if (selected || hovered) d->AddRectFilled(p, q, selected ? theme::kActive : theme::kHover, 6 * sc);
         if (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible)
             d->AddRect(p, q, theme::kRing, 6 * sc, 1 * sc);
-        if (selected)
-            d->AddRectFilled({p.x + 2 * sc, p.y + 8 * sc}, {p.x + 4 * sc, q.y - 8 * sc}, theme::kAccentHi, sc);
-        const ImU32 color = selected ? theme::kAccentHi : hovered ? theme::kText : theme::kMuted;
+        const ImU32 color = selected || hovered ? theme::kText : theme::kMuted;
         rail_icon(d, {p.x + (expanded ? 18 * sc : width * 0.5f), p.y + height * 0.5f}, sc, glyph, color);
         if (expanded) {
             if (selected) ImGui::PushFont(bold, 0);
@@ -213,7 +219,7 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
         ImGui::PopFont();
         ImGui::Dummy({0, 2 * sc});
     };
-    const float foot_h = 83 * sc;
+    const float foot_h = 119 * sc;
     ImGui::SetCursorPos({0, title_h + 10 * sc});
     ImGui::BeginChild("##nav", {w - 1, std::max(1.0f, h - title_h - foot_h - 10 * sc)},
                      ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
@@ -235,6 +241,7 @@ void draw_sidebar(float title_h, bool expanded, ui::S active, ImFont* bold, Open
     ImGui::SetCursorPos({0, foot_top + 5 * sc});
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8 * sc, 2 * sc});
     row(ui::S::NavLog, RailIcon::Log); row(ui::S::NavSettings, RailIcon::Settings);
+    row(ui::S::SettingsUpdates, RailIcon::Updates);
     ImGui::PopStyleVar();
 }
 
@@ -283,9 +290,6 @@ inline float draw_status_contents(ImVec2 o, float w, float h, const char* left, 
 
 inline void draw_page_heading(const char* name, const char* desc, ImFont* bold) {
     const float sc = ImGui::GetStyle().FontScaleDpi;
-    const auto p = ImGui::GetCursorScreenPos();
-    ImGui::GetWindowDrawList()->AddRectFilled(p, {p.x + 33 * sc, p.y + 3 * sc}, theme::kAccentHi, sc);
-    ImGui::Dummy({0, 12 * sc});
     ImGui::PushFont(bold, 30);
     ImGui::TextUnformatted(name);
     ImGui::PopFont();
@@ -293,6 +297,38 @@ inline void draw_page_heading(const char* name, const char* desc, ImFont* bold) 
     ImGui::TextColored(col4(theme::kMuted), "%s", desc);
     ImGui::PopTextWrapPos();
     ImGui::Dummy({0, 11 * sc});
+}
+
+// The same update card is used for the settings page and the headless UI preview.
+inline bool begin_update_card(float width, const char* version, ImFont* bold) {
+    const float sc = ImGui::GetStyle().FontScaleDpi;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, col4(theme::kRail));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16 * sc, 14 * sc});
+    const bool visible = ImGui::BeginChild("##app-update", {width, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY,
+                                          ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    if (visible) {
+        ImGui::PushFont(bold, 18);
+        ImGui::TextUnformatted(ui::tr(ui::S::SettingsUpdates));
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, col4(theme::kMuted));
+        ImGui::TextWrapped("%s", ui::trf(ui::S::SettingsVersion, version).c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+    return visible;
+}
+
+inline bool update_primary_button(const char* label) {
+    ImGui::PushStyleColor(ImGuiCol_Text, col4(theme::kPrimaryText));
+    ImGui::PushStyleColor(ImGuiCol_Button, col4(theme::kAccentHi));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col4(theme::kPrimaryHover));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, col4(theme::kPrimaryPressed));
+    ImGui::PushStyleColor(ImGuiCol_Border, col4(theme::kAccentHi));
+    const bool pressed = ImGui::Button(label);
+    ImGui::PopStyleColor(5);
+    return pressed;
 }
 
 } // namespace nim::chrome
