@@ -1,4 +1,5 @@
 #include "nim/render/scene.hpp"
+#include "nim/render/material_job_index.hpp"
 #include "nim/render/visibility_lod.hpp"
 #include "nim/core/profile.hpp"
 #include "nim/core/parallel.hpp"
@@ -3123,7 +3124,6 @@ struct StaticMeshScene::MaterialScratch {
         ChannelContext channels;
         float4 origin_storage{0, 0, 0, 1};
         bool origin = false;
-        uint64_t key;
         std::string error;
     };
     struct Chunk {
@@ -3137,7 +3137,7 @@ struct StaticMeshScene::MaterialScratch {
     uint32_t epoch = 0;
     std::vector<std::atomic<uint64_t>> scope_ready;
     std::vector<Job> jobs;
-    std::unordered_map<uint64_t, size_t> pending;
+    MaterialJobIndex pending;
     std::vector<std::tuple<size_t, bool, size_t>> job_users;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> job_addresses;
 };
@@ -3378,7 +3378,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
             ChannelContext pc = model_cc;
             pc.world_position = &position;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, pc, vs));
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, pc, vs), false);
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             return a.gpu;
@@ -3436,7 +3436,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             static const float4 origin{0, 0, 0, 1};
             ChannelContext ec = channels_for(set);
             if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic)) ec.world_position = &origin;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs));
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs), false);
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             material_addresses_.emplace(key, a.gpu);
@@ -3525,9 +3525,9 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         for (auto& n : chunk.notes) notes_.push_back(std::move(n));
         for (auto& [table, error] : chunk.table_errors) failed_tables.try_emplace(table, std::move(error));
         for (const auto& [index, vs, key, origin] : chunk.requests) {
-            auto [job, added] = pending.try_emplace(key, jobs.size());
-            if (added) jobs.push_back(MaterialJob{index, vs, channels_for(sets_[items_[index].buffers]), {0, 0, 0, 1}, origin, key, {}});
-            job_users.emplace_back(index, vs, job->second);
+            const auto [job, added] = pending.find_or_insert(key, jobs.size());
+            if (added) jobs.push_back(MaterialJob{index, vs, channels_for(sets_[items_[index].buffers]), {0, 0, 0, 1}, origin, {}});
+            job_users.emplace_back(index, vs, job);
         }
     }
     if (!failed_tables.empty())
@@ -3560,7 +3560,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             auto env = with_channels(base, ec, job.vs);
             if (!job.vs) bind_atlases(env, it);
             const auto& material = job.vs ? it.vs_material : it.ps_material;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env);
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env, false);
         } catch (const std::exception& ex) {
             job.error = ex.what();
         }
@@ -3574,7 +3574,6 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         const auto& cb = jobs[j].vs ? it.vs_constants : it.ps_constants;
         const auto a = gpu.dynamic(cb.size() * sizeof(float4));
         std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
-        material_addresses_.emplace(jobs[j].key, a.gpu);
         job_addresses[j] = a.gpu;
     }
     for (const auto& [index, vs, j] : job_users) {

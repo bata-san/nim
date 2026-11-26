@@ -1,7 +1,9 @@
 // Portable regression tests for the optimized core and viewer LOD policy.
+#include "nim/content/tfx_vm.hpp"
 #include "nim/core/binary.hpp"
 #include "nim/core/block_cache.hpp"
 #include "nim/core/parallel.hpp"
+#include "nim/render/material_job_index.hpp"
 #include "nim/render/visibility_lod.hpp"
 
 #include <algorithm>
@@ -13,9 +15,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <string_view>
 #include <limits>
 #include <latch>
 #include <thread>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
@@ -37,6 +42,63 @@ static unsigned original_lod(uint32_t levels, float px, bool near_camera) {
 }
 
 int main() {
+    // The render path can skip collecting already-resolved bindings, not executing the opcodes.
+    {
+        const uint8_t program[]{
+            0x4D, 0x03, 0x02, 0x59, 0x27, // extern texture 3:2, register 7
+            0x61, 0x02, 0x5D, 0x04,       // sampler 2, register 4
+            0x4F, 0x08, 0x01, 0x5E, 0x05, // extern UAV 8:1, register 5
+            0x42, 0x00, 0x4A, 0x01, 0x00, 0x01, 0x53, 0x01, 0x80,
+        };
+        const float4 initial[]{{std::bit_cast<float>(0x7FC12345u), -0.0f, 1, 2}};
+        const float4 constants[]{{1, 2, 3, 4}};
+        TfxEnvironment env;
+        env.extern_float = [](uint8_t id, uint8_t slot) { return id == 1 && slot == 0 ? 5.f : -1.f; };
+        std::vector<float4> full, numeric;
+        const auto bindings = evaluate_tfx(program, constants, initial, full, env);
+        const auto outputs = evaluate_tfx(program, constants, initial, numeric, env, false);
+        CHECK(bindings.extern_textures.size() == 1 && bindings.extern_textures[0].slot == 7);
+        CHECK(bindings.extern_uavs.size() == 1 && bindings.extern_uavs[0].extern_id == 8);
+        CHECK(bindings.samplers.size() == 1 && bindings.samplers[0].index == 2);
+        CHECK(outputs.extern_textures.empty() && outputs.extern_uavs.empty() && outputs.samplers.empty());
+        CHECK(outputs.instructions == bindings.instructions && outputs.live_inputs == bindings.live_inputs);
+        CHECK(full.size() == numeric.size() && std::memcmp(full.data(), numeric.data(), full.size() * sizeof(float4)) == 0);
+        CHECK((numeric[1] == float4{6, 7, 8, 9}));
+        const uint8_t truncated[]{0x4D, 0x03};
+        for (const bool record : {false, true}) {
+            bool rejected = false;
+            try { evaluate_tfx(truncated, {}, {}, numeric, env, record); }
+            catch (const std::runtime_error& ex) { rejected = std::string_view(ex.what()) == "TFX: truncated instruction"; }
+            CHECK(rejected);
+        }
+    }
+
+    // Material requests must retain their first job assignment across collisions and growth,
+    // and a new pass must never reuse an index from an earlier pass.
+    {
+        MaterialJobIndex jobs;
+        std::unordered_map<uint64_t, size_t> reference;
+        for (size_t pass = 0; pass < 12; ++pass) {
+            jobs.clear();
+            reference.clear();
+            const size_t count = pass == 0 ? 0 : pass % 2 ? 16000 : 127;
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t object = (i * 379 + pass) % (pass < 5 ? 47 : 177);
+                const uint64_t technique = 0x80A00000u | ((i * 37) % 129);
+                const uint64_t key = i % 43 == 0 ? 0 : i % 157 == 0 ? UINT64_MAX
+                    : (object << 33) | (technique << 1) | (i & 1);
+                const size_t next_job = reference.size();
+                const auto [expected, first] = reference.try_emplace(key, next_job);
+                const auto [actual, inserted] = jobs.find_or_insert(key, next_job);
+                CHECK(actual == expected->second && inserted == first);
+            }
+            for (const auto& [key, job] : reference) {
+                const auto [actual, inserted] = jobs.find_or_insert(key, SIZE_MAX);
+                CHECK(actual == job && !inserted);
+            }
+        }
+    }
+
     // Validate all eight-bit authored LOD masks, boundaries and their adjacent float values.
     std::vector<float> radii{0, -1, 100, std::numeric_limits<float>::infinity(),
         -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()};

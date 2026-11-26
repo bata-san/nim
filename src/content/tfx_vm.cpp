@@ -11,7 +11,7 @@ namespace {
 
 // Opcode numbering follows the Tiger TFX VM (same as Destiny 2; cross-checked against Deimos).
 struct OpInfo { const char* name; uint8_t size; };
-OpInfo op_info(uint8_t op) {
+constexpr OpInfo describe_op(uint8_t op) {
     switch (op) {
     case 0x01: return {"add", 1};        case 0x02: return {"sub", 1};
     case 0x03: return {"mul", 1};        case 0x04: return {"div", 1};
@@ -64,6 +64,13 @@ OpInfo op_info(uint8_t op) {
     default: return {nullptr, 0};
     }
 }
+
+constexpr auto kOpcodeInfo = [] {
+    std::array<OpInfo, 256> info{};
+    for (size_t i = 0; i < info.size(); ++i) info[i] = describe_op(uint8_t(i));
+    return info;
+}();
+constexpr OpInfo op_info(uint8_t op) { return kOpcodeInfo[op]; }
 
 float4 map(float4 a, float (*f)(float)) { return {f(a[0]), f(a[1]), f(a[2]), f(a[3])}; }
 template <class F> float4 zip(float4 a, float4 b, F f) {
@@ -576,11 +583,10 @@ TfxResult run_tfx(std::span<const uint8_t> bc, std::span<const float4> constants
 }
 
 TfxResult evaluate_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants,
-                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env) {
+                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env, bool record_bindings) {
     out.assign(initial.begin(), initial.end());
     out.resize(std::max<size_t>(out.size(), 128));
-    TfxResult result = run_tfx(bytecode, constants, out, env);
-    return result;
+    return run_tfx(bytecode, constants, out, env, nullptr, record_bindings);
 }
 
 } // namespace nim
