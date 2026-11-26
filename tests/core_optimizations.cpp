@@ -3,6 +3,7 @@
 #include "nim/core/binary.hpp"
 #include "nim/core/block_cache.hpp"
 #include "nim/core/parallel.hpp"
+#include "nim/render/material_job_index.hpp"
 #include "nim/render/visibility_lod.hpp"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <latch>
 #include <thread>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
@@ -68,6 +70,32 @@ int main() {
             try { evaluate_tfx(truncated, {}, {}, numeric, env, record); }
             catch (const std::runtime_error& ex) { rejected = std::string_view(ex.what()) == "TFX: truncated instruction"; }
             CHECK(rejected);
+        }
+    }
+
+    // Material requests must retain their first job assignment across collisions and growth,
+    // and a new pass must never reuse an index from an earlier pass.
+    {
+        MaterialJobIndex jobs;
+        std::unordered_map<uint64_t, size_t> reference;
+        for (size_t pass = 0; pass < 12; ++pass) {
+            jobs.clear();
+            reference.clear();
+            const size_t count = pass == 0 ? 0 : pass % 2 ? 16000 : 127;
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t object = (i * 379 + pass) % (pass < 5 ? 47 : 177);
+                const uint64_t technique = 0x80A00000u | ((i * 37) % 129);
+                const uint64_t key = i % 43 == 0 ? 0 : i % 157 == 0 ? UINT64_MAX
+                    : (object << 33) | (technique << 1) | (i & 1);
+                const size_t next_job = reference.size();
+                const auto [expected, first] = reference.try_emplace(key, next_job);
+                const auto [actual, inserted] = jobs.find_or_insert(key, next_job);
+                CHECK(actual == expected->second && inserted == first);
+            }
+            for (const auto& [key, job] : reference) {
+                const auto [actual, inserted] = jobs.find_or_insert(key, SIZE_MAX);
+                CHECK(actual == job && !inserted);
+            }
         }
     }
 
