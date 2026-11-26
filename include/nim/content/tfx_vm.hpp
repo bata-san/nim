@@ -63,8 +63,10 @@ TfxResult run_tfx(std::span<const uint8_t> bytecode, std::span<const float4> con
 
 // Evaluate a material for a new frame from its original constants, never the previous frame's
 // outputs. Untouched registers and opaque uint/float bit patterns retain their original values.
+// Disable binding collection when the caller already resolved them and only needs numeric outputs.
 TfxResult evaluate_tfx(std::span<const uint8_t> bytecode, std::span<const float4> constants,
-                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env = {});
+                       std::span<const float4> initial, std::vector<float4>& out, const TfxEnvironment& env = {},
+                       bool record_bindings = true);
 
 // One instruction per line, for `nimcli technique`.
 std::string disassemble_tfx(std::span<const uint8_t> bytecode);

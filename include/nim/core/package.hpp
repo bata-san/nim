@@ -109,10 +109,13 @@ private:
     std::vector<Block> blocks_;
     std::vector<NamedTag> named_tags_;
     std::vector<Hash64Entry> hash64s_;
-    std::unique_ptr<PackageCipher> cipher_;
+    mutable std::once_flag cipher_once_;
+    mutable std::unique_ptr<PackageCipher> cipher_;
 
     mutable DecodedBlockCache cache_;
 
+    uint16_t newest_patch_ = 0;
+    MappedFile newest_file_;
     mutable std::mutex files_mutex_;
     mutable std::map<uint16_t, std::unique_ptr<MappedFile>> files_;
 };

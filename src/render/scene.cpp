@@ -3378,7 +3378,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
         auto at = [&](const TechniqueStage& material, std::vector<float4>& cb, float4 position, bool vs) {
             ChannelContext pc = model_cc;
             pc.world_position = &position;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, pc, vs));
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, pc, vs), false);
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             return a.gpu;
@@ -3436,7 +3436,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             static const float4 origin{0, 0, 0, 1};
             ChannelContext ec = channels_for(set);
             if ((vs ? it.vs_reads_position : it.ps_reads_position) > 0 && (dynamic_ || set.dynamic)) ec.world_position = &origin;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs));
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, cb, material_env(it, ec, vs), false);
             const auto a = gpu.dynamic(cb.size() * sizeof(float4));
             std::memcpy(a.cpu, cb.data(), cb.size() * sizeof(float4));
             material_addresses_.emplace(key, a.gpu);
@@ -3560,7 +3560,7 @@ void StaticMeshScene::update_materials(Gpu& gpu, uint32_t w, uint32_t h, const V
             auto env = with_channels(base, ec, job.vs);
             if (!job.vs) bind_atlases(env, it);
             const auto& material = job.vs ? it.vs_material : it.ps_material;
-            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env);
+            evaluate_tfx(material.bytecode, material.constants, material.cbuffer_init, job.vs ? it.vs_constants : it.ps_constants, env, false);
         } catch (const std::exception& ex) {
             job.error = ex.what();
         }

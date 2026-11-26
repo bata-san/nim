@@ -19,16 +19,15 @@ std::pair<std::string, int> split_patch(const std::string& stem) {
 
 } // namespace
 
-Package::Package(const std::filesystem::path& path) : dir_(path.parent_path()) {
+Package::Package(const std::filesystem::path& path) : dir_(path.parent_path()), newest_file_(path) {
     auto [base, patch] = split_patch(path.stem().string());
     name_ = base;
-    files_[uint16_t(patch)] = std::make_unique<MappedFile>(path);
+    newest_patch_ = uint16_t(patch);
     parse();
-    cipher_ = std::make_unique<PackageCipher>(header_.pkg_id);
 }
 
 void Package::parse() {
-    BinaryReader r(files_.begin()->second->bytes());
+    BinaryReader r(newest_file_.bytes());
     PackageHeader& h = header_;
     h.version = r.u16_at(0x00);
     if (h.version != 0x35)
@@ -96,6 +95,8 @@ void Package::parse() {
 }
 
 const MappedFile& Package::file_for_patch(uint16_t patch) const {
+    // The newest patch already has an immutable mapping; no older-file lookup is needed.
+    if (patch == newest_patch_) return newest_file_;
     std::lock_guard lock(files_mutex_);
     auto it = files_.find(patch);
     if (it != files_.end()) return *it->second;
@@ -111,17 +112,25 @@ std::vector<uint8_t> Package::read_block(uint32_t index) const {
     if (size_t(b.offset) + b.size > src.size())
         throw std::runtime_error(std::format("{}: block {} out of file bounds", name_, index));
 
-    std::vector<uint8_t> raw(src.begin() + b.offset, src.begin() + b.offset + b.size);
     if (b.flags & kBlockRedacted)
         throw std::runtime_error(std::format("{}: block {} is redacted (needs group key)", name_, index));
+    // The decompressor only reads its input. Copy when decryption needs writable bytes, or
+    // when returning an uncompressed block that must own its data beyond this mapping.
+    auto payload = src.subspan(b.offset, b.size);
+    std::vector<uint8_t> raw;
     if (b.flags & kBlockEncrypted) {
+        // Index/metadata scans open packages without reading encrypted payloads.
+        std::call_once(cipher_once_, [this] { cipher_ = std::make_unique<PackageCipher>(header_.pkg_id); });
+        raw.assign(payload.begin(), payload.end());
         if (!cipher_->decrypt(b.flags & kBlockAltKey, b.gcm_tag, raw))
             throw std::runtime_error(std::format("{}: block {} failed GCM authentication", name_, index));
+        if (!(b.flags & kBlockCompressed)) return raw;
+        payload = raw;
+    } else if (!(b.flags & kBlockCompressed)) {
+        return {payload.begin(), payload.end()};
     }
-    if (!(b.flags & kBlockCompressed)) return raw;
-
     std::vector<uint8_t> out(kBlockSize);
-    size_t n = Oodle::decompress(raw, out);
+    size_t n = Oodle::decompress(payload, out);
     if (n == 0) throw std::runtime_error(std::format("{}: block {} failed to decompress", name_, index));
     out.resize(n);
     return out;
